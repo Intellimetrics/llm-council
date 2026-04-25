@@ -80,6 +80,8 @@ Read the latest transcript:
 ```bash
 llm-council last --path-only
 llm-council last
+llm-council transcripts list
+llm-council transcripts summary
 ```
 
 Use explicit participants:

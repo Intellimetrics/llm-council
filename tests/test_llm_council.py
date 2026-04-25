@@ -1,16 +1,20 @@
+import asyncio
 from pathlib import Path
 
+import llm_council.orchestrator as orchestrator_module
 from llm_council.adapters import (
     ParticipantResult,
     _format_arg,
     clean_subprocess_env,
     redact_prompt_args,
 )
+from llm_council.cli import build_parser, cmd_transcripts
 from llm_council.config import load_config, select_participants
 from llm_council.context import build_prompt
 from llm_council.context import read_context_file
 from llm_council.defaults import DEFAULT_CONFIG
 from llm_council.deliberation import (
+    build_deliberation_prompt,
     has_disagreement,
     model_comparison,
     recommendation_counts,
@@ -32,9 +36,18 @@ from llm_council.mcp_server import (
     last_transcript_schema,
     models_schema,
 )
+from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
 from llm_council.setup_wizard import mcp_config, project_config, write_setup_files
-from llm_council.transcript import latest_transcript, result_to_dict, safe_slug, write_transcript
+from llm_council.transcript import (
+    deliberation_summary,
+    final_round_results,
+    latest_transcript,
+    result_to_dict,
+    safe_slug,
+    transcript_records,
+    write_transcript,
+)
 
 
 def test_select_other_cli_peers_excludes_current():
@@ -156,6 +169,146 @@ def test_model_comparison_and_disagreement_detection():
     comparison = "\n".join(model_comparison(results))
     assert "a:" in comparison
     assert "4 tokens" in comparison
+
+
+def test_recommendation_label_handles_common_markdown():
+    assert recommendation_label("**Recommendation:** no - defer") == "no"
+    assert recommendation_label("> ## Recommendation: tradeoff - depends") == "tradeoff"
+    assert (
+        recommendation_label(
+            "```text\nRECOMMENDATION: no - sample\n```\n\n- RECOMMENDATION: yes - do it"
+        )
+        == "yes"
+    )
+    assert recommendation_label("```text\nRECOMMENDATION: no - sample\n```") == "no"
+
+
+def test_disagreement_requires_labeled_positions():
+    results = [
+        ParticipantResult("a", True, "We should proceed.", "", 1),
+        ParticipantResult("b", True, "Avoid this for now.", "", 1),
+    ]
+    assert recommendation_counts(results)["unknown"] == 2
+    assert has_disagreement(results) is False
+
+
+def test_deliberation_prompt_is_capped():
+    result = ParticipantResult("a", True, "x" * 100_000, "", 1)
+    prompt = build_deliberation_prompt("question" * 20_000, [result])
+    assert len(prompt) < 90_000
+    assert "truncated" in prompt
+
+
+def test_deliberation_summary():
+    assert deliberation_summary({"deliberation_status": "ran_no_labeled_disagreement"}) == (
+        "ran; no labeled disagreement remained"
+    )
+    assert "max rounds" in deliberation_summary(
+        {"deliberation_status": "ran_max_rounds_unresolved"}
+    )
+    assert "skipped" in deliberation_summary(
+        {"deliberation_status": "skipped_no_labeled_disagreement"}
+    )
+    assert "max rounds is 1" in deliberation_summary(
+        {"deliberation_status": "skipped_max_rounds"}
+    )
+    assert deliberation_summary({"deliberation_requested": False}) == "not requested"
+
+
+def test_execute_council_skips_second_round_without_labeled_disagreement(
+    monkeypatch, tmp_path: Path
+):
+    calls = 0
+
+    async def fake_run_participants(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return [
+            ParticipantResult("a", True, "Proceed.", "", 1),
+            ParticipantResult("b", True, "Defer.", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    results, metadata = asyncio.run(
+        execute_council(["a", "b"], {}, "question", tmp_path, {}, deliberate=True)
+    )
+    assert calls == 1
+    assert len(results) == 2
+    assert metadata["deliberation_status"] == "skipped_no_labeled_disagreement"
+
+
+def test_execute_council_runs_second_round_on_labeled_disagreement(
+    monkeypatch, tmp_path: Path
+):
+    calls = 0
+
+    async def fake_run_participants(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [
+                ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+                ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1),
+            ]
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: tradeoff - guarded", "", 1),
+            ParticipantResult("b", True, "RECOMMENDATION: tradeoff - guarded", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    results, metadata = asyncio.run(
+        execute_council(["a", "b"], {}, "question", tmp_path, {}, deliberate=True)
+    )
+    assert calls == 2
+    assert metadata["rounds"] == 2
+    assert metadata["deliberation_status"] == "ran_no_labeled_disagreement"
+    assert results[-1].name == "b:round2"
+
+
+def test_execute_council_respects_max_rounds(monkeypatch, tmp_path: Path):
+    calls = 0
+
+    async def fake_run_participants(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+            ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    results, metadata = asyncio.run(
+        execute_council(
+            ["a", "b"], {}, "question", tmp_path, {}, deliberate=True, max_rounds=1
+        )
+    )
+    assert calls == 1
+    assert len(results) == 2
+    assert metadata["deliberation_status"] == "skipped_max_rounds"
+
+
+def test_execute_council_honors_max_rounds_above_two(monkeypatch, tmp_path: Path):
+    calls = 0
+
+    async def fake_run_participants(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+            ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    results, metadata = asyncio.run(
+        execute_council(
+            ["a", "b"], {}, "question", tmp_path, {}, deliberate=True, max_rounds=3
+        )
+    )
+    assert calls == 3
+    assert len(results) == 6
+    assert metadata["rounds"] == 3
+    assert metadata["deliberation_status"] == "ran_max_rounds_unresolved"
+    assert results[-1].name == "b:round3"
 
 
 def test_openrouter_model_normalization():
@@ -295,3 +448,93 @@ def test_last_transcript_reads_latest_from_project_cwd(tmp_path: Path):
     assert "Tokens reported" in result["content"]
     assert "Model Comparison" in result["content"]
     assert latest_transcript(out_dir) == md_path
+    records = transcript_records(out_dir)
+    assert records[0]["question"] == "test"
+    assert records[0]["total"] == 0
+
+
+def test_latest_transcript_ordering_and_corrupt_records(tmp_path: Path):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    out_dir.mkdir(parents=True)
+    old_path = out_dir / "old.md"
+    new_path = out_dir / "new.md"
+    old_path.write_text("old", encoding="utf-8")
+    new_path.write_text("new", encoding="utf-8")
+    old_time = 1_700_000_000
+    new_time = old_time + 10
+    __import__("os").utime(old_path, (old_time, old_time))
+    __import__("os").utime(new_path, (new_time, new_time))
+    assert latest_transcript(out_dir) == new_path
+    assert latest_transcript(tmp_path / "empty") is None
+
+    (out_dir / "bad.json").write_text("{bad-json", encoding="utf-8")
+    assert transcript_records(out_dir) == []
+
+
+def test_write_transcript_uses_final_round_for_recommendations(tmp_path: Path):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "multi.md"
+    json_path = out_dir / "multi.json"
+    results = [
+        ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+        ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1),
+        ParticipantResult("a:round2", True, "RECOMMENDATION: tradeoff - guarded", "", 1),
+        ParticipantResult("b:round2", True, "RECOMMENDATION: tradeoff - guarded", "", 1),
+    ]
+    assert [result.name for result in final_round_results(results)] == [
+        "a:round2",
+        "b:round2",
+    ]
+    write_transcript(
+        md_path,
+        json_path,
+        question="naive unicode: naïve",
+        mode="quick",
+        current="codex",
+        participants=["a", "b"],
+        prompt="prompt",
+        results=results,
+        transparent=False,
+        metadata={"rounds": 2, "deliberation_status": "ran_no_labeled_disagreement"},
+    )
+    content = md_path.read_text(encoding="utf-8")
+    assert "Successful responses: 4/4 total" in content
+    assert "Final-round successful responses: 2/2" in content
+    assert "0 yes / 0 no / 2 tradeoff / 0 unknown" in content
+    assert "Model Comparison" not in content
+
+
+def test_transcripts_cli_limit_zero_and_relative_show(tmp_path: Path, capsys):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "20260425-test.md"
+    json_path = out_dir / "20260425-test.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="test",
+        mode="quick",
+        current="codex",
+        participants=[],
+        prompt="prompt",
+        results=[],
+        metadata={"rounds": 1},
+    )
+
+    parser = build_parser()
+    args = parser.parse_args(
+        ["transcripts", "list", "--cwd", str(tmp_path), "--limit", "0"]
+    )
+    assert cmd_transcripts(args) == 0
+    assert capsys.readouterr().out == ""
+
+    args = parser.parse_args(
+        [
+            "transcripts",
+            "show",
+            ".llm-council/runs/20260425-test.md",
+            "--cwd",
+            str(tmp_path),
+        ]
+    )
+    assert cmd_transcripts(args) == 0
+    assert "LLM Council Transcript" in capsys.readouterr().out

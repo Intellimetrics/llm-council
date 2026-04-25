@@ -8,3 +8,4 @@
 - Added transparency mode with per-model token/cost reporting when providers return usage.
 - Added opt-in deliberation mode with a second round on detected disagreement.
 - Added project setup, doctor checks, OpenRouter model catalog, and transcript storage.
+- Added transcript inspection commands and hardened labeled deliberation across multiple rounds.

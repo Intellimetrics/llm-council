@@ -24,7 +24,12 @@ from llm_council.model_catalog import fetch_openrouter_models
 from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
 from llm_council.setup_wizard import write_setup_files
-from llm_council.transcript import latest_transcript, transcript_paths, write_transcript
+from llm_council.transcript import (
+    latest_transcript,
+    transcript_paths,
+    transcript_records,
+    write_transcript,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -121,6 +126,21 @@ def build_parser() -> argparse.ArgumentParser:
     last.add_argument("--cwd", default=".", help="Working directory")
     last.add_argument("--json-file", action="store_true", help="Use JSON transcript")
     last.add_argument("--path-only", action="store_true", help="Only print path")
+
+    transcripts = sub.add_parser("transcripts", help="Inspect council transcripts")
+    transcripts_sub = transcripts.add_subparsers(dest="transcripts_command")
+    transcripts_list = transcripts_sub.add_parser("list", help="List recent transcripts")
+    transcripts_list.add_argument("--cwd", default=".", help="Working directory")
+    transcripts_list.add_argument("--limit", type=int, default=10)
+    transcripts_list.add_argument("--json", action="store_true", help="Print JSON")
+    transcripts_show = transcripts_sub.add_parser("show", help="Show a transcript")
+    transcripts_show.add_argument("path", nargs="?", help="Transcript path; defaults to latest")
+    transcripts_show.add_argument("--cwd", default=".", help="Working directory")
+    transcripts_show.add_argument("--json-file", action="store_true", help="Show JSON")
+    transcripts_summary = transcripts_sub.add_parser(
+        "summary", help="Summarize transcript totals"
+    )
+    transcripts_summary.add_argument("--cwd", default=".", help="Working directory")
 
     sub.add_parser("mcp-server", help="Run llm-council MCP server over stdio")
 
@@ -281,6 +301,63 @@ def cmd_last(args: argparse.Namespace) -> int:
     else:
         print(path.read_text())
     return 0
+
+
+def _transcript_dir(cwd: Path, config: dict) -> Path:
+    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
+    return out_dir if out_dir.is_absolute() else cwd / out_dir
+
+
+def cmd_transcripts(args: argparse.Namespace) -> int:
+    if not args.transcripts_command:
+        raise SystemExit("transcripts subcommand is required")
+    cwd = Path(args.cwd).resolve()
+    load_project_env(cwd)
+    config = load_config(find_config(cwd))
+    out_dir = _transcript_dir(cwd, config)
+
+    if args.transcripts_command == "list":
+        records = transcript_records(out_dir)
+        records = records[-args.limit :] if args.limit > 0 else []
+        if args.json:
+            print(json.dumps(records, indent=2))
+        else:
+            for record in records:
+                print(
+                    f"{record['ok']}/{record['total']} "
+                    f"${record['cost_usd']:.6f} "
+                    f"{record['mode'] or '-':10} "
+                    f"{record['question'][:80]} "
+                    f"({record['markdown']})"
+                )
+        return 0
+
+    if args.transcripts_command == "show":
+        if args.path:
+            path = Path(args.path)
+            if not path.is_absolute():
+                path = cwd / path
+        else:
+            path = latest_transcript(out_dir, suffix=".json" if args.json_file else ".md")
+            if path is None:
+                raise SystemExit(f"No council transcripts found in {out_dir}")
+        print(path.read_text())
+        return 0
+
+    if args.transcripts_command == "summary":
+        records = transcript_records(out_dir)
+        runs = len(records)
+        tokens = sum(record["tokens"] for record in records)
+        cost = sum(record["cost_usd"] for record in records)
+        successes = sum(record["ok"] for record in records)
+        participants = sum(record["total"] for record in records)
+        print(f"runs: {runs}")
+        print(f"participant_successes: {successes}/{participants}")
+        print(f"tokens: {tokens}")
+        print(f"cost_usd: ${cost:.6f}")
+        return 0
+
+    raise SystemExit(f"Unknown transcripts subcommand: {args.transcripts_command}")
 
 
 def _fmt_cost(value: float | None) -> str:
@@ -463,6 +540,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_recommend(args)
     if args.command == "last":
         return cmd_last(args)
+    if args.command == "transcripts":
+        return cmd_transcripts(args)
     if args.command == "models":
         return cmd_models(args)
     if args.command == "mcp-server":

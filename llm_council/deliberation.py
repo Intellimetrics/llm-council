@@ -2,12 +2,32 @@
 
 from __future__ import annotations
 
+import re
+
 from llm_council.adapters import ParticipantResult
+
+MAX_DELIBERATION_PROMPT_CHARS = 80_000
+RECOMMENDATION_RE = re.compile(
+    r"""
+    ^\s*
+    (?:>\s*)?
+    (?:[-*]\s+)?
+    (?:\#{1,6}\s*)?
+    (?:\*\*)?
+    recommendation
+    (?:\*\*)?
+    \s*[:\-]\s*
+    (?:\*\*)?
+    \s*
+    (yes|no|tradeoff)\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 def first_nonempty_line(text: str) -> str:
     for line in text.splitlines():
-        cleaned = line.strip().strip("*-_ ")
+        cleaned = line.strip().strip(">*-_ ")
         if cleaned:
             return cleaned
     return ""
@@ -30,18 +50,21 @@ def model_comparison(results: list[ParticipantResult]) -> list[str]:
 
 
 def recommendation_label(text: str) -> str:
-    for line in text.splitlines()[:8]:
-        cleaned = line.strip().lower()
-        if not cleaned.startswith("recommendation:"):
+    fenced_label = "unknown"
+    in_fence = False
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
             continue
-        value = cleaned.split(":", 1)[1].strip()
-        if value.startswith("yes"):
-            return "yes"
-        if value.startswith("no"):
-            return "no"
-        if value.startswith("tradeoff"):
-            return "tradeoff"
-    return "unknown"
+        match = RECOMMENDATION_RE.match(line)
+        if not match:
+            continue
+        label = match.group(1).lower()
+        if not in_fence:
+            return label
+        if fenced_label == "unknown":
+            fenced_label = label
+    return fenced_label
 
 
 def recommendation_counts(results: list[ParticipantResult]) -> dict[str, int]:
@@ -55,28 +78,9 @@ def recommendation_counts(results: list[ParticipantResult]) -> dict[str, int]:
 
 def has_disagreement(results: list[ParticipantResult]) -> bool:
     counts = recommendation_counts(results)
-    labeled_positions = sum(counts[label] for label in ("yes", "no", "tradeoff"))
-    if labeled_positions >= 2:
-        return sum(1 for label in ("yes", "no", "tradeoff") if counts[label]) > 1
-
-    lines = [first_nonempty_line(result.output).lower() for result in results if result.ok]
-    if len(lines) < 2:
-        return False
-
-    yes_count = sum(_contains_word(line, "yes") for line in lines)
-    no_count = sum(_contains_word(line, "no") for line in lines)
-    if yes_count and no_count:
-        return True
-
-    positive = sum(
-        any(word in line for word in ("recommend", "should", "use", "proceed"))
-        for line in lines
-    )
-    negative = sum(
-        any(word in line for word in ("avoid", "defer", "do not", "should not"))
-        for line in lines
-    )
-    return bool(positive and negative)
+    labeled_positions = [label for label in ("yes", "no", "tradeoff") if counts[label]]
+    labeled_total = sum(counts[label] for label in labeled_positions)
+    return labeled_total >= 2 and len(labeled_positions) > 1
 
 
 def build_deliberation_prompt(original_prompt: str, results: list[ParticipantResult]) -> str:
@@ -85,7 +89,7 @@ def build_deliberation_prompt(original_prompt: str, results: list[ParticipantRes
         if not result.ok:
             continue
         excerpts.append(f"## {result.name}\n\n{result.output.strip()[:4000]}")
-    return (
+    prompt = (
         f"{original_prompt}\n\n"
         "Second-round deliberation:\n"
         "The first-round participants may disagree. Read the peer responses below, "
@@ -93,7 +97,9 @@ def build_deliberation_prompt(original_prompt: str, results: list[ParticipantRes
         "recommendation. If consensus is impossible, state the remaining split clearly.\n\n"
         + "\n\n".join(excerpts)
     )
-
-
-def _contains_word(text: str, word: str) -> bool:
-    return f" {word} " in f" {text} "
+    if len(prompt) <= MAX_DELIBERATION_PROMPT_CHARS:
+        return prompt
+    return (
+        prompt[:MAX_DELIBERATION_PROMPT_CHARS]
+        + "\n\n[deliberation prompt truncated by llm-council]\n"
+    )

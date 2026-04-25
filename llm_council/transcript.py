@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from llm_council.adapters import ParticipantResult, command_for_display
 from llm_council.deliberation import model_comparison, recommendation_counts
+
+ROUND_SUFFIX_RE = re.compile(r":round(\d+)$")
 
 
 def safe_slug(text: str, max_len: int = 60) -> str:
@@ -24,8 +27,48 @@ def transcript_paths(base_dir: Path, question: str) -> tuple[Path, Path]:
 
 
 def latest_transcript(base_dir: Path, *, suffix: str = ".md") -> Path | None:
-    matches = sorted(base_dir.glob(f"*{suffix}"), key=lambda path: path.stat().st_mtime)
-    return matches[-1] if matches else None
+    matches = sorted(
+        _existing_paths(base_dir.glob(f"*{suffix}")), key=lambda item: item[1]
+    )
+    return matches[-1][0] if matches else None
+
+
+def _existing_paths(paths) -> list[tuple[Path, float]]:
+    existing = []
+    for path in paths:
+        try:
+            existing.append((path, path.stat().st_mtime))
+        except FileNotFoundError:
+            continue
+    return existing
+
+
+def transcript_records(base_dir: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for path, mtime in sorted(
+        _existing_paths(base_dir.glob("*.json")), key=lambda item: item[1]
+    ):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        results = data.get("results") or []
+        records.append(
+            {
+                "path": str(path),
+                "markdown": str(path.with_suffix(".md")),
+                "question": data.get("question", ""),
+                "mode": data.get("mode", ""),
+                "current": data.get("current"),
+                "participants": data.get("participants", []),
+                "ok": sum(1 for result in results if result.get("ok")),
+                "total": len(results),
+                "tokens": sum(result.get("total_tokens") or 0 for result in results),
+                "cost_usd": sum(result.get("cost_usd") or 0 for result in results),
+                "mtime": mtime,
+            }
+        )
+    return records
 
 
 def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
@@ -42,6 +85,37 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
         "total_tokens": result.total_tokens,
         "cost_usd": result.cost_usd,
     }
+
+
+def deliberation_summary(metadata: dict[str, Any]) -> str:
+    status = metadata.get("deliberation_status")
+    if status == "ran_no_labeled_disagreement":
+        return "ran; no labeled disagreement remained"
+    if status == "ran_max_rounds_unresolved":
+        return "ran; max rounds reached with labeled disagreement"
+    if status == "skipped_no_labeled_disagreement":
+        return "skipped, no labeled disagreement detected"
+    if status == "skipped_max_rounds":
+        return "skipped, max rounds is 1"
+    if status == "pending":
+        return "pending"
+    if metadata.get("deliberated"):
+        return "ran"
+    if metadata.get("deliberation_requested"):
+        return "skipped"
+    return "not requested"
+
+
+def result_round(name: str) -> int:
+    match = ROUND_SUFFIX_RE.search(name)
+    return int(match.group(1)) if match else 1
+
+
+def final_round_results(results: list[ParticipantResult]) -> list[ParticipantResult]:
+    if not results:
+        return []
+    final_round = max(result_round(result.name) for result in results)
+    return [result for result in results if result_round(result.name) == final_round]
 
 
 def write_transcript(
@@ -61,22 +135,26 @@ def write_transcript(
 
     metadata = metadata or {}
     ok_count = sum(1 for result in results if result.ok)
+    final_results = final_round_results(results)
+    final_ok_count = sum(1 for result in final_results if result.ok)
     elapsed_total = sum(result.elapsed_seconds for result in results)
     token_total = sum(result.total_tokens or 0 for result in results)
     cost_total = sum(result.cost_usd or 0 for result in results)
-    recommendations = recommendation_counts(results)
+    recommendations = recommendation_counts(final_results)
     lines = [
         "# LLM Council Transcript",
         "",
         f"- Mode: `{mode}`",
         f"- Current agent: `{current or 'unknown'}`",
         f"- Participants: {', '.join(f'`{name}`' for name in participants)}",
-        f"- Successful responses: {ok_count}/{len(results)}",
+        f"- Successful responses: {ok_count}/{len(results)} total",
+        f"- Final-round successful responses: {final_ok_count}/{len(final_results)}",
         f"- Participant elapsed total: `{elapsed_total:.1f}s`",
         f"- Tokens reported: `{token_total}`",
         f"- Cost reported: `${cost_total:.6f}`",
         f"- Rounds: `{metadata.get('rounds', 1)}`",
-        "- Recommendations: "
+        f"- Deliberation: {deliberation_summary(metadata)}",
+        "- Recommendations (final round): "
         f"`{recommendations['yes']} yes / {recommendations['no']} no / "
         f"{recommendations['tradeoff']} tradeoff / {recommendations['unknown']} unknown`",
         "",
@@ -116,7 +194,7 @@ def write_transcript(
             lines.extend(["```", result.error.strip() or "[unknown error]", "```", ""])
 
     lines.extend(["## Prompt Sent", "", "```text", prompt, "```", ""])
-    markdown_path.write_text("\n".join(lines))
+    markdown_path.write_text("\n".join(lines), encoding="utf-8")
 
     json_path.write_text(
         json.dumps(
@@ -131,5 +209,6 @@ def write_transcript(
             },
             indent=2,
         )
-        + "\n"
+        + "\n",
+        encoding="utf-8",
     )
