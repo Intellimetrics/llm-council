@@ -49,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Filter participants by model/lab origin",
     )
     run.add_argument("--context", action="append", default=[], help="Context file")
+    run.add_argument(
+        "--allow-outside-cwd",
+        action="store_true",
+        help="Allow --context files outside the working directory",
+    )
     run.add_argument("--diff", action="store_true", help="Include git diff")
     run.add_argument("--stdin", action="store_true", help="Append stdin as context")
     run.add_argument("--cwd", default=".", help="Working directory")
@@ -345,6 +350,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         context_paths=args.context,
         include_diff=args.diff,
         stdin_text=stdin_text,
+        allow_outside_cwd=args.allow_outside_cwd,
     )
 
     if args.dry_run:

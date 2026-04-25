@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -57,7 +58,8 @@ def normalize_openrouter_model(model: dict[str, Any]) -> dict[str, Any]:
 
 
 def openrouter_cache_path() -> Path:
-    return Path.home() / ".cache" / "llm-council" / "openrouter-models.json"
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    return cache_root / "llm-council" / "openrouter-models.json"
 
 
 def fetch_openrouter_models(

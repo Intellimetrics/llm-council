@@ -29,7 +29,36 @@ def model_comparison(results: list[ParticipantResult]) -> list[str]:
     return lines
 
 
+def recommendation_label(text: str) -> str:
+    for line in text.splitlines()[:8]:
+        cleaned = line.strip().lower()
+        if not cleaned.startswith("recommendation:"):
+            continue
+        value = cleaned.split(":", 1)[1].strip()
+        if value.startswith("yes"):
+            return "yes"
+        if value.startswith("no"):
+            return "no"
+        if value.startswith("tradeoff"):
+            return "tradeoff"
+    return "unknown"
+
+
+def recommendation_counts(results: list[ParticipantResult]) -> dict[str, int]:
+    counts = {"yes": 0, "no": 0, "tradeoff": 0, "unknown": 0}
+    for result in results:
+        if not result.ok:
+            continue
+        counts[recommendation_label(result.output)] += 1
+    return counts
+
+
 def has_disagreement(results: list[ParticipantResult]) -> bool:
+    counts = recommendation_counts(results)
+    labeled_positions = sum(counts[label] for label in ("yes", "no", "tradeoff"))
+    if labeled_positions >= 2:
+        return sum(1 for label in ("yes", "no", "tradeoff") if counts[label]) > 1
+
     lines = [first_nonempty_line(result.output).lower() for result in results if result.ok]
     if len(lines) < 2:
         return False

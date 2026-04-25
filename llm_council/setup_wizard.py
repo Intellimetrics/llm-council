@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from llm_council.config import deep_merge
 from llm_council.defaults import DEFAULT_CONFIG
 
 
@@ -102,13 +104,22 @@ def _mode_participants(mode: dict[str, Any]) -> set[str]:
 
 def mcp_config(project_root: Path) -> dict[str, Any]:
     local_python = project_root / ".venv" / "bin" / "python"
-    command = str(local_python) if local_python.exists() else sys.executable
+    installed = shutil.which("llm-council")
+    if installed:
+        command = installed
+        args = ["mcp-server"]
+    elif local_python.exists():
+        command = str(local_python)
+        args = ["-m", "llm_council.mcp_server"]
+    else:
+        command = sys.executable
+        args = ["-m", "llm_council.mcp_server"]
     return {
         "mcpServers": {
             "llm-council": {
                 "type": "stdio",
                 "command": command,
-                "args": ["-m", "llm_council.mcp_server"],
+                "args": args,
                 "env": {
                     "PYTHONPATH": str(project_root.resolve()),
                     "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}",
@@ -132,16 +143,21 @@ def write_setup_files(
     root.mkdir(parents=True, exist_ok=True)
 
     config_path = root / ".llm-council.yaml"
-    if force or not config_path.exists():
+    desired_config = project_config(
+        include_openrouter=include_openrouter,
+        include_local=include_local,
+        us_only_default=us_only_default,
+    )
+    if config_path.exists() and not force:
+        existing_config = yaml.safe_load(config_path.read_text()) or {}
+        merged_config = deep_merge(desired_config, existing_config)
+    else:
+        merged_config = desired_config
+    if force or not config_path.exists() or merged_config != (
+        yaml.safe_load(config_path.read_text()) if config_path.exists() else None
+    ):
         config_path.write_text(
-            yaml.safe_dump(
-                project_config(
-                    include_openrouter=include_openrouter,
-                    include_local=include_local,
-                    us_only_default=us_only_default,
-                ),
-                sort_keys=False,
-            )
+            yaml.safe_dump(merged_config, sort_keys=False)
         )
         written.append(config_path)
 
@@ -164,5 +180,12 @@ def write_setup_files(
             if force or not path.exists():
                 path.write_text(INSTRUCTION_TEXT)
                 written.append(path)
+
+    runtime_gitignore = root / ".llm-council" / ".gitignore"
+    runtime_gitignore.parent.mkdir(parents=True, exist_ok=True)
+    desired_gitignore = "runs/\n*.log\n"
+    if force or not runtime_gitignore.exists() or runtime_gitignore.read_text() != desired_gitignore:
+        runtime_gitignore.write_text(desired_gitignore)
+        written.append(runtime_gitignore)
 
     return written

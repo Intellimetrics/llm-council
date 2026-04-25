@@ -182,9 +182,13 @@ The MCP server exposes:
 - `council_recommend`: decide whether a task is worth taking to council
 - `council_list_modes`: list configured modes and participants
 - `council_last_transcript`: read the most recent local transcript
+- `council_doctor`: diagnose CLI, OpenRouter, Ollama, and MCP readiness
+- `council_models`: list cached OpenRouter models with filter/origin options
 
 `council_run` accepts `transparent`, `deliberate`, and `max_rounds` for the same
-usage/cost and opt-in deliberation behavior as the CLI.
+usage/cost and opt-in deliberation behavior as the CLI. Context files are
+restricted to `working_directory` by default; pass `allow_outside_cwd` only when
+external files are intentionally part of the prompt.
 
 Run it manually:
 
@@ -216,6 +220,25 @@ Agents should use `council_recommend` when the task looks risky, broad, ambiguou
 or has already failed multiple times. Council should stay manual or suggested,
 not automatic for every task.
 
+## Threat Model
+
+Council participants receive the prompt, selected context files, optional git
+diffs, and stdin context you provide. Native CLI participants run as local
+subprocesses in read-only/plan modes. OpenRouter participants send the prompt to
+OpenRouter and the selected upstream model. Ollama participants send the prompt
+to your configured local Ollama server.
+
+Do not include secrets in context files or diffs. By default, context files must
+be inside the working directory; use `--allow-outside-cwd` only when you intend
+to share external files. Subprocess CLI participants do not inherit common API
+key environment variables by default.
+
+## When Not To Use Council
+
+Skip council for formatting, exact user-directed edits, obvious syntax fixes,
+single-file changes you already understand, or tasks where extra model calls
+would add cost without reducing risk.
+
 ## Transcripts
 
 Each run writes:
@@ -224,3 +247,4 @@ Each run writes:
 - `.llm-council/runs/<timestamp>_<slug>.json`
 
 These are intentionally local run artifacts.
+

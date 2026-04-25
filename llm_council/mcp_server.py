@@ -15,7 +15,9 @@ from llm_council.config import (
     select_participants,
 )
 from llm_council.context import build_prompt
+from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env
+from llm_council.model_catalog import fetch_openrouter_models
 from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
 from llm_council.transcript import latest_transcript, transcript_paths, write_transcript
@@ -45,6 +47,11 @@ def council_run_schema() -> dict[str, Any]:
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Files to include as read-only context.",
+            },
+            "allow_outside_cwd": {
+                "type": "boolean",
+                "default": False,
+                "description": "Allow context files outside working_directory.",
             },
             "include_diff": {"type": "boolean", "default": False},
             "working_directory": {"type": "string"},
@@ -100,8 +107,35 @@ def recommend_schema() -> dict[str, Any]:
     }
 
 
+def doctor_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "working_directory": {"type": "string"},
+            "probe_openrouter": {"type": "boolean", "default": False},
+            "probe_ollama": {"type": "boolean", "default": False},
+        },
+        "additionalProperties": False,
+    }
+
+
+def models_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "filter": {"type": "string"},
+            "origin": {"type": "string", "enum": ["us", "china", "unknown"]},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "no_cache": {"type": "boolean", "default": False},
+        },
+        "additionalProperties": False,
+    }
+
+
 async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = Path(arguments.get("working_directory") or ".").resolve()
+    if not cwd.exists():
+        raise ValueError(f"working_directory does not exist: {cwd}")
     load_project_env(cwd)
     config = load_config(find_config(cwd))
     question = arguments["question"]
@@ -122,6 +156,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         context_paths=arguments.get("context_files") or [],
         include_diff=bool(arguments.get("include_diff")),
         stdin_text=None,
+        allow_outside_cwd=bool(arguments.get("allow_outside_cwd")),
     )
 
     if arguments.get("dry_run"):
@@ -204,6 +239,39 @@ def last_transcript(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"found": True, "path": str(path), "content": path.read_text()}
 
 
+def run_doctor(arguments: dict[str, Any]) -> dict[str, Any]:
+    cwd = Path(arguments.get("working_directory") or ".").resolve()
+    load_project_env(cwd)
+    config = load_config(find_config(cwd))
+    return {
+        "checks": checks_to_dict(
+            check_environment(
+                config,
+                probe_openrouter=bool(arguments.get("probe_openrouter")),
+                probe_ollama=bool(arguments.get("probe_ollama")),
+            )
+        )
+    }
+
+
+def list_models(arguments: dict[str, Any]) -> dict[str, Any]:
+    models = fetch_openrouter_models(use_cache=not bool(arguments.get("no_cache")))
+    if arguments.get("filter"):
+        needle = str(arguments["filter"]).lower()
+        models = [
+            model
+            for model in models
+            if needle in model["id"].lower() or needle in model["name"].lower()
+        ]
+    if arguments.get("origin"):
+        prefix = {"us": "US /", "china": "China /", "unknown": "Unknown"}[
+            arguments["origin"]
+        ]
+        models = [model for model in models if str(model["origin"]).startswith(prefix)]
+    limit = int(arguments.get("limit") or 40)
+    return {"models": models[:limit]}
+
+
 async def _serve() -> None:
     try:
         from mcp.server import Server
@@ -244,6 +312,16 @@ async def _serve() -> None:
                 description="Read the latest council transcript from the project.",
                 inputSchema=last_transcript_schema(),
             ),
+            Tool(
+                name="council_doctor",
+                description="Diagnose local CLI, OpenRouter, Ollama, and MCP readiness.",
+                inputSchema=doctor_schema(),
+            ),
+            Tool(
+                name="council_models",
+                description="List cached OpenRouter models with optional filter/origin.",
+                inputSchema=models_schema(),
+            ),
         ]
 
     @app.call_tool()
@@ -268,6 +346,10 @@ async def _serve() -> None:
             }
         elif name == "council_last_transcript":
             result = last_transcript(arguments)
+        elif name == "council_doctor":
+            result = run_doctor(arguments)
+        elif name == "council_models":
+            result = list_models(arguments)
         else:
             raise ValueError(f"Unknown tool: {name}")
         return [TextContent(type="text", text=json.dumps(result, indent=2))]

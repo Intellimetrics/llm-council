@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from llm_council.adapters import ParticipantResult, command_for_display
-from llm_council.deliberation import model_comparison
+from llm_council.deliberation import model_comparison, recommendation_counts
 
 
 def safe_slug(text: str, max_len: int = 60) -> str:
@@ -64,6 +64,7 @@ def write_transcript(
     elapsed_total = sum(result.elapsed_seconds for result in results)
     token_total = sum(result.total_tokens or 0 for result in results)
     cost_total = sum(result.cost_usd or 0 for result in results)
+    recommendations = recommendation_counts(results)
     lines = [
         "# LLM Council Transcript",
         "",
@@ -75,6 +76,9 @@ def write_transcript(
         f"- Tokens reported: `{token_total}`",
         f"- Cost reported: `${cost_total:.6f}`",
         f"- Rounds: `{metadata.get('rounds', 1)}`",
+        "- Recommendations: "
+        f"`{recommendations['yes']} yes / {recommendations['no']} no / "
+        f"{recommendations['tradeoff']} tradeoff / {recommendations['unknown']} unknown`",
         "",
         "## Question",
         "",

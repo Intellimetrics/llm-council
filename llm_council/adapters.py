@@ -315,6 +315,14 @@ def redact_prompt_args(command: list[str], prompt: str) -> list[str]:
 def clean_subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
+    for key in (
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+    ):
+        env.pop(key, None)
     return env
 
 

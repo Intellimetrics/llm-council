@@ -8,8 +8,14 @@ from llm_council.adapters import (
 )
 from llm_council.config import load_config, select_participants
 from llm_council.context import build_prompt
+from llm_council.context import read_context_file
 from llm_council.defaults import DEFAULT_CONFIG
-from llm_council.deliberation import has_disagreement, model_comparison
+from llm_council.deliberation import (
+    has_disagreement,
+    model_comparison,
+    recommendation_counts,
+    recommendation_label,
+)
 from llm_council.doctor import _probe_ollama, _probe_openrouter
 from llm_council.env import load_project_env
 from llm_council.model_catalog import (
@@ -17,11 +23,14 @@ from llm_council.model_catalog import (
     _write_cache,
     infer_origin,
     normalize_openrouter_model,
+    openrouter_cache_path,
 )
 from llm_council.mcp_server import (
     council_run_schema,
+    doctor_schema,
     last_transcript,
     last_transcript_schema,
+    models_schema,
 )
 from llm_council.policy import should_use_council
 from llm_council.setup_wizard import mcp_config, project_config, write_setup_files
@@ -40,8 +49,10 @@ def test_claude_prompt_goes_to_stdin():
 
 def test_clean_subprocess_env_strips_claudecode(monkeypatch):
     monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
     env = clean_subprocess_env()
     assert "CLAUDECODE" not in env
+    assert "OPENROUTER_API_KEY" not in env
 
 
 def test_prompt_arg_is_redacted_and_literal_braces_are_safe(tmp_path: Path):
@@ -94,6 +105,24 @@ def test_build_prompt_contains_read_only_rules(tmp_path: Path):
     assert "What should we do?" in prompt
 
 
+def test_context_file_outside_cwd_rejected_by_default(tmp_path: Path):
+    outside = tmp_path.parent / "outside-context.txt"
+    outside.write_text("secret")
+    try:
+        read_context_file(outside, cwd=tmp_path)
+    except ValueError as exc:
+        assert "outside working directory" in str(exc)
+    else:
+        raise AssertionError("expected outside context file to be rejected")
+
+
+def test_context_file_outside_cwd_can_be_allowed(tmp_path: Path):
+    outside = tmp_path.parent / "outside-context-allowed.txt"
+    outside.write_text("ok")
+    rendered = read_context_file(outside, cwd=tmp_path, allow_outside_cwd=True)
+    assert "ok" in rendered
+
+
 def test_safe_slug():
     assert safe_slug("Hello, World!") == "hello-world"
 
@@ -118,10 +147,12 @@ def test_result_to_dict_includes_usage():
 
 def test_model_comparison_and_disagreement_detection():
     results = [
-        ParticipantResult("a", True, "Yes, proceed.", "", 1),
-        ParticipantResult("b", True, "No, defer.", "", 1, total_tokens=4),
+        ParticipantResult("a", True, "RECOMMENDATION: yes - proceed.", "", 1),
+        ParticipantResult("b", True, "RECOMMENDATION: no - defer.", "", 1, total_tokens=4),
     ]
     assert has_disagreement(results) is True
+    assert recommendation_label(results[0].output) == "yes"
+    assert recommendation_counts(results)["no"] == 1
     comparison = "\n".join(model_comparison(results))
     assert "a:" in comparison
     assert "4 tokens" in comparison
@@ -146,6 +177,11 @@ def test_openrouter_catalog_cache_round_trip(tmp_path: Path):
     models = [{"id": "openai/gpt-test"}]
     _write_cache(path, models)
     assert _read_cache(path) == models
+
+
+def test_openrouter_cache_uses_xdg_cache_home(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    assert openrouter_cache_path() == tmp_path / "llm-council" / "openrouter-models.json"
 
 
 def test_openrouter_catalog_corrupt_cache_is_ignored(tmp_path: Path):
@@ -186,6 +222,11 @@ def test_mcp_last_transcript_schema():
     assert "format" in schema["properties"]
 
 
+def test_mcp_doctor_and_models_schema():
+    assert "probe_openrouter" in doctor_schema()["properties"]
+    assert "origin" in models_schema()["properties"]
+
+
 def test_recommendation_policy_for_architecture():
     use, mode, reason = should_use_council("architecture decision for auth")
     assert use is True
@@ -221,6 +262,7 @@ def test_setup_writes_config_mcp_and_instructions(tmp_path: Path):
     assert ".llm-council/instructions/claude.md" in names
     assert ".llm-council/instructions/codex.md" in names
     assert ".llm-council/instructions/gemini.md" in names
+    assert ".llm-council/.gitignore" in names
     assert "llm-council" in (tmp_path / ".mcp.json").read_text()
 
 
