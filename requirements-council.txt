@@ -1,0 +1,7 @@
+# Minimal dependencies for the lightweight llm-council tool.
+#
+# Minimal dependencies for the lightweight llm-council CLI/MCP layer.
+pyyaml>=6.0.1
+httpx>=0.27.0
+python-dotenv>=1.0.0
+mcp>=1.0.0

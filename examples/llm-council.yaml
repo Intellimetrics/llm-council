@@ -1,0 +1,51 @@
+version: 1
+transcripts_dir: .llm-council/runs
+
+defaults:
+  mode: quick
+  read_only: true
+  synthesize: false
+
+# Native CLI participants intentionally omit model by default so paid/max CLI
+# accounts can use their own current default model. Add model only when you want
+# exact routing.
+participants:
+  claude:
+    model:
+  codex:
+    model:
+  gemini:
+    model:
+
+  deepseek_v4_pro:
+    type: openrouter
+    family: deepseek
+    origin: China / DeepSeek
+    model: deepseek/deepseek-v4-pro
+    api_key_env: OPENROUTER_API_KEY
+    timeout: 180
+    read_only: true
+
+  qwen_coder_plus:
+    type: openrouter
+    family: qwen
+    origin: China / Alibaba Qwen
+    model: qwen/qwen3-coder-plus
+    api_key_env: OPENROUTER_API_KEY
+    timeout: 180
+    read_only: true
+
+modes:
+  quick:
+    strategy: other_cli_peers
+    description: Ask the other two native CLIs from the current CLI.
+
+  plan:
+    strategy: other_cli_peers
+    add: [deepseek_v4_pro]
+    description: Add DeepSeek V4 Pro for independent planning.
+
+  review:
+    strategy: other_cli_peers
+    add: [qwen_coder_plus]
+    description: Add Qwen Coder Plus for coding review.
