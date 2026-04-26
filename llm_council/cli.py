@@ -188,9 +188,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         raise SystemExit(f"Refusing to overwrite existing config: {target}")
     sample = Path(__file__).resolve().parent.parent / "examples" / "llm-council.yaml"
     if sample.exists():
-        target.write_text(sample.read_text())
+        target.write_text(sample.read_text(encoding="utf-8"), encoding="utf-8")
     else:
-        target.write_text("version: 1\n")
+        target.write_text("version: 1\n", encoding="utf-8")
     print(f"Wrote {target}")
     return 0
 
@@ -299,7 +299,7 @@ def cmd_last(args: argparse.Namespace) -> int:
     if args.path_only:
         print(path)
     else:
-        print(path.read_text())
+        print(path.read_text(encoding="utf-8"))
     return 0
 
 
@@ -341,7 +341,7 @@ def cmd_transcripts(args: argparse.Namespace) -> int:
             path = latest_transcript(out_dir, suffix=".json" if args.json_file else ".md")
             if path is None:
                 raise SystemExit(f"No council transcripts found in {out_dir}")
-        print(path.read_text())
+        print(path.read_text(encoding="utf-8"))
         return 0
 
     if args.transcripts_command == "summary":

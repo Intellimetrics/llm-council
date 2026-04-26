@@ -149,27 +149,30 @@ def write_setup_files(
         us_only_default=us_only_default,
     )
     if config_path.exists() and not force:
-        existing_config = yaml.safe_load(config_path.read_text()) or {}
+        existing_config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         merged_config = deep_merge(desired_config, existing_config)
     else:
         merged_config = desired_config
     if force or not config_path.exists() or merged_config != (
-        yaml.safe_load(config_path.read_text()) if config_path.exists() else None
+        yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else None
     ):
         config_path.write_text(
-            yaml.safe_dump(merged_config, sort_keys=False)
+            yaml.safe_dump(merged_config, sort_keys=False),
+            encoding="utf-8",
         )
         written.append(config_path)
 
     if write_mcp:
         mcp_path = root / ".mcp.json"
         if mcp_path.exists() and not force:
-            existing = json.loads(mcp_path.read_text())
+            existing = json.loads(mcp_path.read_text(encoding="utf-8"))
             servers = existing.setdefault("mcpServers", {})
             servers["llm-council"] = mcp_config(root)["mcpServers"]["llm-council"]
-            mcp_path.write_text(json.dumps(existing, indent=2) + "\n")
+            mcp_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
         else:
-            mcp_path.write_text(json.dumps(mcp_config(root), indent=2) + "\n")
+            mcp_path.write_text(
+                json.dumps(mcp_config(root), indent=2) + "\n", encoding="utf-8"
+            )
         written.append(mcp_path)
 
     if write_instructions:
@@ -178,14 +181,18 @@ def write_setup_files(
         for name in ("claude", "codex", "gemini"):
             path = instructions_dir / f"{name}.md"
             if force or not path.exists():
-                path.write_text(INSTRUCTION_TEXT)
+                path.write_text(INSTRUCTION_TEXT, encoding="utf-8")
                 written.append(path)
 
     runtime_gitignore = root / ".llm-council" / ".gitignore"
     runtime_gitignore.parent.mkdir(parents=True, exist_ok=True)
     desired_gitignore = "runs/\n*.log\n"
-    if force or not runtime_gitignore.exists() or runtime_gitignore.read_text() != desired_gitignore:
-        runtime_gitignore.write_text(desired_gitignore)
+    if (
+        force
+        or not runtime_gitignore.exists()
+        or runtime_gitignore.read_text(encoding="utf-8") != desired_gitignore
+    ):
+        runtime_gitignore.write_text(desired_gitignore, encoding="utf-8")
         written.append(runtime_gitignore)
 
     return written

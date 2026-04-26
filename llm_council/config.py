@@ -55,12 +55,91 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     config = copy.deepcopy(DEFAULT_CONFIG)
     config_path = Path(path).expanduser() if path else find_config()
     if not config_path:
+        validate_config(config)
         return config
 
-    data = yaml.safe_load(config_path.read_text()) or {}
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         raise ValueError(f"Config must be a YAML mapping: {config_path}")
-    return deep_merge(config, data)
+    merged = deep_merge(config, data)
+    validate_config(merged)
+    return merged
+
+
+def validate_config(config: dict[str, Any]) -> None:
+    """Validate the small config surface before any participant is invoked."""
+
+    participants = config.get("participants")
+    if not isinstance(participants, dict) or not participants:
+        raise ValueError("Config must define a non-empty participants mapping")
+    for name, participant in participants.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("Participant names must be non-empty strings")
+        if not isinstance(participant, dict):
+            raise ValueError(f"Participant '{name}' must be a mapping")
+        ptype = participant.get("type")
+        if ptype not in {"cli", "openrouter", "ollama"}:
+            raise ValueError(
+                f"Participant '{name}' has unsupported type '{ptype}'. "
+                "Expected cli, openrouter, or ollama."
+            )
+        if ptype == "cli":
+            if not participant.get("command"):
+                raise ValueError(f"CLI participant '{name}' must define command")
+            args = participant.get("args", [])
+            if not isinstance(args, list) or not all(
+                isinstance(item, str) for item in args
+            ):
+                raise ValueError(f"CLI participant '{name}' args must be a string list")
+        if ptype in {"openrouter", "ollama"} and not participant.get("model"):
+            raise ValueError(f"Participant '{name}' must define model")
+        _validate_positive_int(participant, "timeout", f"participant '{name}'")
+
+    modes = config.get("modes")
+    if not isinstance(modes, dict) or not modes:
+        raise ValueError("Config must define a non-empty modes mapping")
+    for name, mode in modes.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("Mode names must be non-empty strings")
+        if not isinstance(mode, dict):
+            raise ValueError(f"Mode '{name}' must be a mapping")
+        has_participants = "participants" in mode
+        has_strategy = mode.get("strategy") is not None
+        if has_participants == has_strategy:
+            raise ValueError(
+                f"Mode '{name}' must define exactly one of participants or strategy"
+            )
+        referenced = list(mode.get("participants") or []) + list(mode.get("add") or [])
+        if not all(isinstance(item, str) for item in referenced):
+            raise ValueError(f"Mode '{name}' participants/add must contain strings")
+        for participant in referenced:
+            if participant not in participants:
+                raise ValueError(
+                    f"Mode '{name}' references unknown participant '{participant}'"
+                )
+        if has_strategy and mode.get("strategy") != "other_cli_peers":
+            raise ValueError(f"Mode '{name}' has unsupported strategy '{mode.get('strategy')}'")
+        if mode.get("origin_policy") not in (None, "any", "us"):
+            raise ValueError(f"Mode '{name}' origin_policy must be 'any' or 'us'")
+        _validate_positive_int(mode, "max_rounds", f"mode '{name}'")
+
+    defaults = config.get("defaults", {})
+    if not isinstance(defaults, dict):
+        raise ValueError("Config defaults must be a mapping")
+    if defaults.get("origin_policy") not in (None, "any", "us"):
+        raise ValueError("defaults.origin_policy must be 'any' or 'us'")
+    if defaults.get("mode") and defaults["mode"] not in modes:
+        raise ValueError(f"defaults.mode references unknown mode '{defaults['mode']}'")
+    _validate_positive_int(defaults, "max_concurrency", "defaults")
+    _validate_positive_int(defaults, "max_deliberation_rounds", "defaults")
+
+
+def _validate_positive_int(mapping: dict[str, Any], key: str, label: str) -> None:
+    if key not in mapping or mapping[key] is None:
+        return
+    value = mapping[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{label}.{key} must be a positive integer")
 
 
 def detect_current_agent() -> str | None:

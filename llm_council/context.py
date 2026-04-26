@@ -71,6 +71,12 @@ def build_prompt(
         "",
         "User question:",
         question.strip(),
+        "",
+        "Response format:",
+        "- Start with `RECOMMENDATION: yes - ...`, `RECOMMENDATION: no - ...`, or `RECOMMENDATION: tradeoff - ...`.",
+        "- List the strongest reasons.",
+        "- List concrete risks or things to verify.",
+        "- Keep implementation suggestions read-only unless explicitly asked to write code.",
     ]
 
     context_sections: list[str] = []
@@ -86,16 +92,6 @@ def build_prompt(
     if context_sections:
         sections.extend(["", "Context:", *context_sections])
 
-    sections.extend(
-        [
-            "",
-            "Response format:",
-            "- Start with `RECOMMENDATION: yes - ...`, `RECOMMENDATION: no - ...`, or `RECOMMENDATION: tradeoff - ...`.",
-            "- List the strongest reasons.",
-            "- List concrete risks or things to verify.",
-            "- Keep implementation suggestions read-only unless explicitly asked to write code.",
-        ]
-    )
     prompt = "\n".join(sections)
     if len(prompt) > MAX_PROMPT_CHARS:
         prompt = (

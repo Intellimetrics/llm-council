@@ -9,3 +9,4 @@
 - Added opt-in deliberation mode with a second round on detected disagreement.
 - Added project setup, doctor checks, OpenRouter model catalog, and transcript storage.
 - Added transcript inspection commands and hardened labeled deliberation across multiple rounds.
+- Hardened subprocess cleanup, prompt redaction, MCP context boundaries, budget checks, and config validation.

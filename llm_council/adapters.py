@@ -75,10 +75,14 @@ async def run_cli_participant(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(stdin_data.encode() if stdin_data is not None else None),
-            timeout=timeout,
+        communicate = asyncio.create_task(
+            proc.communicate(stdin_data.encode() if stdin_data is not None else None)
         )
+        try:
+            stdout, stderr = await asyncio.wait_for(asyncio.shield(communicate), timeout)
+        except TimeoutError:
+            await _cleanup_timed_out_process(proc, communicate)
+            raise
         elapsed = time.monotonic() - start
         out = stdout.decode(errors="replace").strip()
         err = stderr.decode(errors="replace").strip()
@@ -102,6 +106,33 @@ async def run_cli_participant(
             command=redact_prompt_args(command, prompt),
             model=cfg.get("model"),
         )
+
+
+async def _cleanup_timed_out_process(
+    proc: asyncio.subprocess.Process,
+    communicate: asyncio.Task[tuple[bytes, bytes]],
+    *,
+    terminate_grace_seconds: float = 2.0,
+) -> None:
+    if proc.returncode is None:
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=terminate_grace_seconds)
+        except TimeoutError:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
+
+    try:
+        await communicate
+    except (BrokenPipeError, ConnectionResetError):
+        pass
 
 
 async def run_openrouter_participant(
@@ -308,22 +339,119 @@ def command_for_display(command: list[str] | None) -> str:
 
 def redact_prompt_args(command: list[str], prompt: str) -> list[str]:
     if not prompt:
-        return command
-    return ["[prompt]" if part == prompt else part.replace(prompt, "[prompt]") for part in command]
+        return list(command)
+    return [_redact_prompt_arg(part, prompt) for part in command]
+
+
+def _redact_prompt_arg(part: str, prompt: str) -> str:
+    if part == prompt:
+        return "[prompt]"
+    redacted = part.replace(prompt, "[prompt]")
+    for fragment in _prompt_fragments(prompt):
+        redacted = redacted.replace(fragment, "[prompt]")
+    if _contains_prompt_substring(redacted, prompt):
+        return _redact_arg_value(part)
+    return redacted
+
+
+def _prompt_fragments(prompt: str) -> list[str]:
+    min_length = 64
+    if len(prompt) < min_length:
+        return []
+
+    fragments = {
+        prompt[: min(len(prompt), 256)],
+        prompt[-min(len(prompt), 256) :],
+    }
+    for length in (64, 128):
+        if len(prompt) >= length:
+            fragments.add(prompt[:length])
+            fragments.add(prompt[-length:])
+    for line in prompt.splitlines():
+        line = line.strip()
+        if len(line) >= min_length:
+            fragments.add(line)
+            for length in (64, 128, 256):
+                if len(line) >= length:
+                    fragments.add(line[:length])
+                    fragments.add(line[-length:])
+
+    return sorted(fragments, key=len, reverse=True)
+
+
+def _contains_prompt_substring(part: str, prompt: str) -> bool:
+    min_length = 64
+    if len(prompt) < min_length or len(part) < min_length:
+        return False
+    step = 32
+    last_start = max(0, len(prompt) - min_length)
+    starts = range(0, last_start + 1, step)
+    return any(prompt[start : start + min_length] in part for start in starts) or (
+        prompt[last_start:] in part
+    )
+
+
+def _redact_arg_value(part: str) -> str:
+    prefix, separator, _value = part.partition("=")
+    if separator and prefix:
+        return f"{prefix}=[prompt]"
+    return "[prompt]"
 
 
 def clean_subprocess_env() -> dict[str, str]:
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-    for key in (
-        "ANTHROPIC_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENROUTER_API_KEY",
-    ):
-        env.pop(key, None)
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key == "CLAUDECODE":
+            continue
+        if _is_secret_env_name(key):
+            continue
+        env[key] = value
     return env
+
+
+def _is_secret_env_name(key: str) -> bool:
+    upper = key.upper()
+    if upper in _SAFE_ENV_NAMES or upper.startswith("LC_"):
+        return False
+    parts = [part for part in upper.replace("-", "_").split("_") if part]
+    secret_parts = {
+        "AUTH",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "KEY",
+        "OAUTH",
+        "PASS",
+        "PASSWD",
+        "PASSWORD",
+        "SECRET",
+        "TOKEN",
+    }
+    if any(part in secret_parts for part in parts):
+        return True
+    return any(word in upper for word in ("CREDENTIAL", "PASSWORD"))
+
+
+_SAFE_ENV_NAMES = {
+    "APPDATA",
+    "COLORTERM",
+    "HOME",
+    "LANG",
+    "LOCALAPPDATA",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "USERPROFILE",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "XDG_STATE_HOME",
+}
 
 
 def write_json_atomic(path: Path, data: Any) -> None:

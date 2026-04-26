@@ -69,12 +69,11 @@ DEFAULT_CONFIG: dict = {
             "args": [
                 "--approval-mode",
                 "plan",
-                "--prompt",
-                "{prompt}",
             ],
             "model": None,
             "timeout": 240,
             "read_only": True,
+            "stdin_prompt": True,
         },
         "deepseek_v4_pro": {
             "type": "openrouter",

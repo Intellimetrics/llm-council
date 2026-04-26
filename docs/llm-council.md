@@ -172,7 +172,7 @@ The built-in CLI defaults are read-only:
 
 - Claude: `--permission-mode plan` with read/search/list tools only
 - Codex: `exec --sandbox read-only --ask-for-approval never --ephemeral`
-- Gemini: `--approval-mode plan`
+- Gemini: `--approval-mode plan`, with prompts sent over stdin
 
 The prompt also tells participants not to edit files or run write operations.
 
@@ -188,9 +188,13 @@ The MCP server exposes:
 - `council_models`: list cached OpenRouter models with filter/origin options
 
 `council_run` accepts `transparent`, `deliberate`, and `max_rounds` for the same
-usage/cost and opt-in deliberation behavior as the CLI. Context files are
-restricted to `working_directory` by default; pass `allow_outside_cwd` only when
-external files are intentionally part of the prompt.
+usage/cost and opt-in deliberation behavior as the CLI. MCP context files are
+always restricted to `working_directory`; use the CLI `--allow-outside-cwd` flag
+for intentional external files.
+
+MCP runs also apply conservative budget checks before paid hosted calls. Tune
+them in config with `defaults.mcp_max_prompt_chars` and
+`defaults.mcp_max_estimated_cost_usd`.
 
 Run it manually:
 
@@ -206,7 +210,14 @@ python -m llm_council.mcp_server
 
 ## Keyword Layer
 
-Setup writes instruction snippets for each CLI. The intended user language is:
+Setup writes instruction snippets for each CLI under `.llm-council/instructions/`.
+They are not loaded automatically by the CLIs. Add the matching snippet to the
+project or user instructions for the agent you use, for example Claude project
+instructions, Codex `AGENTS.md` guidance, or Gemini custom instructions. The
+snippets are plain Markdown so you can copy the wording into your existing
+agent memory without changing the project config.
+
+The intended user language is:
 
 ```text
 go to council
@@ -232,8 +243,9 @@ to your configured local Ollama server.
 
 Do not include secrets in context files or diffs. By default, context files must
 be inside the working directory; use `--allow-outside-cwd` only when you intend
-to share external files. Subprocess CLI participants do not inherit common API
-key environment variables by default.
+to share external files through the CLI. MCP does not expose that override.
+Subprocess CLI participants do not inherit broad secret-looking environment
+variables by default.
 
 ## When Not To Use Council
 

@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from llm_council.budget import enforce_mcp_budget, mcp_budget_report
 from llm_council.config import (
     detect_current_agent,
     find_config,
@@ -47,11 +48,6 @@ def council_run_schema() -> dict[str, Any]:
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Files to include as read-only context.",
-            },
-            "allow_outside_cwd": {
-                "type": "boolean",
-                "default": False,
-                "description": "Allow context files outside working_directory.",
             },
             "include_diff": {"type": "boolean", "default": False},
             "working_directory": {"type": "string"},
@@ -156,16 +152,8 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         context_paths=arguments.get("context_files") or [],
         include_diff=bool(arguments.get("include_diff")),
         stdin_text=None,
-        allow_outside_cwd=bool(arguments.get("allow_outside_cwd")),
+        allow_outside_cwd=False,
     )
-
-    if arguments.get("dry_run"):
-        return {
-            "mode": mode,
-            "current": current,
-            "participants": participants,
-            "prompt_chars": len(prompt),
-        }
 
     mode_cfg = config.get("modes", {}).get(mode, {})
     transparent = bool(
@@ -178,6 +166,26 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         or config.get("defaults", {}).get("max_deliberation_rounds")
         or 2
     )
+    budget = mcp_budget_report(
+        config=config,
+        participants=participants,
+        prompt_chars=len(prompt),
+        deliberate=deliberate,
+        max_rounds=max_rounds,
+    )
+
+    if arguments.get("dry_run"):
+        return {
+            "mode": mode,
+            "current": current,
+            "participants": participants,
+            "prompt_chars": len(prompt),
+            "deliberate": deliberate,
+            "max_rounds": max_rounds,
+            "budget": budget,
+        }
+
+    enforce_mcp_budget(budget)
     cfg = config.get("participants", {})
     results, metadata = await execute_council(
         participants,
@@ -236,7 +244,7 @@ def last_transcript(arguments: dict[str, Any]) -> dict[str, Any]:
     path = latest_transcript(out_dir, suffix=".json" if arguments.get("format") == "json" else ".md")
     if path is None:
         return {"found": False, "path": None, "content": ""}
-    return {"found": True, "path": str(path), "content": path.read_text()}
+    return {"found": True, "path": str(path), "content": path.read_text(encoding="utf-8")}
 
 
 def run_doctor(arguments: dict[str, Any]) -> dict[str, Any]:
