@@ -21,6 +21,61 @@ pip install -e .
 llm-council run --dry-run --current codex "Should we add an MCP wrapper?"
 ```
 
+Install directly from GitHub into another project:
+
+```bash
+uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
+cd /path/to/your/project
+llm-council setup --yes
+llm-council doctor
+```
+
+If you prefer `pipx`:
+
+```bash
+pipx install --force git+https://github.com/Intellimetrics/llm-council.git
+cd /path/to/your/project
+llm-council setup --yes
+llm-council doctor
+```
+
+Use `uvx` for quick one-off checks, not as the recommended setup path. `setup`
+writes an MCP command into the target project's `.mcp.json`, so it should run
+from a stable installed `llm-council` command.
+
+Then make the target project's CLI agents aware of the council. `setup` writes
+snippets under `.llm-council/instructions/`, but most CLI tools do not load
+those files automatically:
+
+- Claude Code: add `.llm-council/instructions/claude.md` to the project's `CLAUDE.md`.
+- Codex CLI: add `.llm-council/instructions/codex.md` to the project's `AGENTS.md`.
+- Gemini CLI: add `.llm-council/instructions/gemini.md` to the project's `GEMINI.md`.
+
+If one of those files does not exist yet, create it at the project root. After
+editing `.mcp.json` or instruction files, restart the CLI session so the MCP
+server and project instructions reload.
+
+Manual MCP install without `setup`:
+
+```json
+{
+  "mcpServers": {
+    "llm-council": {
+      "type": "stdio",
+      "command": "/absolute/path/to/llm-council",
+      "args": ["mcp-server"],
+      "env": {
+        "LLM_COUNCIL_MCP_ROOT": "/absolute/path/to/your/project"
+      }
+    }
+  }
+}
+```
+
+Use `command -v llm-council` after `uv tool install` or `pipx install` to find
+the absolute command path. If the project already has `.mcp.json`, add only the
+`llm-council` entry under its existing `mcpServers` object.
+
 Project setup:
 
 ```bash

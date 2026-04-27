@@ -5,6 +5,62 @@ quick-start path.
 
 ## Setup
 
+Install from GitHub into a target project:
+
+```bash
+uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
+cd /path/to/your/project
+llm-council setup --yes
+llm-council doctor
+```
+
+or with `pipx`:
+
+```bash
+pipx install --force git+https://github.com/Intellimetrics/llm-council.git
+cd /path/to/your/project
+llm-council setup --yes
+llm-council doctor
+```
+
+`uvx` is useful for smoke tests, but it is not the recommended setup path
+because `setup` writes the command used by the MCP client. Prefer a stable
+installed `llm-council` executable, then run setup from the target project.
+
+`setup` creates `.mcp.json`, `.llm-council.yaml`, and instruction snippets, but
+the snippets are deliberately separate so existing project instructions are not
+overwritten. Wire each CLI explicitly:
+
+- Claude Code: add `.llm-council/instructions/claude.md` to `CLAUDE.md`.
+- Codex CLI: add `.llm-council/instructions/codex.md` to `AGENTS.md`.
+- Gemini CLI: add `.llm-council/instructions/gemini.md` to `GEMINI.md`.
+
+Create any missing root instruction file. Restart the relevant CLI after
+changing `.mcp.json` or instruction files.
+
+Manual MCP install without `setup`:
+
+```json
+{
+  "mcpServers": {
+    "llm-council": {
+      "type": "stdio",
+      "command": "/absolute/path/to/llm-council",
+      "args": ["mcp-server"],
+      "env": {
+        "LLM_COUNCIL_MCP_ROOT": "/absolute/path/to/your/project"
+      }
+    }
+  }
+}
+```
+
+Use `command -v llm-council` after `uv tool install` or `pipx install` to find
+the absolute command path. If the project already has `.mcp.json`, add only the
+`llm-council` entry under its existing `mcpServers` object. A project config is
+optional for manual installs; without `.llm-council.yaml`, the built-in default
+modes and participants are used.
+
 Install from a checkout:
 
 ```bash
