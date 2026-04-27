@@ -90,6 +90,14 @@ Setup writes:
 - `.llm-council/instructions/codex.md`
 - `.llm-council/instructions/gemini.md`
 
+`.mcp.json` contains local absolute paths for the installed command and project
+root. It is meant to be machine-local; setup adds `.mcp.json` to `.gitignore`.
+Commit `.llm-council.yaml` if your team wants to share council modes, but have
+each developer run `llm-council setup --yes` on their own machine.
+If `.mcp.json` was already committed, remove it from the index with
+`git rm --cached .mcp.json` after confirming your team does not intentionally
+share local MCP config.
+
 Restart your coding CLI after setup so `.mcp.json` and project instructions
 reload.
 
@@ -148,6 +156,7 @@ Install LLM Council into this project. Follow these steps exactly and stop if an
 ```text
 Verify the LLM Council install in this project:
 - `.mcp.json` exists and has an `llm-council` MCP server entry.
+- `.mcp.json` is ignored by git unless this project intentionally commits local MCP config.
 - `.llm-council.yaml` exists.
 - The generated instruction snippet for this CLI exists under `.llm-council/instructions/`.
 - The snippet was appended to the right project instruction file: `CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`.
@@ -277,6 +286,11 @@ the existing `mcpServers` object.
 - Secrets can live in `.env`, `.env.local`, or `.llm-council.env`.
 - Prompt-size guards skip oversized participants before long timeouts where
   possible.
+- Do not use council for classified, CUI, regulated, customer, production,
+  credential, or `DEPLOY_MODE=secret` content unless every configured
+  participant is explicitly approved for that data.
+- US-origin participants identify the model/company origin. They do not imply
+  GovCloud, FedRAMP, or enterprise data-handling approval.
 
 ## Versioning And Updates
 

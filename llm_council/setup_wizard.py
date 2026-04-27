@@ -31,6 +31,7 @@ When the user says "go to council", "ask council", or "take this to council",
 call the `llm-council` MCP tool `council_run`.
 
 Default behavior:
+- Always pass `current` as this CLI's identity: `{current}`.
 - Use `quick` mode unless the user names a mode.
 - Treat "with deepseek" as including `deepseek_v4_pro`.
 - Treat "with qwen" as including `qwen_coder_plus`.
@@ -43,6 +44,15 @@ Use council when the task is architectural, risky, cross-cutting, ambiguous, has
 failed multiple times, or needs an independent code review. Do not use council
 for trivial edits, formatting, obvious syntax fixes, or when the user gave exact
 implementation steps.
+
+Data boundary:
+- Do not send classified, CUI, regulated, production, secret, credential, or
+  customer data to council unless the user explicitly confirms the configured
+  participants are approved for that data.
+- Do not include files, diffs, logs, or environment content marked secret,
+  sensitive, private, or deployment-only.
+- US-origin participants mean model/company origin only; that is not the same
+  as GovCloud, FedRAMP, or an enterprise data-handling approval.
 
 Council is advisory and read-only by default. Do not apply edits from council
 without explicit user direction.
@@ -82,6 +92,7 @@ def project_config(
         config["defaults"]["mode"] = "quick"
     if us_only_default:
         config["defaults"]["origin_policy"] = "us"
+        modes.pop("us-only", None)
     if include_native:
         for name in ("claude", "codex", "gemini"):
             config["participants"][name] = DEFAULT_CONFIG["participants"][name]
@@ -219,7 +230,10 @@ def write_setup_files(
         for name in ("claude", "codex", "gemini"):
             path = instructions_dir / f"{name}.md"
             if force or not path.exists():
-                path.write_text(INSTRUCTION_TEXT, encoding="utf-8")
+                path.write_text(
+                    INSTRUCTION_TEXT.format(current=name),
+                    encoding="utf-8",
+                )
                 written.append(path)
 
     runtime_gitignore = root / ".llm-council" / ".gitignore"
@@ -233,7 +247,33 @@ def write_setup_files(
         runtime_gitignore.write_text(desired_gitignore, encoding="utf-8")
         written.append(runtime_gitignore)
 
+    project_gitignore = root / ".gitignore"
+    if write_mcp:
+        updated = _ensure_project_gitignore(project_gitignore)
+        if updated:
+            written.append(project_gitignore)
+
     return written
+
+
+def _ensure_project_gitignore(path: Path) -> bool:
+    desired_lines = [
+        "# LLM Council local machine config and runtime data",
+        ".mcp.json",
+        ".llm-council/runs/",
+        ".llm-council/*.log",
+        ".llm-council.env",
+    ]
+    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    missing = [line for line in desired_lines if line not in existing]
+    if not missing:
+        return False
+    lines = existing[:]
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.extend(missing)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
 
 
 def _read_yaml_mapping(path: Path) -> dict[str, Any]:

@@ -65,6 +65,14 @@ llm-council setup --yes --force
 `setup` writes `.llm-council.yaml`, `.mcp.json`, and optional instruction
 snippets under `.llm-council/instructions/`.
 
+`.mcp.json` contains local absolute paths for the installed `llm-council`
+command and project root. Treat it as machine-local config. Setup adds
+`.mcp.json`, `.llm-council/runs/`, `.llm-council/*.log`, and
+`.llm-council.env` to the project `.gitignore` when it writes MCP config.
+If `.mcp.json` was already committed, remove it from the index with
+`git rm --cached .mcp.json` after confirming your team does not intentionally
+share local MCP config.
+
 ## Coding-Agent Install Path
 
 When a user asks a coding agent to install LLM Council, the agent should do the
@@ -95,6 +103,7 @@ Verification checklist:
 
 ```text
 .mcp.json exists and has an llm-council MCP server entry.
+.mcp.json is ignored by git unless the project intentionally commits local MCP config.
 .llm-council.yaml exists.
 .llm-council/instructions/<active-cli>.md exists.
 CLAUDE.md, AGENTS.md, or GEMINI.md includes the generated snippet.
@@ -411,3 +420,9 @@ variables are forwarded.
 Do not include secrets in diffs or context files. OpenRouter participants send
 the prompt to OpenRouter and the selected upstream model. Ollama participants
 send the prompt to the configured Ollama server.
+
+Do not use council for classified, CUI, regulated, customer, production,
+credential, or `DEPLOY_MODE=secret` content unless every configured participant
+is explicitly approved for that data. US-origin participants identify
+model/company origin only; they do not imply GovCloud, FedRAMP, or enterprise
+data-handling approval.

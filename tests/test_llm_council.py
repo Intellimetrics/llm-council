@@ -859,7 +859,7 @@ def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path):
 
     config = yaml.safe_load((tmp_path / ".llm-council.yaml").read_text())
     assert set(config["participants"]) == {"claude", "codex", "gemini"}
-    assert set(config["modes"]) == {"quick", "us-only"}
+    assert set(config["modes"]) == {"quick"}
     assert config["defaults"]["origin_policy"] == "us"
     assert not (tmp_path / ".mcp.json").exists()
     assert not (tmp_path / ".llm-council" / "instructions").exists()
@@ -952,7 +952,12 @@ def test_setup_writes_config_mcp_and_instructions(tmp_path: Path):
     assert ".llm-council/instructions/codex.md" in names
     assert ".llm-council/instructions/gemini.md" in names
     assert ".llm-council/.gitignore" in names
+    assert ".gitignore" in names
     assert "llm-council" in (tmp_path / ".mcp.json").read_text()
+    assert ".mcp.json" in (tmp_path / ".gitignore").read_text()
+    assert "current` as this CLI's identity: `codex`" in (
+        tmp_path / ".llm-council/instructions/codex.md"
+    ).read_text()
 
 
 def test_mcp_config_does_not_embed_openrouter_env_reference(tmp_path: Path):

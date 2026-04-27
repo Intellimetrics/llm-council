@@ -383,6 +383,14 @@ def _print_setup_next_steps(
         print("  1. Add council instructions to CLAUDE.md, AGENTS.md, and GEMINI.md.")
     if write_mcp:
         print("  2. Restart the CLI session(s) you use so MCP reloads.")
+        print(
+            "     `.mcp.json` contains local absolute paths; setup adds it to "
+            ".gitignore unless it is already ignored."
+        )
+        print(
+            "     If `.mcp.json` was already committed, use "
+            "`git rm --cached .mcp.json` after confirming it should stay local."
+        )
     else:
         print("  2. Add the llm-council MCP server to your MCP config, then restart CLIs.")
     print("  3. Run `llm-council doctor` from the project root.")

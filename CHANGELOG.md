@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2 - 2026-04-27
+
+- Treat generated `.mcp.json` as local machine config by adding it to project `.gitignore`.
+- Add explicit data-boundary policy text to generated CLI instruction snippets and docs.
+- Make generated snippets pass the active CLI identity to council calls.
+- Add comparable native CLI prompt caps for Codex and Gemini.
+- Avoid generating a duplicate `us-only` mode when `--us-only-default` already applies globally.
+
 ## 0.2.1 - 2026-04-27
 
 - Switch update checks to public release tags instead of raw `main` metadata so new releases are visible immediately after tagging.
