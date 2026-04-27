@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-council"
-version = "0.2.4"
+version = "0.2.5"
 description = "Lightweight read-only multi-agent council for coding projects."
 readme = "README.md"
 requires-python = ">=3.11"

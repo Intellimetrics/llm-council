@@ -111,6 +111,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     setup.add_argument("--force", action="store_true", help="Overwrite existing files")
     setup.add_argument(
+        "--allow-incomplete",
+        action="store_true",
+        help="Write a preset even when required CLIs or API keys are not detected",
+    )
+    setup.add_argument(
         "--us-only-default",
         action="store_true",
         help="Default generated config to US-origin participants only",
@@ -289,6 +294,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
         preset = _auto_setup_preset()
         print(f"Auto preset selected: {preset}")
 
+    _guard_setup_preset(preset, args)
+
     include_native = preset != "openrouter"
     include_openrouter = preset in {"openrouter", "tri-cli-openrouter", "all"}
     include_local = preset in {"local-private", "all"}
@@ -360,8 +367,8 @@ def _auto_setup_preset() -> str:
         f"Found native CLIs: {found}. "
         "Install at least two of claude/codex/gemini, or set OPENROUTER_API_KEY "
         "in your shell, .env, .env.local, or .llm-council.env and rerun setup. "
-        "Advanced users can choose an explicit preset such as --preset tri-cli "
-        "or --preset openrouter."
+        "Advanced users who intentionally want to stage an incomplete config "
+        "can choose an explicit preset with --allow-incomplete."
     )
 
 
@@ -434,6 +441,25 @@ def _preset_status(preset: str, routes: dict[str, object]) -> tuple[str, str]:
             missing.append("ollama")
         return "blocked", "needs " + " and ".join(missing)
     return "unknown", ""
+
+
+def _guard_setup_preset(preset: str, args: argparse.Namespace) -> None:
+    if getattr(args, "allow_incomplete", False):
+        return
+    status, detail = _preset_status(preset, _detect_setup_routes())
+    if status != "blocked":
+        return
+    message = (
+        f"Preset `{preset}` is not usable in this environment: {detail}. "
+        "Run `llm-council setup --plan` to see available presets."
+    )
+    if getattr(args, "yes", False):
+        raise SystemExit(
+            message
+            + " To write this config anyway, rerun with `--allow-incomplete`."
+        )
+    if not _confirm(message + " Write it anyway?", default=False):
+        raise SystemExit("Setup cancelled.")
 
 
 def _print_setup_plan(root: Path) -> None:

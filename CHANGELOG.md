@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.5 - 2026-04-27
+
+- Refuse explicit setup presets when required CLIs or API keys are missing.
+- Add `--allow-incomplete` for advanced users who intentionally want to stage an incomplete setup.
+- Add regression coverage for blocked preset writes.
+
 ## 0.2.4 - 2026-04-27
 
 - Add `llm-council setup --plan` so agent installers show detected routes and ask before choosing a preset.

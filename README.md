@@ -3,7 +3,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
 [![MCP](https://img.shields.io/badge/MCP-ready-2f855a)](docs/llm-council.md)
 [![Read Only](https://img.shields.io/badge/default-read--only-6b7280)](#safety)
-[![Version](https://img.shields.io/badge/version-0.2.4-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.5-111827)](CHANGELOG.md)
 
 Give your coding agent a council of other models.
 
@@ -130,6 +130,11 @@ least two native CLIs, or `OPENROUTER_API_KEY` for hosted reviewers. If you only
 have one CLI account, OpenRouter is usually the easiest way to add additional
 reviewers.
 
+Setup stops before writing presets whose required CLI tools or API keys are
+missing. In interactive mode, it asks for confirmation first. Advanced users can
+add `--allow-incomplete` when they deliberately want to write config before
+installing the missing tools.
+
 ## What Setup Creates
 
 ```text
@@ -188,6 +193,12 @@ llm-council setup --plan
 llm-council setup --yes --preset <chosen-preset>
 llm-council doctor
 llm-council check-update
+```
+
+Advanced staging example:
+
+```bash
+llm-council setup --yes --preset openrouter --allow-incomplete
 ```
 
 Direct review:

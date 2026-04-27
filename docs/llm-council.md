@@ -75,6 +75,11 @@ finds a usable route: at least two installed native CLIs, or `OPENROUTER_API_KEY
 in your shell or project env files. This protects the common one-CLI case from
 getting a native-only council that cannot run.
 
+Explicit presets are validated too. If the chosen preset needs missing CLI tools
+or API keys, non-interactive setup stops before writing files, and interactive
+setup asks for confirmation. Use `--allow-incomplete` only when you intentionally
+want to stage config before installing those dependencies.
+
 Preset choices:
 
 - `auto`: choose `tri-cli` when at least two native CLIs exist, otherwise choose
@@ -95,6 +100,7 @@ llm-council setup --yes --preset tri-cli
 llm-council setup --yes --preset tri-cli --us-only-default
 llm-council setup --yes --preset tri-cli --no-mcp --no-instructions
 llm-council setup --yes --preset tri-cli --force
+llm-council setup --yes --preset openrouter --allow-incomplete
 ```
 
 `setup` writes `.llm-council.yaml`, `.mcp.json`, and optional instruction

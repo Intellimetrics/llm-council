@@ -911,7 +911,7 @@ def test_setup_yes_auto_fails_without_usable_route(tmp_path: Path, monkeypatch):
     parser = build_parser()
     args = parser.parse_args(["setup", "--yes", "--root", str(tmp_path)])
 
-    with pytest.raises(SystemExit, match="could not find a usable default"):
+    with pytest.raises(SystemExit, match="allow-incomplete"):
         cmd_setup(args)
 
 
@@ -932,6 +932,46 @@ def test_setup_plan_prints_routes_without_writing(tmp_path: Path, monkeypatch, c
     assert "tri-cli-openrouter" in output
     assert "Agent installers: show this plan to the user" in output
     assert not (tmp_path / ".mcp.json").exists()
+
+
+def test_setup_yes_explicit_blocked_preset_fails_without_override(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(cli_module.shutil, "which", lambda _name: None)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    parser = build_parser()
+    args = parser.parse_args(
+        ["setup", "--yes", "--preset", "openrouter", "--root", str(tmp_path)]
+    )
+
+    with pytest.raises(SystemExit, match="Preset `openrouter` is not usable"):
+        cmd_setup(args)
+
+    assert not (tmp_path / ".llm-council.yaml").exists()
+
+
+def test_setup_yes_allow_incomplete_writes_blocked_preset(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(cli_module.shutil, "which", lambda _name: None)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "setup",
+            "--yes",
+            "--preset",
+            "openrouter",
+            "--allow-incomplete",
+            "--root",
+            str(tmp_path),
+        ]
+    )
+
+    assert cmd_setup(args) == 0
+
+    config = load_config(tmp_path / ".llm-council.yaml")
+    assert "deepseek_v4_flash" in config["participants"]
 
 
 def test_setup_prints_next_steps_and_cli_warnings(tmp_path: Path, monkeypatch, capsys):
