@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 - 2026-04-27
+
+- Add `llm-council estimate` and MCP `council_estimate` for hosted cost previews.
+- Add `llm-council check-update`, `doctor --check-update`, and MCP `council_doctor` version reporting.
+- Improve beginner setup guidance for native CLIs, OpenRouter, local models, and frontier-model cost tradeoffs.
+- Use `qwen_coder_flash` for reliable cheap hosted defaults while retaining `qwen_coder_free` for explicit experiments.
+- Handle empty OpenRouter responses gracefully instead of surfacing adapter tracebacks.
+- Fix project config discovery so `--cwd` controls config lookup.
+
 ## 0.1.0 - 2026-04-25
 
 - Initial clean Intellimetrics `llm-council` project.

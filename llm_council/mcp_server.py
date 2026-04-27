@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from llm_council import __version__
 from llm_council.budget import enforce_mcp_budget, mcp_budget_report
 from llm_council.config import (
     detect_current_agent,
@@ -24,6 +25,7 @@ from llm_council.model_catalog import fetch_openrouter_models
 from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
 from llm_council.transcript import latest_transcript, transcript_paths, write_transcript
+from llm_council.update_check import check_for_update
 
 
 def council_run_schema() -> dict[str, Any]:
@@ -164,6 +166,7 @@ def doctor_schema() -> dict[str, Any]:
             "working_directory": {"type": "string"},
             "probe_openrouter": {"type": "boolean", "default": False},
             "probe_ollama": {"type": "boolean", "default": False},
+            "check_update": {"type": "boolean", "default": False},
         },
         "additionalProperties": False,
     }
@@ -305,7 +308,7 @@ def run_doctor(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
     config = load_config(find_config(cwd), search=False)
-    return {
+    result: dict[str, Any] = {
         "checks": checks_to_dict(
             check_environment(
                 config,
@@ -314,6 +317,10 @@ def run_doctor(arguments: dict[str, Any]) -> dict[str, Any]:
             )
         )
     }
+    result["version"] = __version__
+    if arguments.get("check_update"):
+        result["update"] = check_for_update(__version__).to_dict()
+    return result
 
 
 def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:

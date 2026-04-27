@@ -32,6 +32,7 @@ from llm_council.transcript import (
     transcript_records,
     write_transcript,
 )
+from llm_council.update_check import check_for_update
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -127,6 +128,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate Ollama is serving its tags endpoint",
     )
+    doctor.add_argument(
+        "--check-update",
+        action="store_true",
+        help="Check public GitHub version and print update guidance",
+    )
+
+    update = sub.add_parser("check-update", help="Check whether llm-council is current")
+    update.add_argument("--json", action="store_true", help="Print JSON")
 
     recommend = sub.add_parser("recommend", help="Recommend whether to use council")
     recommend.add_argument("task", nargs="*", help="Task description")
@@ -410,12 +419,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         probe_openrouter=args.probe_openrouter,
         probe_ollama=args.probe_ollama,
     )
+    check_update = bool(getattr(args, "check_update", False))
     if args.json:
-        print(json.dumps(checks_to_dict(checks), indent=2))
+        if check_update:
+            result = {"checks": checks_to_dict(checks)}
+            result["update"] = check_for_update(__version__).to_dict()
+            print(json.dumps(result, indent=2))
+        else:
+            print(json.dumps(checks_to_dict(checks), indent=2))
     else:
         for check in checks:
             status = "ok" if check.ok else "missing"
             print(f"{status:8} {check.name:24} {check.detail}")
+        if check_update:
+            _print_update_status(check_for_update(__version__))
     required_names = {"python:mcp"}
     default_mode = config.get("defaults", {}).get("mode", "quick")
     try:
@@ -439,6 +456,29 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if args.probe_ollama:
         required.extend(check for check in checks if check.name == "probe:ollama")
     return 0 if all(check.ok for check in required) else 1
+
+
+def cmd_check_update(args: argparse.Namespace) -> int:
+    status = check_for_update(__version__)
+    if args.json:
+        print(json.dumps(status.to_dict(), indent=2))
+    else:
+        _print_update_status(status)
+    return 0 if status.error is None else 1
+
+
+def _print_update_status(status) -> None:
+    print(f"version: {status.current_version}")
+    if status.error:
+        print(f"update_check: unavailable ({status.error})")
+        print(f"update_command: {status.install_command}")
+        return
+    print(f"latest: {status.latest_version}")
+    if status.update_available:
+        print("update_available: true")
+        print(f"update_command: {status.install_command}")
+    else:
+        print("update_available: false")
 
 
 def cmd_recommend(args: argparse.Namespace) -> int:
@@ -850,6 +890,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_setup(args)
     if args.command == "doctor":
         return cmd_doctor(args)
+    if args.command == "check-update":
+        return cmd_check_update(args)
     if args.command == "recommend":
         return cmd_recommend(args)
     if args.command == "estimate":

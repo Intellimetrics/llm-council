@@ -12,6 +12,7 @@ uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
 cd /path/to/your/project
 llm-council setup --yes
 llm-council doctor
+llm-council check-update
 ```
 
 If you do not use `uv`, install with `pipx`:
@@ -103,6 +104,28 @@ llm-council setup --yes --force
 
 `setup` writes `.llm-council.yaml`, `.mcp.json`, and optional instruction
 snippets under `.llm-council/instructions/`.
+
+## Versioning And Updates
+
+Releases are versioned in `pyproject.toml`, exposed by the package, recorded in
+`CHANGELOG.md`, and tagged as `vX.Y.Z` in git. The installed package version is
+visible through:
+
+```bash
+llm-council --version
+llm-council check-update
+llm-council doctor --check-update
+```
+
+`check-update` compares the installed version to the public `main` branch
+`pyproject.toml` version and prints the update command:
+
+```bash
+uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
+```
+
+MCP clients can pass `check_update: true` to `council_doctor` to get the same
+version and update status in the returned JSON.
 
 For hosted OpenRouter modes, estimate before running:
 

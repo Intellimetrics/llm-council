@@ -8,10 +8,12 @@ from pathlib import Path
 import pytest
 import yaml
 
+from llm_council import __version__
 import llm_council.adapters as adapters_module
 import llm_council.orchestrator as orchestrator_module
 import llm_council.cli as cli_module
 import llm_council.estimate as estimate_module
+import llm_council.update_check as update_check_module
 from llm_council.adapters import (
     ParticipantResult,
     _format_arg,
@@ -726,9 +728,49 @@ def test_mcp_last_transcript_schema():
 
 def test_mcp_doctor_and_models_schema():
     assert "probe_openrouter" in doctor_schema()["properties"]
+    assert "check_update" in doctor_schema()["properties"]
     assert "origin" in models_schema()["properties"]
     assert "openrouter_models" in estimate_schema()["properties"]
     assert "question" in estimate_schema()["required"]
+
+
+def test_check_update_reports_available(monkeypatch, capsys):
+    class FakeResponse:
+        text = '[project]\nversion = "9.9.9"\n'
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(
+        update_check_module.httpx, "get", lambda *_args, **_kwargs: FakeResponse()
+    )
+
+    assert main(["check-update"]) == 0
+
+    output = capsys.readouterr().out
+    assert f"version: {__version__}" in output
+    assert "latest: 9.9.9" in output
+    assert "update_available: true" in output
+    assert "uv tool install --force" in output
+
+
+def test_check_update_json_reports_current(monkeypatch, capsys):
+    class FakeResponse:
+        text = f'[project]\nversion = "{__version__}"\n'
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(
+        update_check_module.httpx, "get", lambda *_args, **_kwargs: FakeResponse()
+    )
+
+    assert main(["check-update", "--json"]) == 0
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["current_version"] == __version__
+    assert data["latest_version"] == __version__
+    assert data["update_available"] is False
 
 
 def test_recommendation_policy_for_architecture():

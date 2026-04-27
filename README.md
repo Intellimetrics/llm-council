@@ -22,6 +22,7 @@ uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
 cd /path/to/your/project
 llm-council setup --yes
 llm-council doctor
+llm-council check-update
 ```
 
 If you do not use `uv`, install with `pipx`:
@@ -101,6 +102,7 @@ Project setup:
 ```bash
 llm-council setup --yes
 llm-council doctor
+llm-council doctor --check-update
 llm-council doctor --probe-openrouter --probe-ollama
 ```
 
@@ -119,6 +121,24 @@ These files are loaded from the project directory and parent directories without
 overriding already-exported environment variables.
 The generated MCP config does not embed API keys; use one of those local env
 files or your MCP client's normal environment configuration for hosted models.
+
+## Versioning And Updates
+
+Releases are versioned in `pyproject.toml`, exposed by the package, recorded in
+`CHANGELOG.md`, and tagged as `vX.Y.Z` in git. `llm-council --version` prints
+the installed package version. `llm-council check-update` compares it with the
+public `main` branch package version and prints the update command when the
+install is behind:
+
+```bash
+llm-council --version
+llm-council check-update
+uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
+```
+
+`llm-council doctor --check-update` includes the same check alongside local
+readiness diagnostics. MCP clients can request update status with
+`council_doctor` by passing `check_update: true`.
 
 Live call:
 
@@ -491,4 +511,4 @@ Each run writes:
 These are intentionally local run artifacts.
 
 See [LLM Council reference](docs/llm-council.md) for the full config/MCP
-operator reference. 
+operator reference. See [CHANGELOG](CHANGELOG.md) for release history.

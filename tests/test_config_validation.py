@@ -1,14 +1,21 @@
 from pathlib import Path
+import tomllib
 
 import pytest
 import yaml
 
+from llm_council import __version__
 from llm_council.config import load_config, validate_config
 from llm_council.defaults import DEFAULT_CONFIG
 
 
 def test_default_config_validates():
     validate_config(DEFAULT_CONFIG)
+
+
+def test_package_version_matches_pyproject():
+    data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    assert __version__ == data["project"]["version"]
 
 
 def test_load_config_rejects_unknown_participant_reference(tmp_path: Path):
