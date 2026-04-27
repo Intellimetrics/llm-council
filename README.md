@@ -1,31 +1,31 @@
 # LLM Council
 
-Get a second opinion from other LLMs without leaving your coding CLI.
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
+[![MCP](https://img.shields.io/badge/MCP-ready-2f855a)](docs/llm-council.md)
+[![Read Only](https://img.shields.io/badge/default-read--only-6b7280)](#safety)
+[![Version](https://img.shields.io/badge/version-0.2.3-111827)](CHANGELOG.md)
 
-LLM Council lets Claude Code, Codex CLI, Gemini CLI, OpenRouter models, and
-local Ollama models review the same question, plan, diff, or architecture
-choice. It is read-only by default: council participants are asked to analyze
-and advise, not edit your files.
+Give your coding agent a council of other models.
 
-Use it when one model is not enough: architecture tradeoffs, risky refactors,
-security-sensitive changes, release gates, stubborn bugs, or any point where
-you want another model to challenge the plan before you act.
-
-## What It Does
-
-From your terminal:
-
-```bash
-llm-council run --current codex --mode review --diff "Review this change before I ship it"
-```
-
-Or from an MCP-enabled coding agent:
+LLM Council is an MCP server for Claude Code, Codex CLI, Gemini CLI, and other
+MCP-capable coding agents. Once installed, you do not normally run
+`llm-council` by hand. You keep working in your usual agent and say things
+like:
 
 ```text
-Use llm-council to review this plan with the other models before editing files.
+Review this migration plan and use council before editing files.
 ```
 
-A run shows what the council is doing, then writes a transcript:
+```text
+This auth refactor feels risky. Take it to council and compare the tradeoffs.
+```
+
+```text
+Use council on the current diff. I want Claude and Gemini to challenge the plan.
+```
+
+Your current agent asks the configured council for read-only review, shows what
+the other models said, and keeps a local transcript for auditability.
 
 ```text
 Council starting: mode=quick, current=codex, participants=claude, gemini
@@ -37,179 +37,161 @@ Council complete: 2/2 participants succeeded
 Transcript: .llm-council/runs/20260427_090457_review.md
 ```
 
-## Choose Your Setup
+## Why Use It
 
-| Your situation | Best preset | What it uses |
+Single-agent coding is fast, but it is also easy for one model to overfit its
+own plan. LLM Council gives your agent a lightweight way to ask independent
+reviewers for:
+
+- architecture pushback before a big implementation
+- security and data-handling review before touching sensitive paths
+- second opinions on stubborn bugs
+- release-gate review of a diff
+- model diversity when one agent keeps looping
+- local/private review through Ollama when hosted calls are not appropriate
+
+Council participants are advisory and read-only by default. They are asked to
+analyze, not edit.
+
+## Install The Way Users Actually Will
+
+Open the project where you want council installed, then paste this into your
+active coding agent:
+
+```text
+Install LLM Council into this project from https://github.com/Intellimetrics/llm-council.
+
+Use the agent-first install path:
+1. Check for `uv` with `command -v uv`. If present, run:
+   `uv tool install --force git+https://github.com/Intellimetrics/llm-council.git`
+2. If `uv` is not installed, check for `pipx` with `command -v pipx`. If present, run:
+   `pipx install --force git+https://github.com/Intellimetrics/llm-council.git`
+3. Do not use `uvx`; this must be a stable project install.
+4. From this project root, run `llm-council setup --yes`.
+5. If setup reports no usable council route, stop and ask me whether to set `OPENROUTER_API_KEY` or install another native CLI.
+6. After setup, read the generated snippet for this CLI from `.llm-council/instructions/`, then append that file's full contents to the correct project instruction file without overwriting existing content:
+   - Claude Code: `.llm-council/instructions/claude.md` -> `CLAUDE.md`
+   - Codex CLI: `.llm-council/instructions/codex.md` -> `AGENTS.md`
+   - Gemini CLI: `.llm-council/instructions/gemini.md` -> `GEMINI.md`
+7. Confirm the destination file now contains the LLM Council routing rules.
+8. Run `llm-council doctor` and show me the result.
+9. Tell me to restart this CLI session so MCP and project instructions reload.
+```
+
+That is the primary install path. It avoids the common mistakes agents make:
+using `uvx`, copying placeholder paths into `.mcp.json`, overwriting existing
+project instructions, skipping the instruction-file append step, or declaring
+success before `doctor` passes.
+
+## After Install
+
+Restart your coding agent, then talk naturally:
+
+```text
+Use council to review this plan before implementing it.
+```
+
+```text
+Ask council whether this database migration is safe. Include the current diff.
+```
+
+```text
+Take this bug to council. I want independent theories before we change code.
+```
+
+```text
+Use cheap council first, then tell me whether this is worth a frontier review.
+```
+
+Generated project instructions teach your agent the routing rules:
+
+- `go to council`, `ask council`, or `use council` calls `council_run`
+- the active CLI passes its identity, so it does not ask itself for review
+- `on the diff` includes the current git diff
+- `cheap` uses budget hosted reviewers
+- `private` or `local` uses the local Ollama route
+- council feedback is advisory unless you explicitly ask the agent to act
+
+## Pick Your Council
+
+| If you have... | Choose... | Best for... |
 | --- | --- | --- |
-| You have one coding CLI and want more opinions | `openrouter` | Hosted API models through OpenRouter |
-| You have Claude Code, Codex CLI, and/or Gemini CLI installed | `auto` or `tri-cli` | Your existing CLI accounts |
-| You want native CLIs plus hosted frontier or budget reviewers | `tri-cli-openrouter` | CLI accounts plus OpenRouter |
-| You want local/private review | `local-private` | Ollama on your machine |
+| One coding CLI | `openrouter` | adding outside model opinions with one API key |
+| Two or more of Claude Code, Codex CLI, Gemini CLI | `auto` | using accounts you already have |
+| Native CLIs plus hosted models | `tri-cli-openrouter` | stronger diversity and frontier escalation |
+| Local models through Ollama | `local-private` | private/offline review |
 
-`setup --yes` defaults to `--preset auto`. Auto setup writes a config only when
-it finds a usable council route: at least two native CLIs, or
-`OPENROUTER_API_KEY` for hosted reviewers. If you only have one CLI installed,
-set up OpenRouter or choose a preset explicitly.
+`llm-council setup --yes` uses `auto`. Auto writes a config only when it finds a
+usable route: at least two native CLIs, or `OPENROUTER_API_KEY` for hosted
+reviewers. If you only have one CLI account, OpenRouter is usually the easiest
+way to add additional reviewers.
 
-## Quick Start
+## What Setup Creates
 
-Install the command, then run setup from the project you want to use council in:
+```text
+.llm-council.yaml                  shared project council config
+.mcp.json                          local MCP command and project path
+.llm-council/instructions/*.md      snippets to append to agent instructions
+.llm-council/runs/                  local transcripts
+```
+
+`.mcp.json` contains absolute paths for one machine. Setup adds it to
+`.gitignore`. Commit `.llm-council.yaml` only if your team wants shared council
+modes; each developer should run setup locally.
+
+If `.mcp.json` was already committed:
+
+```bash
+git rm --cached .mcp.json
+```
+
+## Costs And Data Boundaries
+
+Council can call different kinds of participants:
+
+- Native CLI participants use your installed Claude Code, Codex CLI, or Gemini
+  CLI account. Billing and limits are controlled by those tools.
+- OpenRouter participants are hosted API calls billed by token. Run an estimate
+  before expensive reviews.
+- Ollama participants run locally on your machine.
+
+Ask your agent:
+
+```text
+Estimate the council cost for reviewing the current diff before running it.
+```
+
+Or run directly:
+
+```bash
+llm-council estimate --mode review-cheap --diff "Review this change"
+```
+
+Do not use council for classified, CUI, regulated, customer, production,
+credential, or `DEPLOY_MODE=secret` content unless every configured participant
+is approved for that data. US-origin model/company origin is not the same as
+GovCloud, FedRAMP, or enterprise data-handling approval.
+
+## Manual Terminal Use
+
+Most users will interact through their coding agent. The terminal command is
+still useful for setup, diagnostics, transcripts, and occasional direct runs.
 
 ```bash
 uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
-cd /path/to/your/project
+cd /path/to/project
 llm-council setup --yes
 llm-council doctor
+llm-council check-update
 ```
 
-If you do not use `uv`, use `pipx`:
+Direct review:
 
 ```bash
-pipx install --force git+https://github.com/Intellimetrics/llm-council.git
+llm-council run --current codex --mode review --diff "Review this change"
 ```
 
-Do not use `uvx` for project installation. `setup` writes the MCP command into
-the target project's `.mcp.json`, so the project needs a stable installed
-`llm-council` executable.
-
-Common setup choices:
-
-```bash
-llm-council setup --yes --preset auto
-llm-council setup --yes --preset openrouter
-llm-council setup --yes --preset tri-cli
-llm-council setup --yes --preset tri-cli-openrouter
-llm-council setup --yes --preset local-private
-```
-
-Setup writes:
-
-- `.llm-council.yaml`
-- `.mcp.json`
-- `.llm-council/instructions/claude.md`
-- `.llm-council/instructions/codex.md`
-- `.llm-council/instructions/gemini.md`
-
-`.mcp.json` contains local absolute paths for the installed command and project
-root. It is meant to be machine-local; setup adds `.mcp.json` to `.gitignore`.
-Commit `.llm-council.yaml` if your team wants to share council modes, but have
-each developer run `llm-council setup --yes` on their own machine.
-If `.mcp.json` was already committed, remove it from the index with
-`git rm --cached .mcp.json` after confirming your team does not intentionally
-share local MCP config.
-
-Restart your coding CLI after setup so `.mcp.json` and project instructions
-reload.
-
-## Let Your Coding Agent Install It
-
-Paste one of these prompts into the coding CLI you are using inside the target
-project.
-
-### Claude Code
-
-```text
-Install LLM Council into this project. Follow these steps exactly and stop if any step fails.
-
-1. Run `command -v uv`. If it exists, run `uv tool install --force git+https://github.com/Intellimetrics/llm-council.git`.
-2. If `uv` is not installed, run `command -v pipx`. If it exists, run `pipx install --force git+https://github.com/Intellimetrics/llm-council.git`.
-3. Do not use `uvx`.
-4. From the project root, run `llm-council setup --yes`.
-5. If setup says there is no usable route, ask me whether to set `OPENROUTER_API_KEY` or install another native CLI. Do not guess.
-6. Append the full contents of `.llm-council/instructions/claude.md` to `CLAUDE.md` in the project root. Create `CLAUDE.md` if needed. Do not overwrite existing content.
-7. Run `llm-council doctor` and show me the output.
-8. Tell me to restart this Claude Code session so MCP and project instructions reload.
-```
-
-### Codex CLI
-
-```text
-Install LLM Council into this project. Follow these steps exactly and stop if any step fails.
-
-1. Run `command -v uv`. If it exists, run `uv tool install --force git+https://github.com/Intellimetrics/llm-council.git`.
-2. If `uv` is not installed, run `command -v pipx`. If it exists, run `pipx install --force git+https://github.com/Intellimetrics/llm-council.git`.
-3. Do not use `uvx`.
-4. From the project root, run `llm-council setup --yes`.
-5. If setup says there is no usable route, ask me whether to set `OPENROUTER_API_KEY` or install another native CLI. Do not guess.
-6. Append the full contents of `.llm-council/instructions/codex.md` to `AGENTS.md` in the project root. Create `AGENTS.md` if needed. Do not overwrite existing content.
-7. Run `llm-council doctor` and show me the output.
-8. Tell me to restart this Codex session so MCP and project instructions reload.
-```
-
-### Gemini CLI
-
-```text
-Install LLM Council into this project. Follow these steps exactly and stop if any step fails.
-
-1. Run `command -v uv`. If it exists, run `uv tool install --force git+https://github.com/Intellimetrics/llm-council.git`.
-2. If `uv` is not installed, run `command -v pipx`. If it exists, run `pipx install --force git+https://github.com/Intellimetrics/llm-council.git`.
-3. Do not use `uvx`.
-4. From the project root, run `llm-council setup --yes`.
-5. If setup says there is no usable route, ask me whether to set `OPENROUTER_API_KEY` or install another native CLI. Do not guess.
-6. Append the full contents of `.llm-council/instructions/gemini.md` to `GEMINI.md` in the project root. Create `GEMINI.md` if needed. Do not overwrite existing content.
-7. Run `llm-council doctor` and show me the output.
-8. Tell me to restart this Gemini session so MCP and project instructions reload.
-```
-
-### Verify An Agent Install
-
-```text
-Verify the LLM Council install in this project:
-- `.mcp.json` exists and has an `llm-council` MCP server entry.
-- `.mcp.json` is ignored by git unless this project intentionally commits local MCP config.
-- `.llm-council.yaml` exists.
-- The generated instruction snippet for this CLI exists under `.llm-council/instructions/`.
-- The snippet was appended to the right project instruction file: `CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`.
-- `llm-council doctor` passes or explains exactly what is missing.
-- `llm-council --version` prints a version.
-```
-
-## Wire Your CLI Manually
-
-`setup` creates instruction snippets, but it does not overwrite your project
-instruction files. Append the right snippet yourself if you are not using the
-agent prompts above:
-
-- Claude Code: append `.llm-council/instructions/claude.md` to `CLAUDE.md`.
-- Codex CLI: append `.llm-council/instructions/codex.md` to `AGENTS.md`.
-- Gemini CLI: append `.llm-council/instructions/gemini.md` to `GEMINI.md`.
-
-Restart the relevant CLI session after editing `.mcp.json` or instruction
-files.
-
-## First Runs
-
-Preview the route without calling participants:
-
-```bash
-llm-council run --dry-run --current codex "Should we split this service?"
-```
-
-Ask for a review:
-
-```bash
-llm-council run --current codex --mode review "Review this architecture plan"
-```
-
-Include the current git diff:
-
-```bash
-llm-council run --current claude --mode review --diff "Find risks in this change"
-```
-
-Show usage, cost when available, and a model-by-model comparison:
-
-```bash
-llm-council run --transparent --current codex --mode review "Compare the risks"
-```
-
-Ask whether a task is worth taking to council:
-
-```bash
-llm-council recommend --risk high "Refactor auth and database session handling"
-```
-
-Read transcripts:
+Transcript tools:
 
 ```bash
 llm-council last
@@ -217,66 +199,22 @@ llm-council transcripts list
 llm-council transcripts summary
 ```
 
-## Costs In 30 Seconds
-
-- Native CLI participants use your installed Claude Code, Codex CLI, or Gemini
-  CLI account. Billing and limits are whatever those tools use.
-- OpenRouter participants are hosted API calls billed by token. Use
-  `llm-council estimate` before spending money.
-- Ollama participants run locally. They use your machine, not a hosted API.
-
-Estimate first:
-
-```bash
-llm-council estimate --mode review-cheap "Review this plan"
-llm-council estimate --mode review-cheap --completion-tokens 2500 "Review this diff"
-```
-
-Use cheap hosted modes for broad feedback. Escalate to frontier hosted models
-for release gates, security-sensitive decisions, architecture tradeoffs, or
-bugs where cheaper reviewers are not enough.
-
 ## MCP Tools
 
-The generated `.mcp.json` exposes an MCP (Model Context Protocol) server named
-`llm-council`. Coding agents can call:
+The generated `.mcp.json` exposes an MCP server named `llm-council`.
 
-- `council_run`: ask the configured council a question.
-- `council_estimate`: estimate prompt size and hosted model cost before a run.
-- `council_recommend`: ask whether council is worth using for a task.
-- `council_doctor`: check local setup, version, and optional update status.
-- `council_list_modes`: inspect configured modes and participants.
-- `council_last_transcript`: fetch the latest transcript path or content.
-- `council_models`: inspect configured or hosted model choices.
+| Tool | Purpose |
+| --- | --- |
+| `council_run` | ask the configured council a question |
+| `council_estimate` | estimate prompt size and hosted cost before a run |
+| `council_recommend` | ask whether council is worth using for a task |
+| `council_doctor` | check setup, version, and optional update status |
+| `council_list_modes` | inspect configured modes and participants |
+| `council_last_transcript` | fetch the latest transcript path or content |
+| `council_models` | inspect configured or hosted model choices |
 
 MCP calls return participant progress in `metadata.progress_events` when the
 tool call completes.
-
-## Manual MCP Install
-
-Prefer `llm-council setup --yes`. If you must configure MCP by hand, resolve
-the executable path dynamically.
-
-Autonomous agents configuring this MCP server must run `command -v llm-council`
-and must not copy the placeholder path below literally.
-
-```json
-{
-  "mcpServers": {
-    "llm-council": {
-      "type": "stdio",
-      "command": "/absolute/path/from/command-v/llm-council",
-      "args": ["mcp-server"],
-      "env": {
-        "LLM_COUNCIL_MCP_ROOT": "/absolute/path/to/your/project"
-      }
-    }
-  }
-}
-```
-
-If the project already has `.mcp.json`, add only the `llm-council` entry under
-the existing `mcpServers` object.
 
 ## Safety
 
@@ -286,22 +224,17 @@ the existing `mcpServers` object.
 - Secrets can live in `.env`, `.env.local`, or `.llm-council.env`.
 - Prompt-size guards skip oversized participants before long timeouts where
   possible.
-- Do not use council for classified, CUI, regulated, customer, production,
-  credential, or `DEPLOY_MODE=secret` content unless every configured
-  participant is explicitly approved for that data.
-- US-origin participants identify the model/company origin. They do not imply
-  GovCloud, FedRAMP, or enterprise data-handling approval.
+- Hosted model calls are explicit through your config and provider keys.
 
-## Versioning And Updates
+## Update
 
 ```bash
 llm-council --version
 llm-council check-update
-llm-council doctor --check-update
 uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
 ```
 
-Releases are recorded in [CHANGELOG](CHANGELOG.md) and tagged as `vX.Y.Z`.
+Releases are tagged as `vX.Y.Z` and recorded in [CHANGELOG](CHANGELOG.md).
 
 ## More
 

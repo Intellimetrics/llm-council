@@ -1,17 +1,45 @@
 # LLM Council Operator Reference
 
-Use the README for the fastest path to a working install. Use this file when
-you need the exact setup behavior, config schema, MCP surface, model routing, or
-cost controls.
+The README is the agent-first user guide. This file is the deeper reference for
+people and coding agents that need exact setup behavior, config fields, MCP
+tool names, cost controls, and custom participant routing.
 
-LLM Council has two entry points:
+In normal use, a person does not run council by hand. They ask their coding
+agent to install it, then ask that same agent to use council during real work:
 
-- the `llm-council` terminal command
-- the `llm-council` MCP server used by coding agents
+```text
+Install LLM Council from https://github.com/Intellimetrics/llm-council in this project.
+```
 
-## Setup
+```text
+Use council to review this migration before editing files.
+```
 
-Install the command once, then run setup from each project that should use it:
+The terminal command remains available for setup, diagnostics, direct runs, and
+transcript inspection.
+
+## Agent-First Setup
+
+Recommended user prompt:
+
+```text
+Install LLM Council into this project from https://github.com/Intellimetrics/llm-council.
+
+Use the agent-first install path:
+1. Check for `uv` with `command -v uv`. If present, run:
+   `uv tool install --force git+https://github.com/Intellimetrics/llm-council.git`
+2. If `uv` is not installed, check for `pipx` with `command -v pipx`. If present, run:
+   `pipx install --force git+https://github.com/Intellimetrics/llm-council.git`
+3. Do not use `uvx`; this must be a stable project install.
+4. From this project root, run `llm-council setup --yes`.
+5. If setup reports no usable council route, stop and ask me whether to set `OPENROUTER_API_KEY` or install another native CLI.
+6. After setup, read the generated snippet for this CLI from `.llm-council/instructions/`, then append that file's full contents to the correct project instruction file without overwriting existing content.
+7. Confirm the destination file now contains the LLM Council routing rules.
+8. Run `llm-council doctor` and show me the result.
+9. Tell me to restart this CLI session so MCP and project instructions reload.
+```
+
+Manual equivalent:
 
 ```bash
 uv tool install --force git+https://github.com/Intellimetrics/llm-council.git

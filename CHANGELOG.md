@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3 - 2026-04-27
+
+- Rewrite the README around agent-first installation and natural council usage.
+- Expand generated project instructions so coding agents know when and how to call council.
+- Move direct terminal usage behind the primary MCP/coding-agent workflow.
+
 ## 0.2.2 - 2026-04-27
 
 - Treat generated `.mcp.json` as local machine config by adding it to project `.gitignore`.

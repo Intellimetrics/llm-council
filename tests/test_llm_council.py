@@ -955,7 +955,7 @@ def test_setup_writes_config_mcp_and_instructions(tmp_path: Path):
     assert ".gitignore" in names
     assert "llm-council" in (tmp_path / ".mcp.json").read_text()
     assert ".mcp.json" in (tmp_path / ".gitignore").read_text()
-    assert "current` as this CLI's identity: `codex`" in (
+    assert "Always pass `current` as `codex`" in (
         tmp_path / ".llm-council/instructions/codex.md"
     ).read_text()
 

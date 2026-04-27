@@ -27,23 +27,48 @@ OPENROUTER_PARTICIPANTS = (
 
 INSTRUCTION_TEXT = """# LLM Council
 
-When the user says "go to council", "ask council", or "take this to council",
-call the `llm-council` MCP tool `council_run`.
+This project has LLM Council installed. Use it as a read-only second-opinion
+system when the user wants more than this single agent's judgment.
 
-Default behavior:
-- Always pass `current` as this CLI's identity: `{current}`.
+Natural triggers:
+- "use council"
+- "go to council"
+- "ask council"
+- "take this to council"
+- "get another model's opinion"
+- "have Claude/Gemini/Codex review this"
+
+When triggered, call the `llm-council` MCP tool `council_run`.
+
+Routing rules:
+- Always pass `current` as `{current}` so council does not call this same CLI
+  back as a reviewer.
 - Use `quick` mode unless the user names a mode.
+- Treat "on the diff", "current diff", or "review my changes" as
+  `include_diff: true`.
+- Treat "cheap" or "budget" as `review-cheap`.
+- Treat "private", "local", or "offline" as `private-local`.
 - Treat "with deepseek" as including `deepseek_v4_pro`.
 - Treat "with qwen" as including `qwen_coder_plus`.
 - Treat "with glm" as including `glm_5_1`.
-- Treat "cheap" as `review-cheap`.
-- Treat "private" or "local" as `private-local`.
-- Treat "on the diff" as `include_diff: true`.
 
-Use council when the task is architectural, risky, cross-cutting, ambiguous, has
-failed multiple times, or needs an independent code review. Do not use council
-for trivial edits, formatting, obvious syntax fixes, or when the user gave exact
-implementation steps.
+Use council for:
+- architecture or design decisions
+- risky or cross-cutting refactors
+- security-sensitive code paths
+- database migrations
+- release-gate reviews
+- stubborn bugs after a failed attempt
+- plans where independent disagreement would be useful
+
+Do not use council for trivial formatting, obvious syntax fixes, or exact
+mechanical edits the user already specified.
+
+Before acting on council feedback:
+- Summarize the main agreements, disagreements, and concrete risks.
+- Identify which recommendations you will follow.
+- Ask before making large or risky edits unless the user already authorized
+  implementation.
 
 Data boundary:
 - Do not send classified, CUI, regulated, production, secret, credential, or
@@ -54,8 +79,8 @@ Data boundary:
 - US-origin participants mean model/company origin only; that is not the same
   as GovCloud, FedRAMP, or an enterprise data-handling approval.
 
-Council is advisory and read-only by default. Do not apply edits from council
-without explicit user direction.
+Council is advisory and read-only by default. Council participants should not
+edit files; this agent remains responsible for deciding what to do next.
 """
 
 
