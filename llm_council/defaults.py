@@ -108,6 +108,17 @@ DEFAULT_CONFIG: dict = {
             "timeout": 180,
             "read_only": True,
         },
+        "qwen_coder_flash": {
+            "type": "openrouter",
+            "family": "qwen",
+            "origin": "China / Alibaba Qwen",
+            "model": "qwen/qwen3-coder-flash",
+            "input_per_million": 0.195,
+            "output_per_million": 0.975,
+            "api_key_env": "OPENROUTER_API_KEY",
+            "timeout": 180,
+            "read_only": True,
+        },
         "qwen_coder_free": {
             "type": "openrouter",
             "family": "qwen",
@@ -116,6 +127,7 @@ DEFAULT_CONFIG: dict = {
             "api_key_env": "OPENROUTER_API_KEY",
             "timeout": 180,
             "read_only": True,
+            "deprecated": "Account-dependent free route; use qwen_coder_flash for reliable cheap defaults.",
         },
         "glm_5_1": {
             "type": "openrouter",
@@ -178,7 +190,7 @@ DEFAULT_CONFIG: dict = {
         "review-cheap": {
             "participants": [
                 "deepseek_v4_flash",
-                "qwen_coder_free",
+                "qwen_coder_flash",
                 "glm_4_7_flash",
             ],
             "description": "Cheap hosted breadth reviewers.",

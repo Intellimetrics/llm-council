@@ -49,14 +49,19 @@ def find_config(start: Path | None = None) -> Path | None:
     return None
 
 
-def load_config(path: str | Path | None = None) -> dict[str, Any]:
+def load_config(path: str | Path | None = None, *, search: bool = True) -> dict[str, Any]:
     """Load config, merging project values over built-in defaults."""
 
     config = copy.deepcopy(DEFAULT_CONFIG)
-    config_path = Path(path).expanduser() if path else find_config()
+    if path:
+        config_path = Path(path).expanduser()
+    else:
+        config_path = find_config() if search else None
     if not config_path:
         validate_config(config)
         return config
+    if not config_path.exists():
+        raise ValueError(f"Config file does not exist: {config_path}")
 
     data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):

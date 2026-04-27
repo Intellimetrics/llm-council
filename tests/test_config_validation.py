@@ -96,3 +96,13 @@ def test_load_config_rejects_invalid_budget_defaults(tmp_path: Path):
 
     with pytest.raises(ValueError, match="mcp_max_estimated_cost_usd"):
         load_config(path)
+
+
+def test_load_config_missing_explicit_path_is_clear(tmp_path: Path):
+    with pytest.raises(ValueError, match="Config file does not exist"):
+        load_config(tmp_path / "missing.yaml")
+
+
+def test_load_config_search_false_uses_defaults():
+    config = load_config(None, search=False)
+    assert "qwen_coder_flash" in config["participants"]

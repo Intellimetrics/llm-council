@@ -18,7 +18,7 @@ OPENROUTER_PARTICIPANTS = (
     "deepseek_v4_pro",
     "deepseek_v4_flash",
     "qwen_coder_plus",
-    "qwen_coder_free",
+    "qwen_coder_flash",
     "glm_5_1",
     "glm_4_7_flash",
     "kimi_k2_6",
@@ -114,7 +114,7 @@ def _openrouter_only_modes() -> dict[str, dict[str, Any]]:
         "quick": {
             "participants": [
                 "deepseek_v4_flash",
-                "qwen_coder_free",
+                "qwen_coder_flash",
                 "glm_4_7_flash",
             ],
             "description": "Hosted OpenRouter breadth reviewers.",

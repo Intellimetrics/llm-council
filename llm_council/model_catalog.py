@@ -41,7 +41,7 @@ def price_per_million(raw_price: str | int | float | None) -> float | None:
 
 
 def infer_origin(model_id: str) -> str:
-    provider = model_id.split("/", 1)[0]
+    provider = model_id.split("/", 1)[0].lstrip("~")
     return PROVIDER_ORIGINS.get(provider, "Unknown")
 
 

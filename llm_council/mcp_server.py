@@ -19,6 +19,7 @@ from llm_council.config import (
 from llm_council.context import MAX_PROMPT_CHARS, build_prompt
 from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env
+from llm_council.estimate import estimate_council
 from llm_council.model_catalog import fetch_openrouter_models
 from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
@@ -104,6 +105,58 @@ def recommend_schema() -> dict[str, Any]:
     }
 
 
+def estimate_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "minLength": 1},
+            "mode": {
+                "type": "string",
+                "description": "Council mode such as quick, plan, review, diverse, review-cheap, private-local.",
+            },
+            "current": {"type": "string", "enum": ["claude", "codex", "gemini"]},
+            "participants": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Explicit participants. Overrides mode routing.",
+            },
+            "include": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Extra participants to add to mode routing.",
+            },
+            "context_files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Files to include as read-only context.",
+            },
+            "include_diff": {"type": "boolean", "default": False},
+            "working_directory": {"type": "string"},
+            "deliberate": {"type": "boolean", "default": False},
+            "max_rounds": {"type": "integer", "minimum": 1, "maximum": 3},
+            "completion_tokens": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 1500,
+                "description": "Assumed output tokens per participant per round.",
+            },
+            "openrouter_models": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Extra OpenRouter model IDs to price without editing config.",
+            },
+            "origin_policy": {
+                "type": "string",
+                "enum": ["any", "us"],
+                "description": "Set to 'us' to allow only US-origin participants.",
+            },
+            "no_cache": {"type": "boolean", "default": False},
+        },
+        "required": ["question"],
+        "additionalProperties": False,
+    }
+
+
 def doctor_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -132,7 +185,7 @@ def models_schema() -> dict[str, Any]:
 async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
-    config = load_config(find_config(cwd))
+    config = load_config(find_config(cwd), search=False)
     question = arguments["question"]
     mode = arguments.get("mode") or config.get("defaults", {}).get("mode", "quick")
     current = arguments.get("current") or detect_current_agent()
@@ -238,7 +291,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
 def last_transcript(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
-    config = load_config(find_config(cwd))
+    config = load_config(find_config(cwd), search=False)
     out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
     if not out_dir.is_absolute():
         out_dir = cwd / out_dir
@@ -251,7 +304,7 @@ def last_transcript(arguments: dict[str, Any]) -> dict[str, Any]:
 def run_doctor(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
-    config = load_config(find_config(cwd))
+    config = load_config(find_config(cwd), search=False)
     return {
         "checks": checks_to_dict(
             check_environment(
@@ -261,6 +314,42 @@ def run_doctor(arguments: dict[str, Any]) -> dict[str, Any]:
             )
         )
     }
+
+
+def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        cwd = _resolve_working_directory(arguments)
+        load_project_env(cwd)
+        config = load_config(find_config(cwd), search=False)
+        mode = arguments.get("mode") or config.get("defaults", {}).get("mode", "quick")
+        current = arguments.get("current") or detect_current_agent()
+        completion_tokens = (
+            1500
+            if arguments.get("completion_tokens") is None
+            else int(arguments["completion_tokens"])
+        )
+        estimate = estimate_council(
+            config=config,
+            cwd=cwd,
+            question=arguments["question"],
+            mode=mode,
+            current=current,
+            explicit=arguments.get("participants"),
+            include=arguments.get("include"),
+            origin_policy=arguments.get("origin_policy"),
+            context_paths=arguments.get("context_files") or [],
+            include_diff=bool(arguments.get("include_diff")),
+            stdin_text=None,
+            allow_outside_cwd=False,
+            deliberate=bool(arguments.get("deliberate")),
+            max_rounds=arguments.get("max_rounds"),
+            completion_tokens=completion_tokens,
+            openrouter_models=arguments.get("openrouter_models") or [],
+            use_cache=not bool(arguments.get("no_cache")),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": True, **estimate}
 
 
 def list_models(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -284,7 +373,7 @@ def list_models(arguments: dict[str, Any]) -> dict[str, Any]:
 def list_modes(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
-    config = load_config(find_config(cwd))
+    config = load_config(find_config(cwd), search=False)
     return {
         "modes": config.get("modes", {}),
         "participants": list(config.get("participants", {}).keys()),
@@ -316,6 +405,11 @@ async def _serve() -> None:
                 name="council_recommend",
                 description="Recommend whether a task should go to council and which mode to use.",
                 inputSchema=recommend_schema(),
+            ),
+            Tool(
+                name="council_estimate",
+                description="Estimate prompt size and OpenRouter costs before running council.",
+                inputSchema=estimate_schema(),
             ),
             Tool(
                 name="council_list_modes",
@@ -355,6 +449,8 @@ async def _serve() -> None:
                 risk=arguments.get("risk") or "medium",
             )
             result = {"use_council": use, "mode": mode, "reason": reason}
+        elif name == "council_estimate":
+            result = estimate_run(arguments)
         elif name == "council_list_modes":
             result = list_modes(arguments)
         elif name == "council_last_transcript":

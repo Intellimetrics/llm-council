@@ -204,8 +204,40 @@ async def run_openrouter_participant(
                 json=payload,
             )
             data = response.json()
-        content = data["choices"][0]["message"]["content"]
         usage = data.get("usage") or {}
+        if data.get("error"):
+            return ParticipantResult(
+                name=name,
+                ok=False,
+                output="",
+                error=f"OpenRouterError: {data['error']}",
+                elapsed_seconds=time.monotonic() - start,
+                model=data.get("model") or model,
+                prompt_tokens=_int_or_none(usage.get("prompt_tokens")),
+                completion_tokens=_int_or_none(usage.get("completion_tokens")),
+                total_tokens=_int_or_none(usage.get("total_tokens")),
+                cost_usd=_float_or_none(usage.get("cost")),
+            )
+        choices = data.get("choices") or []
+        choice = choices[0] if choices else {}
+        message = choice.get("message") or {}
+        content = _message_content_text(message.get("content"))
+        if not content:
+            content = _message_content_text(message.get("reasoning"))
+        if not content or not content.strip():
+            detail = choice.get("finish_reason") or "missing message content"
+            return ParticipantResult(
+                name=name,
+                ok=False,
+                output="",
+                error=f"OpenRouterEmptyResponse: {detail}",
+                elapsed_seconds=time.monotonic() - start,
+                model=data.get("model") or model,
+                prompt_tokens=_int_or_none(usage.get("prompt_tokens")),
+                completion_tokens=_int_or_none(usage.get("completion_tokens")),
+                total_tokens=_int_or_none(usage.get("total_tokens")),
+                cost_usd=_float_or_none(usage.get("cost")),
+            )
         return ParticipantResult(
             name=name,
             ok=True,
@@ -377,6 +409,24 @@ def _float_or_none(value: Any) -> float | None:
     return float(value)
 
 
+def _message_content_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content)
+
+
 def command_for_display(command: list[str] | None) -> str:
     if not command:
         return ""
@@ -499,4 +549,3 @@ _SAFE_ENV_NAMES = {
     "XDG_RUNTIME_DIR",
     "XDG_STATE_HOME",
 }
-

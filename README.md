@@ -2,13 +2,16 @@
 
 LLM Council is a lightweight, read-only-first multi-agent tool for coding projects.
 
-Baseline assumption: the user usually works inside one of three premium CLIs:
+LLM Council supports three common starting points:
 
-- Claude Code
-- Codex CLI
-- Gemini CLI
+- one native CLI, expanded with hosted OpenRouter reviewers
+- multiple native CLIs, such as Claude Code, Codex CLI, and Gemini CLI
+- local/private reviewers through Ollama
 
-By default, `llm-council` asks the other two CLIs for read-only opinions. OpenRouter and local models are explicit participants, not fallbacks.
+The built-in native modes ask the other two CLIs for read-only opinions.
+Generated setup uses `--preset auto` so one-CLI projects get a clear
+OpenRouter path instead of a broken native-only council. Local models are
+explicit opt-in participants.
 
 ## Quick Start
 
@@ -134,6 +137,13 @@ Turn on transparency for terminal usage/cost details and a transcript comparison
 llm-council run --transparent --current codex --mode review "Compare the risks"
 ```
 
+Estimate hosted cost before spending money:
+
+```bash
+llm-council estimate --mode review-cheap "Review this plan"
+llm-council estimate --mode review-cheap --completion-tokens 2500 "Review this diff"
+```
+
 Run expensive opt-in deliberation. This runs a second round only when first-round
 responses appear to disagree:
 
@@ -245,6 +255,109 @@ participants:
     api_key_env: OPENROUTER_API_KEY
 ```
 
+## Choosing Models And Costs
+
+Use council when another independent reviewer can reduce real risk: architecture
+choices, broad refactors, security-sensitive changes, release readiness, or a
+bug you have failed to solve once already. Skip it for mechanical edits where
+the extra calls only add latency and cost.
+
+There are three cost shapes:
+
+- Native CLI participants such as Claude Code, Codex CLI, and Gemini CLI use
+  your existing CLI account, subscription, and rate limits. `llm-council` cannot
+  price those as API calls, so `estimate` marks them as external.
+- OpenRouter participants send the prompt to OpenRouter and are billed per
+  input and output token. This is the right path when, for example, you are
+  working in Codex but do not have Claude Code or Gemini CLI installed.
+- Ollama participants run locally. There is no hosted API bill, but you still
+  pay in setup time, latency, hardware, and quality tradeoffs.
+
+Start cheap, then escalate deliberately:
+
+```bash
+llm-council setup --yes --preset openrouter
+llm-council doctor --probe-openrouter
+llm-council estimate --mode review-cheap "Review this change"
+llm-council run --mode review-cheap --transparent "Review this change"
+```
+
+Cheap hosted breadth models are useful for catching obvious mistakes and adding
+different failure modes. Frontier models through OpenRouter, such as Claude
+Opus/Sonnet or Gemini Pro routes when OpenRouter lists them, are better reserved
+for hard design reviews, release gates, and arbitration. They can cost much
+more because council multiplies prompt tokens by participants and, when
+deliberation is enabled, by rounds. Output tokens often dominate cost.
+
+Built-in cheap modes use low-cost paid routes instead of `:free` routes because
+OpenRouter free routes can reject calls with account-dependent `402 Payment
+Required` errors. The legacy `qwen_coder_free` participant remains available
+for explicit experiments, but generated configs and built-in cheap modes use
+`qwen_coder_flash`.
+
+The rough formula for one participant in one round is:
+
+```text
+cost ~= (prompt_tokens * input_price_per_1M / 1_000_000)
+      + (completion_tokens * output_price_per_1M / 1_000_000)
+```
+
+Total hosted cost is that number multiplied by hosted participants and
+deliberation rounds.
+
+For a 20k-token prompt with a 1.5k-token answer, a model priced at
+`$0.50/$2.00` per 1M input/output tokens is roughly one cent per participant.
+A frontier model priced at `$15/$75` for the same run is roughly forty cents
+per participant. Those are examples for scale, not promises; always check the
+live catalog because OpenRouter availability and prices change.
+
+Find Claude, Gemini, OpenAI, DeepSeek, Qwen, or other routes live:
+
+```bash
+llm-council models openrouter --no-cache --filter claude
+llm-council models openrouter --no-cache --filter gemini
+llm-council models openrouter --no-cache --filter opus
+```
+
+Then estimate exact candidate models before editing config:
+
+```bash
+llm-council estimate \
+  --openrouter-model anthropic/<copy-exact-model-id-from-catalog> \
+  --openrouter-model google/<copy-exact-model-id-from-catalog> \
+  "Review this architecture"
+```
+
+To make those models reusable, add named participants:
+
+```yaml
+participants:
+  claude_frontier_openrouter:
+    type: openrouter
+    model: anthropic/<copy-exact-claude-model-id>
+    api_key_env: OPENROUTER_API_KEY
+  gemini_frontier_openrouter:
+    type: openrouter
+    model: google/<copy-exact-gemini-model-id>
+    api_key_env: OPENROUTER_API_KEY
+
+modes:
+  frontier-review:
+    participants:
+      - claude_frontier_openrouter
+      - gemini_frontier_openrouter
+```
+
+For MCP use, refresh the catalog first or copy `input_per_million` and
+`output_per_million` into the participant config:
+
+```bash
+llm-council models openrouter --no-cache --filter <provider>
+```
+
+MCP paid calls fail closed when pricing is unknown so an agent cannot
+accidentally send an unpriced hosted request.
+
 Custom CLI participants inherit a sanitized subprocess environment. Add
 `env_passthrough` for the specific secret-looking variables that participant
 needs for authentication:
@@ -258,7 +371,7 @@ participants:
     env_passthrough: ["MY_CLI_API_KEY"]
 ```
 
-Refresh the live OpenRouter catalog when deciding what to add:
+Other useful OpenRouter catalog filters:
 
 ```bash
 llm-council models openrouter --filter deepseek
@@ -288,6 +401,7 @@ The MCP server exposes:
 
 - `council_run`: run a read-only council
 - `council_recommend`: decide whether a task is worth taking to council
+- `council_estimate`: estimate prompt size and hosted OpenRouter cost
 - `council_list_modes`: list configured modes and participants
 - `council_last_transcript`: read the most recent local transcript
 - `council_doctor`: diagnose CLI, OpenRouter, Ollama, and MCP readiness

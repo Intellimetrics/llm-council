@@ -104,6 +104,13 @@ llm-council setup --yes --force
 `setup` writes `.llm-council.yaml`, `.mcp.json`, and optional instruction
 snippets under `.llm-council/instructions/`.
 
+For hosted OpenRouter modes, estimate before running:
+
+```bash
+llm-council estimate --mode review-cheap "Review this change"
+llm-council estimate --mode review-cheap --completion-tokens 2500 "Review this diff"
+```
+
 ## Config Model
 
 Project config merges over built-in defaults unless `replace_defaults: true` is
@@ -169,6 +176,93 @@ participants:
 Hosted paid MCP calls fail closed when pricing is unknown. Add
 `input_per_million` and `output_per_million` for custom paid hosted models.
 
+## Model And Cost Selection
+
+Native CLI participants use the user's installed Claude Code, Codex CLI, or
+Gemini CLI account. That cost is external to `llm-council`; it may be a
+subscription, a rate limit, or a CLI-specific API setup. OpenRouter participants
+are hosted API calls billed by token. Ollama participants are local runtime
+calls.
+
+For users with only one native CLI, the simplest expansion path is:
+
+```bash
+export OPENROUTER_API_KEY=...
+llm-council setup --yes --preset openrouter
+llm-council doctor --probe-openrouter
+llm-council estimate --mode review-cheap "Review this plan"
+```
+
+Use cheap OpenRouter modes first for breadth. Escalate to frontier hosted
+models when the extra quality can justify the bill: release gates, architecture
+tradeoffs, security-sensitive decisions, or unresolved bugs.
+
+Built-in cheap modes use low-cost paid routes rather than `:free` OpenRouter
+routes. Free routes are account-dependent and can reject otherwise valid calls
+with `402 Payment Required`. The legacy `qwen_coder_free` participant remains
+available for explicit experiments; use `qwen_coder_flash` for reliable cheap
+defaults.
+
+The cost shape is roughly:
+
+```text
+participants * rounds * ((prompt_tokens * input_price) + (output_tokens * output_price))
+```
+
+where prices are dollars per million tokens divided by 1,000,000. A long diff,
+many participants, high output token assumptions, or deliberation can multiply
+cost quickly.
+
+`estimate` builds the same prompt surface as `run` but does not call
+participants:
+
+```bash
+llm-council estimate --current codex --mode review --diff "Review the diff"
+llm-council estimate --participants deepseek_v4_pro,qwen_coder_plus "Review this"
+llm-council estimate --deliberate --max-rounds 2 "Decide between these designs"
+```
+
+Use live OpenRouter catalog lookup when considering Claude Opus/Sonnet, Gemini
+Pro, OpenAI, or other hosted frontier routes:
+
+```bash
+llm-council models openrouter --no-cache --filter claude
+llm-council models openrouter --no-cache --filter gemini
+llm-council estimate \
+  --openrouter-model anthropic/<copy-exact-model-id> \
+  --openrouter-model google/<copy-exact-model-id> \
+  "Review this architecture"
+```
+
+Do not hardcode example model IDs from old docs without checking the live
+catalog. OpenRouter model IDs, prices, capacity, and availability change.
+
+Reusable frontier-hosted mode template:
+
+```yaml
+participants:
+  claude_frontier_openrouter:
+    type: openrouter
+    model: anthropic/<copy-exact-claude-model-id>
+    api_key_env: OPENROUTER_API_KEY
+    # Optional: copy prices from the live catalog for MCP fail-closed budget checks.
+    # input_per_million: <input price per 1M tokens>
+    # output_per_million: <output price per 1M tokens>
+  gemini_frontier_openrouter:
+    type: openrouter
+    model: google/<copy-exact-gemini-model-id>
+    api_key_env: OPENROUTER_API_KEY
+
+modes:
+  frontier-review:
+    participants:
+      - claude_frontier_openrouter
+      - gemini_frontier_openrouter
+```
+
+Prefer `llm-council estimate --openrouter-model ...` and the live model catalog
+for current costs.
+
 ## Modes
 
 A mode either lists exact participants or uses `strategy: other_cli_peers`.
@@ -181,7 +275,7 @@ modes:
     strategy: other_cli_peers
     add: ["qwen_coder_plus"]
   cheap:
-    participants: ["deepseek_v4_flash", "qwen_coder_free"]
+    participants: ["deepseek_v4_flash", "qwen_coder_flash"]
 ```
 
 `origin_policy: us` filters non-US participants. If the filter removes every
@@ -206,6 +300,7 @@ MCP tools:
 
 - `council_run`: run the council
 - `council_recommend`: decide whether council is useful for a task
+- `council_estimate`: estimate prompt size and hosted OpenRouter cost
 - `council_list_modes`: show configured modes and participants
 - `council_last_transcript`: read the latest transcript
 - `council_doctor`: diagnose local readiness

@@ -21,6 +21,7 @@ from llm_council.config import (
 from llm_council.context import MAX_PROMPT_CHARS, build_prompt
 from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env
+from llm_council.estimate import estimate_council
 from llm_council.model_catalog import fetch_openrouter_models
 from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
@@ -135,6 +136,50 @@ def build_parser() -> argparse.ArgumentParser:
         "--risk", choices=["low", "medium", "high"], default="medium"
     )
     recommend.add_argument("--json", action="store_true", help="Print JSON")
+
+    estimate = sub.add_parser(
+        "estimate", help="Estimate prompt size and OpenRouter costs before a run"
+    )
+    estimate.add_argument("question", nargs="*", help="Question or prompt")
+    estimate.add_argument("--config", help="Path to config YAML")
+    estimate.add_argument("--mode", default=None, help="Council mode")
+    estimate.add_argument("--current", choices=["claude", "codex", "gemini"])
+    estimate.add_argument("--participants", help="Comma-separated explicit participants")
+    estimate.add_argument("--include", help="Comma-separated extra participants")
+    estimate.add_argument(
+        "--origin-policy",
+        choices=["any", "us"],
+        help="Filter participants by model/lab origin",
+    )
+    estimate.add_argument("--context", action="append", default=[], help="Context file")
+    estimate.add_argument(
+        "--allow-outside-cwd",
+        action="store_true",
+        help="Allow --context files outside the working directory",
+    )
+    estimate.add_argument("--diff", action="store_true", help="Include git diff")
+    estimate.add_argument("--stdin", action="store_true", help="Append stdin as context")
+    estimate.add_argument("--cwd", default=".", help="Working directory")
+    estimate.add_argument(
+        "--deliberate",
+        action="store_true",
+        help="Estimate an opt-in deliberation run",
+    )
+    estimate.add_argument("--max-rounds", type=int, help="Maximum deliberation rounds")
+    estimate.add_argument(
+        "--completion-tokens",
+        type=int,
+        default=1500,
+        help="Assumed output tokens per participant per round",
+    )
+    estimate.add_argument(
+        "--openrouter-model",
+        action="append",
+        default=[],
+        help="Extra OpenRouter model ID to price without editing config",
+    )
+    estimate.add_argument("--no-cache", action="store_true", help="Bypass model cache")
+    estimate.add_argument("--json", action="store_true", help="Print JSON")
 
     last = sub.add_parser("last", help="Print the latest council transcript path/content")
     last.add_argument("--cwd", default=".", help="Working directory")
@@ -332,6 +377,11 @@ def _print_setup_next_steps(
     else:
         print("  2. Add the llm-council MCP server to your MCP config, then restart CLIs.")
     print("  3. Run `llm-council doctor` from the project root.")
+    if include_openrouter:
+        print(
+            "  4. Run `llm-council estimate --mode review-cheap \"Review this\"` "
+            "before paid hosted calls."
+        )
 
     warnings: list[str] = []
     if include_native:
@@ -409,10 +459,93 @@ def cmd_recommend(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_estimate(args: argparse.Namespace) -> int:
+    cwd = Path(args.cwd).resolve()
+    question = _question_from_args(args.question)
+    load_project_env(cwd)
+    try:
+        config = load_config(args.config or find_config(cwd), search=False)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    mode = args.mode or config.get("defaults", {}).get("mode", "quick")
+    current = args.current or detect_current_agent()
+    stdin_text = sys.stdin.read() if args.stdin else None
+    try:
+        estimate = estimate_council(
+            config=config,
+            cwd=cwd,
+            question=question,
+            mode=mode,
+            current=current,
+            explicit=parse_csv(args.participants),
+            include=parse_csv(args.include),
+            origin_policy=args.origin_policy,
+            context_paths=args.context,
+            include_diff=args.diff,
+            stdin_text=stdin_text,
+            allow_outside_cwd=args.allow_outside_cwd,
+            deliberate=args.deliberate,
+            max_rounds=args.max_rounds,
+            completion_tokens=args.completion_tokens,
+            openrouter_models=args.openrouter_model,
+            use_cache=not args.no_cache,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+    if args.json:
+        print(json.dumps(estimate, indent=2))
+    else:
+        _print_estimate(estimate)
+    return 0
+
+
+def _print_estimate(estimate: dict) -> None:
+    participants = list(estimate.get("participants") or [])
+    extras = [
+        f"openrouter:{model}"
+        for model in estimate.get("extra_openrouter_models") or []
+    ]
+    print(f"mode: {estimate['mode']}")
+    print(f"current: {estimate.get('current') or 'unknown'}")
+    print("participants: " + ", ".join(participants + extras))
+    print(f"prompt_chars: {estimate['prompt_chars']}")
+    print(f"estimated_prompt_tokens: {estimate['estimated_prompt_tokens']}")
+    print(f"budgeted_rounds: {estimate['budgeted_rounds']}")
+    print(
+        "completion_tokens_assumed_each: "
+        f"{estimate['completion_tokens_assumed_each']}"
+    )
+    print()
+    print(
+        f"{'participant/model':44} {'type':10} {'in/1M':>9} "
+        f"{'out/1M':>9} {'input':>10} {'output':>10} {'total':>10}"
+    )
+    for row in estimate["rows"]:
+        label = row["name"] if row["model"] == "cli default" else row["model"]
+        print(
+            f"{label[:44]:44} "
+            f"{row['type'][:10]:10} "
+            f"{_fmt_cost(row['input_per_million']):>9} "
+            f"{_fmt_cost(row['output_per_million']):>9} "
+            f"{_fmt_usd(row['estimated_input_cost_usd']):>10} "
+            f"{_fmt_usd(row['estimated_output_cost_usd']):>10} "
+            f"{_fmt_usd(row['estimated_total_cost_usd']):>10}"
+        )
+    print()
+    print(f"known_total_usd: {_fmt_usd(estimate['known_total_usd'])}")
+    if estimate.get("unknown_cost_rows"):
+        print("unknown_cost_rows: " + ", ".join(estimate["unknown_cost_rows"]))
+    if estimate.get("notes"):
+        print("notes:")
+        for note in estimate["notes"]:
+            print(f"  - {note}")
+
+
 def cmd_last(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).resolve()
     load_project_env(cwd)
-    config = load_config(find_config(cwd))
+    config = load_config(find_config(cwd), search=False)
     out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
     if not out_dir.is_absolute():
         out_dir = cwd / out_dir
@@ -436,7 +569,7 @@ def cmd_transcripts(args: argparse.Namespace) -> int:
         raise SystemExit("transcripts subcommand is required")
     cwd = Path(args.cwd).resolve()
     load_project_env(cwd)
-    config = load_config(find_config(cwd))
+    config = load_config(find_config(cwd), search=False)
     out_dir = _transcript_dir(cwd, config)
 
     if args.transcripts_command == "list":
@@ -489,6 +622,16 @@ def _fmt_cost(value: float | None) -> str:
     if value == 0:
         return "$0"
     return f"${value:.3f}"
+
+
+def _fmt_usd(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    if value == 0:
+        return "$0"
+    if value < 0.001:
+        return f"${value:.6f}"
+    return f"${value:.4f}"
 
 
 def _print_progress_event(event: dict) -> None:
@@ -557,7 +700,10 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).resolve()
     question = _question_from_args(args.question)
     load_project_env(cwd)
-    config = load_config(args.config or find_config(cwd))
+    try:
+        config = load_config(args.config or find_config(cwd), search=False)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
     mode = args.mode or config.get("defaults", {}).get("mode", "quick")
     current = args.current or detect_current_agent()
     explicit = parse_csv(args.participants)
@@ -706,6 +852,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(args)
     if args.command == "recommend":
         return cmd_recommend(args)
+    if args.command == "estimate":
+        return cmd_estimate(args)
     if args.command == "last":
         return cmd_last(args)
     if args.command == "transcripts":

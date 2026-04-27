@@ -1,5 +1,6 @@
 import asyncio
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -7,13 +8,16 @@ from pathlib import Path
 import pytest
 import yaml
 
+import llm_council.adapters as adapters_module
 import llm_council.orchestrator as orchestrator_module
 import llm_council.cli as cli_module
+import llm_council.estimate as estimate_module
 from llm_council.adapters import (
     ParticipantResult,
     _format_arg,
     clean_subprocess_env,
     redact_prompt_args,
+    run_openrouter_participant,
     run_participants,
 )
 from llm_council.cli import build_parser, cmd_doctor, cmd_setup, cmd_transcripts, main
@@ -41,6 +45,8 @@ from llm_council.model_catalog import (
 from llm_council.mcp_server import (
     council_run_schema,
     doctor_schema,
+    estimate_run,
+    estimate_schema,
     last_transcript,
     last_transcript_schema,
     models_schema,
@@ -185,6 +191,55 @@ def test_cli_missing_context_file_exits_without_traceback(tmp_path: Path):
     assert str(exc.value).startswith("Context file does not exist:")
 
 
+def test_cli_missing_config_file_exits_without_traceback(tmp_path: Path):
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "estimate",
+                "--cwd",
+                str(tmp_path),
+                "--config",
+                str(tmp_path / "missing.yaml"),
+                "check",
+            ]
+        )
+    assert str(exc.value).startswith("Config file does not exist:")
+
+
+def test_estimate_cwd_without_config_uses_defaults_not_process_cwd_config(
+    tmp_path: Path, capsys
+):
+    assert main(
+        [
+            "estimate",
+            "--cwd",
+            str(tmp_path),
+            "--current",
+            "claude",
+            "--mode",
+            "review-cheap",
+            "--completion-tokens",
+            "100",
+            "check",
+        ]
+    ) == 0
+
+    output = capsys.readouterr().out
+    assert "qwen/qwen3-coder-flash" in output
+    assert "qwen/qwen3-coder:free" not in output
+
+
+def test_legacy_qwen_free_participant_remains_explicitly_available():
+    config = load_config(None, search=False)
+    selected = select_participants(
+        config,
+        "quick",
+        "codex",
+        explicit=["qwen_coder_free"],
+    )
+    assert selected == ["qwen_coder_free"]
+
+
 def test_git_diff_includes_staged_changes(tmp_path: Path):
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
@@ -256,6 +311,46 @@ def test_run_participants_emits_progress_events(tmp_path: Path):
     assert events[1]["participant"] == "python"
     assert events[1]["status"] == "ok"
     assert events[1]["elapsed_seconds"] >= 0
+
+
+def test_openrouter_empty_content_is_graceful(monkeypatch):
+    class FakeResponse:
+        def json(self):
+            return {
+                "model": "z-ai/glm-test",
+                "choices": [
+                    {
+                        "message": {"content": None},
+                        "finish_reason": "content_filter",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 0,
+                    "total_tokens": 10,
+                    "cost": 0.001,
+                },
+            }
+
+    async def fake_request(*_args, **_kwargs):
+        return FakeResponse()
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openrouter_participant(
+            "glm",
+            {"type": "openrouter", "model": "z-ai/glm-test"},
+            "prompt",
+        )
+    )
+
+    assert result.ok is False
+    assert result.output == ""
+    assert result.error == "OpenRouterEmptyResponse: content_filter"
+    assert result.total_tokens == 10
+    assert result.cost_usd == 0.001
 
 
 def test_model_comparison_and_disagreement_detection():
@@ -447,6 +542,144 @@ def test_openrouter_catalog_cache_round_trip(tmp_path: Path):
     assert _read_cache(path) == models
 
 
+def test_estimate_reports_configured_openrouter_cost(tmp_path: Path, capsys):
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "replace_defaults": True,
+                "version": 1,
+                "participants": {
+                    "remote": {
+                        "type": "openrouter",
+                        "model": "provider/model",
+                        "api_key_env": "OPENROUTER_API_KEY",
+                        "input_per_million": 2.0,
+                        "output_per_million": 4.0,
+                    }
+                },
+                "modes": {"quick": {"participants": ["remote"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(
+        [
+            "estimate",
+            "--cwd",
+            str(tmp_path),
+            "--config",
+            str(config_path),
+            "--mode",
+            "quick",
+            "--completion-tokens",
+            "100",
+            "--json",
+            "Review this",
+        ]
+    ) == 0
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["rows"][0]["name"] == "remote"
+    assert data["rows"][0]["pricing_source"] == "config"
+    assert data["rows"][0]["estimated_total_cost_usd"] > 0
+    assert data["known_total_usd"] == data["rows"][0]["estimated_total_cost_usd"]
+
+
+def test_estimate_extra_openrouter_model_uses_catalog(
+    tmp_path: Path, monkeypatch, capsys
+):
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "replace_defaults": True,
+                "version": 1,
+                "participants": {
+                    "local_cli": {
+                        "type": "cli",
+                        "command": "example",
+                    }
+                },
+                "modes": {"quick": {"participants": ["local_cli"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        estimate_module,
+        "fetch_openrouter_models",
+        lambda **_kwargs: [
+            {
+                "id": "anthropic/claude-opus-test",
+                "name": "Claude Opus Test",
+                "origin": "US / Anthropic",
+                "context_length": 200000,
+                "input_per_million": 15.0,
+                "output_per_million": 75.0,
+            }
+        ],
+    )
+
+    assert main(
+        [
+            "estimate",
+            "--cwd",
+            str(tmp_path),
+            "--config",
+            str(config_path),
+            "--openrouter-model",
+            "anthropic/claude-opus-test",
+            "--completion-tokens",
+            "100",
+            "Review this",
+        ]
+    ) == 0
+
+    output = capsys.readouterr().out
+    assert "anthropic/claude-opus-test" in output
+    assert "known_total_usd:" in output
+    assert "Native CLI and Ollama rows are not API-priced" in output
+
+
+def test_mcp_estimate_preserves_zero_completion_tokens(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "replace_defaults": True,
+                "version": 1,
+                "participants": {
+                    "remote": {
+                        "type": "openrouter",
+                        "model": "provider/model",
+                        "api_key_env": "OPENROUTER_API_KEY",
+                        "input_per_million": 2.0,
+                        "output_per_million": 4.0,
+                    }
+                },
+                "modes": {"quick": {"participants": ["remote"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+
+    result = estimate_run(
+        {
+            "question": "Review this",
+            "working_directory": str(tmp_path),
+            "completion_tokens": 0,
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["completion_tokens_assumed_each"] == 0
+    assert result["rows"][0]["estimated_output_tokens"] == 0
+    assert result["rows"][0]["estimated_output_cost_usd"] == 0
+
+
 def test_openrouter_cache_uses_xdg_cache_home(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     assert openrouter_cache_path() == tmp_path / "llm-council" / "openrouter-models.json"
@@ -477,6 +710,7 @@ def test_load_project_env_precedence(tmp_path: Path, monkeypatch):
 
 def test_origin_inference_for_us_model():
     assert infer_origin("openai/gpt-5.2") == "US / OpenAI"
+    assert infer_origin("~anthropic/claude-opus-latest") == "US / Anthropic"
 
 
 def test_mcp_run_schema_has_question():
@@ -493,6 +727,8 @@ def test_mcp_last_transcript_schema():
 def test_mcp_doctor_and_models_schema():
     assert "probe_openrouter" in doctor_schema()["properties"]
     assert "origin" in models_schema()["properties"]
+    assert "openrouter_models" in estimate_schema()["properties"]
+    assert "question" in estimate_schema()["required"]
 
 
 def test_recommendation_policy_for_architecture():
@@ -618,7 +854,7 @@ def test_setup_yes_auto_selects_openrouter_when_native_route_missing(
     assert set(config["modes"]) >= {"quick", "plan", "review"}
     assert config["modes"]["quick"]["participants"] == [
         "deepseek_v4_flash",
-        "qwen_coder_free",
+        "qwen_coder_flash",
         "glm_4_7_flash",
     ]
     assert "Auto preset selected: openrouter" in capsys.readouterr().out
