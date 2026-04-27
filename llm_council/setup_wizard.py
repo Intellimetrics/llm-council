@@ -66,12 +66,12 @@ def project_config(
     }
     config = {
         "version": 1,
+        "replace_defaults": True,
         "transcripts_dir": ".llm-council/runs",
         "defaults": DEFAULT_CONFIG["defaults"],
         "participants": {
-            "claude": {"model": None},
-            "codex": {"model": None},
-            "gemini": {"model": None},
+            name: DEFAULT_CONFIG["participants"][name]
+            for name in ("claude", "codex", "gemini")
         },
         "modes": modes,
     }
@@ -122,7 +122,7 @@ def mcp_config(project_root: Path) -> dict[str, Any]:
                 "args": args,
                 "env": {
                     "PYTHONPATH": str(project_root.resolve()),
-                    "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}",
+                    "LLM_COUNCIL_MCP_ROOT": str(project_root.resolve()),
                 },
             }
         }
@@ -149,12 +149,12 @@ def write_setup_files(
         us_only_default=us_only_default,
     )
     if config_path.exists() and not force:
-        existing_config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        existing_config = _read_yaml_mapping(config_path)
         merged_config = deep_merge(desired_config, existing_config)
     else:
         merged_config = desired_config
     if force or not config_path.exists() or merged_config != (
-        yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else None
+        _read_yaml_mapping(config_path) if config_path.exists() else None
     ):
         config_path.write_text(
             yaml.safe_dump(merged_config, sort_keys=False),
@@ -165,7 +165,7 @@ def write_setup_files(
     if write_mcp:
         mcp_path = root / ".mcp.json"
         if mcp_path.exists() and not force:
-            existing = json.loads(mcp_path.read_text(encoding="utf-8"))
+            existing = _read_json_mapping(mcp_path)
             servers = existing.setdefault("mcpServers", {})
             servers["llm-council"] = mcp_config(root)["mcpServers"]["llm-council"]
             mcp_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
@@ -196,3 +196,23 @@ def write_setup_files(
         written.append(runtime_gitignore)
 
     return written
+
+
+def _read_yaml_mapping(path: Path) -> dict[str, Any]:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Could not parse {path}. Fix it or rerun setup with --force.") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a YAML mapping. Fix it or rerun setup with --force.")
+    return data
+
+
+def _read_json_mapping(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Could not parse {path}. Fix it or rerun setup with --force.") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a JSON object. Fix it or rerun setup with --force.")
+    return data

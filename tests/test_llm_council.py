@@ -1,17 +1,25 @@
 import asyncio
+import argparse
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
+import yaml
+
 import llm_council.orchestrator as orchestrator_module
+import llm_council.cli as cli_module
 from llm_council.adapters import (
     ParticipantResult,
     _format_arg,
     clean_subprocess_env,
     redact_prompt_args,
+    run_participants,
 )
-from llm_council.cli import build_parser, cmd_transcripts
+from llm_council.cli import build_parser, cmd_doctor, cmd_setup, cmd_transcripts, main
 from llm_council.config import load_config, select_participants
 from llm_council.context import build_prompt
-from llm_council.context import read_context_file
+from llm_council.context import read_context_file, read_git_diff
 from llm_council.defaults import DEFAULT_CONFIG
 from llm_council.deliberation import (
     build_deliberation_prompt,
@@ -20,7 +28,8 @@ from llm_council.deliberation import (
     recommendation_counts,
     recommendation_label,
 )
-from llm_council.doctor import _probe_ollama, _probe_openrouter
+from llm_council.doctor import _probe_ollama, _probe_openrouter, check_environment
+from llm_council.doctor import Check
 from llm_council.env import load_project_env
 from llm_council.model_catalog import (
     _read_cache,
@@ -43,6 +52,7 @@ from llm_council.transcript import (
     deliberation_summary,
     final_round_results,
     latest_transcript,
+    markdown_fence,
     result_to_dict,
     safe_slug,
     transcript_records,
@@ -98,10 +108,28 @@ def test_explicit_participants_win():
     assert selected == ["glm_5_1"]
 
 
+def test_explicit_participants_respect_origin_policy_with_clear_error():
+    config = load_config(None)
+    with pytest.raises(ValueError, match="No participants selected"):
+        select_participants(
+            config,
+            "quick",
+            "codex",
+            explicit=["deepseek_v4_pro"],
+            origin_policy="us",
+        )
+
+
 def test_us_origin_policy_filters_non_us_additions():
     config = load_config(None)
     selected = select_participants(config, "diverse", "codex", origin_policy="us")
     assert selected == ["claude", "gemini"]
+
+
+def test_origin_policy_empty_selection_is_clear():
+    config = load_config(None)
+    with pytest.raises(ValueError, match="No participants selected"):
+        select_participants(config, "private-local", "codex", origin_policy="us")
 
 
 def test_build_prompt_contains_read_only_rules(tmp_path: Path):
@@ -136,6 +164,50 @@ def test_context_file_outside_cwd_can_be_allowed(tmp_path: Path):
     assert "ok" in rendered
 
 
+def test_missing_context_file_error_is_clear(tmp_path: Path):
+    with pytest.raises(ValueError, match="Context file does not exist"):
+        read_context_file("missing.txt", cwd=tmp_path)
+
+
+def test_cli_missing_context_file_exits_without_traceback(tmp_path: Path):
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "run",
+                "--cwd",
+                str(tmp_path),
+                "--dry-run",
+                "--context",
+                "missing.txt",
+                "check",
+            ]
+        )
+    assert str(exc.value).startswith("Context file does not exist:")
+
+
+def test_git_diff_includes_staged_changes(tmp_path: Path):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    source = tmp_path / "file.txt"
+    source.write_text("old\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True)
+
+    source.write_text("new\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True)
+
+    diff = read_git_diff(tmp_path)
+    assert "### Staged Changes" in diff
+    assert "+new" in diff
+    assert "[no diff]" not in diff
+
+
+def test_git_diff_outside_repo_is_prompt_placeholder(tmp_path: Path):
+    diff = read_git_diff(tmp_path)
+    assert "git diff unavailable: not a git repository" in diff
+
+
 def test_safe_slug():
     assert safe_slug("Hello, World!") == "hello-world"
 
@@ -158,6 +230,34 @@ def test_result_to_dict_includes_usage():
     assert data["cost_usd"] == 0.000123
 
 
+def test_run_participants_emits_progress_events(tmp_path: Path):
+    events: list[dict] = []
+
+    results = asyncio.run(
+        run_participants(
+            ["python"],
+            {
+                "python": {
+                    "type": "cli",
+                    "command": sys.executable,
+                    "args": ["-c", "print('RECOMMENDATION: yes - ok')"],
+                    "timeout": 5,
+                }
+            },
+            "prompt",
+            tmp_path,
+            progress=events.append,
+        )
+    )
+
+    assert results[0].ok is True
+    assert events[0] == {"event": "participant_start", "participant": "python", "round": 1}
+    assert events[1]["event"] == "participant_finish"
+    assert events[1]["participant"] == "python"
+    assert events[1]["status"] == "ok"
+    assert events[1]["elapsed_seconds"] >= 0
+
+
 def test_model_comparison_and_disagreement_detection():
     results = [
         ParticipantResult("a", True, "RECOMMENDATION: yes - proceed.", "", 1),
@@ -169,6 +269,21 @@ def test_model_comparison_and_disagreement_detection():
     comparison = "\n".join(model_comparison(results))
     assert "a:" in comparison
     assert "4 tokens" in comparison
+
+
+def test_model_comparison_prefers_recommendation_line():
+    results = [
+        ParticipantResult(
+            "a",
+            True,
+            "Here is my review.\n\nRECOMMENDATION: no - wait",
+            "",
+            1,
+        )
+    ]
+    comparison = "\n".join(model_comparison(results))
+    assert "RECOMMENDATION: no - wait" in comparison
+    assert "Here is my review" not in comparison
 
 
 def test_recommendation_label_handles_common_markdown():
@@ -407,6 +522,68 @@ def test_tri_cli_setup_omits_openrouter_modes():
     assert "private-local" not in config["modes"]
 
 
+def test_example_config_loads_exact_modes():
+    config = load_config(Path("examples/llm-council.yaml"))
+    assert set(config["participants"]) == {
+        "claude",
+        "codex",
+        "gemini",
+        "deepseek_v4_pro",
+        "qwen_coder_plus",
+    }
+    assert set(config["modes"]) == {"quick", "plan", "review"}
+
+
+def test_tri_cli_setup_loaded_config_does_not_restore_defaults(tmp_path: Path):
+    write_setup_files(tmp_path, include_openrouter=False, include_local=False)
+    config = load_config(tmp_path / ".llm-council.yaml")
+    assert set(config["participants"]) == {"claude", "codex", "gemini"}
+    assert set(config["modes"]) == {"quick", "us-only"}
+
+
+def test_setup_interactive_uses_preset_and_suppression_flags(
+    tmp_path: Path, monkeypatch
+):
+    answers: list[str] = []
+    monkeypatch.setattr("builtins.input", lambda _prompt: answers.pop(0) if answers else "")
+    args = argparse.Namespace(
+        root=str(tmp_path),
+        preset="tri-cli",
+        yes=False,
+        force=False,
+        us_only_default=True,
+        no_mcp=True,
+        no_instructions=True,
+    )
+    assert cmd_setup(args) == 0
+
+    config = yaml.safe_load((tmp_path / ".llm-council.yaml").read_text())
+    assert set(config["participants"]) == {"claude", "codex", "gemini"}
+    assert config["defaults"]["origin_policy"] == "us"
+    assert not (tmp_path / ".mcp.json").exists()
+    assert not (tmp_path / ".llm-council" / "instructions").exists()
+
+
+def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path):
+    args = argparse.Namespace(
+        root=str(tmp_path),
+        preset="tri-cli",
+        yes=True,
+        force=False,
+        us_only_default=True,
+        no_mcp=True,
+        no_instructions=True,
+    )
+    assert cmd_setup(args) == 0
+
+    config = yaml.safe_load((tmp_path / ".llm-council.yaml").read_text())
+    assert set(config["participants"]) == {"claude", "codex", "gemini"}
+    assert set(config["modes"]) == {"quick", "us-only"}
+    assert config["defaults"]["origin_policy"] == "us"
+    assert not (tmp_path / ".mcp.json").exists()
+    assert not (tmp_path / ".llm-council" / "instructions").exists()
+
+
 def test_setup_writes_config_mcp_and_instructions(tmp_path: Path):
     written = write_setup_files(tmp_path)
     names = {path.relative_to(tmp_path).as_posix() for path in written}
@@ -419,13 +596,22 @@ def test_setup_writes_config_mcp_and_instructions(tmp_path: Path):
     assert "llm-council" in (tmp_path / ".mcp.json").read_text()
 
 
-def test_mcp_config_passes_openrouter_env_reference(tmp_path: Path):
+def test_mcp_config_does_not_embed_openrouter_env_reference(tmp_path: Path):
     config = mcp_config(tmp_path)
     env = config["mcpServers"]["llm-council"]["env"]
-    assert env["OPENROUTER_API_KEY"] == "${OPENROUTER_API_KEY}"
+    assert env["PYTHONPATH"] == str(tmp_path.resolve())
+    assert env["LLM_COUNCIL_MCP_ROOT"] == str(tmp_path.resolve())
+    assert "OPENROUTER_API_KEY" not in env
 
 
-def test_last_transcript_reads_latest_from_project_cwd(tmp_path: Path):
+def test_setup_parse_errors_are_actionable(tmp_path: Path):
+    (tmp_path / ".mcp.json").write_text("{bad-json", encoding="utf-8")
+    with pytest.raises(ValueError, match="rerun setup with --force"):
+        write_setup_files(tmp_path)
+
+
+def test_last_transcript_reads_latest_from_project_cwd(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
     out_dir = tmp_path / ".llm-council" / "runs"
     md_path = out_dir / "20260425-test.md"
     json_path = out_dir / "20260425-test.json"
@@ -451,6 +637,92 @@ def test_last_transcript_reads_latest_from_project_cwd(tmp_path: Path):
     records = transcript_records(out_dir)
     assert records[0]["question"] == "test"
     assert records[0]["total"] == 0
+
+
+def test_prompt_sent_uses_longer_markdown_fence(tmp_path: Path):
+    prompt = "Context:\n```text\ninside\n```"
+    assert markdown_fence(prompt) == "````"
+    md_path = tmp_path / "run.md"
+    json_path = tmp_path / "run.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="test",
+        mode="quick",
+        current="codex",
+        participants=[],
+        prompt=prompt,
+        results=[],
+    )
+    content = md_path.read_text(encoding="utf-8")
+    assert "````text\nContext:\n```text\ninside\n```\n````" in content
+
+
+def test_doctor_does_not_require_optional_ollama(monkeypatch):
+    checks = [
+        Check("cli:claude", True, "ok"),
+        Check("cli:codex", True, "ok"),
+        Check("cli:gemini", True, "ok"),
+        Check("cli:ollama", False, "missing"),
+        Check("python:mcp", True, "ok"),
+    ]
+    monkeypatch.setattr(cli_module, "check_environment", lambda *args, **kwargs: checks)
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli_module, "load_config", lambda *_args, **_kwargs: {})
+    args = argparse.Namespace(
+        config=None,
+        json=False,
+        probe_openrouter=False,
+        probe_ollama=False,
+    )
+    assert cmd_doctor(args) == 0
+
+
+def test_doctor_requires_python_mcp(monkeypatch):
+    checks = [
+        Check("cli:claude", True, "ok"),
+        Check("cli:codex", True, "ok"),
+        Check("cli:gemini", True, "ok"),
+        Check("python:mcp", False, "missing"),
+    ]
+    monkeypatch.setattr(cli_module, "check_environment", lambda *args, **kwargs: checks)
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli_module, "load_config", lambda *_args, **_kwargs: {})
+    args = argparse.Namespace(
+        config=None,
+        json=False,
+        probe_openrouter=False,
+        probe_ollama=False,
+    )
+    assert cmd_doctor(args) == 1
+
+
+def test_doctor_openrouter_only_does_not_require_native_clis(monkeypatch):
+    config = {
+        "defaults": {"mode": "remote"},
+        "participants": {
+            "remote": {
+                "type": "openrouter",
+                "model": "openai/gpt-test",
+                "api_key_env": "CUSTOM_OPENROUTER_KEY",
+            }
+        },
+        "modes": {"remote": {"participants": ["remote"]}},
+    }
+    monkeypatch.setenv("CUSTOM_OPENROUTER_KEY", "secret")
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli_module, "load_config", lambda *_args, **_kwargs: config)
+    args = argparse.Namespace(
+        config=None,
+        json=False,
+        probe_openrouter=False,
+        probe_ollama=False,
+    )
+
+    checks = check_environment(config)
+    assert {check.name for check in checks} >= {"env:CUSTOM_OPENROUTER_KEY", "python:mcp"}
+    assert "cli:claude" not in {check.name for check in checks}
+    assert cmd_doctor(args) == 0
 
 
 def test_latest_transcript_ordering_and_corrupt_records(tmp_path: Path):

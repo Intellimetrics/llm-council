@@ -61,6 +61,10 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         raise ValueError(f"Config must be a YAML mapping: {config_path}")
+    if data.get("replace_defaults"):
+        config["participants"] = {}
+        config["modes"] = {}
+        data = {key: value for key, value in data.items() if key != "replace_defaults"}
     merged = deep_merge(config, data)
     validate_config(merged)
     return merged
@@ -86,14 +90,14 @@ def validate_config(config: dict[str, Any]) -> None:
         if ptype == "cli":
             if not participant.get("command"):
                 raise ValueError(f"CLI participant '{name}' must define command")
-            args = participant.get("args", [])
-            if not isinstance(args, list) or not all(
-                isinstance(item, str) for item in args
-            ):
-                raise ValueError(f"CLI participant '{name}' args must be a string list")
+            _validate_string_list(participant, "args", f"CLI participant '{name}'")
+            _validate_string_list(
+                participant, "env_passthrough", f"CLI participant '{name}'"
+            )
         if ptype in {"openrouter", "ollama"} and not participant.get("model"):
             raise ValueError(f"Participant '{name}' must define model")
         _validate_positive_int(participant, "timeout", f"participant '{name}'")
+        _validate_positive_int(participant, "max_prompt_chars", f"participant '{name}'")
 
     modes = config.get("modes")
     if not isinstance(modes, dict) or not modes:
@@ -132,6 +136,9 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError(f"defaults.mode references unknown mode '{defaults['mode']}'")
     _validate_positive_int(defaults, "max_concurrency", "defaults")
     _validate_positive_int(defaults, "max_deliberation_rounds", "defaults")
+    _validate_positive_int(defaults, "max_prompt_chars", "defaults")
+    _validate_positive_int(defaults, "mcp_max_prompt_chars", "defaults")
+    _validate_positive_number(defaults, "mcp_max_estimated_cost_usd", "defaults")
 
 
 def _validate_positive_int(mapping: dict[str, Any], key: str, label: str) -> None:
@@ -140,6 +147,20 @@ def _validate_positive_int(mapping: dict[str, Any], key: str, label: str) -> Non
     value = mapping[key]
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{label}.{key} must be a positive integer")
+
+
+def _validate_string_list(mapping: dict[str, Any], key: str, label: str) -> None:
+    value = mapping.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{label} {key} must be a string list")
+
+
+def _validate_positive_number(mapping: dict[str, Any], key: str, label: str) -> None:
+    if key not in mapping or mapping[key] is None:
+        return
+    value = mapping[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError(f"{label}.{key} must be a positive number")
 
 
 def detect_current_agent() -> str | None:
@@ -202,7 +223,8 @@ def select_participants(
         or "any"
     )
 
-    if explicit:
+    explicit_requested = bool(explicit)
+    if explicit_requested:
         selected = list(explicit)
     else:
         if not mode_cfg:
@@ -230,4 +252,13 @@ def select_participants(
                 continue
         if name not in deduped:
             deduped.append(name)
+    if not deduped:
+        raise ValueError(
+            "No participants selected"
+            + (
+                f" after applying origin_policy '{effective_origin_policy}'"
+                if effective_origin_policy != "any"
+                else ""
+            )
+        )
     return deduped

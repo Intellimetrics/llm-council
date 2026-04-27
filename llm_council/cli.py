@@ -17,7 +17,7 @@ from llm_council.config import (
     parse_csv,
     select_participants,
 )
-from llm_council.context import build_prompt
+from llm_council.context import MAX_PROMPT_CHARS, build_prompt
 from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env
 from llm_council.model_catalog import fetch_openrouter_models
@@ -214,25 +214,36 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print("\nDetected CLIs:")
         for name in ("claude", "codex", "gemini", "ollama"):
             print(f"  {name:8} {shutil.which(name) or 'not found'}")
-        include_openrouter = _confirm("Include OpenRouter participant presets?", True)
-        include_local = _confirm("Include local/Ollama participant preset?", True)
-        us_only_default = _confirm("Default to US-origin participants only?", False)
-        write_mcp = _confirm("Write/update .mcp.json for project MCP?", True)
-        write_instructions = _confirm("Write keyword instruction snippets?", True)
+        include_openrouter = _confirm(
+            "Include OpenRouter participant presets?", include_openrouter
+        )
+        include_local = _confirm("Include local/Ollama participant preset?", include_local)
+        us_only_default = _confirm(
+            "Default to US-origin participants only?", args.us_only_default
+        )
+        write_mcp = False if args.no_mcp else _confirm(
+            "Write/update .mcp.json for project MCP?", True
+        )
+        write_instructions = False if args.no_instructions else _confirm(
+            "Write keyword instruction snippets?", True
+        )
     else:
         write_mcp = not args.no_mcp
         write_instructions = not args.no_instructions
         us_only_default = args.us_only_default
 
-    written = write_setup_files(
-        root,
-        include_openrouter=include_openrouter,
-        include_local=include_local,
-        us_only_default=us_only_default,
-        write_mcp=write_mcp,
-        write_instructions=write_instructions,
-        force=args.force,
-    )
+    try:
+        written = write_setup_files(
+            root,
+            include_openrouter=include_openrouter,
+            include_local=include_local,
+            us_only_default=us_only_default,
+            write_mcp=write_mcp,
+            write_instructions=write_instructions,
+            force=args.force,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if written:
         print("Wrote:")
         for path in written:
@@ -257,8 +268,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for check in checks:
             status = "ok" if check.ok else "missing"
             print(f"{status:8} {check.name:24} {check.detail}")
-    # Missing optional OpenRouter/local bits should not make doctor fail.
-    required = [check for check in checks if check.name.startswith("cli:")]
+    required_names = {"python:mcp"}
+    default_mode = config.get("defaults", {}).get("mode", "quick")
+    try:
+        default_participants = select_participants(config, default_mode, current=None)
+    except ValueError:
+        default_participants = []
+    for name in default_participants:
+        participant = config.get("participants", {}).get(name, {})
+        if participant.get("type") == "cli":
+            required_names.add(f"cli:{name}")
+        elif participant.get("type") == "openrouter":
+            api_key_env = participant.get("api_key_env") or "OPENROUTER_API_KEY"
+            required_names.add(f"env:{api_key_env}")
+        elif participant.get("type") == "ollama":
+            required_names.add("cli:ollama")
+    required = [check for check in checks if check.name in required_names]
     if args.probe_openrouter:
         required.extend(
             check for check in checks if check.name == "probe:openrouter"
@@ -368,6 +393,37 @@ def _fmt_cost(value: float | None) -> str:
     return f"${value:.3f}"
 
 
+def _print_progress_event(event: dict) -> None:
+    kind = event.get("event")
+    participant = event.get("participant")
+    round_label = f"round {event.get('round')}" if event.get("round") else "round ?"
+    if kind == "participant_start":
+        print(f"- {participant}: starting {round_label}", flush=True)
+        return
+    if kind == "participant_finish":
+        status = event.get("status") or ("ok" if event.get("ok") else "error")
+        details = [f"{float(event.get('elapsed_seconds') or 0):.1f}s"]
+        if event.get("total_tokens") is not None:
+            details.append(f"{event['total_tokens']} tokens")
+        if event.get("cost_usd") is not None:
+            details.append(f"${float(event['cost_usd']):.6f}")
+        print(f"- {participant}: {status} {round_label} ({'; '.join(details)})", flush=True)
+        if event.get("error"):
+            print(f"  {event['error']}", flush=True)
+        return
+    if kind == "deliberation_pending":
+        print(f"Deliberation: disagreement detected; starting round {event.get('round')}", flush=True)
+        return
+    if kind == "deliberation_round_start":
+        print(f"Deliberation: running round {event.get('round')}", flush=True)
+        return
+    if kind == "deliberation_skip":
+        print(f"Deliberation: skipped ({event.get('reason')})", flush=True)
+        return
+    if kind == "deliberation_finish":
+        print(f"Deliberation: {event.get('status')} after {event.get('rounds')} rounds", flush=True)
+
+
 def cmd_models(args: argparse.Namespace) -> int:
     if args.models_command != "openrouter":
         raise SystemExit("models subcommand is required")
@@ -420,15 +476,20 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     stdin_text = sys.stdin.read() if args.stdin else None
-    prompt = build_prompt(
-        question,
-        mode=mode,
-        cwd=cwd,
-        context_paths=args.context,
-        include_diff=args.diff,
-        stdin_text=stdin_text,
-        allow_outside_cwd=args.allow_outside_cwd,
-    )
+    try:
+        prompt = build_prompt(
+            question,
+            mode=mode,
+            cwd=cwd,
+            context_paths=args.context,
+            include_diff=args.diff,
+            stdin_text=stdin_text,
+            allow_outside_cwd=args.allow_outside_cwd,
+            max_prompt_chars=config.get("defaults", {}).get("max_prompt_chars")
+            or MAX_PROMPT_CHARS,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
     if args.dry_run:
         print(f"mode: {mode}")
@@ -447,6 +508,14 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         or 2
     )
     participant_cfg = config.get("participants", {})
+    if not args.json:
+        print(
+            f"Council starting: mode={mode}, current={current or 'unknown'}, "
+            f"participants={', '.join(participants)}, prompt_chars={len(prompt)}",
+            flush=True,
+        )
+        if deliberate:
+            print(f"Deliberation enabled: max_rounds={max_rounds}", flush=True)
     results, metadata = await execute_council(
         participants,
         participant_cfg,
@@ -455,6 +524,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         config,
         deliberate=deliberate,
         max_rounds=max_rounds,
+        progress=None if args.json else _print_progress_event,
     )
 
     out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))

@@ -29,26 +29,67 @@ def read_context_file(
         source = cwd / source
     if not allow_outside_cwd:
         ensure_inside_cwd(source, cwd)
+    if not source.exists():
+        raise ValueError(f"Context file does not exist: {source}")
+    if not source.is_file():
+        raise ValueError(f"Context path is not a file: {source}")
     text = source.read_text(errors="replace")
     if len(text) > MAX_CONTEXT_FILE_CHARS:
         text = text[:MAX_CONTEXT_FILE_CHARS] + "\n\n[truncated]\n"
-    label = source.resolve().relative_to(cwd.resolve()) if source.resolve().is_relative_to(cwd.resolve()) else source
+    label = (
+        source.resolve().relative_to(cwd.resolve())
+        if source.resolve().is_relative_to(cwd.resolve())
+        else source
+    )
     return f"## File: {label}\n\n```\n{text}\n```"
 
 
 def read_git_diff(cwd: Path) -> str:
-    result = subprocess.run(
-        ["git", "diff", "--"],
-        cwd=str(cwd),
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=GIT_DIFF_TIMEOUT_SECONDS,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "git diff failed")
-    diff = result.stdout.strip()
-    return "## Git Diff\n\n```diff\n" + (diff or "[no diff]") + "\n```"
+    if not _git_ok(cwd, ["rev-parse", "--is-inside-work-tree"]):
+        return _git_diff_unavailable("not a git repository")
+
+    staged = _git_output(cwd, ["diff", "--cached", "--"])
+    unstaged = _git_output(cwd, ["diff", "--"])
+    if staged is None or unstaged is None:
+        return _git_diff_unavailable("git diff failed")
+
+    sections = ["## Git Diff"]
+    if staged.strip():
+        sections.extend(["", "### Staged Changes", "", "```diff", staged.strip(), "```"])
+    if unstaged.strip():
+        sections.extend(
+            ["", "### Unstaged Changes", "", "```diff", unstaged.strip(), "```"]
+        )
+    if len(sections) == 1:
+        sections.extend(["", "```diff", "[no diff]", "```"])
+    return "\n".join(sections)
+
+
+def _git_ok(cwd: Path, args: list[str]) -> bool:
+    return _run_git(cwd, args).returncode == 0
+
+
+def _git_output(cwd: Path, args: list[str]) -> str | None:
+    result = _run_git(cwd, args)
+    return result.stdout if result.returncode == 0 else None
+
+
+def _run_git(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=GIT_DIFF_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(["git", *args], 1, "", str(exc))
+
+
+def _git_diff_unavailable(reason: str) -> str:
+    return f"## Git Diff\n\n```text\n[git diff unavailable: {reason}]\n```"
 
 
 def build_prompt(
@@ -60,6 +101,7 @@ def build_prompt(
     include_diff: bool,
     stdin_text: str | None,
     allow_outside_cwd: bool = False,
+    max_prompt_chars: int | None = MAX_PROMPT_CHARS,
 ) -> str:
     """Build the read-only prompt sent to each participant."""
 
@@ -93,11 +135,11 @@ def build_prompt(
         sections.extend(["", "Context:", *context_sections])
 
     prompt = "\n".join(sections)
-    if len(prompt) > MAX_PROMPT_CHARS:
+    if max_prompt_chars is not None and len(prompt) > max_prompt_chars:
         prompt = (
-            prompt[:MAX_PROMPT_CHARS]
+            prompt[:max_prompt_chars]
             + "\n\n[llm-council prompt truncated at "
-            + str(MAX_PROMPT_CHARS)
+            + str(max_prompt_chars)
             + " characters]\n"
         )
     return prompt

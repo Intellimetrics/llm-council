@@ -1,27 +1,85 @@
 version: 1
+replace_defaults: true
 transcripts_dir: .llm-council/runs
 
 defaults:
   mode: quick
   read_only: true
   synthesize: false
+  origin_policy: any
+  max_concurrency: 4
+  transparent: false
+  max_deliberation_rounds: 2
 
 # Native CLI participants intentionally omit model by default so paid/max CLI
 # accounts can use their own current default model. Add model only when you want
 # exact routing.
 participants:
   claude:
+    type: cli
+    family: claude
+    origin: US / Anthropic
+    command: claude
+    args:
+    - -p
+    - --permission-mode
+    - plan
+    - --tools
+    - Read,Grep,Glob,LS
+    - --no-session-persistence
     model:
+    timeout: 240
+    max_prompt_chars: 120000
+    read_only: true
+    stdin_prompt: true
+    env_passthrough:
+    - ANTHROPIC_API_KEY
+
   codex:
+    type: cli
+    family: codex
+    origin: US / OpenAI
+    command: codex
+    args:
+    - exec
+    - --sandbox
+    - read-only
+    - --ask-for-approval
+    - never
+    - --ephemeral
+    - --cd
+    - "{cwd}"
+    - "-"
     model:
+    timeout: 240
+    read_only: true
+    stdin_prompt: true
+    env_passthrough:
+    - OPENAI_API_KEY
+
   gemini:
+    type: cli
+    family: gemini
+    origin: US / Google
+    command: gemini
+    args:
+    - --approval-mode
+    - plan
     model:
+    timeout: 240
+    read_only: true
+    stdin_prompt: true
+    env_passthrough:
+    - GEMINI_API_KEY
+    - GOOGLE_API_KEY
 
   deepseek_v4_pro:
     type: openrouter
     family: deepseek
     origin: China / DeepSeek
     model: deepseek/deepseek-v4-pro
+    input_per_million: 0.435
+    output_per_million: 0.87
     api_key_env: OPENROUTER_API_KEY
     timeout: 180
     read_only: true
@@ -31,6 +89,8 @@ participants:
     family: qwen
     origin: China / Alibaba Qwen
     model: qwen/qwen3-coder-plus
+    input_per_million: 0.65
+    output_per_million: 3.25
     api_key_env: OPENROUTER_API_KEY
     timeout: 180
     read_only: true
@@ -42,10 +102,12 @@ modes:
 
   plan:
     strategy: other_cli_peers
-    add: [deepseek_v4_pro]
+    add:
+    - deepseek_v4_pro
     description: Add DeepSeek V4 Pro for independent planning.
 
   review:
     strategy: other_cli_peers
-    add: [qwen_coder_plus]
+    add:
+    - qwen_coder_plus
     description: Add Qwen Coder Plus for coding review.

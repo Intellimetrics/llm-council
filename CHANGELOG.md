@@ -10,3 +10,9 @@
 - Added project setup, doctor checks, OpenRouter model catalog, and transcript storage.
 - Added transcript inspection commands and hardened labeled deliberation across multiple rounds.
 - Hardened subprocess cleanup, prompt redaction, MCP context boundaries, budget checks, and config validation.
+- Added live CLI progress reporting and MCP `metadata.progress_events` so users can see council participant starts, finishes, skips, errors, and deliberation status.
+- Added prompt-size preflight guards for CLI participants, including Claude, to skip oversized prompts immediately with a clear message.
+- Hardened setup presets with `replace_defaults`, MCP project-root isolation, staged/unstaged diff capture, transcript markdown fencing, and actionable setup parse errors.
+- Added fail-closed MCP pricing checks for paid hosted participants and documented custom CLI `env_passthrough`.
+- Added an operator reference, manual MCP root guidance, non-run MCP tool tests, setup `--yes` coverage, and configurable global prompt construction limits.
+- Kept MCP budget guards independent from global prompt sizing, removed stale timeout defaults, and made `doctor` validate the configured default route instead of always requiring all native CLIs.

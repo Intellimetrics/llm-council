@@ -32,6 +32,26 @@ def test_long_context_keeps_response_format_and_read_only_instructions(
     assert "[llm-council prompt truncated" in prompt
 
 
+def test_build_prompt_honors_configured_prompt_limit(tmp_path: Path) -> None:
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("a" * 120_000)
+    second.write_text("b" * 120_000)
+
+    prompt = build_prompt(
+        "Should we make this change?",
+        mode="review",
+        cwd=tmp_path,
+        context_paths=[str(first), str(second)],
+        include_diff=False,
+        stdin_text=None,
+        max_prompt_chars=300_000,
+    )
+
+    assert len(prompt) > 200_000
+    assert "[llm-council prompt truncated" not in prompt
+
+
 def test_gemini_default_sends_large_prompt_to_stdin_not_argv(
     monkeypatch,
     tmp_path: Path,

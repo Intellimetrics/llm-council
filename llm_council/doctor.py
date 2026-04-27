@@ -26,8 +26,9 @@ def check_environment(
     checks: list[Check] = []
     participants = config.get("participants", {})
 
-    for name in ("claude", "codex", "gemini"):
-        cfg = participants.get(name, {})
+    for name, cfg in participants.items():
+        if cfg.get("type") != "cli":
+            continue
         command = cfg.get("command", name)
         resolved = shutil.which(command)
         checks.append(
@@ -38,17 +39,26 @@ def check_environment(
             )
         )
 
-    if any(cfg.get("type") == "openrouter" for cfg in participants.values()):
-        api_key = os.environ.get("OPENROUTER_API_KEY")
+    openrouter_envs = sorted(
+        {
+            str(cfg.get("api_key_env") or "OPENROUTER_API_KEY")
+            for cfg in participants.values()
+            if cfg.get("type") == "openrouter"
+        }
+    )
+    for key_env in openrouter_envs:
+        api_key = os.environ.get(key_env)
         checks.append(
             Check(
-                name="env:OPENROUTER_API_KEY",
+                name=f"env:{key_env}",
                 ok=bool(api_key),
                 detail="set" if api_key else "not set",
             )
         )
+    if openrouter_envs:
         if probe_openrouter:
-            checks.append(_probe_openrouter(api_key))
+            key_env = openrouter_envs[0]
+            checks.append(_probe_openrouter(os.environ.get(key_env), key_env=key_env))
 
     if any(cfg.get("type") == "ollama" for cfg in participants.values()):
         resolved = shutil.which("ollama")
@@ -81,12 +91,14 @@ def check_environment(
     return checks
 
 
-def _probe_openrouter(api_key: str | None) -> Check:
+def _probe_openrouter(
+    api_key: str | None, *, key_env: str = "OPENROUTER_API_KEY"
+) -> Check:
     if not api_key:
         return Check(
             name="probe:openrouter",
             ok=False,
-            detail="skipped because OPENROUTER_API_KEY is not set",
+            detail=f"skipped because {key_env} is not set",
         )
     try:
         response = httpx.get(

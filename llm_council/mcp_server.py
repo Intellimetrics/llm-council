@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from llm_council.config import (
     load_config,
     select_participants,
 )
-from llm_council.context import build_prompt
+from llm_council.context import MAX_PROMPT_CHARS, build_prompt
 from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env
 from llm_council.model_catalog import fetch_openrouter_models
@@ -129,9 +130,7 @@ def models_schema() -> dict[str, Any]:
 
 
 async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
-    cwd = Path(arguments.get("working_directory") or ".").resolve()
-    if not cwd.exists():
-        raise ValueError(f"working_directory does not exist: {cwd}")
+    cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
     config = load_config(find_config(cwd))
     question = arguments["question"]
@@ -153,6 +152,8 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         include_diff=bool(arguments.get("include_diff")),
         stdin_text=None,
         allow_outside_cwd=False,
+        max_prompt_chars=config.get("defaults", {}).get("max_prompt_chars")
+        or MAX_PROMPT_CHARS,
     )
 
     mode_cfg = config.get("modes", {}).get(mode, {})
@@ -235,7 +236,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def last_transcript(arguments: dict[str, Any]) -> dict[str, Any]:
-    cwd = Path(arguments.get("working_directory") or ".").resolve()
+    cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
     config = load_config(find_config(cwd))
     out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
@@ -248,7 +249,7 @@ def last_transcript(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_doctor(arguments: dict[str, Any]) -> dict[str, Any]:
-    cwd = Path(arguments.get("working_directory") or ".").resolve()
+    cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
     config = load_config(find_config(cwd))
     return {
@@ -278,6 +279,16 @@ def list_models(arguments: dict[str, Any]) -> dict[str, Any]:
         models = [model for model in models if str(model["origin"]).startswith(prefix)]
     limit = int(arguments.get("limit") or 40)
     return {"models": models[:limit]}
+
+
+def list_modes(arguments: dict[str, Any]) -> dict[str, Any]:
+    cwd = _resolve_working_directory(arguments)
+    load_project_env(cwd)
+    config = load_config(find_config(cwd))
+    return {
+        "modes": config.get("modes", {}),
+        "participants": list(config.get("participants", {}).keys()),
+    }
 
 
 async def _serve() -> None:
@@ -345,13 +356,7 @@ async def _serve() -> None:
             )
             result = {"use_council": use, "mode": mode, "reason": reason}
         elif name == "council_list_modes":
-            cwd = Path(arguments.get("working_directory") or ".").resolve()
-            load_project_env(cwd)
-            config = load_config(find_config(cwd))
-            result = {
-                "modes": config.get("modes", {}),
-                "participants": list(config.get("participants", {}).keys()),
-            }
+            result = list_modes(arguments)
         elif name == "council_last_transcript":
             result = last_transcript(arguments)
         elif name == "council_doctor":
@@ -375,6 +380,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.parse_args(argv or [])
     asyncio.run(_serve())
     return 0
+
+
+def _resolve_working_directory(arguments: dict[str, Any]) -> Path:
+    root = Path(os.environ.get("LLM_COUNCIL_MCP_ROOT") or ".").resolve()
+    cwd = Path(arguments.get("working_directory") or root).resolve()
+    if not cwd.exists():
+        raise ValueError(f"working_directory does not exist: {cwd}")
+    if not cwd.is_dir():
+        raise ValueError(f"working_directory is not a directory: {cwd}")
+    try:
+        cwd.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"working_directory must be inside MCP project root: {root}"
+        ) from exc
+    return cwd
 
 
 if __name__ == "__main__":

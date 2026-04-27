@@ -42,12 +42,19 @@ The generated `.mcp.json` exposes the `llm-council` MCP server.
 Secrets can live in a local `.env`, `.env.local`, or `.llm-council.env` file.
 These files are loaded from the project directory and parent directories without
 overriding already-exported environment variables.
+The generated MCP config does not embed API keys; use one of those local env
+files or your MCP client's normal environment configuration for hosted models.
 
 Live call:
 
 ```bash
 llm-council run --current codex "Review this architecture decision"
 ```
+
+During live CLI runs, `llm-council` prints progress as each participant starts,
+finishes, skips, or errors, then writes the full transcript. MCP calls return
+the same participant progress in `metadata.progress_events` when the tool call
+completes; the stdio MCP server does not stream incremental progress events.
 
 Turn on transparency for terminal usage/cost details and a transcript comparison:
 
@@ -63,7 +70,8 @@ llm-council run --mode deliberate --transparent "Decide between these designs"
 llm-council run --deliberate --max-rounds 2 "Decide between these designs"
 ```
 
-Include a file and git diff:
+Include a file and git diff. The diff context includes both staged and unstaged
+changes when the working directory is a Git repository:
 
 ```bash
 llm-council run --current claude --mode review --context server.py --diff "Find risks in this change"
@@ -90,6 +98,9 @@ Use explicit participants:
 llm-council run --participants deepseek_v4_pro,qwen_coder_plus "Compare these two designs"
 ```
 
+Explicit participants still respect `--origin-policy us`; a non-US participant
+under that policy fails clearly instead of being silently selected or dropped.
+
 US-origin only:
 
 ```bash
@@ -102,6 +113,10 @@ For users who want this as the default:
 ```bash
 llm-council setup --yes --us-only-default
 ```
+
+Generated setup configs use `replace_defaults: true` so presets such as
+`tri-cli` stay exact instead of re-expanding omitted hosted or local defaults at
+load time.
 
 ## Current-Agent Routing
 
@@ -129,6 +144,11 @@ llm-council run --current gemini "Question"
 ## Model Routing
 
 Native CLI participants do not specify models by default. This lets paid/max CLI accounts use their own best current defaults.
+Prompts are globally capped by `defaults.max_prompt_chars` before participant
+calls are made. Individual participants can also set `max_prompt_chars`; that
+skips only that participant when the built prompt is too large for the model or
+CLI. Claude has a conservative default participant guard so very large reviews
+skip it immediately instead of waiting for a long process timeout.
 
 Use explicit models only when you want exact routing:
 
@@ -136,6 +156,7 @@ Use explicit models only when you want exact routing:
 participants:
   claude:
     model: claude-opus-4-7
+    max_prompt_chars: 200000
   gemini:
     model: gemini-3.1-pro-preview
   codex:
@@ -150,6 +171,19 @@ participants:
     type: openrouter
     model: deepseek/deepseek-v4-pro
     api_key_env: OPENROUTER_API_KEY
+```
+
+Custom CLI participants inherit a sanitized subprocess environment. Add
+`env_passthrough` for the specific secret-looking variables that participant
+needs for authentication:
+
+```yaml
+participants:
+  my_cli:
+    type: cli
+    command: my-cli
+    args: ["--prompt", "{prompt}"]
+    env_passthrough: ["MY_CLI_API_KEY"]
 ```
 
 Refresh the live OpenRouter catalog when deciding what to add:
@@ -195,18 +229,24 @@ for intentional external files.
 MCP runs also apply conservative budget checks before paid hosted calls. Tune
 them in config with `defaults.mcp_max_prompt_chars` and
 `defaults.mcp_max_estimated_cost_usd`.
+MCP `working_directory` values are restricted to the project root configured by
+setup, so MCP callers cannot widen context access by setting `/` as the working
+directory.
 
 Run it manually:
 
 ```bash
-python -m llm_council mcp-server
+LLM_COUNCIL_MCP_ROOT=/path/to/project python -m llm_council mcp-server
 ```
 
 or:
 
 ```bash
-python -m llm_council.mcp_server
+LLM_COUNCIL_MCP_ROOT=/path/to/project python -m llm_council.mcp_server
 ```
+
+When `LLM_COUNCIL_MCP_ROOT` is not set, the MCP root defaults to the server
+process current directory.
 
 ## Keyword Layer
 
@@ -245,7 +285,9 @@ Do not include secrets in context files or diffs. By default, context files must
 be inside the working directory; use `--allow-outside-cwd` only when you intend
 to share external files through the CLI. MCP does not expose that override.
 Subprocess CLI participants do not inherit broad secret-looking environment
-variables by default.
+variables by default. The built-in Claude, Codex, and Gemini participants pass
+through their standard API key variables only, so env-based CLI auth can work
+without exposing unrelated credentials.
 
 ## When Not To Use Council
 
@@ -262,3 +304,5 @@ Each run writes:
 
 These are intentionally local run artifacts.
 
+See [LLM Council reference](docs/llm-council.md) for the full config/MCP
+operator reference. 

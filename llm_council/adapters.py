@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shlex
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -62,9 +60,23 @@ async def run_cli_participant(
     start = time.monotonic()
     timeout = int(cfg.get("timeout") or 240)
     command = _build_cli_command(name, cfg, prompt, cwd)
+    max_prompt_chars = cfg.get("max_prompt_chars")
+    if max_prompt_chars is not None and len(prompt) > int(max_prompt_chars):
+        return ParticipantResult(
+            name=name,
+            ok=False,
+            output="",
+            error=(
+                "PromptTooLarge: participant skipped before launch; "
+                f"prompt has {len(prompt)} chars, limit is {int(max_prompt_chars)}"
+            ),
+            elapsed_seconds=time.monotonic() - start,
+            command=redact_prompt_args(command, prompt),
+            model=cfg.get("model"),
+        )
     stdin_prompt = bool(cfg.get("stdin_prompt"))
     stdin_data = prompt if stdin_prompt else None
-    env = clean_subprocess_env()
+    env = clean_subprocess_env(cfg.get("env_passthrough"))
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -91,6 +103,17 @@ async def run_cli_participant(
             ok=proc.returncode == 0,
             output=out,
             error=err,
+            elapsed_seconds=elapsed,
+            command=redact_prompt_args(command, prompt),
+            model=cfg.get("model"),
+        )
+    except TimeoutError:
+        elapsed = time.monotonic() - start
+        return ParticipantResult(
+            name=name,
+            ok=False,
+            output="",
+            error=f"TimeoutError: participant exceeded {timeout}s timeout",
             elapsed_seconds=elapsed,
             command=redact_prompt_args(command, prompt),
             model=cfg.get("model"),
@@ -309,12 +332,35 @@ async def run_participants(
     cwd: Path,
     *,
     max_concurrency: int = 4,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    round_number: int = 1,
 ) -> list[ParticipantResult]:
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
     async def run_one(name: str) -> ParticipantResult:
         async with semaphore:
-            return await run_participant(name, participant_cfg[name], prompt, cwd)
+            if progress:
+                progress({"event": "participant_start", "participant": name, "round": round_number})
+            result = await run_participant(name, participant_cfg[name], prompt, cwd)
+            status = "ok" if result.ok else "error"
+            if result.error.startswith("PromptTooLarge:"):
+                status = "skipped"
+            if progress:
+                progress(
+                    {
+                        "event": "participant_finish",
+                        "participant": name,
+                        "round": round_number,
+                        "status": status,
+                        "ok": result.ok,
+                        "elapsed_seconds": round(result.elapsed_seconds, 3),
+                        "error": result.error,
+                        "model": result.model,
+                        "total_tokens": result.total_tokens,
+                        "cost_usd": result.cost_usd,
+                    }
+                )
+            return result
 
     return await asyncio.gather(*[run_one(name) for name in selected])
 
@@ -398,12 +444,13 @@ def _redact_arg_value(part: str) -> str:
     return "[prompt]"
 
 
-def clean_subprocess_env() -> dict[str, str]:
+def clean_subprocess_env(env_passthrough: list[str] | None = None) -> dict[str, str]:
+    allowed = {key.upper() for key in (env_passthrough or [])}
     env: dict[str, str] = {}
     for key, value in os.environ.items():
         if key == "CLAUDECODE":
             continue
-        if _is_secret_env_name(key):
+        if _is_secret_env_name(key) and key.upper() not in allowed:
             continue
         env[key] = value
     return env
@@ -453,11 +500,3 @@ _SAFE_ENV_NAMES = {
     "XDG_STATE_HOME",
 }
 
-
-def write_json_atomic(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent)) as handle:
-        json.dump(data, handle, indent=2)
-        handle.write("\n")
-        temp_name = handle.name
-    Path(temp_name).replace(path)

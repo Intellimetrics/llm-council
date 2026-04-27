@@ -59,7 +59,16 @@ def mcp_budget_report(
         rounds=budgeted_rounds,
         catalog_path=openrouter_cache_path(),
     )
-    if cost is not None:
+    if paid_hosted and cost is None:
+        report["violations"].append(
+            {
+                "limit": "known_paid_hosted_pricing",
+                "actual": ", ".join(paid_hosted),
+                "maximum": "configured input_per_million or cached catalog price",
+                "participants": paid_hosted,
+            }
+        )
+    elif cost is not None:
         report["estimated_input_cost_usd"] = round(cost, 6)
         report["cost_estimate_available"] = True
         if cost > limits["max_estimated_cost_usd"]:
@@ -89,13 +98,11 @@ def _budget_limits(config: dict[str, Any]) -> dict[str, float | int]:
     defaults = config.get("defaults", {})
     max_prompt_chars = _first_configured(
         defaults,
-        "max_prompt_chars",
         "mcp_max_prompt_chars",
         fallback=DEFAULT_MCP_MAX_PROMPT_CHARS,
     )
     max_estimated_cost_usd = _first_configured(
         defaults,
-        "max_estimated_cost_usd",
         "mcp_max_estimated_cost_usd",
         fallback=DEFAULT_MCP_MAX_ESTIMATED_COST_USD,
     )

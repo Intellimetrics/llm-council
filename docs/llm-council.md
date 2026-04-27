@@ -1,264 +1,182 @@
-# LLM Council
+# LLM Council Reference
 
-LLM Council is a lightweight, read-only-first multi-agent tool for coding projects.
+This file is the operator reference. The README is the product overview and
+quick-start path.
 
-Baseline assumption: the user usually works inside one of three premium CLIs:
+## Setup
 
-- Claude Code
-- Codex CLI
-- Gemini CLI
-
-By default, `llm-council` asks the other two CLIs for read-only opinions. OpenRouter and local models are explicit participants, not fallbacks.
-
-## Quick Start
-
-From this checkout:
+Install from a checkout:
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e .
-llm-council run --dry-run --current codex "Should we add an MCP wrapper?"
-```
-
-Project setup:
-
-```bash
 llm-council setup --yes
 llm-council doctor
-llm-council doctor --probe-openrouter --probe-ollama
 ```
 
-The setup command writes:
-
-- `.llm-council.yaml`
-- `.mcp.json`
-- `.llm-council/instructions/claude.md`
-- `.llm-council/instructions/codex.md`
-- `.llm-council/instructions/gemini.md`
-
-The generated `.mcp.json` exposes the `llm-council` MCP server.
-
-Secrets can live in a local `.env`, `.env.local`, or `.llm-council.env` file.
-These files are loaded from the project directory and parent directories without
-overriding already-exported environment variables.
-
-Live call:
+Useful setup variants:
 
 ```bash
-llm-council run --current codex "Review this architecture decision"
+llm-council setup --yes --preset tri-cli
+llm-council setup --yes --preset tri-cli --us-only-default
+llm-council setup --yes --no-mcp --no-instructions
+llm-council setup --yes --force
 ```
 
-Turn on transparency for terminal usage/cost details and a transcript comparison:
+`setup` writes `.llm-council.yaml`, `.mcp.json`, and optional instruction
+snippets under `.llm-council/instructions/`.
 
-```bash
-llm-council run --transparent --current codex --mode review "Compare the risks"
+## Config Model
+
+Project config merges over built-in defaults unless `replace_defaults: true` is
+set. Generated setup configs use `replace_defaults: true` so presets remain
+exact.
+
+Core keys:
+
+- `defaults.mode`: default mode, usually `quick`
+- `defaults.origin_policy`: `any` or `us`
+- `defaults.transparent`: include usage/cost and comparison details by default
+- `defaults.max_concurrency`: maximum concurrent participant calls per round
+- `defaults.max_deliberation_rounds`: default cap for opt-in deliberation
+- `defaults.max_prompt_chars`: global prompt construction cap, default 200000
+- `defaults.mcp_max_prompt_chars`: MCP budget guard for hosted paid calls
+- `defaults.mcp_max_estimated_cost_usd`: MCP estimated cost guard
+- `participants`: named CLI, OpenRouter, or Ollama participants
+- `modes`: named participant routing presets
+- `transcripts_dir`: local run transcript directory
+
+Prompt sizing has two layers. `defaults.max_prompt_chars` limits the built
+prompt before any participant runs. A participant-level `max_prompt_chars`
+skips only that participant when the already-built prompt is too large for that
+model or CLI.
+
+## Participants
+
+CLI participants:
+
+```yaml
+participants:
+  my_cli:
+    type: cli
+    command: my-cli
+    args: ["--prompt", "{prompt}"]
+    timeout: 180
+    stdin_prompt: false
+    env_passthrough: ["MY_CLI_API_KEY"]
 ```
 
-Run expensive opt-in deliberation. This runs a second round only when first-round
-responses appear to disagree:
+OpenRouter participants:
 
-```bash
-llm-council run --mode deliberate --transparent "Decide between these designs"
-llm-council run --deliberate --max-rounds 2 "Decide between these designs"
+```yaml
+participants:
+  reviewer:
+    type: openrouter
+    model: provider/model-id
+    api_key_env: OPENROUTER_API_KEY
+    input_per_million: 0.5
+    output_per_million: 1.5
 ```
 
-Include a file and git diff:
+Ollama participants:
 
-```bash
-llm-council run --current claude --mode review --context server.py --diff "Find risks in this change"
+```yaml
+participants:
+  local_reviewer:
+    type: ollama
+    model: qwen3-coder-next:q4_K_M
+    base_url: http://localhost:11434
 ```
 
-Ask whether a task is worth taking to council:
+Hosted paid MCP calls fail closed when pricing is unknown. Add
+`input_per_million` and `output_per_million` for custom paid hosted models.
 
-```bash
-llm-council recommend --risk high "Refactor auth and database session handling"
+## Modes
+
+A mode either lists exact participants or uses `strategy: other_cli_peers`.
+
+```yaml
+modes:
+  quick:
+    strategy: other_cli_peers
+  review:
+    strategy: other_cli_peers
+    add: ["qwen_coder_plus"]
+  cheap:
+    participants: ["deepseek_v4_flash", "qwen_coder_free"]
 ```
 
-Read the latest transcript:
+`origin_policy: us` filters non-US participants. If the filter removes every
+participant, the run fails clearly.
+
+## MCP
+
+Generated `.mcp.json` sets:
+
+- `PYTHONPATH` to the project root
+- `LLM_COUNCIL_MCP_ROOT` to the project root
+
+Every MCP `working_directory` must be inside `LLM_COUNCIL_MCP_ROOT`. If you run
+the server manually without that environment variable, the root is the process
+current directory:
 
 ```bash
-llm-council last --path-only
+LLM_COUNCIL_MCP_ROOT=/path/to/project python -m llm_council.mcp_server
+```
+
+MCP tools:
+
+- `council_run`: run the council
+- `council_recommend`: decide whether council is useful for a task
+- `council_list_modes`: show configured modes and participants
+- `council_last_transcript`: read the latest transcript
+- `council_doctor`: diagnose local readiness
+- `council_models`: list cached OpenRouter models
+
+`council_run` returns `metadata.progress_events`, including participant start,
+finish, skip, error, and deliberation events. With the stdio MCP server these
+events are returned when the tool call completes, not streamed incrementally.
+MCP context files are always restricted to the selected working directory.
+
+## User-Facing Output
+
+CLI runs print:
+
+- selected mode, current agent, participants, and prompt size
+- one line when each participant starts
+- one line when each participant finishes, skips, or errors
+- deliberation status when a second round is considered or run
+- transcript paths
+
+With `--transparent`, the transcript includes prompt text, per-model usage and
+cost when available, and a compact final-round model comparison.
+
+## Transcripts
+
+Each run writes a Markdown transcript and JSON metadata:
+
+```text
+.llm-council/runs/<timestamp>_<slug>.md
+.llm-council/runs/<timestamp>_<slug>.json
+```
+
+Use:
+
+```bash
 llm-council last
+llm-council last --path-only
 llm-council transcripts list
 llm-council transcripts summary
 ```
 
-Use explicit participants:
+## Safety Notes
 
-```bash
-llm-council run --participants deepseek_v4_pro,qwen_coder_plus "Compare these two designs"
-```
+The built-in Claude, Codex, and Gemini participants are configured for
+read-only or plan modes, and prompts are sent over stdin where the CLI supports
+it. Subprocess environments are sanitized; only configured `env_passthrough`
+variables are forwarded.
 
-US-origin only:
-
-```bash
-llm-council run --mode us-only "Review this plan"
-llm-council run --mode diverse --origin-policy us "Review this plan"
-```
-
-For users who want this as the default:
-
-```bash
-llm-council setup --yes --us-only-default
-```
-
-## Current-Agent Routing
-
-`quick`, `plan`, and `review` use `strategy: other_cli_peers`.
-
-If current is `codex`, default native participants are:
-
-- `claude`
-- `gemini`
-
-If current is unknown, all three native CLIs are used.
-
-You can set current explicitly:
-
-```bash
-LLM_COUNCIL_CURRENT=gemini llm-council run "Question"
-```
-
-or:
-
-```bash
-llm-council run --current gemini "Question"
-```
-
-## Model Routing
-
-Native CLI participants do not specify models by default. This lets paid/max CLI accounts use their own best current defaults.
-
-Use explicit models only when you want exact routing:
-
-```yaml
-participants:
-  claude:
-    model: claude-opus-4-7
-  gemini:
-    model: gemini-3.1-pro-preview
-  codex:
-    model: gpt-5.4
-```
-
-OpenRouter participants must specify models:
-
-```yaml
-participants:
-  deepseek_v4_pro:
-    type: openrouter
-    model: deepseek/deepseek-v4-pro
-    api_key_env: OPENROUTER_API_KEY
-```
-
-Refresh the live OpenRouter catalog when deciding what to add:
-
-```bash
-llm-council models openrouter --filter deepseek
-llm-council models openrouter --origin china --limit 20
-llm-council models openrouter --origin us --limit 20
-llm-council models openrouter --no-cache --filter qwen
-```
-
-Prices are normalized to dollars per million input/output tokens. Origin labels
-are inferred from provider IDs, so treat unknown or edge cases as a starting
-point rather than a compliance database. OpenRouter model listings are cached
-under `~/.cache/llm-council` for one hour by default.
-
-## Safety
-
-The built-in CLI defaults are read-only:
-
-- Claude: `--permission-mode plan` with read/search/list tools only
-- Codex: `exec --sandbox read-only --ask-for-approval never --ephemeral`
-- Gemini: `--approval-mode plan`, with prompts sent over stdin
-
-The prompt also tells participants not to edit files or run write operations.
-
-## MCP Tools
-
-The MCP server exposes:
-
-- `council_run`: run a read-only council
-- `council_recommend`: decide whether a task is worth taking to council
-- `council_list_modes`: list configured modes and participants
-- `council_last_transcript`: read the most recent local transcript
-- `council_doctor`: diagnose CLI, OpenRouter, Ollama, and MCP readiness
-- `council_models`: list cached OpenRouter models with filter/origin options
-
-`council_run` accepts `transparent`, `deliberate`, and `max_rounds` for the same
-usage/cost and opt-in deliberation behavior as the CLI. MCP context files are
-always restricted to `working_directory`; use the CLI `--allow-outside-cwd` flag
-for intentional external files.
-
-MCP runs also apply conservative budget checks before paid hosted calls. Tune
-them in config with `defaults.mcp_max_prompt_chars` and
-`defaults.mcp_max_estimated_cost_usd`.
-
-Run it manually:
-
-```bash
-python -m llm_council mcp-server
-```
-
-or:
-
-```bash
-python -m llm_council.mcp_server
-```
-
-## Keyword Layer
-
-Setup writes instruction snippets for each CLI under `.llm-council/instructions/`.
-They are not loaded automatically by the CLIs. Add the matching snippet to the
-project or user instructions for the agent you use, for example Claude project
-instructions, Codex `AGENTS.md` guidance, or Gemini custom instructions. The
-snippets are plain Markdown so you can copy the wording into your existing
-agent memory without changing the project config.
-
-The intended user language is:
-
-```text
-go to council
-go to council with deepseek
-go to council with qwen and glm
-go to council on the diff
-go to council cheap
-go to council private
-ask council if this plan is sound
-```
-
-Agents should use `council_recommend` when the task looks risky, broad, ambiguous,
-or has already failed multiple times. Council should stay manual or suggested,
-not automatic for every task.
-
-## Threat Model
-
-Council participants receive the prompt, selected context files, optional git
-diffs, and stdin context you provide. Native CLI participants run as local
-subprocesses in read-only/plan modes. OpenRouter participants send the prompt to
-OpenRouter and the selected upstream model. Ollama participants send the prompt
-to your configured local Ollama server.
-
-Do not include secrets in context files or diffs. By default, context files must
-be inside the working directory; use `--allow-outside-cwd` only when you intend
-to share external files through the CLI. MCP does not expose that override.
-Subprocess CLI participants do not inherit broad secret-looking environment
-variables by default.
-
-## When Not To Use Council
-
-Skip council for formatting, exact user-directed edits, obvious syntax fixes,
-single-file changes you already understand, or tasks where extra model calls
-would add cost without reducing risk.
-
-## Transcripts
-
-Each run writes:
-
-- `.llm-council/runs/<timestamp>_<slug>.md`
-- `.llm-council/runs/<timestamp>_<slug>.json`
-
-These are intentionally local run artifacts.
-
+Do not include secrets in diffs or context files. OpenRouter participants send
+the prompt to OpenRouter and the selected upstream model. Ollama participants
+send the prompt to the configured Ollama server.

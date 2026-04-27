@@ -45,8 +45,25 @@ def model_comparison(results: list[ParticipantResult]) -> list[str]:
         if result.cost_usd is not None:
             usage.append(f"${result.cost_usd:.6f}")
         suffix = f" ({', '.join(usage)})" if usage else ""
-        lines.append(f"- {result.name}: {first_nonempty_line(result.output)}{suffix}")
+        lines.append(f"- {result.name}: {recommendation_line(result.output)}{suffix}")
     return lines
+
+
+def recommendation_line(text: str) -> str:
+    fenced_line = ""
+    in_fence = False
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not RECOMMENDATION_RE.match(line):
+            continue
+        cleaned = line.strip()
+        if not in_fence:
+            return cleaned
+        if not fenced_line:
+            fenced_line = cleaned
+    return fenced_line or first_nonempty_line(text)
 
 
 def recommendation_label(text: str) -> str:

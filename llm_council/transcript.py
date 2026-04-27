@@ -193,7 +193,8 @@ def write_transcript(
         else:
             lines.extend(["```", result.error.strip() or "[unknown error]", "```", ""])
 
-    lines.extend(["## Prompt Sent", "", "```text", prompt, "```", ""])
+    fence = markdown_fence(prompt)
+    lines.extend(["## Prompt Sent", "", f"{fence}text", prompt, fence, ""])
     markdown_path.write_text("\n".join(lines), encoding="utf-8")
 
     json_path.write_text(
@@ -212,3 +213,10 @@ def write_transcript(
         + "\n",
         encoding="utf-8",
     )
+
+
+def markdown_fence(text: str) -> str:
+    longest = 0
+    for match in re.finditer(r"`+", text):
+        longest = max(longest, len(match.group(0)))
+    return "`" * max(3, longest + 1)

@@ -26,7 +26,7 @@ def test_run_cli_participant_cleans_up_timed_out_process(tmp_path: Path):
     assert result.ok is False
     assert result.output == ""
     assert result.command == [sys.executable, "-c", code]
-    assert result.error.startswith("TimeoutError:")
+    assert result.error == "TimeoutError: participant exceeded 1s timeout"
 
     pid = int((tmp_path / "child.pid").read_text())
     try:
@@ -35,6 +35,35 @@ def test_run_cli_participant_cleans_up_timed_out_process(tmp_path: Path):
         pass
     else:
         raise AssertionError(f"timed-out subprocess still exists: {pid}")
+
+
+def test_run_cli_participant_skips_prompt_over_size_limit(monkeypatch, tmp_path: Path):
+    async def fail_create_subprocess_exec(*_args, **_kwargs):
+        raise AssertionError("subprocess should not be launched")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_create_subprocess_exec)
+
+    result = asyncio.run(
+        run_cli_participant(
+            "python",
+            {
+                "type": "cli",
+                "command": sys.executable,
+                "args": ["-c", "print('ok')"],
+                "max_prompt_chars": 3,
+            },
+            "too long",
+            tmp_path,
+        )
+    )
+
+    assert result.ok is False
+    assert result.output == ""
+    assert result.error == (
+        "PromptTooLarge: participant skipped before launch; "
+        "prompt has 8 chars, limit is 3"
+    )
+    assert result.command == [sys.executable, "-c", "print('ok')"]
 
 
 def test_clean_subprocess_env_strips_broad_secret_names(monkeypatch):
@@ -77,6 +106,10 @@ def test_clean_subprocess_env_strips_broad_secret_names(monkeypatch):
         "CLAUDECODE",
     ):
         assert key not in env
+
+    env = clean_subprocess_env(["OPENAI_API_KEY"])
+    assert env["OPENAI_API_KEY"] == "secret"
+    assert "SERVICE_TOKEN" not in env
 
 
 def test_redact_prompt_args_removes_full_prompt_and_large_fragments():

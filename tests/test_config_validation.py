@@ -49,6 +49,25 @@ def test_load_config_rejects_bad_cli_args_shape(tmp_path: Path):
         load_config(path)
 
 
+def test_load_config_rejects_bad_cli_prompt_limit(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "participants": {
+                    "claude": {
+                        "max_prompt_chars": 0,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="max_prompt_chars"):
+        load_config(path)
+
+
 def test_load_config_rejects_invalid_defaults_mode(tmp_path: Path):
     path = tmp_path / ".llm-council.yaml"
     path.write_text(
@@ -57,4 +76,23 @@ def test_load_config_rejects_invalid_defaults_mode(tmp_path: Path):
     )
 
     with pytest.raises(ValueError, match="defaults.mode references unknown mode"):
+        load_config(path)
+
+
+def test_load_config_rejects_invalid_budget_defaults(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump({"defaults": {"mcp_max_prompt_chars": "not-an-int"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="mcp_max_prompt_chars"):
+        load_config(path)
+
+    path.write_text(
+        yaml.safe_dump({"defaults": {"mcp_max_estimated_cost_usd": "nope"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="mcp_max_estimated_cost_usd"):
         load_config(path)
