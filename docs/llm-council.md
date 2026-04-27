@@ -1,11 +1,17 @@
-# LLM Council Reference
+# LLM Council Operator Reference
 
-This file is the operator reference. The README is the product overview and
-quick-start path.
+Use the README for the fastest path to a working install. Use this file when
+you need the exact setup behavior, config schema, MCP surface, model routing, or
+cost controls.
+
+LLM Council has two entry points:
+
+- the `llm-council` terminal command
+- the `llm-council` MCP server used by coding agents
 
 ## Setup
 
-Install from GitHub into a target project:
+Install the command once, then run setup from each project that should use it:
 
 ```bash
 uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
@@ -15,7 +21,7 @@ llm-council doctor
 llm-council check-update
 ```
 
-If you do not use `uv`, install with `pipx`:
+If you do not use `uv`, install the same package with `pipx`:
 
 ```bash
 pipx install --force git+https://github.com/Intellimetrics/llm-council.git
@@ -28,11 +34,12 @@ Do not use `uvx` for project installation. `uvx` is useful for one-off smoke
 tests, but `setup` writes the command used by the MCP client. Prefer a stable
 installed `llm-council` executable, then run setup from the target project.
 
-`setup --yes` uses `--preset auto` by default. Auto setup refuses to write a
-default config unless it finds a usable route: at least two installed native
-CLIs, or `OPENROUTER_API_KEY` in your shell or project env files. This is meant
-for the common one-CLI case: set an OpenRouter key, run setup, and get hosted
-reviewers instead of a broken native-only council.
+## Presets
+
+`setup --yes` uses `--preset auto` by default. Auto setup writes a default
+config only when it finds a usable route: at least two installed native CLIs, or
+`OPENROUTER_API_KEY` in your shell or project env files. This protects the
+common one-CLI case from getting a native-only council that cannot run.
 
 Preset choices:
 
@@ -43,53 +50,6 @@ Preset choices:
 - `tri-cli-openrouter`: native CLIs plus hosted OpenRouter reviewers.
 - `local-private`: native CLIs plus Ollama.
 - `all`: every built-in preset.
-
-`setup` creates `.mcp.json`, `.llm-council.yaml`, and instruction snippets, but
-the snippets are deliberately separate so existing project instructions are not
-overwritten. Wire each CLI explicitly by appending the full snippet contents:
-
-- Claude Code: create `CLAUDE.md` in the project root if needed, then append
-  the full contents of `.llm-council/instructions/claude.md` to it.
-- Codex CLI: create `AGENTS.md` in the project root if needed, then append the
-  full contents of `.llm-council/instructions/codex.md` to it.
-- Gemini CLI: create `GEMINI.md` in the project root if needed, then append the
-  full contents of `.llm-council/instructions/gemini.md` to it.
-
-Restart the relevant CLI after changing `.mcp.json` or instruction files.
-
-Manual MCP install without `setup`:
-
-```json
-{
-  "mcpServers": {
-    "llm-council": {
-      "type": "stdio",
-      "command": "/absolute/path/to/llm-council",
-      "args": ["mcp-server"],
-      "env": {
-        "LLM_COUNCIL_MCP_ROOT": "/absolute/path/to/your/project"
-      }
-    }
-  }
-}
-```
-
-Do not copy `/absolute/path/to/llm-council` literally. Run
-`command -v llm-council` after `uv tool install` or `pipx install` to find the
-real absolute command path. If the project already has `.mcp.json`, add only
-the `llm-council` entry under its existing `mcpServers` object. A project
-config is optional for manual installs; without `.llm-council.yaml`, the
-built-in default modes and participants are used.
-
-Install from a checkout:
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .
-llm-council setup --yes
-llm-council doctor
-```
 
 Useful setup variants:
 
@@ -104,6 +64,82 @@ llm-council setup --yes --force
 
 `setup` writes `.llm-council.yaml`, `.mcp.json`, and optional instruction
 snippets under `.llm-council/instructions/`.
+
+## Coding-Agent Install Path
+
+When a user asks a coding agent to install LLM Council, the agent should do the
+same thing a careful human would do:
+
+1. Install with `uv tool install --force git+https://github.com/Intellimetrics/llm-council.git`, or fall back to `pipx install --force git+https://github.com/Intellimetrics/llm-council.git`.
+2. Do not use `uvx`; it is not a stable project install path.
+3. Run `llm-council setup --yes` from the target project root.
+4. If setup reports no usable route, ask the user whether to set
+   `OPENROUTER_API_KEY` or install another native CLI.
+5. Append the generated instruction snippet to the right project instruction
+   file. Do not overwrite existing content.
+6. Run `llm-council doctor` and report the result.
+7. Tell the user to restart the active coding CLI.
+
+Instruction snippet mapping:
+
+- Claude Code: create `CLAUDE.md` in the project root if needed, then append
+  the full contents of `.llm-council/instructions/claude.md` to it.
+- Codex CLI: create `AGENTS.md` in the project root if needed, then append the
+  full contents of `.llm-council/instructions/codex.md` to it.
+- Gemini CLI: create `GEMINI.md` in the project root if needed, then append the
+  full contents of `.llm-council/instructions/gemini.md` to it.
+
+Restart the relevant CLI after changing `.mcp.json` or instruction files.
+
+Verification checklist:
+
+```text
+.mcp.json exists and has an llm-council MCP server entry.
+.llm-council.yaml exists.
+.llm-council/instructions/<active-cli>.md exists.
+CLAUDE.md, AGENTS.md, or GEMINI.md includes the generated snippet.
+llm-council doctor passes or gives an actionable missing requirement.
+llm-council --version prints a version.
+```
+
+## Manual MCP Install
+
+Manual MCP install without `setup`:
+
+```json
+{
+  "mcpServers": {
+    "llm-council": {
+      "type": "stdio",
+      "command": "/absolute/path/from/command-v/llm-council",
+      "args": ["mcp-server"],
+      "env": {
+        "LLM_COUNCIL_MCP_ROOT": "/absolute/path/to/your/project"
+      }
+    }
+  }
+}
+```
+
+Do not copy the placeholder command literally. Run `command -v llm-council`
+after `uv tool install` or `pipx install`, then write that resolved absolute
+path into `.mcp.json`. Autonomous agents configuring this file must resolve the
+path dynamically instead of copying the example string.
+
+If the project already has `.mcp.json`, add only the `llm-council` entry under
+its existing `mcpServers` object. A project config is optional for manual
+installs; without `.llm-council.yaml`, the built-in default modes and
+participants are used.
+
+Install from a checkout:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .
+llm-council setup --yes
+llm-council doctor
+```
 
 ## Versioning And Updates
 
