@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -84,8 +85,21 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--root", default=".", help="Project root")
     setup.add_argument(
         "--preset",
-        choices=["tri-cli", "tri-cli-openrouter", "local-private", "all"],
-        default="all",
+        choices=[
+            "auto",
+            "tri-cli",
+            "openrouter",
+            "tri-cli-openrouter",
+            "local-private",
+            "all",
+        ],
+        default="auto",
+        help=(
+            "Setup scope: auto detects local CLIs/OpenRouter, "
+            "tri-cli for Claude/Codex/Gemini only, openrouter for hosted-only, "
+            "tri-cli-openrouter for native CLIs plus hosted models, "
+            "local-private for native CLIs plus Ollama, all for every preset"
+        ),
     )
     setup.add_argument("--yes", action="store_true", help="Non-interactive defaults")
     setup.add_argument("--force", action="store_true", help="Overwrite existing files")
@@ -205,8 +219,15 @@ def _confirm(prompt: str, default: bool = True) -> bool:
 
 def cmd_setup(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
-    include_openrouter = args.preset in {"tri-cli-openrouter", "all"}
-    include_local = args.preset in {"local-private", "all"}
+    load_project_env(root)
+    preset = args.preset
+    if preset == "auto":
+        preset = _auto_setup_preset()
+        print(f"Auto preset selected: {preset}")
+
+    include_native = preset != "openrouter"
+    include_openrouter = preset in {"openrouter", "tri-cli-openrouter", "all"}
+    include_local = preset in {"local-private", "all"}
 
     if not args.yes:
         print("LLM Council setup")
@@ -235,6 +256,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     try:
         written = write_setup_files(
             root,
+            include_native=include_native,
             include_openrouter=include_openrouter,
             include_local=include_local,
             us_only_default=us_only_default,
@@ -250,7 +272,83 @@ def cmd_setup(args: argparse.Namespace) -> int:
             print(f"  {path}")
     else:
         print("No files written; existing setup left in place.")
+    _print_setup_next_steps(
+        root,
+        include_native=include_native,
+        write_mcp=write_mcp,
+        write_instructions=write_instructions,
+        include_openrouter=include_openrouter,
+        include_local=include_local,
+    )
     return 0
+
+
+def _auto_setup_preset() -> str:
+    native_names = ("claude", "codex", "gemini")
+    native_count = sum(1 for name in native_names if shutil.which(name))
+    if native_count >= 2:
+        return "tri-cli"
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return "openrouter"
+    found = ", ".join(name for name in native_names if shutil.which(name)) or "none"
+    raise SystemExit(
+        "Auto setup could not find a usable default council route. "
+        f"Found native CLIs: {found}. "
+        "Install at least two of claude/codex/gemini, or set OPENROUTER_API_KEY "
+        "in your shell, .env, .env.local, or .llm-council.env and rerun setup. "
+        "Advanced users can choose an explicit preset such as --preset tri-cli "
+        "or --preset openrouter."
+    )
+
+
+def _print_setup_next_steps(
+    root: Path,
+    *,
+    include_native: bool,
+    write_mcp: bool,
+    write_instructions: bool,
+    include_openrouter: bool,
+    include_local: bool,
+) -> None:
+    print()
+    print("Next steps:")
+    if write_instructions:
+        print(
+            "  1. For each CLI you use, append the full contents of "
+            f"{root / '.llm-council/instructions/claude.md'} to CLAUDE.md."
+        )
+        print(
+            "     Append the full contents of "
+            f"{root / '.llm-council/instructions/codex.md'} to AGENTS.md."
+        )
+        print(
+            "     Append the full contents of "
+            f"{root / '.llm-council/instructions/gemini.md'} to GEMINI.md."
+        )
+    else:
+        print("  1. Add council instructions to CLAUDE.md, AGENTS.md, and GEMINI.md.")
+    if write_mcp:
+        print("  2. Restart the CLI session(s) you use so MCP reloads.")
+    else:
+        print("  2. Add the llm-council MCP server to your MCP config, then restart CLIs.")
+    print("  3. Run `llm-council doctor` from the project root.")
+
+    warnings: list[str] = []
+    if include_native:
+        for name in ("claude", "codex", "gemini"):
+            if shutil.which(name) is None:
+                warnings.append(f"{name} was not found on PATH; native CLI modes need it.")
+    if include_openrouter and not os.environ.get("OPENROUTER_API_KEY"):
+        warnings.append(
+            "OPENROUTER_API_KEY is not exported; hosted OpenRouter modes need it."
+        )
+    if include_local and shutil.which("ollama") is None:
+        warnings.append("ollama was not found on PATH; private-local mode needs it.")
+    if warnings:
+        print()
+        print("Warnings:")
+        for warning in warnings:
+            print(f"  - {warning}")
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:

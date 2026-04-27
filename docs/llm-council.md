@@ -14,7 +14,7 @@ llm-council setup --yes
 llm-council doctor
 ```
 
-or with `pipx`:
+If you do not use `uv`, install with `pipx`:
 
 ```bash
 pipx install --force git+https://github.com/Intellimetrics/llm-council.git
@@ -23,20 +23,38 @@ llm-council setup --yes
 llm-council doctor
 ```
 
-`uvx` is useful for smoke tests, but it is not the recommended setup path
-because `setup` writes the command used by the MCP client. Prefer a stable
+Do not use `uvx` for project installation. `uvx` is useful for one-off smoke
+tests, but `setup` writes the command used by the MCP client. Prefer a stable
 installed `llm-council` executable, then run setup from the target project.
+
+`setup --yes` uses `--preset auto` by default. Auto setup refuses to write a
+default config unless it finds a usable route: at least two installed native
+CLIs, or `OPENROUTER_API_KEY` in your shell or project env files. This is meant
+for the common one-CLI case: set an OpenRouter key, run setup, and get hosted
+reviewers instead of a broken native-only council.
+
+Preset choices:
+
+- `auto`: choose `tri-cli` when at least two native CLIs exist, otherwise choose
+  `openrouter` when `OPENROUTER_API_KEY` is available.
+- `tri-cli`: Claude Code, Codex CLI, and Gemini CLI.
+- `openrouter`: hosted OpenRouter reviewers only.
+- `tri-cli-openrouter`: native CLIs plus hosted OpenRouter reviewers.
+- `local-private`: native CLIs plus Ollama.
+- `all`: every built-in preset.
 
 `setup` creates `.mcp.json`, `.llm-council.yaml`, and instruction snippets, but
 the snippets are deliberately separate so existing project instructions are not
-overwritten. Wire each CLI explicitly:
+overwritten. Wire each CLI explicitly by appending the full snippet contents:
 
-- Claude Code: add `.llm-council/instructions/claude.md` to `CLAUDE.md`.
-- Codex CLI: add `.llm-council/instructions/codex.md` to `AGENTS.md`.
-- Gemini CLI: add `.llm-council/instructions/gemini.md` to `GEMINI.md`.
+- Claude Code: create `CLAUDE.md` in the project root if needed, then append
+  the full contents of `.llm-council/instructions/claude.md` to it.
+- Codex CLI: create `AGENTS.md` in the project root if needed, then append the
+  full contents of `.llm-council/instructions/codex.md` to it.
+- Gemini CLI: create `GEMINI.md` in the project root if needed, then append the
+  full contents of `.llm-council/instructions/gemini.md` to it.
 
-Create any missing root instruction file. Restart the relevant CLI after
-changing `.mcp.json` or instruction files.
+Restart the relevant CLI after changing `.mcp.json` or instruction files.
 
 Manual MCP install without `setup`:
 
@@ -55,11 +73,12 @@ Manual MCP install without `setup`:
 }
 ```
 
-Use `command -v llm-council` after `uv tool install` or `pipx install` to find
-the absolute command path. If the project already has `.mcp.json`, add only the
-`llm-council` entry under its existing `mcpServers` object. A project config is
-optional for manual installs; without `.llm-council.yaml`, the built-in default
-modes and participants are used.
+Do not copy `/absolute/path/to/llm-council` literally. Run
+`command -v llm-council` after `uv tool install` or `pipx install` to find the
+real absolute command path. If the project already has `.mcp.json`, add only
+the `llm-council` entry under its existing `mcpServers` object. A project
+config is optional for manual installs; without `.llm-council.yaml`, the
+built-in default modes and participants are used.
 
 Install from a checkout:
 
@@ -74,6 +93,8 @@ llm-council doctor
 Useful setup variants:
 
 ```bash
+llm-council setup --yes
+llm-council setup --yes --preset openrouter
 llm-council setup --yes --preset tri-cli
 llm-council setup --yes --preset tri-cli --us-only-default
 llm-council setup --yes --no-mcp --no-instructions

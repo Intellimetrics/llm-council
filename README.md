@@ -12,16 +12,7 @@ By default, `llm-council` asks the other two CLIs for read-only opinions. OpenRo
 
 ## Quick Start
 
-From this checkout:
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .
-llm-council run --dry-run --current codex "Should we add an MCP wrapper?"
-```
-
-Install directly from GitHub into another project:
+Install directly from GitHub into a target project:
 
 ```bash
 uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
@@ -30,7 +21,7 @@ llm-council setup --yes
 llm-council doctor
 ```
 
-If you prefer `pipx`:
+If you do not use `uv`, install with `pipx`:
 
 ```bash
 pipx install --force git+https://github.com/Intellimetrics/llm-council.git
@@ -39,21 +30,46 @@ llm-council setup --yes
 llm-council doctor
 ```
 
-Use `uvx` for quick one-off checks, not as the recommended setup path. `setup`
-writes an MCP command into the target project's `.mcp.json`, so it should run
-from a stable installed `llm-council` command.
+Do not use `uvx` for project installation. `uvx` is useful for one-off smoke
+tests, but `setup` writes the MCP command into the target project's `.mcp.json`,
+so it should run from a stable installed `llm-council` executable.
 
-Then make the target project's CLI agents aware of the council. `setup` writes
-snippets under `.llm-council/instructions/`, but most CLI tools do not load
-those files automatically:
+`setup --yes` uses `--preset auto` by default. Auto setup refuses to write a
+default config unless it finds a usable route: at least two installed native
+CLIs, or `OPENROUTER_API_KEY` in your shell or project env files. This keeps a
+one-CLI project from silently getting a broken native-only council. Choose a
+preset explicitly when you know what you want:
 
-- Claude Code: add `.llm-council/instructions/claude.md` to the project's `CLAUDE.md`.
-- Codex CLI: add `.llm-council/instructions/codex.md` to the project's `AGENTS.md`.
-- Gemini CLI: add `.llm-council/instructions/gemini.md` to the project's `GEMINI.md`.
+```bash
+llm-council setup --yes --preset tri-cli              # Claude/Codex/Gemini
+llm-council setup --yes --preset openrouter           # hosted-only fallback
+llm-council setup --yes --preset tri-cli-openrouter   # native CLIs + hosted
+llm-council setup --yes --preset local-private        # native CLIs + Ollama
+llm-council setup --yes --preset all                  # every built-in preset
+```
 
-If one of those files does not exist yet, create it at the project root. After
-editing `.mcp.json` or instruction files, restart the CLI session so the MCP
-server and project instructions reload.
+Then make each CLI agent aware of council. `setup` writes snippets under
+`.llm-council/instructions/`, but Claude Code, Codex CLI, and Gemini CLI do not
+load those snippets automatically:
+
+- Claude Code: create `CLAUDE.md` in the project root if needed, then append
+  the full contents of `.llm-council/instructions/claude.md` to it.
+- Codex CLI: create `AGENTS.md` in the project root if needed, then append the
+  full contents of `.llm-council/instructions/codex.md` to it.
+- Gemini CLI: create `GEMINI.md` in the project root if needed, then append the
+  full contents of `.llm-council/instructions/gemini.md` to it.
+
+Restart the relevant CLI session after editing `.mcp.json` or instruction
+files so the MCP server and project instructions reload.
+
+From this checkout:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .
+llm-council run --dry-run --current codex "Should we add an MCP wrapper?"
+```
 
 Manual MCP install without `setup`:
 
@@ -72,9 +88,10 @@ Manual MCP install without `setup`:
 }
 ```
 
-Use `command -v llm-council` after `uv tool install` or `pipx install` to find
-the absolute command path. If the project already has `.mcp.json`, add only the
-`llm-council` entry under its existing `mcpServers` object.
+Do not copy `/absolute/path/to/llm-council` literally. Run
+`command -v llm-council` after `uv tool install` or `pipx install` to find the
+real absolute command path. If the project already has `.mcp.json`, add only
+the `llm-council` entry under its existing `mcpServers` object.
 
 Project setup:
 

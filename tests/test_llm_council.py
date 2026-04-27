@@ -584,6 +584,84 @@ def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path):
     assert not (tmp_path / ".llm-council" / "instructions").exists()
 
 
+def test_setup_yes_auto_selects_tri_cli_when_native_clis_exist(
+    tmp_path: Path, monkeypatch, capsys
+):
+    def fake_which(name: str):
+        return f"/usr/bin/{name}" if name in {"claude", "codex"} else None
+
+    monkeypatch.setattr(cli_module.shutil, "which", fake_which)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    parser = build_parser()
+    args = parser.parse_args(["setup", "--yes", "--root", str(tmp_path)])
+
+    assert cmd_setup(args) == 0
+
+    config = load_config(tmp_path / ".llm-council.yaml")
+    assert set(config["participants"]) == {"claude", "codex", "gemini"}
+    assert set(config["modes"]) == {"quick", "us-only"}
+    assert "Auto preset selected: tri-cli" in capsys.readouterr().out
+
+
+def test_setup_yes_auto_selects_openrouter_when_native_route_missing(
+    tmp_path: Path, monkeypatch, capsys
+):
+    monkeypatch.setattr(cli_module.shutil, "which", lambda _name: None)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    parser = build_parser()
+    args = parser.parse_args(["setup", "--yes", "--root", str(tmp_path)])
+
+    assert cmd_setup(args) == 0
+
+    config = load_config(tmp_path / ".llm-council.yaml")
+    assert "claude" not in config["participants"]
+    assert set(config["modes"]) >= {"quick", "plan", "review"}
+    assert config["modes"]["quick"]["participants"] == [
+        "deepseek_v4_flash",
+        "qwen_coder_free",
+        "glm_4_7_flash",
+    ]
+    assert "Auto preset selected: openrouter" in capsys.readouterr().out
+
+
+def test_setup_yes_auto_fails_without_usable_route(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cli_module.shutil, "which", lambda _name: None)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    parser = build_parser()
+    args = parser.parse_args(["setup", "--yes", "--root", str(tmp_path)])
+
+    with pytest.raises(SystemExit, match="could not find a usable default"):
+        cmd_setup(args)
+
+
+def test_setup_prints_next_steps_and_cli_warnings(tmp_path: Path, monkeypatch, capsys):
+    def fake_which(name: str):
+        return None if name == "claude" else f"/usr/bin/{name}"
+
+    monkeypatch.setattr(cli_module.shutil, "which", fake_which)
+    args = argparse.Namespace(
+        root=str(tmp_path),
+        preset="tri-cli",
+        yes=True,
+        force=False,
+        us_only_default=False,
+        no_mcp=False,
+        no_instructions=False,
+    )
+
+    assert cmd_setup(args) == 0
+
+    output = capsys.readouterr().out
+    assert "Next steps:" in output
+    assert "Append the full contents" in output
+    assert "CLAUDE.md" in output
+    assert "AGENTS.md" in output
+    assert "GEMINI.md" in output
+    assert "Run `llm-council doctor`" in output
+    assert "Warnings:" in output
+    assert "claude was not found on PATH" in output
+
+
 def test_setup_writes_config_mcp_and_instructions(tmp_path: Path):
     written = write_setup_files(tmp_path)
     names = {path.relative_to(tmp_path).as_posix() for path in written}

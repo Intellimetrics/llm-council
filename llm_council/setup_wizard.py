@@ -14,6 +14,17 @@ from llm_council.config import deep_merge
 from llm_council.defaults import DEFAULT_CONFIG
 
 
+OPENROUTER_PARTICIPANTS = (
+    "deepseek_v4_pro",
+    "deepseek_v4_flash",
+    "qwen_coder_plus",
+    "qwen_coder_free",
+    "glm_5_1",
+    "glm_4_7_flash",
+    "kimi_k2_6",
+)
+
+
 INSTRUCTION_TEXT = """# LLM Council
 
 When the user says "go to council", "ask council", or "take this to council",
@@ -39,55 +50,43 @@ without explicit user direction.
 
 
 def project_config(
+    include_native: bool = True,
     include_openrouter: bool = True,
     include_local: bool = True,
     us_only_default: bool = False,
 ) -> dict:
-    participant_names = {"claude", "codex", "gemini"}
+    participant_names: set[str] = set()
+    if include_native:
+        participant_names.update({"claude", "codex", "gemini"})
     if include_openrouter:
-        participant_names.update(
-            {
-                "deepseek_v4_pro",
-                "deepseek_v4_flash",
-                "qwen_coder_plus",
-                "qwen_coder_free",
-                "glm_5_1",
-                "glm_4_7_flash",
-                "kimi_k2_6",
-            }
-        )
+        participant_names.update(OPENROUTER_PARTICIPANTS)
     if include_local:
         participant_names.add("local_qwen_coder")
 
     modes = {
         name: mode
         for name, mode in DEFAULT_CONFIG["modes"].items()
-        if _mode_participants(mode).issubset(participant_names)
+        if _mode_available(mode, participant_names, include_native=include_native)
     }
+    if not include_native and include_openrouter:
+        modes.update(_openrouter_only_modes())
     config = {
         "version": 1,
         "replace_defaults": True,
         "transcripts_dir": ".llm-council/runs",
-        "defaults": DEFAULT_CONFIG["defaults"],
-        "participants": {
-            name: DEFAULT_CONFIG["participants"][name]
-            for name in ("claude", "codex", "gemini")
-        },
+        "defaults": dict(DEFAULT_CONFIG["defaults"]),
+        "participants": {},
         "modes": modes,
     }
+    if not include_native and include_openrouter:
+        config["defaults"]["mode"] = "quick"
     if us_only_default:
-        config["defaults"] = dict(config["defaults"])
         config["defaults"]["origin_policy"] = "us"
+    if include_native:
+        for name in ("claude", "codex", "gemini"):
+            config["participants"][name] = DEFAULT_CONFIG["participants"][name]
     if include_openrouter:
-        for name in (
-            "deepseek_v4_pro",
-            "deepseek_v4_flash",
-            "qwen_coder_plus",
-            "qwen_coder_free",
-            "glm_5_1",
-            "glm_4_7_flash",
-            "kimi_k2_6",
-        ):
+        for name in OPENROUTER_PARTICIPANTS:
             config["participants"][name] = DEFAULT_CONFIG["participants"][name]
     if include_local:
         config["participants"]["local_qwen_coder"] = DEFAULT_CONFIG["participants"][
@@ -100,6 +99,43 @@ def _mode_participants(mode: dict[str, Any]) -> set[str]:
     names = set(mode.get("participants", []))
     names.update(mode.get("add", []))
     return names
+
+
+def _mode_available(
+    mode: dict[str, Any], participant_names: set[str], *, include_native: bool
+) -> bool:
+    if mode.get("strategy") == "other_cli_peers" and not include_native:
+        return False
+    return _mode_participants(mode).issubset(participant_names)
+
+
+def _openrouter_only_modes() -> dict[str, dict[str, Any]]:
+    return {
+        "quick": {
+            "participants": [
+                "deepseek_v4_flash",
+                "qwen_coder_free",
+                "glm_4_7_flash",
+            ],
+            "description": "Hosted OpenRouter breadth reviewers.",
+        },
+        "plan": {
+            "participants": [
+                "deepseek_v4_pro",
+                "qwen_coder_plus",
+                "glm_5_1",
+            ],
+            "description": "Hosted OpenRouter planning reviewers.",
+        },
+        "review": {
+            "participants": [
+                "deepseek_v4_flash",
+                "qwen_coder_plus",
+                "glm_4_7_flash",
+            ],
+            "description": "Hosted OpenRouter code review.",
+        },
+    }
 
 
 def mcp_config(project_root: Path) -> dict[str, Any]:
@@ -132,6 +168,7 @@ def mcp_config(project_root: Path) -> dict[str, Any]:
 def write_setup_files(
     root: Path,
     *,
+    include_native: bool = True,
     include_openrouter: bool = True,
     include_local: bool = True,
     us_only_default: bool = False,
@@ -144,6 +181,7 @@ def write_setup_files(
 
     config_path = root / ".llm-council.yaml"
     desired_config = project_config(
+        include_native=include_native,
         include_openrouter=include_openrouter,
         include_local=include_local,
         us_only_default=us_only_default,
