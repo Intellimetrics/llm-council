@@ -127,7 +127,7 @@ files or your MCP client's normal environment configuration for hosted models.
 Releases are versioned in `pyproject.toml`, exposed by the package, recorded in
 `CHANGELOG.md`, and tagged as `vX.Y.Z` in git. `llm-council --version` prints
 the installed package version. `llm-council check-update` compares it with the
-public `main` branch package version and prints the update command when the
+latest public `vX.Y.Z` release tag and prints the update command when the
 install is behind:
 
 ```bash

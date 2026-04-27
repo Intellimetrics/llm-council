@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 - 2026-04-27
+
+- Switch update checks to public release tags instead of raw `main` metadata so new releases are visible immediately after tagging.
+
 ## 0.2.0 - 2026-04-27
 
 - Add `llm-council estimate` and MCP `council_estimate` for hosted cost previews.

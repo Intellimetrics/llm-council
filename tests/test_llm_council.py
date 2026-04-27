@@ -736,10 +736,11 @@ def test_mcp_doctor_and_models_schema():
 
 def test_check_update_reports_available(monkeypatch, capsys):
     class FakeResponse:
-        text = '[project]\nversion = "9.9.9"\n'
-
         def raise_for_status(self):
             return None
+
+        def json(self):
+            return [{"name": "v9.9.9"}]
 
     monkeypatch.setattr(
         update_check_module.httpx, "get", lambda *_args, **_kwargs: FakeResponse()
@@ -752,14 +753,16 @@ def test_check_update_reports_available(monkeypatch, capsys):
     assert "latest: 9.9.9" in output
     assert "update_available: true" in output
     assert "uv tool install --force" in output
+    assert "@v9.9.9" in output
 
 
 def test_check_update_json_reports_current(monkeypatch, capsys):
     class FakeResponse:
-        text = f'[project]\nversion = "{__version__}"\n'
-
         def raise_for_status(self):
             return None
+
+        def json(self):
+            return [{"name": f"v{__version__}"}]
 
     monkeypatch.setattr(
         update_check_module.httpx, "get", lambda *_args, **_kwargs: FakeResponse()

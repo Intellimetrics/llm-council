@@ -9,9 +9,7 @@ from typing import Any
 import httpx
 
 
-PYPROJECT_URL = (
-    "https://raw.githubusercontent.com/Intellimetrics/llm-council/main/pyproject.toml"
-)
+TAGS_URL = "https://api.github.com/repos/Intellimetrics/llm-council/tags?per_page=50"
 INSTALL_COMMAND = "uv tool install --force git+https://github.com/Intellimetrics/llm-council.git"
 
 
@@ -36,34 +34,64 @@ class UpdateStatus:
 
 
 def check_for_update(current_version: str, *, timeout: float = 10) -> UpdateStatus:
-    """Compare the installed version to the public main-branch package version."""
+    """Compare the installed version to the latest public release tag."""
     try:
-        response = httpx.get(PYPROJECT_URL, timeout=timeout)
+        response = httpx.get(
+            TAGS_URL,
+            headers={"Accept": "application/vnd.github+json"},
+            timeout=timeout,
+        )
         response.raise_for_status()
-        latest_version = _extract_pyproject_version(response.text)
+        latest_version, latest_tag = _latest_tag_version(response.json())
         return UpdateStatus(
             current_version=current_version,
             latest_version=latest_version,
             update_available=_compare_versions(current_version, latest_version) < 0,
-            source=PYPROJECT_URL,
-            install_command=INSTALL_COMMAND,
+            source=TAGS_URL,
+            install_command=_install_command(latest_tag),
         )
     except Exception as exc:
         return UpdateStatus(
             current_version=current_version,
             latest_version=None,
             update_available=None,
-            source=PYPROJECT_URL,
+            source=TAGS_URL,
             install_command=INSTALL_COMMAND,
             error=f"{type(exc).__name__}: {exc}",
         )
 
 
-def _extract_pyproject_version(text: str) -> str:
-    match = re.search(r'^version\s*=\s*"([^"]+)"\s*$', text, re.MULTILINE)
-    if not match:
-        raise ValueError("Could not find project version in pyproject.toml")
-    return match.group(1)
+def _latest_tag_version(tags: Any) -> tuple[str, str]:
+    if not isinstance(tags, list):
+        raise ValueError("Expected GitHub tags response to be a list")
+    best_version: str | None = None
+    best_tag: str | None = None
+    for tag in tags:
+        if not isinstance(tag, dict):
+            continue
+        name = tag.get("name")
+        if not isinstance(name, str):
+            continue
+        version = _version_from_tag(name)
+        if version is None:
+            continue
+        if best_version is None or _compare_versions(best_version, version) < 0:
+            best_version = version
+            best_tag = name
+    if best_version is None or best_tag is None:
+        raise ValueError("Could not find a semantic version tag")
+    return best_version, best_tag
+
+
+def _version_from_tag(tag: str) -> str | None:
+    match = re.fullmatch(r"v?(\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?)", tag)
+    return match.group(1) if match else None
+
+
+def _install_command(tag: str | None) -> str:
+    if not tag:
+        return INSTALL_COMMAND
+    return f"{INSTALL_COMMAND}@{tag}"
 
 
 def _compare_versions(left: str, right: str) -> int:

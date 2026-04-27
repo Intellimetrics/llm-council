@@ -117,8 +117,8 @@ llm-council check-update
 llm-council doctor --check-update
 ```
 
-`check-update` compares the installed version to the public `main` branch
-`pyproject.toml` version and prints the update command:
+`check-update` compares the installed version to the latest public `vX.Y.Z`
+release tag and prints the update command:
 
 ```bash
 uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
