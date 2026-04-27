@@ -3,7 +3,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
 [![MCP](https://img.shields.io/badge/MCP-ready-2f855a)](docs/llm-council.md)
 [![Read Only](https://img.shields.io/badge/default-read--only-6b7280)](#safety)
-[![Version](https://img.shields.io/badge/version-0.2.3-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.4-111827)](CHANGELOG.md)
 
 Give your coding agent a council of other models.
 
@@ -67,21 +67,23 @@ Use the agent-first install path:
 2. If `uv` is not installed, check for `pipx` with `command -v pipx`. If present, run:
    `pipx install --force git+https://github.com/Intellimetrics/llm-council.git`
 3. Do not use `uvx`; this must be a stable project install.
-4. From this project root, run `llm-council setup --yes`.
-5. If setup reports no usable council route, stop and ask me whether to set `OPENROUTER_API_KEY` or install another native CLI.
-6. After setup, read the generated snippet for this CLI from `.llm-council/instructions/`, then append that file's full contents to the correct project instruction file without overwriting existing content:
+4. From this project root, run `llm-council setup --plan`.
+5. Show me the detected routes and ask which preset I want: `auto`, `tri-cli`, `openrouter`, `tri-cli-openrouter`, `local-private`, or `all`. Do not choose silently unless I explicitly say to use the recommendation.
+6. Run `llm-council setup --yes --preset <my-choice>`.
+7. If setup reports no usable council route, stop and ask me whether to set `OPENROUTER_API_KEY` or install another native CLI.
+8. After setup, read the generated snippet for this CLI from `.llm-council/instructions/`, then append that file's full contents to the correct project instruction file without overwriting existing content:
    - Claude Code: `.llm-council/instructions/claude.md` -> `CLAUDE.md`
    - Codex CLI: `.llm-council/instructions/codex.md` -> `AGENTS.md`
    - Gemini CLI: `.llm-council/instructions/gemini.md` -> `GEMINI.md`
-7. Confirm the destination file now contains the LLM Council routing rules.
-8. Run `llm-council doctor` and show me the result.
-9. Tell me to restart this CLI session so MCP and project instructions reload.
+9. Confirm the destination file now contains the LLM Council routing rules.
+10. Run `llm-council doctor` and show me the result.
+11. Tell me to restart this CLI session so MCP and project instructions reload.
 ```
 
 That is the primary install path. It avoids the common mistakes agents make:
 using `uvx`, copying placeholder paths into `.mcp.json`, overwriting existing
-project instructions, skipping the instruction-file append step, or declaring
-success before `doctor` passes.
+project instructions, silently accepting the wrong preset, skipping the
+instruction-file append step, or declaring success before `doctor` passes.
 
 ## After Install
 
@@ -121,10 +123,12 @@ Generated project instructions teach your agent the routing rules:
 | Native CLIs plus hosted models | `tri-cli-openrouter` | stronger diversity and frontier escalation |
 | Local models through Ollama | `local-private` | private/offline review |
 
-`llm-council setup --yes` uses `auto`. Auto writes a config only when it finds a
-usable route: at least two native CLIs, or `OPENROUTER_API_KEY` for hosted
-reviewers. If you only have one CLI account, OpenRouter is usually the easiest
-way to add additional reviewers.
+Agent installs should run `llm-council setup --plan` first and ask you which
+preset to write. `llm-council setup --yes` uses `auto` only when you explicitly
+accept the default. Auto writes a config only when it finds a usable route: at
+least two native CLIs, or `OPENROUTER_API_KEY` for hosted reviewers. If you only
+have one CLI account, OpenRouter is usually the easiest way to add additional
+reviewers.
 
 ## What Setup Creates
 
@@ -180,7 +184,8 @@ still useful for setup, diagnostics, transcripts, and occasional direct runs.
 ```bash
 uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
 cd /path/to/project
-llm-council setup --yes
+llm-council setup --plan
+llm-council setup --yes --preset <chosen-preset>
 llm-council doctor
 llm-council check-update
 ```

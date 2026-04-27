@@ -915,6 +915,25 @@ def test_setup_yes_auto_fails_without_usable_route(tmp_path: Path, monkeypatch):
         cmd_setup(args)
 
 
+def test_setup_plan_prints_routes_without_writing(tmp_path: Path, monkeypatch, capsys):
+    def fake_which(name: str):
+        return f"/usr/bin/{name}" if name in {"claude", "codex", "ollama"} else None
+
+    monkeypatch.setattr(cli_module.shutil, "which", fake_which)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    parser = build_parser()
+    args = parser.parse_args(["setup", "--plan", "--root", str(tmp_path)])
+
+    assert cmd_setup(args) == 0
+
+    output = capsys.readouterr().out
+    assert "LLM Council setup plan" in output
+    assert "Auto" not in output
+    assert "tri-cli-openrouter" in output
+    assert "Agent installers: show this plan to the user" in output
+    assert not (tmp_path / ".mcp.json").exists()
+
+
 def test_setup_prints_next_steps_and_cli_warnings(tmp_path: Path, monkeypatch, capsys):
     def fake_which(name: str):
         return None if name == "claude" else f"/usr/bin/{name}"

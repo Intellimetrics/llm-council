@@ -31,12 +31,14 @@ Use the agent-first install path:
 2. If `uv` is not installed, check for `pipx` with `command -v pipx`. If present, run:
    `pipx install --force git+https://github.com/Intellimetrics/llm-council.git`
 3. Do not use `uvx`; this must be a stable project install.
-4. From this project root, run `llm-council setup --yes`.
-5. If setup reports no usable council route, stop and ask me whether to set `OPENROUTER_API_KEY` or install another native CLI.
-6. After setup, read the generated snippet for this CLI from `.llm-council/instructions/`, then append that file's full contents to the correct project instruction file without overwriting existing content.
-7. Confirm the destination file now contains the LLM Council routing rules.
-8. Run `llm-council doctor` and show me the result.
-9. Tell me to restart this CLI session so MCP and project instructions reload.
+4. From this project root, run `llm-council setup --plan`.
+5. Show me the detected routes and ask which preset I want: `auto`, `tri-cli`, `openrouter`, `tri-cli-openrouter`, `local-private`, or `all`. Do not choose silently unless I explicitly say to use the recommendation.
+6. Run `llm-council setup --yes --preset <my-choice>`.
+7. If setup reports no usable council route, stop and ask me whether to set `OPENROUTER_API_KEY` or install another native CLI.
+8. After setup, read the generated snippet for this CLI from `.llm-council/instructions/`, then append that file's full contents to the correct project instruction file without overwriting existing content.
+9. Confirm the destination file now contains the LLM Council routing rules.
+10. Run `llm-council doctor` and show me the result.
+11. Tell me to restart this CLI session so MCP and project instructions reload.
 ```
 
 Manual equivalent:
@@ -44,7 +46,8 @@ Manual equivalent:
 ```bash
 uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
 cd /path/to/your/project
-llm-council setup --yes
+llm-council setup --plan
+llm-council setup --yes --preset <chosen-preset>
 llm-council doctor
 llm-council check-update
 ```
@@ -54,7 +57,8 @@ If you do not use `uv`, install the same package with `pipx`:
 ```bash
 pipx install --force git+https://github.com/Intellimetrics/llm-council.git
 cd /path/to/your/project
-llm-council setup --yes
+llm-council setup --plan
+llm-council setup --yes --preset <chosen-preset>
 llm-council doctor
 ```
 
@@ -64,10 +68,12 @@ installed `llm-council` executable, then run setup from the target project.
 
 ## Presets
 
-`setup --yes` uses `--preset auto` by default. Auto setup writes a default
-config only when it finds a usable route: at least two installed native CLIs, or
-`OPENROUTER_API_KEY` in your shell or project env files. This protects the
-common one-CLI case from getting a native-only council that cannot run.
+Agent installs should run `llm-council setup --plan` first and ask the user
+which preset to write. `setup --yes` uses `--preset auto` only when the user has
+explicitly accepted the default. Auto setup writes a default config only when it
+finds a usable route: at least two installed native CLIs, or `OPENROUTER_API_KEY`
+in your shell or project env files. This protects the common one-CLI case from
+getting a native-only council that cannot run.
 
 Preset choices:
 
@@ -82,12 +88,13 @@ Preset choices:
 Useful setup variants:
 
 ```bash
-llm-council setup --yes
+llm-council setup --plan
+llm-council setup --yes --preset <chosen-preset>
 llm-council setup --yes --preset openrouter
 llm-council setup --yes --preset tri-cli
 llm-council setup --yes --preset tri-cli --us-only-default
-llm-council setup --yes --no-mcp --no-instructions
-llm-council setup --yes --force
+llm-council setup --yes --preset tri-cli --no-mcp --no-instructions
+llm-council setup --yes --preset tri-cli --force
 ```
 
 `setup` writes `.llm-council.yaml`, `.mcp.json`, and optional instruction
@@ -108,13 +115,15 @@ same thing a careful human would do:
 
 1. Install with `uv tool install --force git+https://github.com/Intellimetrics/llm-council.git`, or fall back to `pipx install --force git+https://github.com/Intellimetrics/llm-council.git`.
 2. Do not use `uvx`; it is not a stable project install path.
-3. Run `llm-council setup --yes` from the target project root.
-4. If setup reports no usable route, ask the user whether to set
+3. Run `llm-council setup --plan` from the target project root.
+4. Show the plan to the user and ask which preset to write.
+5. Run `llm-council setup --yes --preset <chosen-preset>`.
+6. If setup reports no usable route, ask the user whether to set
    `OPENROUTER_API_KEY` or install another native CLI.
-5. Append the generated instruction snippet to the right project instruction
+7. Append the generated instruction snippet to the right project instruction
    file. Do not overwrite existing content.
-6. Run `llm-council doctor` and report the result.
-7. Tell the user to restart the active coding CLI.
+8. Run `llm-council doctor` and report the result.
+9. Tell the user to restart the active coding CLI.
 
 Instruction snippet mapping:
 
@@ -174,7 +183,8 @@ Install from a checkout:
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e .
-llm-council setup --yes
+llm-council setup --plan
+llm-council setup --yes --preset <chosen-preset>
 llm-council doctor
 ```
 

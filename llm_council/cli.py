@@ -104,6 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     setup.add_argument("--yes", action="store_true", help="Non-interactive defaults")
+    setup.add_argument(
+        "--plan",
+        action="store_true",
+        help="Print detected setup routes without writing files",
+    )
     setup.add_argument("--force", action="store_true", help="Overwrite existing files")
     setup.add_argument(
         "--us-only-default",
@@ -274,8 +279,13 @@ def _confirm(prompt: str, default: bool = True) -> bool:
 def cmd_setup(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     load_project_env(root)
+    if getattr(args, "plan", False):
+        _print_setup_plan(root)
+        return 0
     preset = args.preset
-    if preset == "auto":
+    if preset == "auto" and not args.yes:
+        preset = _prompt_setup_preset(root)
+    elif preset == "auto":
         preset = _auto_setup_preset()
         print(f"Auto preset selected: {preset}")
 
@@ -353,6 +363,132 @@ def _auto_setup_preset() -> str:
         "Advanced users can choose an explicit preset such as --preset tri-cli "
         "or --preset openrouter."
     )
+
+
+def _detect_setup_routes() -> dict[str, object]:
+    native_names = ("claude", "codex", "gemini")
+    native_paths = {name: shutil.which(name) for name in native_names}
+    native_count = sum(1 for path in native_paths.values() if path)
+    has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
+    ollama_path = shutil.which("ollama")
+    return {
+        "native_paths": native_paths,
+        "native_count": native_count,
+        "has_openrouter": has_openrouter,
+        "ollama_path": ollama_path,
+        "auto": _auto_setup_preset_or_none(),
+    }
+
+
+def _auto_setup_preset_or_none() -> str | None:
+    try:
+        return _auto_setup_preset()
+    except SystemExit:
+        return None
+
+
+def _preset_status(preset: str, routes: dict[str, object]) -> tuple[str, str]:
+    native_count = int(routes["native_count"])
+    has_openrouter = bool(routes["has_openrouter"])
+    has_ollama = bool(routes["ollama_path"])
+    if preset == "auto":
+        selected = routes["auto"]
+        if selected:
+            return "recommended", f"would select `{selected}`"
+        return "blocked", "needs at least two native CLIs or OPENROUTER_API_KEY"
+    if preset == "tri-cli":
+        if native_count >= 2:
+            return "available", "uses installed Claude/Codex/Gemini CLI accounts"
+        return "blocked", "needs at least two of claude/codex/gemini"
+    if preset == "openrouter":
+        if has_openrouter:
+            return "available", "uses hosted OpenRouter reviewers"
+        return "blocked", "needs OPENROUTER_API_KEY"
+    if preset == "tri-cli-openrouter":
+        if native_count >= 2 and has_openrouter:
+            return "available", "uses native CLI peers plus hosted reviewers"
+        missing = []
+        if native_count < 2:
+            missing.append("two native CLIs")
+        if not has_openrouter:
+            missing.append("OPENROUTER_API_KEY")
+        return "blocked", "needs " + " and ".join(missing)
+    if preset == "local-private":
+        if native_count >= 2 and has_ollama:
+            return "available", "uses native CLI peers plus local Ollama"
+        missing = []
+        if native_count < 2:
+            missing.append("two native CLIs")
+        if not has_ollama:
+            missing.append("ollama")
+        return "blocked", "needs " + " and ".join(missing)
+    if preset == "all":
+        if native_count >= 2 and has_openrouter and has_ollama:
+            return "available", "writes native, hosted, and local presets"
+        missing = []
+        if native_count < 2:
+            missing.append("two native CLIs")
+        if not has_openrouter:
+            missing.append("OPENROUTER_API_KEY")
+        if not has_ollama:
+            missing.append("ollama")
+        return "blocked", "needs " + " and ".join(missing)
+    return "unknown", ""
+
+
+def _print_setup_plan(root: Path) -> None:
+    routes = _detect_setup_routes()
+    native_paths = routes["native_paths"]
+    assert isinstance(native_paths, dict)
+    print("LLM Council setup plan")
+    print(f"Project root: {root}")
+    print()
+    print("Detected:")
+    for name in ("claude", "codex", "gemini"):
+        print(f"  {name:8} {native_paths.get(name) or 'not found'}")
+    print(f"  openrouter {'OPENROUTER_API_KEY set' if routes['has_openrouter'] else 'OPENROUTER_API_KEY not set'}")
+    print(f"  ollama   {routes['ollama_path'] or 'not found'}")
+    print()
+    print("Preset choices:")
+    for preset in (
+        "auto",
+        "tri-cli",
+        "openrouter",
+        "tri-cli-openrouter",
+        "local-private",
+        "all",
+    ):
+        status, detail = _preset_status(preset, routes)
+        print(f"  {preset:19} {status:11} {detail}")
+    print()
+    print("Agent installers: show this plan to the user and ask which preset to write.")
+    print("Do not choose a blocked preset unless the user is deliberately preparing config for later.")
+    print("Then run: llm-council setup --yes --preset <chosen-preset>")
+
+
+def _prompt_setup_preset(root: Path) -> str:
+    _print_setup_plan(root)
+    default = _auto_setup_preset_or_none() or "openrouter"
+    valid = {
+        "auto",
+        "tri-cli",
+        "openrouter",
+        "tri-cli-openrouter",
+        "local-private",
+        "all",
+    }
+    answer = input(f"Choose setup preset [{default}]: ").strip()
+    if not answer:
+        answer = default
+    if answer not in valid:
+        raise SystemExit(
+            f"Unknown preset '{answer}'. Choose one of: {', '.join(sorted(valid))}."
+        )
+    if answer == "auto":
+        selected = _auto_setup_preset()
+        print(f"Auto preset selected: {selected}")
+        return selected
+    return answer
 
 
 def _print_setup_next_steps(

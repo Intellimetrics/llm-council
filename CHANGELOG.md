@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.4 - 2026-04-27
+
+- Add `llm-council setup --plan` so agent installers show detected routes and ask before choosing a preset.
+- Update agent-first install instructions to avoid silently accepting `auto` setup.
+
 ## 0.2.3 - 2026-04-27
 
 - Rewrite the README around agent-first installation and natural council usage.
