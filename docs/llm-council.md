@@ -378,13 +378,22 @@ for current costs.
 ## Modes
 
 A mode either lists exact participants or uses `strategy: other_cli_peers`.
+Built-in native modes set `include_current: true`, so `quick` asks Claude,
+Codex, and Gemini as explicit read-only participants even when one of them is
+the active host. Use `peer-only`, or set `include_current: false`, when you only
+want outside perspectives.
 
 ```yaml
 modes:
   quick:
     strategy: other_cli_peers
+    include_current: true
+  peer-only:
+    strategy: other_cli_peers
+    include_current: false
   review:
     strategy: other_cli_peers
+    include_current: true
     add: ["qwen_coder_plus"]
   cheap:
     participants: ["deepseek_v4_flash", "qwen_coder_flash"]

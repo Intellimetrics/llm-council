@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.7 - 2026-04-28
+
+- Make built-in native modes ask Claude, Codex, and Gemini as explicit participants by default.
+- Add `peer-only` mode for the old behavior that excludes the current host subprocess.
+- Add `include_current` routing support while preserving peer-only behavior for custom `other_cli_peers` modes.
+- Update generated instructions, docs, and example config for full-triad default council runs.
+
 ## 0.2.6 - 2026-04-28
 
 - Change the generated Claude Code participant from `--permission-mode plan` to `--permission-mode default` while keeping read-only tools.

@@ -35,7 +35,7 @@ def council_run_schema() -> dict[str, Any]:
             "question": {"type": "string", "minLength": 1},
             "mode": {
                 "type": "string",
-                "description": "Council mode such as quick, plan, review, diverse, review-cheap, private-local.",
+                "description": "Council mode such as quick, peer-only, plan, review, diverse, review-cheap, private-local.",
             },
             "current": {"type": "string", "enum": ["claude", "codex", "gemini"]},
             "participants": {
@@ -114,7 +114,7 @@ def estimate_schema() -> dict[str, Any]:
             "question": {"type": "string", "minLength": 1},
             "mode": {
                 "type": "string",
-                "description": "Council mode such as quick, plan, review, diverse, review-cheap, private-local.",
+                "description": "Council mode such as quick, peer-only, plan, review, diverse, review-cheap, private-local.",
             },
             "current": {"type": "string", "enum": ["claude", "codex", "gemini"]},
             "participants": {

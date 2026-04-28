@@ -175,17 +175,25 @@ DEFAULT_CONFIG: dict = {
     "modes": {
         "quick": {
             "strategy": "other_cli_peers",
-            "description": "Ask the other two native CLIs from the current CLI.",
+            "include_current": True,
+            "description": "Ask Claude, Codex, and Gemini as explicit council participants.",
+        },
+        "peer-only": {
+            "strategy": "other_cli_peers",
+            "include_current": False,
+            "description": "Ask only the other native CLIs, excluding the current host.",
         },
         "plan": {
             "strategy": "other_cli_peers",
+            "include_current": True,
             "add": ["deepseek_v4_pro"],
-            "description": "Premium local CLI peers plus DeepSeek for independent planning.",
+            "description": "Claude/Codex/Gemini plus DeepSeek for independent planning.",
         },
         "review": {
             "strategy": "other_cli_peers",
+            "include_current": True,
             "add": ["qwen_coder_plus"],
-            "description": "CLI peers plus Qwen coding model.",
+            "description": "Claude/Codex/Gemini plus Qwen coding model.",
         },
         "review-cheap": {
             "participants": [
@@ -197,8 +205,9 @@ DEFAULT_CONFIG: dict = {
         },
         "diverse": {
             "strategy": "other_cli_peers",
+            "include_current": True,
             "add": ["deepseek_v4_pro", "glm_5_1", "kimi_k2_6"],
-            "description": "Cross-lab planning diversity.",
+            "description": "Native triad plus cross-lab planning diversity.",
         },
         "private-local": {
             "participants": ["local_qwen_coder"],
@@ -206,11 +215,13 @@ DEFAULT_CONFIG: dict = {
         },
         "us-only": {
             "strategy": "other_cli_peers",
+            "include_current": True,
             "origin_policy": "us",
             "description": "Use only US-origin native CLI participants.",
         },
         "deliberate": {
             "strategy": "other_cli_peers",
+            "include_current": True,
             "add": ["deepseek_v4_pro"],
             "deliberate": True,
             "description": "Expensive opt-in second round when first-round responses disagree.",

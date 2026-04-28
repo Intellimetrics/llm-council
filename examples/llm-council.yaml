@@ -23,7 +23,7 @@ participants:
     args:
     - -p
     - --permission-mode
-    - plan
+    - default
     - --tools
     - Read,Grep,Glob,LS
     - --no-session-persistence
@@ -44,8 +44,6 @@ participants:
     - exec
     - --sandbox
     - read-only
-    - --ask-for-approval
-    - never
     - --ephemeral
     - --cd
     - "{cwd}"
@@ -98,16 +96,24 @@ participants:
 modes:
   quick:
     strategy: other_cli_peers
-    description: Ask the other two native CLIs from the current CLI.
+    include_current: true
+    description: Ask Claude, Codex, and Gemini as explicit council participants.
+
+  peer-only:
+    strategy: other_cli_peers
+    include_current: false
+    description: Ask only the other native CLIs, excluding the current host.
 
   plan:
     strategy: other_cli_peers
+    include_current: true
     add:
     - deepseek_v4_pro
-    description: Add DeepSeek V4 Pro for independent planning.
+    description: Claude/Codex/Gemini plus DeepSeek V4 Pro for independent planning.
 
   review:
     strategy: other_cli_peers
+    include_current: true
     add:
     - qwen_coder_plus
-    description: Add Qwen Coder Plus for coding review.
+    description: Claude/Codex/Gemini plus Qwen Coder Plus for coding review.

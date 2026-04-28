@@ -13,6 +13,9 @@ from llm_council.defaults import DEFAULT_CONFIG
 
 
 BASELINE_CLIS = ("claude", "codex", "gemini")
+BUILTIN_FULL_TRIAD_MODES = frozenset(
+    {"quick", "plan", "review", "diverse", "us-only", "deliberate"}
+)
 CONFIG_NAMES = (
     ".llm-council.yaml",
     ".llm-council.yml",
@@ -148,6 +151,8 @@ def validate_config(config: dict[str, Any]) -> None:
                 )
         if has_strategy and mode.get("strategy") != "other_cli_peers":
             raise ValueError(f"Mode '{name}' has unsupported strategy '{mode.get('strategy')}'")
+        if "include_current" in mode and not isinstance(mode["include_current"], bool):
+            raise ValueError(f"Mode '{name}' include_current must be a boolean")
         if mode.get("origin_policy") not in (None, "any", "us"):
             raise ValueError(f"Mode '{name}' origin_policy must be 'any' or 'us'")
         _validate_positive_int(mode, "max_rounds", f"mode '{name}'")
@@ -183,6 +188,24 @@ def migrate_known_cli_defaults(config: dict[str, Any]) -> None:
         and codex.get("args") == OLD_CODEX_APPROVAL_ARGS
     ):
         codex["args"] = list(DEFAULT_CONFIG["participants"]["codex"]["args"])
+    modes = config.get("modes", {})
+    if not isinstance(modes, dict):
+        return
+    participants = config.get("participants", {})
+    if (
+        isinstance(participants, dict)
+        and all(name in participants for name in BASELINE_CLIS)
+        and "peer-only" not in modes
+    ):
+        modes["peer-only"] = copy.deepcopy(DEFAULT_CONFIG["modes"]["peer-only"])
+    for name in BUILTIN_FULL_TRIAD_MODES:
+        mode = modes.get(name)
+        if (
+            isinstance(mode, dict)
+            and mode.get("strategy") == "other_cli_peers"
+            and "include_current" not in mode
+        ):
+            mode["include_current"] = True
 
 
 def _validate_positive_int(mapping: dict[str, Any], key: str, label: str) -> None:
@@ -276,9 +299,12 @@ def select_participants(
         if "participants" in mode_cfg:
             selected = list(mode_cfg["participants"])
         elif mode_cfg.get("strategy") == "other_cli_peers":
-            selected = [name for name in BASELINE_CLIS if name != current]
-            if not current:
+            if mode_cfg.get("include_current", False):
                 selected = list(BASELINE_CLIS)
+            else:
+                selected = [name for name in BASELINE_CLIS if name != current]
+                if not current:
+                    selected = list(BASELINE_CLIS)
             selected.extend(mode_cfg.get("add", []))
         else:
             raise ValueError(f"Mode '{mode}' has no participants or known strategy")

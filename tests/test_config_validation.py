@@ -86,6 +86,17 @@ def test_load_config_rejects_invalid_defaults_mode(tmp_path: Path):
         load_config(path)
 
 
+def test_load_config_rejects_bad_include_current(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump({"modes": {"quick": {"include_current": "yes"}}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="include_current must be a boolean"):
+        load_config(path)
+
+
 def test_load_config_rejects_invalid_budget_defaults(tmp_path: Path):
     path = tmp_path / ".llm-council.yaml"
     path.write_text(

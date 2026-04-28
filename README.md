@@ -3,7 +3,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
 [![MCP](https://img.shields.io/badge/MCP-ready-2f855a)](docs/llm-council.md)
 [![Read Only](https://img.shields.io/badge/default-read--only-6b7280)](#safety)
-[![Version](https://img.shields.io/badge/version-0.2.6-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.7-111827)](CHANGELOG.md)
 
 Give your coding agent a council of other models.
 
@@ -21,19 +21,21 @@ This auth refactor feels risky. Take it to council and compare the tradeoffs.
 ```
 
 ```text
-Use council on the current diff. I want Claude and Gemini to challenge the plan.
+Use council on the current diff. I want Claude, Codex, and Gemini to challenge the plan.
 ```
 
 Your current agent asks the configured council for read-only review, shows what
-the other models said, and keeps a local transcript for auditability.
+the models said, and keeps a local transcript for auditability.
 
 ```text
-Council starting: mode=quick, current=codex, participants=claude, gemini
+Council starting: mode=quick, current=codex, participants=claude, codex, gemini
 - claude: starting round 1
+- codex: starting round 1
 - gemini: starting round 1
+- codex: ok round 1
 - gemini: ok round 1
 - claude: ok round 1
-Council complete: 2/2 participants succeeded
+Council complete: 3/3 participants succeeded
 Transcript: .llm-council/runs/20260427_090457_review.md
 ```
 
@@ -108,7 +110,11 @@ Use cheap council first, then tell me whether this is worth a frontier review.
 Generated project instructions teach your agent the routing rules:
 
 - `go to council`, `ask council`, or `use council` calls `council_run`
-- the active CLI passes its identity, so it does not ask itself for review
+- the active CLI passes its identity, so transcripts show which host will
+  synthesize and act
+- `quick` asks Claude, Codex, and Gemini as explicit read-only participants
+- `peer-only` excludes the current host subprocess when you only want outside
+  perspectives
 - `on the diff` includes the current git diff
 - `cheap` uses budget hosted reviewers
 - `private` or `local` uses the local Ollama route

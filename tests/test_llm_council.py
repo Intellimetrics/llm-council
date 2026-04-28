@@ -73,9 +73,22 @@ from llm_council.transcript import (
 )
 
 
-def test_select_other_cli_peers_excludes_current():
+def test_builtin_quick_selects_full_native_triad():
     config = load_config(None)
     selected = select_participants(config, "quick", "codex")
+    assert selected == ["claude", "codex", "gemini"]
+
+
+def test_peer_only_excludes_current():
+    config = load_config(None)
+    selected = select_participants(config, "peer-only", "codex")
+    assert selected == ["claude", "gemini"]
+
+
+def test_custom_other_cli_peers_stays_peer_only_by_default():
+    config = load_config(None)
+    config["modes"]["custom-peer"] = {"strategy": "other_cli_peers"}
+    selected = select_participants(config, "custom-peer", "codex")
     assert selected == ["claude", "gemini"]
 
 
@@ -121,8 +134,14 @@ def test_load_config_migrates_old_cli_args(tmp_path: Path):
                         "command": "codex",
                         "args": OLD_CODEX_APPROVAL_ARGS,
                     },
+                    "gemini": {
+                        "type": "cli",
+                        "family": "gemini",
+                        "command": "gemini",
+                        "args": ["--approval-mode", "plan"],
+                    },
                 },
-                "modes": {"quick": {"participants": ["claude", "codex"]}},
+                "modes": {"quick": {"strategy": "other_cli_peers"}},
             },
             sort_keys=False,
         ),
@@ -145,6 +164,8 @@ def test_load_config_migrates_old_cli_args(tmp_path: Path):
         "{cwd}",
         "-",
     ]
+    assert config["modes"]["quick"]["include_current"] is True
+    assert config["modes"]["peer-only"]["include_current"] is False
 
 
 def test_clean_subprocess_env_strips_claudecode(monkeypatch):
@@ -169,13 +190,13 @@ def test_prompt_arg_is_redacted_and_literal_braces_are_safe(tmp_path: Path):
 def test_plan_mode_adds_deepseek():
     config = load_config(None)
     selected = select_participants(config, "plan", "claude")
-    assert selected == ["codex", "gemini", "deepseek_v4_pro"]
+    assert selected == ["claude", "codex", "gemini", "deepseek_v4_pro"]
 
 
 def test_deliberate_mode_adds_deepseek_and_marks_expensive():
     config = load_config(None)
     selected = select_participants(config, "deliberate", "claude")
-    assert selected == ["codex", "gemini", "deepseek_v4_pro"]
+    assert selected == ["claude", "codex", "gemini", "deepseek_v4_pro"]
     assert config["modes"]["deliberate"]["deliberate"] is True
 
 
@@ -200,7 +221,7 @@ def test_explicit_participants_respect_origin_policy_with_clear_error():
 def test_us_origin_policy_filters_non_us_additions():
     config = load_config(None)
     selected = select_participants(config, "diverse", "codex", origin_policy="us")
-    assert selected == ["claude", "gemini"]
+    assert selected == ["claude", "codex", "gemini"]
 
 
 def test_origin_policy_empty_selection_is_clear():
@@ -963,6 +984,7 @@ def test_ollama_probe_bad_port_is_clear():
 def test_tri_cli_setup_omits_openrouter_modes():
     config = project_config(include_openrouter=False, include_local=False)
     assert "quick" in config["modes"]
+    assert "peer-only" in config["modes"]
     assert "us-only" in config["modes"]
     assert "plan" not in config["modes"]
     assert "private-local" not in config["modes"]
@@ -977,14 +999,14 @@ def test_example_config_loads_exact_modes():
         "deepseek_v4_pro",
         "qwen_coder_plus",
     }
-    assert set(config["modes"]) == {"quick", "plan", "review"}
+    assert set(config["modes"]) == {"quick", "peer-only", "plan", "review"}
 
 
 def test_tri_cli_setup_loaded_config_does_not_restore_defaults(tmp_path: Path):
     write_setup_files(tmp_path, include_openrouter=False, include_local=False)
     config = load_config(tmp_path / ".llm-council.yaml")
     assert set(config["participants"]) == {"claude", "codex", "gemini"}
-    assert set(config["modes"]) == {"quick", "us-only"}
+    assert set(config["modes"]) == {"quick", "peer-only", "us-only"}
 
 
 def test_setup_interactive_uses_preset_and_suppression_flags(
@@ -1024,7 +1046,7 @@ def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path):
 
     config = yaml.safe_load((tmp_path / ".llm-council.yaml").read_text())
     assert set(config["participants"]) == {"claude", "codex", "gemini"}
-    assert set(config["modes"]) == {"quick"}
+    assert set(config["modes"]) == {"quick", "peer-only"}
     assert config["defaults"]["origin_policy"] == "us"
     assert not (tmp_path / ".mcp.json").exists()
     assert not (tmp_path / ".llm-council" / "instructions").exists()
@@ -1045,7 +1067,7 @@ def test_setup_yes_auto_selects_tri_cli_when_native_clis_exist(
 
     config = load_config(tmp_path / ".llm-council.yaml")
     assert set(config["participants"]) == {"claude", "codex", "gemini"}
-    assert set(config["modes"]) == {"quick", "us-only"}
+    assert set(config["modes"]) == {"quick", "peer-only", "us-only"}
     assert "Auto preset selected: tri-cli" in capsys.readouterr().out
 
 

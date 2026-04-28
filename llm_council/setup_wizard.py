@@ -41,9 +41,11 @@ Natural triggers:
 When triggered, call the `llm-council` MCP tool `council_run`.
 
 Routing rules:
-- Always pass `current` as `{current}` so council does not call this same CLI
-  back as a reviewer.
-- Use `quick` mode unless the user names a mode.
+- Always pass `current` as `{current}` so transcripts show which host will
+  synthesize and act on the council output.
+- Use `quick` mode unless the user names a mode. `quick` asks Claude, Codex,
+  and Gemini as explicit read-only participants. Use `peer-only` only when the
+  user specifically wants to exclude this host CLI from subprocess review.
 - Treat "on the diff", "current diff", or "review my changes" as
   `include_diff: true`.
 - Treat "cheap" or "budget" as `review-cheap`.
