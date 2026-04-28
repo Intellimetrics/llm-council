@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.6 - 2026-04-28
+
+- Change the generated Claude Code participant from `--permission-mode plan` to `--permission-mode default` while keeping read-only tools.
+- Treat successful subprocesses without the required `RECOMMENDATION:` label as invalid participant responses.
+- Preserve invalid participant output in transcripts so adapter failures are debuggable.
+- Remove the obsolete Codex `--ask-for-approval never` flag from defaults.
+- Stop printing successful CLI stderr banners as participant error details.
+- Migrate old generated Claude and Codex args at config load time.
+
 ## 0.2.5 - 2026-04-27
 
 - Refuse explicit setup presets when required CLIs or API keys are missing.

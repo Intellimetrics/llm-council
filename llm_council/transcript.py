@@ -192,6 +192,8 @@ def write_transcript(
             lines.extend([result.output.strip() or "[empty response]", ""])
         else:
             lines.extend(["```", result.error.strip() or "[unknown error]", "```", ""])
+            if result.output.strip():
+                lines.extend(["Captured output:", "", result.output.strip(), ""])
 
     fence = markdown_fence(prompt)
     lines.extend(["## Prompt Sent", "", f"{fence}text", prompt, fence, ""])

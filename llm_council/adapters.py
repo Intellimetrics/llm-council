@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shlex
 import time
 from dataclasses import dataclass
@@ -11,6 +12,24 @@ from pathlib import Path
 from typing import Any, Callable
 
 import httpx
+
+
+RECOMMENDATION_RE = re.compile(
+    r"""
+    ^\s*
+    (?:>\s*)?
+    (?:[-*]\s+)?
+    (?:\#{1,6}\s*)?
+    (?:\*\*)?
+    recommendation
+    (?:\*\*)?
+    \s*[:\-]\s*
+    (?:\*\*)?
+    \s*
+    (yes|no|tradeoff)\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 @dataclass
@@ -98,11 +117,13 @@ async def run_cli_participant(
         elapsed = time.monotonic() - start
         out = stdout.decode(errors="replace").strip()
         err = stderr.decode(errors="replace").strip()
+        ok = proc.returncode == 0
+        validation_error = _response_validation_error(out, cfg) if ok else ""
         return ParticipantResult(
             name=name,
-            ok=proc.returncode == 0,
+            ok=ok and not validation_error,
             output=out,
-            error=err,
+            error=validation_error or (err if not ok else ""),
             elapsed_seconds=elapsed,
             command=redact_prompt_args(command, prompt),
             model=cfg.get("model"),
@@ -238,6 +259,20 @@ async def run_openrouter_participant(
                 total_tokens=_int_or_none(usage.get("total_tokens")),
                 cost_usd=_float_or_none(usage.get("cost")),
             )
+        validation_error = _response_validation_error(content, cfg)
+        if validation_error:
+            return ParticipantResult(
+                name=name,
+                ok=False,
+                output=content.strip(),
+                error=validation_error,
+                elapsed_seconds=time.monotonic() - start,
+                model=data.get("model") or model,
+                prompt_tokens=_int_or_none(usage.get("prompt_tokens")),
+                completion_tokens=_int_or_none(usage.get("completion_tokens")),
+                total_tokens=_int_or_none(usage.get("total_tokens")),
+                cost_usd=_float_or_none(usage.get("cost")),
+            )
         return ParticipantResult(
             name=name,
             ok=True,
@@ -283,11 +318,12 @@ async def run_ollama_participant(
             )
             data = response.json()
         content = data.get("message", {}).get("content", "")
+        validation_error = _response_validation_error(content, cfg)
         return ParticipantResult(
             name=name,
-            ok=True,
+            ok=not validation_error,
             output=content.strip(),
-            error="",
+            error=validation_error,
             elapsed_seconds=time.monotonic() - start,
             model=model,
         )
@@ -425,6 +461,42 @@ def _message_content_text(content: Any) -> str:
                     parts.append(text)
         return "\n".join(parts)
     return str(content)
+
+
+def _response_validation_error(output: str, cfg: dict[str, Any]) -> str:
+    if cfg.get("require_recommendation") is False:
+        return ""
+    if _has_recommendation_label(output):
+        return ""
+    excerpt = _first_output_excerpt(output)
+    if excerpt:
+        return (
+            "InvalidParticipantResponse: missing required RECOMMENDATION label. "
+            f"First output: {excerpt}"
+        )
+    return "InvalidParticipantResponse: empty response"
+
+
+def _has_recommendation_label(output: str) -> bool:
+    in_fence = False
+    fenced_match = False
+    for line in output.splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not RECOMMENDATION_RE.match(line):
+            continue
+        if not in_fence:
+            return True
+        fenced_match = True
+    return fenced_match
+
+
+def _first_output_excerpt(output: str, max_chars: int = 240) -> str:
+    cleaned = " ".join(output.split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 3].rstrip() + "..."
 
 
 def command_for_display(command: list[str] | None) -> str:

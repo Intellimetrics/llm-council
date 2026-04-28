@@ -26,7 +26,7 @@ DEFAULT_CONFIG: dict = {
             "args": [
                 "-p",
                 "--permission-mode",
-                "plan",
+                "default",
                 "--tools",
                 "Read,Grep,Glob,LS",
                 "--no-session-persistence",
@@ -47,8 +47,6 @@ DEFAULT_CONFIG: dict = {
                 "exec",
                 "--sandbox",
                 "read-only",
-                "--ask-for-approval",
-                "never",
                 "--ephemeral",
                 "--cd",
                 "{cwd}",

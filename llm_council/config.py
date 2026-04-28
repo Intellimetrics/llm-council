@@ -19,6 +19,25 @@ CONFIG_NAMES = (
     "llm-council.yaml",
     "llm-council.yml",
 )
+OLD_CLAUDE_PLAN_ARGS = [
+    "-p",
+    "--permission-mode",
+    "plan",
+    "--tools",
+    "Read,Grep,Glob,LS",
+    "--no-session-persistence",
+]
+OLD_CODEX_APPROVAL_ARGS = [
+    "exec",
+    "--sandbox",
+    "read-only",
+    "--ask-for-approval",
+    "never",
+    "--ephemeral",
+    "--cd",
+    "{cwd}",
+    "-",
+]
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -71,6 +90,7 @@ def load_config(path: str | Path | None = None, *, search: bool = True) -> dict[
         config["modes"] = {}
         data = {key: value for key, value in data.items() if key != "replace_defaults"}
     merged = deep_merge(config, data)
+    migrate_known_cli_defaults(merged)
     validate_config(merged)
     return merged
 
@@ -144,6 +164,25 @@ def validate_config(config: dict[str, Any]) -> None:
     _validate_positive_int(defaults, "max_prompt_chars", "defaults")
     _validate_positive_int(defaults, "mcp_max_prompt_chars", "defaults")
     _validate_positive_number(defaults, "mcp_max_estimated_cost_usd", "defaults")
+
+
+def migrate_known_cli_defaults(config: dict[str, Any]) -> None:
+    """Apply compatibility fixes for previously generated unsafe defaults."""
+
+    claude = config.get("participants", {}).get("claude")
+    if isinstance(claude, dict) and (
+        claude.get("type") == "cli"
+        and claude.get("family") == "claude"
+        and claude.get("args") == OLD_CLAUDE_PLAN_ARGS
+    ):
+        claude["args"] = list(DEFAULT_CONFIG["participants"]["claude"]["args"])
+    codex = config.get("participants", {}).get("codex")
+    if isinstance(codex, dict) and (
+        codex.get("type") == "cli"
+        and codex.get("family") == "codex"
+        and codex.get("args") == OLD_CODEX_APPROVAL_ARGS
+    ):
+        codex["args"] = list(DEFAULT_CONFIG["participants"]["codex"]["args"])
 
 
 def _validate_positive_int(mapping: dict[str, Any], key: str, label: str) -> None:

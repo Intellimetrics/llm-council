@@ -23,7 +23,12 @@ from llm_council.adapters import (
     run_participants,
 )
 from llm_council.cli import build_parser, cmd_doctor, cmd_setup, cmd_transcripts, main
-from llm_council.config import load_config, select_participants
+from llm_council.config import (
+    OLD_CLAUDE_PLAN_ARGS,
+    OLD_CODEX_APPROVAL_ARGS,
+    load_config,
+    select_participants,
+)
 from llm_council.context import build_prompt
 from llm_council.context import read_context_file, read_git_diff
 from llm_council.defaults import DEFAULT_CONFIG
@@ -76,6 +81,70 @@ def test_select_other_cli_peers_excludes_current():
 
 def test_claude_prompt_goes_to_stdin():
     assert DEFAULT_CONFIG["participants"]["claude"]["stdin_prompt"] is True
+    assert DEFAULT_CONFIG["participants"]["claude"]["args"][:3] == [
+        "-p",
+        "--permission-mode",
+        "default",
+    ]
+
+
+def test_codex_default_uses_current_read_only_exec_flags():
+    assert DEFAULT_CONFIG["participants"]["codex"]["args"] == [
+        "exec",
+        "--sandbox",
+        "read-only",
+        "--ephemeral",
+        "--cd",
+        "{cwd}",
+        "-",
+    ]
+
+
+def test_load_config_migrates_old_cli_args(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "replace_defaults": True,
+                "defaults": {"mode": "quick"},
+                "participants": {
+                    "claude": {
+                        "type": "cli",
+                        "family": "claude",
+                        "command": "claude",
+                        "args": OLD_CLAUDE_PLAN_ARGS,
+                    },
+                    "codex": {
+                        "type": "cli",
+                        "family": "codex",
+                        "command": "codex",
+                        "args": OLD_CODEX_APPROVAL_ARGS,
+                    },
+                },
+                "modes": {"quick": {"participants": ["claude", "codex"]}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["participants"]["claude"]["args"][:3] == [
+        "-p",
+        "--permission-mode",
+        "default",
+    ]
+    assert config["participants"]["codex"]["args"] == [
+        "exec",
+        "--sandbox",
+        "read-only",
+        "--ephemeral",
+        "--cd",
+        "{cwd}",
+        "-",
+    ]
 
 
 def test_clean_subprocess_env_strips_claudecode(monkeypatch):
@@ -313,6 +382,102 @@ def test_run_participants_emits_progress_events(tmp_path: Path):
     assert events[1]["participant"] == "python"
     assert events[1]["status"] == "ok"
     assert events[1]["elapsed_seconds"] >= 0
+
+
+def test_cli_participant_rejects_successful_non_answer(monkeypatch, tmp_path: Path):
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, input=None):
+            captured["stdin"] = input
+            return (
+                b"I don't have access to the Write tool. I also don't have access to ExitPlanMode.",
+                b"",
+            )
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        captured["command"] = command
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+            },
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert result.ok is False
+    assert result.output.startswith("I don't have access")
+    assert result.error.startswith("InvalidParticipantResponse")
+    assert "RECOMMENDATION" in result.error
+
+
+def test_cli_participant_can_disable_recommendation_validation(
+    monkeypatch, tmp_path: Path
+):
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, input=None):
+            return b"OK", b""
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "custom",
+            {
+                "type": "cli",
+                "command": "custom",
+                "args": [],
+                "require_recommendation": False,
+            },
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert result.ok is True
+    assert result.output == "OK"
+
+
+def test_cli_participant_ignores_success_stderr_banner(monkeypatch, tmp_path: Path):
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, input=None):
+            return b"RECOMMENDATION: yes - ok", b"tool banner on stderr"
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "codex",
+            {"type": "cli", "command": "codex", "args": []},
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert result.ok is True
+    assert result.error == ""
 
 
 def test_openrouter_empty_content_is_graceful(monkeypatch):
@@ -1197,6 +1362,36 @@ def test_write_transcript_uses_final_round_for_recommendations(tmp_path: Path):
     assert "Final-round successful responses: 2/2" in content
     assert "0 yes / 0 no / 2 tradeoff / 0 unknown" in content
     assert "Model Comparison" not in content
+
+
+def test_write_transcript_keeps_invalid_participant_output(tmp_path: Path):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "invalid.md"
+    json_path = out_dir / "invalid.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="test",
+        mode="quick",
+        current="codex",
+        participants=["claude"],
+        prompt="prompt",
+        results=[
+            ParticipantResult(
+                "claude",
+                False,
+                "I don't have access to ExitPlanMode.",
+                "InvalidParticipantResponse: missing required RECOMMENDATION label.",
+                1,
+            )
+        ],
+    )
+
+    content = md_path.read_text(encoding="utf-8")
+    assert "### claude (error)" in content
+    assert "InvalidParticipantResponse" in content
+    assert "Captured output:" in content
+    assert "I don't have access to ExitPlanMode." in content
 
 
 def test_transcripts_cli_limit_zero_and_relative_show(tmp_path: Path, capsys):
