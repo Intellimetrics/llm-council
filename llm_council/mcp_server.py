@@ -261,6 +261,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
     if not transcripts_root.is_absolute():
         transcripts_root = cwd / transcripts_root
     md_path, json_path = transcript_paths(transcripts_root, question)
+    sweep_old_inline_inputs(cwd)
     inline_staged = _stage_inline_images(arguments.get("images"), cwd, md_path.stem)
     image_path_inputs = list(arguments.get("image_paths") or []) + inline_staged
     image_manifest = (
@@ -420,6 +421,7 @@ def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
         estimate_slug = (
             "estimate-" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         )
+        sweep_old_inline_inputs(cwd)
         inline_staged = _stage_inline_images(
             arguments.get("images"), cwd, estimate_slug
         )
@@ -582,6 +584,47 @@ _MIME_TO_EXT = {
     "image/webp": ".webp",
     "image/gif": ".gif",
 }
+INLINE_INPUTS_RETENTION_DAYS = 7
+
+
+def sweep_old_inline_inputs(
+    cwd: Path, *, retention_days: int = INLINE_INPUTS_RETENTION_DAYS
+) -> int:
+    """Best-effort cleanup of staged inline-image directories older than
+    `retention_days`. Returns the number of directories removed.
+
+    Called opportunistically before staging new inputs, so a long-running
+    project doesn't accumulate gigabytes of screenshot artifacts. Failures
+    are swallowed: cleanup must never block a council run.
+    """
+
+    import shutil
+    import time
+
+    inputs_root = cwd / ".llm-council" / "inputs"
+    if not inputs_root.is_dir():
+        return 0
+    cutoff = time.time() - max(0, retention_days) * 86400
+    removed = 0
+    try:
+        candidates = list(inputs_root.iterdir())
+    except OSError:
+        return 0
+    for entry in candidates:
+        if not entry.is_dir():
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            continue
+        try:
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def _stage_inline_images(

@@ -31,10 +31,12 @@ from llm_council.context import (
     resolve_image_path,
 )
 from llm_council.mcp_server import (
+    INLINE_INPUTS_RETENTION_DAYS,
     _stage_inline_images,
     council_run_schema,
     estimate_schema,
     run_council,
+    sweep_old_inline_inputs,
 )
 
 
@@ -461,6 +463,40 @@ def test_stage_inline_images_rejects_invalid_base64(tmp_path: Path):
 def test_stage_inline_images_returns_empty_when_none(tmp_path: Path):
     assert _stage_inline_images(None, tmp_path, "run") == []
     assert _stage_inline_images([], tmp_path, "run") == []
+
+
+def test_sweep_old_inline_inputs_removes_dirs_past_retention(tmp_path: Path):
+    """Both reviewers flagged: .llm-council/inputs/ would grow unbounded
+    without a sweep. Confirm the helper removes old run dirs and keeps
+    fresh ones."""
+    import os
+    import time
+
+    inputs_root = tmp_path / ".llm-council" / "inputs"
+    inputs_root.mkdir(parents=True)
+    fresh = inputs_root / "fresh-run"
+    fresh.mkdir()
+    (fresh / "img.png").write_bytes(b"fresh")
+    stale = inputs_root / "stale-run"
+    stale.mkdir()
+    (stale / "img.png").write_bytes(b"stale")
+    # Backdate the stale dir to 30 days ago.
+    old_ts = time.time() - (30 * 86400)
+    os.utime(stale, (old_ts, old_ts))
+
+    removed = sweep_old_inline_inputs(tmp_path, retention_days=7)
+    assert removed == 1
+    assert fresh.exists()
+    assert not stale.exists()
+
+
+def test_sweep_old_inline_inputs_no_inputs_dir_is_noop(tmp_path: Path):
+    """No .llm-council/inputs/ directory yet → sweep is a noop returning 0."""
+    assert sweep_old_inline_inputs(tmp_path) == 0
+
+
+def test_inline_inputs_retention_default_is_seven_days():
+    assert INLINE_INPUTS_RETENTION_DAYS == 7
 
 
 def test_stage_inline_images_forces_extension_to_match_mime(tmp_path: Path):
