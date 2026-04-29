@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 - 2026-04-29
+
+- Add image passthrough to council: `council_run` and `estimate` accept `image_paths` (path-first) and inline `images: [{data, mime, name?}]` (sandboxed-host fallback). CLI grows a repeatable `--image PATH` flag. `build_prompt` emits a `## Images` section so CLI participants Read images from disk via their existing tools.
+- Add per-participant `vision: true` flag. OpenRouter adapter switches to multimodal content arrays and Ollama adapter populates `messages[].images` for vision-capable participants. Non-vision participants in a council with images present get the text manifest only and surface an `images_skipped` progress event.
+- Stage inline images under `.llm-council/inputs/<run-id>/` with 8 MB per-file and 32 MB total caps. Add `.llm-council/inputs/` to runtime and project gitignores. Force the staged extension to match the declared mime so downstream mime detection succeeds.
+- Make CLI participant timeouts graceful: actionable error message naming the participant, timeout, prompt size, and the config knob to turn; `participant_slow` watchdog event at 75% of timeout; `status="timeout"` distinct from `"error"`/`"skipped"`; transcript labels timed-out participants `(timeout)`; CLI summary calls out timeouts with the actionable hint and base-name dedupe; deliberation rounds skip timed-out participants cumulatively; `skipped_all_excluded` deliberation status preserved after a round has run.
+- Add temporary pinned-version Claude participants `claude_4_6` and `claude_4_7` and an `opus-versions` mode for head-to-head comparison. Setup wizard ships them under the native preset; routing keywords cover "with opus 4.6/4.7", "compare opus versions", and "opus 4.6 vs 4.7".
+
 ## 0.2.7 - 2026-04-28
 
 - Make built-in native modes ask Claude, Codex, and Gemini as explicit participants by default.
