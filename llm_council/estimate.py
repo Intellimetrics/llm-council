@@ -6,9 +6,16 @@ import math
 from pathlib import Path
 from typing import Any
 
-from llm_council.budget import ESTIMATED_CHARS_PER_TOKEN
+from llm_council.budget import (
+    ESTIMATED_CHARS_PER_TOKEN,
+    image_attachment_violations,
+)
 from llm_council.config import select_participants
-from llm_council.context import MAX_PROMPT_CHARS, build_prompt
+from llm_council.context import (
+    MAX_PROMPT_CHARS,
+    build_image_manifest,
+    build_prompt,
+)
 from llm_council.model_catalog import fetch_openrouter_models
 
 
@@ -45,6 +52,25 @@ def estimate_council(
         include=include,
         origin_policy=origin_policy,
     )
+    # Match the runtime image budget so an estimate that passes can't be
+    # rejected by the actual run.
+    image_manifest = (
+        build_image_manifest(
+            image_paths, cwd=cwd, allow_outside_cwd=allow_outside_cwd
+        )
+        if image_paths
+        else []
+    )
+    if image_manifest:
+        violations = image_attachment_violations(image_manifest)
+        if violations:
+            raise ValueError(
+                "Image attachment budget exceeded: "
+                + ", ".join(
+                    f"{v['limit']} {v.get('actual')} > {v.get('maximum')}"
+                    for v in violations
+                )
+            )
     prompt = build_prompt(
         question,
         mode=mode,
@@ -55,7 +81,7 @@ def estimate_council(
         allow_outside_cwd=allow_outside_cwd,
         max_prompt_chars=config.get("defaults", {}).get("max_prompt_chars")
         or MAX_PROMPT_CHARS,
-        image_paths=image_paths,
+        image_manifest=image_manifest or None,
     )
     mode_cfg = config.get("modes", {}).get(mode, {})
     deliberate = bool(deliberate or mode_cfg.get("deliberate"))

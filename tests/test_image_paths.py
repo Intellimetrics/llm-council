@@ -536,6 +536,38 @@ def test_council_run_schema_accepts_inline_images_field():
     assert "mime" in item["required"]
 
 
+def test_estimate_council_enforces_image_budget(tmp_path: Path):
+    """Regression for review point: estimate must reject the same image
+    sets the actual run will reject, so preflight is honest."""
+    from llm_council.estimate import estimate_council
+
+    big = tmp_path / "huge.png"
+    big.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * (DEFAULT_IMAGE_MAX_BYTES + 100))
+    config = {
+        "version": 1,
+        "defaults": {"mode": "single"},
+        "participants": {
+            "x": {
+                "type": "openrouter",
+                "model": "x/y",
+                "input_per_million": 1.0,
+                "output_per_million": 1.0,
+                "api_key_env": "OPENROUTER_API_KEY",
+            },
+        },
+        "modes": {"single": {"participants": ["x"]}},
+    }
+    with pytest.raises(ValueError, match="Image attachment budget exceeded"):
+        estimate_council(
+            config=config,
+            cwd=tmp_path,
+            question="describe",
+            mode="single",
+            current=None,
+            image_paths=[str(big)],
+        )
+
+
 def test_estimate_image_token_heuristic_only_charges_vision_participants(tmp_path: Path):
     """Vision-flagged participants get extra tokens; text-only ones don't."""
     from llm_council.estimate import IMAGE_TOKEN_HEURISTIC, estimate_council
