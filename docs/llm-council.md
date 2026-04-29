@@ -402,6 +402,62 @@ modes:
 `origin_policy: us` filters non-US participants. If the filter removes every
 participant, the run fails clearly.
 
+The temporary `opus-versions` mode runs `claude_4_6` and `claude_4_7`
+side-by-side for a head-to-head comparison of Opus 4.6 vs 4.7 on the same
+prompt. Both ship as part of the native preset and can also be added to other
+modes via `include: [claude_4_6]`.
+
+## Images
+
+Council can review screenshots and other UI artifacts. Pass `image_paths` (list
+of repo-relative paths) on `council_run`/`estimate` or via the CLI's repeatable
+`--image PATH` flag. Native CLI participants share the project filesystem and
+open staged images themselves with their file-read tool. Hosted participants
+need `vision: true` on their config; the OpenRouter adapter then sends a
+multimodal `content` array, and the Ollama adapter populates
+`messages[].images`. Non-vision participants in a council with images present
+get the textual `## Images` section only and the orchestrator emits an
+`images_skipped` progress event for them.
+
+For sandboxed hosts that cannot write to disk, `council_run` also accepts
+inline `images: [{data, mime, name?}]`. llm-council decodes them under
+`.llm-council/inputs/<run-id>/` before participants run, with hard caps of
+8 MB per file and 32 MB total enforced both pre-decode (base64 length
+heuristic) and post-decode (exact byte count). The same byte caps apply to
+`image_paths` via `image_attachment_violations` so an estimate that passes
+matches a run that passes. `.llm-council/inputs/` is gitignored by setup.
+Stale subdirectories older than `INLINE_INPUTS_RETENTION_DAYS` (default 7
+days) are pruned opportunistically before each new staging.
+
+Allowed mime types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`.
+`image/svg+xml` is refused.
+
+## Timeouts and slow warnings
+
+Each CLI participant has a per-config `timeout` (default 240s). When the
+deadline is hit, the participant returns an actionable error naming the
+participant, the timeout, the prompt size, and the config knob to raise:
+
+```
+Timeout: `claude` did not respond within 240s (prompt was 9342 chars). To
+raise the limit, set `participants.claude.timeout: <seconds>` in
+`.llm-council.yaml`. ...
+```
+
+Before the hard deadline, the orchestrator emits a `participant_slow`
+progress event at `slow_warn_after_seconds` (per-participant config) or, by
+default, `max(30.0, timeout * 0.75)`. The event is recorded in
+`metadata.progress_events` and rendered as `still running after Xs` in the
+CLI. The `participant_finish` event uses `status="timeout"` distinct from
+`"error"`/`"skipped"`. Transcripts label the participant section
+`(timeout)`, and the CLI run summary calls out timeouts with the same
+config-knob hint.
+
+In deliberation mode, participants that timed out (or hit `PromptTooLarge`)
+are excluded from subsequent rounds — cumulatively, so a participant that
+times out in round 1 stays excluded in round 3 even if round 2 ran
+successfully without them.
+
 ## MCP
 
 Generated `.mcp.json` sets:

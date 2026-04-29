@@ -87,6 +87,25 @@ using `uvx`, copying placeholder paths into `.mcp.json`, overwriting existing
 project instructions, silently accepting the wrong preset, skipping the
 instruction-file append step, or declaring success before `doctor` passes.
 
+## What's New
+
+- **Image passthrough.** Council can review UI screenshots, browser captures,
+  and other image artifacts. Stage them under `.llm-council/inputs/<slug>/`
+  and pass `image_paths` to `council_run` (or `--image` on the CLI). Native
+  CLI participants Read them from disk; vision-capable hosted models (set
+  `vision: true` on their participant config) get them as multimodal
+  attachments.
+- **Graceful CLI participant timeouts.** A participant that exceeds its
+  timeout returns an actionable error pointing at the config knob to raise,
+  emits a `participant_slow` heads-up event before the deadline, is shown
+  with a distinct `timeout` status in transcripts and CLI output, and is
+  cumulatively excluded from deliberation rounds so one slow model doesn't
+  burn another full timeout window.
+- **Compare Claude versions head-to-head.** The temporary `claude_4_6` and
+  `claude_4_7` participants pin specific Opus versions; the `opus-versions`
+  mode runs them as a pair for direct comparison. Trigger naturally with
+  "compare opus versions" or "with opus 4.6/4.7".
+
 ## After Install
 
 Restart your coding agent, then talk naturally:
