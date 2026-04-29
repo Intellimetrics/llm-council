@@ -367,6 +367,12 @@ async def run_participant(
 ) -> ParticipantResult:
     ptype = cfg.get("type")
     if ptype == "cli":
+        # CLI participants intentionally don't receive image_manifest at the
+        # adapter layer: they share the project filesystem with the host and
+        # open staged images themselves via the file paths listed in the
+        # ## Images prompt section. Adding `vision: true` to a CLI cfg
+        # therefore has no effect — the orchestrator's images_skipped check
+        # treats CLI as always image-aware (orchestrator.py).
         return await run_cli_participant(name, cfg, prompt, cwd)
     if ptype == "openrouter":
         return await run_openrouter_participant(

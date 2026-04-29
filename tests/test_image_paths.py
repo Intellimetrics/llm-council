@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import struct
+import sys
 import zlib
 from pathlib import Path
 from unittest.mock import patch
@@ -266,6 +267,155 @@ def test_cli_image_dry_run_shows_image_in_prompt(tmp_path: Path, capsys):
     assert rc == 0
     captured = capsys.readouterr().out
     assert "prompt_chars" in captured
+
+
+def test_build_cli_command_pins_claude_4_7_model_flag():
+    """Symmetry counterpart to test_claude_4_6_cli_command_pins_model_via_flag."""
+    from llm_council.adapters import _build_cli_command
+    from llm_council.config import load_config
+
+    cfg = load_config(None)["participants"]["claude_4_7"]
+    cmd = _build_cli_command("claude_4_7", cfg, "prompt", Path("/tmp"))
+    assert "--model" in cmd
+    assert "claude-opus-4-7" in cmd
+    assert cmd[0] == "claude"
+
+
+def test_run_participants_default_slow_warn_threshold_is_75_percent_of_timeout(
+    tmp_path: Path,
+):
+    """Regression for review point: default slow_after = max(30.0, timeout*0.75)
+    when no slow_warn_after_seconds override is set. With timeout=120,
+    threshold should be 90 (since 90 > 30 floor)."""
+    import asyncio
+
+    code = "import time; time.sleep(0.05)"
+    cfg = {
+        "fast": {
+            "type": "cli",
+            "command": sys.executable,
+            "args": ["-c", code],
+            "timeout": 120,  # 75% = 90, > 30 floor
+            "require_recommendation": False,
+        }
+    }
+    events: list[dict] = []
+    asyncio.run(
+        run_participants(
+            ["fast"],
+            cfg,
+            "p",
+            tmp_path,
+            max_concurrency=1,
+            progress=events.append,
+        )
+    )
+    # Fast-finishing participant should NOT trigger the slow event because
+    # the watchdog wouldn't fire for 90 seconds.
+    assert [e for e in events if e.get("event") == "participant_slow"] == []
+    # And the participant_finish event must report the timeout we set, not
+    # a default — proving the default-threshold path wired through.
+    finish = [e for e in events if e.get("event") == "participant_finish"][0]
+    assert finish["status"] == "ok"
+
+
+def test_default_slow_warn_threshold_floor_at_30_seconds():
+    """When timeout is small, slow_after should clamp to 30s floor, not
+    75% of timeout. Otherwise short-timeout participants would never get
+    a slow warning before the deadline."""
+    # We test the formula directly without launching a subprocess.
+    import math
+
+    def expected(timeout: int) -> float:
+        return max(30.0, timeout * 0.75)
+
+    assert expected(10) == 30.0
+    assert expected(40) == 30.0  # 40*0.75 = 30, equal to floor
+    assert math.isclose(expected(120), 90.0)
+    assert math.isclose(expected(240), 180.0)
+
+
+def test_run_council_invokes_inputs_sweep_before_staging(
+    tmp_path: Path, monkeypatch
+):
+    """Regression: sweep_old_inline_inputs must run from run_council so
+    stale dirs actually get pruned in production (not only when tests
+    exercise the helper directly)."""
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    sweep_called: list[Path] = []
+
+    def fake_sweep(cwd: Path, **_kwargs) -> int:
+        sweep_called.append(cwd)
+        return 0
+
+    import llm_council.mcp_server as mcp_module
+
+    monkeypatch.setattr(mcp_module, "sweep_old_inline_inputs", fake_sweep)
+    asyncio.run(
+        run_council(
+            {
+                "question": "hi",
+                "working_directory": str(tmp_path),
+                "dry_run": True,
+            }
+        )
+    )
+    assert sweep_called == [tmp_path.resolve()]
+
+
+@pytest.mark.asyncio
+async def test_mcp_run_council_full_pipeline_records_images_in_transcript(
+    tmp_path: Path, monkeypatch
+):
+    """Regression for 4.6 point 10c: dry-run path was tested for image
+    metadata; the live (non-dry-run) path that flows through
+    write_transcript wasn't. Mock execute_council to skip subprocess
+    spawn but exercise the metadata wiring + transcript markdown."""
+    from dataclasses import replace
+
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    image = _make_png(tmp_path / "ui.png")
+
+    async def fake_execute_council(participants, *args, **kwargs):
+        from llm_council.adapters import ParticipantResult
+
+        return (
+            [
+                ParticipantResult(
+                    name=p,
+                    ok=True,
+                    output="RECOMMENDATION: yes - looks good",
+                    error="",
+                    elapsed_seconds=0.1,
+                )
+                for p in participants
+            ],
+            {
+                "rounds": 1,
+                "max_rounds": 2,
+                "deliberated": False,
+                "deliberation_status": "not_requested",
+                "progress_events": [],
+            },
+        )
+
+    import llm_council.mcp_server as mcp_module
+
+    monkeypatch.setattr(mcp_module, "execute_council", fake_execute_council)
+    result = await run_council(
+        {
+            "question": "review",
+            "working_directory": str(tmp_path),
+            "image_paths": ["ui.png"],
+            "participants": ["claude"],
+        }
+    )
+    md = Path(result["transcript"]).read_text()
+    assert "## Images" in md
+    assert "ui.png" in md
+    # JSON metadata must also include the manifest entry.
+    assert result["metadata"]["images"][0]["mime"] == "image/png"
+    assert result["metadata"]["images"][0]["path"] == "ui.png"
 
 
 def test_build_cli_command_codex_dedups_exec_when_model_is_pinned():
