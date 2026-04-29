@@ -3,7 +3,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
 [![MCP](https://img.shields.io/badge/MCP-ready-2f855a)](docs/llm-council.md)
 [![Read Only](https://img.shields.io/badge/default-read--only-6b7280)](#safety)
-[![Version](https://img.shields.io/badge/version-0.3.0-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.3.1-111827)](CHANGELOG.md)
 
 Give your coding agent a council of other models.
 

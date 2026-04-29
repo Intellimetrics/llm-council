@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.1 - 2026-04-29
+
+Reviewer-driven follow-up. Two Claude council runs (4.6 and 4.7
+head-to-head against the 0.3.0 codebase) surfaced a handful of real
+issues; this release ships the verified ones.
+
+- Enforce image-attachment budget at estimate time so a passing preflight matches a passing run. `estimate_council` now builds the image manifest and runs `image_attachment_violations`, mirroring `run_council`.
+- Auto-generate the MCP `mode` schema description from `DEFAULT_CONFIG["modes"]` so new modes (e.g. `opus-versions`) can't fall off the schema as they did in 0.3.0.
+- Make the `## Images` prompt copy audience-agnostic: CLI subprocesses are told to open the file with their file-read tool; vision-capable hosted models are told to refer to the attachments by relative path.
+- Sweep stale `.llm-council/inputs/<run-id>/` directories before each new staging (default 7-day retention via `INLINE_INPUTS_RETENTION_DAYS`) so disk usage doesn't grow unbounded with screenshot-heavy councils.
+- Single-source `RECOMMENDATION_RE`: `deliberation.py` now re-exports the regex from `adapters.py` instead of carrying a byte-identical copy.
+- Promote the deliberation per-peer excerpt cap to a named constant `MAX_DELIBERATION_PEER_EXCERPT_CHARS = 20_000` and raise it from a magic 4 000 so a 3-peer second round actually uses the 80 000-char window.
+- Simplify `_build_cli_command`: collapse three identical model-flag branches into one default branch, isolate the Codex `exec -m` case, and lock the shape with regression tests.
+- Remove the unused sync `_build_user_content` helper from `adapters.py` (production uses the async variant).
+
 ## 0.3.0 - 2026-04-29
 
 - Add image passthrough to council: `council_run` and `estimate` accept `image_paths` (path-first) and inline `images: [{data, mime, name?}]` (sandboxed-host fallback). CLI grows a repeatable `--image PATH` flag. `build_prompt` emits a `## Images` section so CLI participants Read images from disk via their existing tools.
