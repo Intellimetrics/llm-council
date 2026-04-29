@@ -12,6 +12,9 @@ from llm_council.context import MAX_PROMPT_CHARS, build_prompt
 from llm_council.model_catalog import fetch_openrouter_models
 
 
+IMAGE_TOKEN_HEURISTIC = 1500
+
+
 def estimate_council(
     *,
     config: dict[str, Any],
@@ -31,6 +34,7 @@ def estimate_council(
     completion_tokens: int = 1500,
     openrouter_models: list[str] | None = None,
     use_cache: bool = True,
+    image_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """Return a best-effort preflight estimate for a council run."""
     participants = select_participants(
@@ -51,6 +55,7 @@ def estimate_council(
         allow_outside_cwd=allow_outside_cwd,
         max_prompt_chars=config.get("defaults", {}).get("max_prompt_chars")
         or MAX_PROMPT_CHARS,
+        image_paths=image_paths,
     )
     mode_cfg = config.get("modes", {}).get(mode, {})
     deliberate = bool(deliberate or mode_cfg.get("deliberate"))
@@ -82,12 +87,15 @@ def estimate_council(
         except Exception as exc:  # pragma: no cover - depends on network state
             catalog_error = str(exc)
 
+    image_count = len(image_paths or [])
+    image_token_overhead = image_count * IMAGE_TOKEN_HEURISTIC
     rows = [
         _estimate_participant_row(
             name=name,
             cfg=participant_cfg.get(name, {}),
             catalog_by_id=catalog_by_id,
-            prompt_tokens=prompt_tokens,
+            prompt_tokens=prompt_tokens
+            + (image_token_overhead if participant_cfg.get(name, {}).get("vision") else 0),
             completion_tokens=completion_tokens,
             rounds=budgeted_rounds,
         )
@@ -112,6 +120,13 @@ def estimate_council(
     unknown_cost_rows = [
         row["name"] for row in rows if row["estimated_total_cost_usd"] is None
     ]
+    notes = _estimate_notes(rows, catalog_error)
+    if image_paths:
+        notes.append(
+            f"Image attachments add a heuristic {IMAGE_TOKEN_HEURISTIC} input "
+            "tokens per image to vision-capable participants only; non-vision "
+            "participants see images as text references."
+        )
     return {
         "mode": mode,
         "current": current,
@@ -122,11 +137,12 @@ def estimate_council(
         "budgeted_rounds": budgeted_rounds,
         "deliberate": deliberate,
         "completion_tokens_assumed_each": completion_tokens,
+        "image_paths": list(image_paths or []),
         "known_total_usd": round(known_total, 6),
         "unknown_cost_rows": unknown_cost_rows,
         "catalog_error": catalog_error,
         "rows": rows,
-        "notes": _estimate_notes(rows, catalog_error),
+        "notes": notes,
     }
 
 

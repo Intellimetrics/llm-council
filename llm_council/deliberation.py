@@ -34,10 +34,13 @@ def first_nonempty_line(text: str) -> str:
 
 
 def model_comparison(results: list[ParticipantResult]) -> list[str]:
+    from llm_council.adapters import is_timeout_error
+
     lines: list[str] = []
     for result in results:
         if not result.ok:
-            lines.append(f"- {result.name}: error - {result.error}")
+            label = "timeout" if is_timeout_error(result.error) else "error"
+            lines.append(f"- {result.name}: {label} - {result.error}")
             continue
         usage = []
         if result.total_tokens is not None:

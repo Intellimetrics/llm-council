@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import re
 import shlex
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 import httpx
+
+from llm_council.context import IMAGE_MIME_ALLOWLIST
 
 
 RECOMMENDATION_RE = re.compile(
@@ -134,7 +137,7 @@ async def run_cli_participant(
             name=name,
             ok=False,
             output="",
-            error=f"TimeoutError: participant exceeded {timeout}s timeout",
+            error=_format_timeout_error(name, timeout, len(prompt)),
             elapsed_seconds=elapsed,
             command=redact_prompt_args(command, prompt),
             model=cfg.get("model"),
@@ -180,7 +183,11 @@ async def _cleanup_timed_out_process(
 
 
 async def run_openrouter_participant(
-    name: str, cfg: dict[str, Any], prompt: str
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    *,
+    image_manifest: list[dict[str, Any]] | None = None,
 ) -> ParticipantResult:
     start = time.monotonic()
     key_env = cfg.get("api_key_env", "OPENROUTER_API_KEY")
@@ -196,6 +203,7 @@ async def run_openrouter_participant(
             model=model,
         )
 
+    user_content = await _build_user_content_async(prompt, image_manifest, cfg)
     payload = {
         "model": model,
         "messages": [
@@ -203,7 +211,7 @@ async def run_openrouter_participant(
                 "role": "system",
                 "content": "You are a read-only coding council participant.",
             },
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": user_content},
         ],
         "usage": {"include": True},
     }
@@ -297,14 +305,24 @@ async def run_openrouter_participant(
 
 
 async def run_ollama_participant(
-    name: str, cfg: dict[str, Any], prompt: str
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    *,
+    image_manifest: list[dict[str, Any]] | None = None,
 ) -> ParticipantResult:
     start = time.monotonic()
     model = cfg.get("model")
     base_url = str(cfg.get("base_url") or "http://localhost:11434").rstrip("/")
+    user_message: dict[str, Any] = {"role": "user", "content": prompt}
+    if cfg.get("vision") and image_manifest:
+        user_message["images"] = [
+            await asyncio.to_thread(_read_image_base64, entry)
+            for entry in image_manifest
+        ]
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [user_message],
         "stream": False,
     }
     try:
@@ -339,15 +357,24 @@ async def run_ollama_participant(
 
 
 async def run_participant(
-    name: str, cfg: dict[str, Any], prompt: str, cwd: Path
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    cwd: Path,
+    *,
+    image_manifest: list[dict[str, Any]] | None = None,
 ) -> ParticipantResult:
     ptype = cfg.get("type")
     if ptype == "cli":
         return await run_cli_participant(name, cfg, prompt, cwd)
     if ptype == "openrouter":
-        return await run_openrouter_participant(name, cfg, prompt)
+        return await run_openrouter_participant(
+            name, cfg, prompt, image_manifest=image_manifest
+        )
     if ptype == "ollama":
-        return await run_ollama_participant(name, cfg, prompt)
+        return await run_ollama_participant(
+            name, cfg, prompt, image_manifest=image_manifest
+        )
     return ParticipantResult(
         name=name,
         ok=False,
@@ -402,17 +429,60 @@ async def run_participants(
     max_concurrency: int = 4,
     progress: Callable[[dict[str, Any]], None] | None = None,
     round_number: int = 1,
+    image_manifest: list[dict[str, Any]] | None = None,
 ) -> list[ParticipantResult]:
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
     async def run_one(name: str) -> ParticipantResult:
         async with semaphore:
-            if progress:
-                progress({"event": "participant_start", "participant": name, "round": round_number})
-            result = await run_participant(name, participant_cfg[name], prompt, cwd)
+            cfg = participant_cfg[name]
+            timeout = int(cfg.get("timeout") or 240)
+            override = cfg.get("slow_warn_after_seconds")
+            if override is not None:
+                slow_after = float(override)
+            else:
+                slow_after = max(30.0, timeout * 0.75)
+
+            slow_task = None
+            try:
+                if progress and slow_after < timeout:
+                    async def _emit_slow() -> None:
+                        try:
+                            await asyncio.sleep(slow_after)
+                        except asyncio.CancelledError:
+                            return
+                        progress(
+                            {
+                                "event": "participant_slow",
+                                "participant": name,
+                                "round": round_number,
+                                "elapsed_seconds": slow_after,
+                                "timeout_seconds": timeout,
+                            }
+                        )
+
+                    slow_task = asyncio.create_task(_emit_slow())
+                if progress:
+                    progress({"event": "participant_start", "participant": name, "round": round_number})
+                result = await run_participant(
+                    name,
+                    cfg,
+                    prompt,
+                    cwd,
+                    image_manifest=image_manifest,
+                )
+            finally:
+                if slow_task is not None and not slow_task.done():
+                    slow_task.cancel()
+                    try:
+                        await slow_task
+                    except asyncio.CancelledError:
+                        pass
             status = "ok" if result.ok else "error"
             if result.error.startswith("PromptTooLarge:"):
                 status = "skipped"
+            elif is_timeout_error(result.error):
+                status = "timeout"
             if progress:
                 progress(
                     {
@@ -497,6 +567,70 @@ def _first_output_excerpt(output: str, max_chars: int = 240) -> str:
     if len(cleaned) <= max_chars:
         return cleaned
     return cleaned[: max_chars - 3].rstrip() + "..."
+
+
+def _format_timeout_error(name: str, timeout: int, prompt_chars: int) -> str:
+    return (
+        f"Timeout: `{name}` did not respond within {timeout}s "
+        f"(prompt was {prompt_chars} chars). "
+        "To raise the limit, set `participants."
+        f"{name}.timeout: <seconds>` in `.llm-council.yaml`. "
+        "To skip this participant for one run, pass an explicit participant "
+        "list that omits it. To shorten the prompt, drop large `--context` "
+        "files or use `--diff` more selectively."
+    )
+
+
+def is_timeout_error(error: str) -> bool:
+    return error.startswith("Timeout:") or error.startswith("TimeoutError:")
+
+
+def _read_image_base64(entry: dict[str, Any]) -> str:
+    mime = entry.get("mime")
+    if mime not in IMAGE_MIME_ALLOWLIST:
+        raise ValueError(f"Image mime '{mime}' is not allowed for council attachments")
+    path = Path(entry.get("path") or entry.get("relative_path") or "")
+    if not path.exists():
+        raise ValueError(f"Image path does not exist: {path}")
+    return base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+def _build_user_content(
+    prompt: str,
+    image_manifest: list[dict[str, Any]] | None,
+    cfg: dict[str, Any],
+) -> Any:
+    if not (image_manifest and cfg.get("vision")):
+        return prompt
+    parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for entry in image_manifest:
+        b64 = _read_image_base64(entry)
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{entry['mime']};base64,{b64}"},
+            }
+        )
+    return parts
+
+
+async def _build_user_content_async(
+    prompt: str,
+    image_manifest: list[dict[str, Any]] | None,
+    cfg: dict[str, Any],
+) -> Any:
+    if not (image_manifest and cfg.get("vision")):
+        return prompt
+    parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for entry in image_manifest:
+        b64 = await asyncio.to_thread(_read_image_base64, entry)
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{entry['mime']};base64,{b64}"},
+            }
+        )
+    return parts
 
 
 def command_for_display(command: list[str] | None) -> str:

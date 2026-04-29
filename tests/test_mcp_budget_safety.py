@@ -209,6 +209,51 @@ participants:
 
 
 @pytest.mark.asyncio
+async def test_mcp_image_paths_outside_cwd_rejected(tmp_path: Path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(project))
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"not really a png")
+
+    with pytest.raises(ValueError, match="outside working directory"):
+        await run_council(
+            {
+                "question": "review the screenshot",
+                "working_directory": str(project),
+                "image_paths": [str(outside)],
+                "dry_run": True,
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_mcp_image_paths_present_does_not_break_budget_check(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    image = tmp_path / "ui.png"
+    image.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+        + b"\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4"
+        + b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    # dry_run still computes the prompt+budget; image references must flow
+    # through without tripping the prompt-size guard or path-resolution.
+    result = await run_council(
+        {
+            "question": "review",
+            "working_directory": str(tmp_path),
+            "image_paths": [str(image.relative_to(tmp_path))],
+            "dry_run": True,
+        }
+    )
+    assert result["prompt_chars"] > 0
+
+
+@pytest.mark.asyncio
 async def test_mcp_budget_rejects_paid_hosted_unknown_price(
     tmp_path: Path, monkeypatch
 ):

@@ -126,6 +126,11 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(f"Participant '{name}' must define model")
         _validate_positive_int(participant, "timeout", f"participant '{name}'")
         _validate_positive_int(participant, "max_prompt_chars", f"participant '{name}'")
+        _validate_positive_number(
+            participant, "slow_warn_after_seconds", f"participant '{name}'"
+        )
+        if "vision" in participant and not isinstance(participant["vision"], bool):
+            raise ValueError(f"Participant '{name}' vision must be a boolean")
 
     modes = config.get("modes")
     if not isinstance(modes, dict) or not modes:

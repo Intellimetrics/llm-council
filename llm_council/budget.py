@@ -12,6 +12,41 @@ from llm_council.model_catalog import _read_cache, openrouter_cache_path
 DEFAULT_MCP_MAX_PROMPT_CHARS = 80_000
 DEFAULT_MCP_MAX_ESTIMATED_COST_USD = 0.10
 ESTIMATED_CHARS_PER_TOKEN = 4
+DEFAULT_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+DEFAULT_IMAGE_TOTAL_MAX_BYTES = 32 * 1024 * 1024
+
+
+def image_attachment_violations(
+    manifest: list[dict[str, Any]],
+    *,
+    max_per_file: int = DEFAULT_IMAGE_MAX_BYTES,
+    max_total: int = DEFAULT_IMAGE_TOTAL_MAX_BYTES,
+) -> list[dict[str, Any]]:
+    """Return budget violations for staged image attachments before any encode."""
+
+    violations: list[dict[str, Any]] = []
+    total = 0
+    for entry in manifest:
+        size = int(entry.get("size") or 0)
+        total += size
+        if size > max_per_file:
+            violations.append(
+                {
+                    "limit": "image_max_bytes",
+                    "path": entry.get("relative_path") or entry.get("path"),
+                    "actual": size,
+                    "maximum": max_per_file,
+                }
+            )
+    if total > max_total:
+        violations.append(
+            {
+                "limit": "image_total_max_bytes",
+                "actual": total,
+                "maximum": max_total,
+            }
+        )
+    return violations
 
 
 def mcp_budget_report(

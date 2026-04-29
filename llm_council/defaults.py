@@ -38,6 +38,51 @@ DEFAULT_CONFIG: dict = {
             "stdin_prompt": True,
             "env_passthrough": ["ANTHROPIC_API_KEY"],
         },
+        # Temporary: pinned-version Claude participants for opt-in head-to-head
+        # review when the user wants a specific Opus version's perspective.
+        # Remove (or merge back into `claude`) once version-to-version drift is
+        # no longer interesting. Both reuse the host `claude` CLI; only the
+        # `--model` flag differs from the default `claude` participant.
+        "claude_4_6": {
+            "type": "cli",
+            "family": "claude",
+            "origin": "US / Anthropic",
+            "command": "claude",
+            "args": [
+                "-p",
+                "--permission-mode",
+                "default",
+                "--tools",
+                "Read,Grep,Glob,LS",
+                "--no-session-persistence",
+            ],
+            "model": "claude-opus-4-6",
+            "timeout": 240,
+            "max_prompt_chars": 120_000,
+            "read_only": True,
+            "stdin_prompt": True,
+            "env_passthrough": ["ANTHROPIC_API_KEY"],
+        },
+        "claude_4_7": {
+            "type": "cli",
+            "family": "claude",
+            "origin": "US / Anthropic",
+            "command": "claude",
+            "args": [
+                "-p",
+                "--permission-mode",
+                "default",
+                "--tools",
+                "Read,Grep,Glob,LS",
+                "--no-session-persistence",
+            ],
+            "model": "claude-opus-4-7",
+            "timeout": 240,
+            "max_prompt_chars": 120_000,
+            "read_only": True,
+            "stdin_prompt": True,
+            "env_passthrough": ["ANTHROPIC_API_KEY"],
+        },
         "codex": {
             "type": "cli",
             "family": "codex",
@@ -225,6 +270,12 @@ DEFAULT_CONFIG: dict = {
             "add": ["deepseek_v4_pro"],
             "deliberate": True,
             "description": "Expensive opt-in second round when first-round responses disagree.",
+        },
+        # Temporary: head-to-head review using both Opus versions. Remove or
+        # collapse once version drift between 4.6 and 4.7 is no longer notable.
+        "opus-versions": {
+            "participants": ["claude_4_6", "claude_4_7"],
+            "description": "Compare Claude Opus 4.6 vs 4.7 directly. Temporary; may be removed.",
         },
     },
 }

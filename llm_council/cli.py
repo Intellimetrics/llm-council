@@ -18,7 +18,8 @@ from llm_council.config import (
     parse_csv,
     select_participants,
 )
-from llm_council.context import MAX_PROMPT_CHARS, build_prompt
+from llm_council.budget import image_attachment_violations
+from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_prompt
 from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env
 from llm_council.estimate import estimate_council
@@ -58,9 +59,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--context", action="append", default=[], help="Context file")
     run.add_argument(
+        "--image",
+        action="append",
+        default=[],
+        help="Image file path (PNG/JPEG/WebP/GIF) for council to inspect; repeatable",
+    )
+    run.add_argument(
         "--allow-outside-cwd",
         action="store_true",
-        help="Allow --context files outside the working directory",
+        help="Allow --context and --image files outside the working directory",
     )
     run.add_argument("--diff", action="store_true", help="Include git diff")
     run.add_argument("--stdin", action="store_true", help="Append stdin as context")
@@ -172,9 +179,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     estimate.add_argument("--context", action="append", default=[], help="Context file")
     estimate.add_argument(
+        "--image",
+        action="append",
+        default=[],
+        help="Image file path (PNG/JPEG/WebP/GIF) for council to inspect; repeatable",
+    )
+    estimate.add_argument(
         "--allow-outside-cwd",
         action="store_true",
-        help="Allow --context files outside the working directory",
+        help="Allow --context and --image files outside the working directory",
     )
     estimate.add_argument("--diff", action="store_true", help="Include git diff")
     estimate.add_argument("--stdin", action="store_true", help="Append stdin as context")
@@ -699,6 +712,7 @@ def cmd_estimate(args: argparse.Namespace) -> int:
             completion_tokens=args.completion_tokens,
             openrouter_models=args.openrouter_model,
             use_cache=not args.no_cache,
+            image_paths=args.image or None,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -851,6 +865,15 @@ def _print_progress_event(event: dict) -> None:
     if kind == "participant_start":
         print(f"- {participant}: starting {round_label}", flush=True)
         return
+    if kind == "participant_slow":
+        elapsed = float(event.get("elapsed_seconds") or 0)
+        timeout = float(event.get("timeout_seconds") or 0)
+        print(
+            f"- {participant}: still running after {elapsed:.1f}s "
+            f"(hard timeout at {timeout:.0f}s)",
+            flush=True,
+        )
+        return
     if kind == "participant_finish":
         status = event.get("status") or ("ok" if event.get("ok") else "error")
         details = [f"{float(event.get('elapsed_seconds') or 0):.1f}s"]
@@ -861,6 +884,14 @@ def _print_progress_event(event: dict) -> None:
         print(f"- {participant}: {status} {round_label} ({'; '.join(details)})", flush=True)
         if event.get("error"):
             print(f"  {event['error']}", flush=True)
+        return
+    if kind == "deliberation_skip_participants":
+        skipped = ", ".join(event.get("skipped") or [])
+        print(
+            f"Deliberation: skipping {skipped} from round {event.get('round')} "
+            f"({event.get('reason')})",
+            flush=True,
+        )
         return
     if kind == "deliberation_pending":
         print(f"Deliberation: disagreement detected; starting round {event.get('round')}", flush=True)
@@ -873,6 +904,13 @@ def _print_progress_event(event: dict) -> None:
         return
     if kind == "deliberation_finish":
         print(f"Deliberation: {event.get('status')} after {event.get('rounds')} rounds", flush=True)
+        return
+    if kind == "images_skipped":
+        print(
+            f"- {participant}: image attachments skipped ({event.get('reason')}; "
+            f"{event.get('image_count')} image(s) referenced as text only)",
+            flush=True,
+        )
 
 
 def cmd_models(args: argparse.Namespace) -> int:
@@ -931,6 +969,23 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         raise SystemExit(str(exc)) from exc
     stdin_text = sys.stdin.read() if args.stdin else None
     try:
+        image_manifest = (
+            build_image_manifest(
+                args.image, cwd=cwd, allow_outside_cwd=args.allow_outside_cwd
+            )
+            if args.image
+            else []
+        )
+        if image_manifest:
+            violations = image_attachment_violations(image_manifest)
+            if violations:
+                raise ValueError(
+                    "Image attachment budget exceeded: "
+                    + ", ".join(
+                        f"{v['limit']} {v.get('actual')} > {v.get('maximum')}"
+                        for v in violations
+                    )
+                )
         prompt = build_prompt(
             question,
             mode=mode,
@@ -941,6 +996,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             allow_outside_cwd=args.allow_outside_cwd,
             max_prompt_chars=config.get("defaults", {}).get("max_prompt_chars")
             or MAX_PROMPT_CHARS,
+            image_manifest=image_manifest or None,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -979,7 +1035,18 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         deliberate=deliberate,
         max_rounds=max_rounds,
         progress=None if args.json else _print_progress_event,
+        image_manifest=image_manifest or None,
     )
+    if image_manifest:
+        metadata["images"] = [
+            {
+                "path": entry.get("relative_path") or entry.get("path"),
+                "mime": entry.get("mime"),
+                "size": entry.get("size"),
+                "sha256": entry.get("sha256"),
+            }
+            for entry in image_manifest
+        ]
 
     out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
     if not out_dir.is_absolute():
@@ -1022,12 +1089,20 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             )
         )
     else:
+        from llm_council.adapters import is_timeout_error
+
         ok = sum(1 for result in results if result.ok)
+        timed_out = [result for result in results if is_timeout_error(result.error)]
         print(f"Council complete: {ok}/{len(results)} participants succeeded")
         if metadata.get("deliberated"):
             print("Deliberation: second round ran after disagreement detection")
         for result in results:
-            status = "ok" if result.ok else "error"
+            if result.ok:
+                status = "ok"
+            elif is_timeout_error(result.error):
+                status = "timeout"
+            else:
+                status = "error"
             print(f"- {result.name}: {status} ({result.elapsed_seconds:.1f}s)")
             if transparent:
                 details = []
@@ -1039,6 +1114,14 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                     print(f"  {'; '.join(details)}")
             if not result.ok:
                 print(f"  {result.error}")
+        if timed_out:
+            names = ", ".join(
+                sorted({r.name.split(":round")[0] for r in timed_out})
+            )
+            print(
+                f"Note: {names} timed out. Increase `participants.<name>.timeout` "
+                "in `.llm-council.yaml` for slower models, or shorten the prompt."
+            )
         print(f"Transcript: {md_path}")
     return 0
 

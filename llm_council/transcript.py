@@ -8,7 +8,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from llm_council.adapters import ParticipantResult, command_for_display
+from llm_council.adapters import (
+    ParticipantResult,
+    command_for_display,
+    is_timeout_error,
+)
 from llm_council.deliberation import model_comparison, recommendation_counts
 
 ROUND_SUFFIX_RE = re.compile(r":round(\d+)$")
@@ -164,6 +168,18 @@ def write_transcript(
         "",
     ]
 
+    images = metadata.get("images") or []
+    if images:
+        lines.extend(["## Images", ""])
+        for entry in images:
+            label = entry.get("path") or "?"
+            mime = entry.get("mime") or "?"
+            size = entry.get("size")
+            sha = (entry.get("sha256") or "")[:12]
+            size_str = f"{size} bytes" if size is not None else "?"
+            lines.append(f"- `{label}` ({mime}, {size_str}, sha256:{sha})")
+        lines.append("")
+
     if transparent:
         lines.extend(["## Model Comparison", ""])
         lines.extend(model_comparison(results))
@@ -172,7 +188,12 @@ def write_transcript(
     lines.extend(["## Participant Responses", ""])
 
     for result in results:
-        status = "ok" if result.ok else "error"
+        if result.ok:
+            status = "ok"
+        elif is_timeout_error(result.error):
+            status = "timeout"
+        else:
+            status = "error"
         lines.extend(
             [
                 f"### {result.name} ({status})",

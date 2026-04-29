@@ -53,6 +53,33 @@ Routing rules:
 - Treat "with deepseek" as including `deepseek_v4_pro`.
 - Treat "with qwen" as including `qwen_coder_plus`.
 - Treat "with glm" as including `glm_5_1`.
+- Treat "with opus 4.6" or "with claude 4.6" as including `claude_4_6`.
+- Treat "with opus 4.7" or "with claude 4.7" as including `claude_4_7`.
+- Treat "compare opus versions", "opus 4.6 vs 4.7", or "both opus versions"
+  as `opus-versions` mode (head-to-head; temporary feature).
+
+Reviewing UI, screenshots, or browser state:
+- Council CLI participants share the project filesystem, so they can Read any
+  file you stage. Inline screenshot bytes that live only in this agent's
+  conversation context cannot be seen by council.
+- Before calling `council_run`, save each image to
+  `.llm-council/inputs/<short-slug>/<name>.png`. Use whatever capture tool
+  you already have (Playwright with an explicit `path:` arg, claude-in-chrome
+  `gif_creator`, or a `Bash`/`Write` step that decodes base64 from a prior
+  tool result).
+- Pass the relative paths in `image_paths` when calling `council_run`. CLI
+  participants will Read the file with their own tools; do not inline the
+  image into the question.
+- If your environment cannot write to disk, fall back to passing
+  `images: [{{ data: <base64>, mime: "image/png" }}]` in the `council_run`
+  call. llm-council stages those bytes under `.llm-council/inputs/<run-id>/`
+  before participants run. Per-image cap is 8 MB; total cap is 32 MB.
+- Hosted/local LLM participants see images only when their config has
+  `vision: true`; otherwise they get the text reference list and council
+  emits an `images_skipped` progress event for that participant.
+- Treat staged screenshots with the same care as `context_files`: redact or
+  omit screens that capture credentials, session tokens in URLs, or customer
+  data, and respect `DEPLOY_MODE=secret`.
 
 Use council for:
 - architecture or design decisions
@@ -95,6 +122,10 @@ def project_config(
     participant_names: set[str] = set()
     if include_native:
         participant_names.update({"claude", "codex", "gemini"})
+        # Temporary: ship pinned-version Claude variants so `opus-versions`
+        # mode is reachable without manual config edits. Remove when version
+        # drift no longer warrants direct comparison.
+        participant_names.update({"claude_4_6", "claude_4_7"})
     if include_openrouter:
         participant_names.update(OPENROUTER_PARTICIPANTS)
     if include_local:
@@ -121,7 +152,7 @@ def project_config(
         config["defaults"]["origin_policy"] = "us"
         modes.pop("us-only", None)
     if include_native:
-        for name in ("claude", "codex", "gemini"):
+        for name in ("claude", "codex", "gemini", "claude_4_6", "claude_4_7"):
             config["participants"][name] = DEFAULT_CONFIG["participants"][name]
     if include_openrouter:
         for name in OPENROUTER_PARTICIPANTS:
@@ -265,7 +296,7 @@ def write_setup_files(
 
     runtime_gitignore = root / ".llm-council" / ".gitignore"
     runtime_gitignore.parent.mkdir(parents=True, exist_ok=True)
-    desired_gitignore = "runs/\n*.log\n"
+    desired_gitignore = "runs/\ninputs/\n*.log\n"
     if (
         force
         or not runtime_gitignore.exists()
@@ -288,6 +319,7 @@ def _ensure_project_gitignore(path: Path) -> bool:
         "# LLM Council local machine config and runtime data",
         ".mcp.json",
         ".llm-council/runs/",
+        ".llm-council/inputs/",
         ".llm-council/*.log",
         ".llm-council.env",
     ]

@@ -4,20 +4,30 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 from llm_council import __version__
-from llm_council.budget import enforce_mcp_budget, mcp_budget_report
+from llm_council.budget import (
+    DEFAULT_IMAGE_MAX_BYTES,
+    DEFAULT_IMAGE_TOTAL_MAX_BYTES,
+    enforce_mcp_budget,
+    image_attachment_violations,
+    mcp_budget_report,
+)
+from llm_council.context import IMAGE_MIME_ALLOWLIST
 from llm_council.config import (
     detect_current_agent,
     find_config,
     load_config,
     select_participants,
 )
-from llm_council.context import MAX_PROMPT_CHARS, build_prompt
+from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_prompt
 from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env
 from llm_council.estimate import estimate_council
@@ -52,6 +62,28 @@ def council_run_schema() -> dict[str, Any]:
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Files to include as read-only context.",
+            },
+            "image_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Repo-relative paths to image files (PNG/JPEG/WebP/GIF) the host has staged for council review. CLI participants Read them with their own tools.",
+            },
+            "images": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "data": {"type": "string", "description": "Base64-encoded image bytes."},
+                        "mime": {
+                            "type": "string",
+                            "enum": sorted(IMAGE_MIME_ALLOWLIST),
+                        },
+                        "name": {"type": "string"},
+                    },
+                    "required": ["data", "mime"],
+                    "additionalProperties": False,
+                },
+                "description": "Inline base64 images. llm-council writes them under .llm-council/inputs/<run-id>/ before participants run. Use only when the host cannot stage to disk; image_paths is preferred.",
             },
             "include_diff": {"type": "boolean", "default": False},
             "working_directory": {"type": "string"},
@@ -132,6 +164,25 @@ def estimate_schema() -> dict[str, Any]:
                 "items": {"type": "string"},
                 "description": "Files to include as read-only context.",
             },
+            "image_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Repo-relative paths to image files (PNG/JPEG/WebP/GIF). Counted against prompt-size guard as text references only.",
+            },
+            "images": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "data": {"type": "string"},
+                        "mime": {"type": "string", "enum": sorted(IMAGE_MIME_ALLOWLIST)},
+                        "name": {"type": "string"},
+                    },
+                    "required": ["data", "mime"],
+                    "additionalProperties": False,
+                },
+                "description": "Inline base64 images. Estimate stages them to .llm-council/inputs/<run-id>/ before computing prompt size.",
+            },
             "include_diff": {"type": "boolean", "default": False},
             "working_directory": {"type": "string"},
             "deliberate": {"type": "boolean", "default": False},
@@ -200,6 +251,26 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         include=arguments.get("include"),
         origin_policy=arguments.get("origin_policy"),
     )
+    transcripts_root = Path(config.get("transcripts_dir", ".llm-council/runs"))
+    if not transcripts_root.is_absolute():
+        transcripts_root = cwd / transcripts_root
+    md_path, json_path = transcript_paths(transcripts_root, question)
+    inline_staged = _stage_inline_images(arguments.get("images"), cwd, md_path.stem)
+    image_path_inputs = list(arguments.get("image_paths") or []) + inline_staged
+    image_manifest = (
+        build_image_manifest(image_path_inputs, cwd=cwd, allow_outside_cwd=False)
+        if image_path_inputs
+        else []
+    )
+    image_violations = image_attachment_violations(image_manifest)
+    if image_violations:
+        raise ValueError(
+            "Image attachment budget exceeded: "
+            + ", ".join(
+                f"{item['limit']} {item.get('actual')} > {item.get('maximum')}"
+                for item in image_violations
+            )
+        )
     prompt = build_prompt(
         question,
         mode=mode,
@@ -210,6 +281,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         allow_outside_cwd=False,
         max_prompt_chars=config.get("defaults", {}).get("max_prompt_chars")
         or MAX_PROMPT_CHARS,
+        image_manifest=image_manifest or None,
     )
 
     mode_cfg = config.get("modes", {}).get(mode, {})
@@ -240,6 +312,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
             "deliberate": deliberate,
             "max_rounds": max_rounds,
             "budget": budget,
+            "images": [_public_image_entry(entry, cwd) for entry in image_manifest],
         }
 
     enforce_mcp_budget(budget)
@@ -252,11 +325,12 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         config,
         deliberate=deliberate,
         max_rounds=max_rounds,
+        image_manifest=image_manifest or None,
     )
-    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
-    if not out_dir.is_absolute():
-        out_dir = cwd / out_dir
-    md_path, json_path = transcript_paths(out_dir, question)
+    if image_manifest:
+        metadata["images"] = [
+            _public_image_entry(entry, cwd) for entry in image_manifest
+        ]
     write_transcript(
         md_path,
         json_path,
@@ -335,6 +409,15 @@ def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
             if arguments.get("completion_tokens") is None
             else int(arguments["completion_tokens"])
         )
+        from datetime import datetime
+
+        estimate_slug = (
+            "estimate-" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        )
+        inline_staged = _stage_inline_images(
+            arguments.get("images"), cwd, estimate_slug
+        )
+        image_path_inputs = list(arguments.get("image_paths") or []) + inline_staged
         estimate = estimate_council(
             config=config,
             cwd=cwd,
@@ -353,6 +436,7 @@ def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
             completion_tokens=completion_tokens,
             openrouter_models=arguments.get("openrouter_models") or [],
             use_cache=not bool(arguments.get("no_cache")),
+            image_paths=image_path_inputs or None,
         )
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -483,6 +567,94 @@ def main(argv: list[str] | None = None) -> int:
     parser.parse_args(argv or [])
     asyncio.run(_serve())
     return 0
+
+
+_INLINE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_MIME_TO_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+
+def _stage_inline_images(
+    images: list[dict[str, Any]] | None,
+    cwd: Path,
+    run_slug: str,
+) -> list[str]:
+    if not images:
+        return []
+    if not isinstance(images, list):
+        raise ValueError("images must be an array of {data, mime, name?} entries")
+    inputs_root = cwd / ".llm-council" / "inputs" / run_slug
+    inputs_root.mkdir(parents=True, exist_ok=True)
+    staged_relative: list[str] = []
+    total_bytes = 0
+    for index, entry in enumerate(images):
+        if not isinstance(entry, dict):
+            raise ValueError("images entry must be an object")
+        mime = entry.get("mime")
+        if mime not in IMAGE_MIME_ALLOWLIST:
+            raise ValueError(
+                f"Inline image #{index} mime '{mime}' is not allowed. "
+                f"Allowed: {', '.join(sorted(IMAGE_MIME_ALLOWLIST))}."
+            )
+        data = entry.get("data")
+        if not isinstance(data, str) or not data:
+            raise ValueError(f"Inline image #{index} missing base64 'data'")
+        # Cheap pre-decode size guard: base64 expands ~4/3.
+        approx_bytes = (len(data) * 3) // 4
+        if approx_bytes > DEFAULT_IMAGE_MAX_BYTES:
+            raise ValueError(
+                f"Inline image #{index} exceeds per-file budget before decode "
+                f"(~{approx_bytes} > {DEFAULT_IMAGE_MAX_BYTES})"
+            )
+        if total_bytes + approx_bytes > DEFAULT_IMAGE_TOTAL_MAX_BYTES:
+            raise ValueError(
+                "Inline images exceed total attachment budget before decode "
+                f"(~{total_bytes + approx_bytes} > {DEFAULT_IMAGE_TOTAL_MAX_BYTES})"
+            )
+        try:
+            decoded = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(f"Inline image #{index} base64 decode failed: {exc}") from exc
+        total_bytes += len(decoded)
+        if len(decoded) > DEFAULT_IMAGE_MAX_BYTES:
+            raise ValueError(
+                f"Inline image #{index} exceeds per-file budget after decode "
+                f"({len(decoded)} > {DEFAULT_IMAGE_MAX_BYTES})"
+            )
+        if total_bytes > DEFAULT_IMAGE_TOTAL_MAX_BYTES:
+            raise ValueError(
+                "Inline images exceed total attachment budget "
+                f"({total_bytes} > {DEFAULT_IMAGE_TOTAL_MAX_BYTES})"
+            )
+        ext = _MIME_TO_EXT.get(mime, "")
+        raw_name = entry.get("name") or f"img-{index:02d}{ext}"
+        safe_name = _INLINE_NAME_RE.sub("-", str(raw_name)).strip("-") or f"img-{index:02d}{ext}"
+        # Force the extension to match the declared mime so downstream
+        # mimetypes.guess_type matches what the host claimed.
+        if Path(safe_name).suffix.lower() != ext:
+            safe_name = Path(safe_name).stem + ext
+        target = inputs_root / safe_name
+        # Avoid path collisions if the host reuses names.
+        suffix = 0
+        while target.exists():
+            suffix += 1
+            target = inputs_root / f"{Path(safe_name).stem}-{suffix}{ext}"
+        target.write_bytes(decoded)
+        staged_relative.append(str(target.resolve().relative_to(cwd.resolve())))
+    return staged_relative
+
+
+def _public_image_entry(entry: dict[str, Any], cwd: Path) -> dict[str, Any]:
+    return {
+        "path": entry.get("relative_path") or entry.get("path"),
+        "mime": entry.get("mime"),
+        "size": entry.get("size"),
+        "sha256": entry.get("sha256"),
+    }
 
 
 def _resolve_working_directory(arguments: dict[str, Any]) -> Path:

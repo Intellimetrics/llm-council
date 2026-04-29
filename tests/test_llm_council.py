@@ -709,6 +709,337 @@ def test_execute_council_honors_max_rounds_above_two(monkeypatch, tmp_path: Path
     assert results[-1].name == "b:round3"
 
 
+def test_execute_council_skips_timed_out_participants_in_deliberation(
+    monkeypatch, tmp_path: Path
+):
+    """Round 2 should not re-run a participant that timed out in round 1."""
+    calls: list[list[str]] = []
+
+    async def fake_run_participants(selected, *args, **kwargs):
+        calls.append(list(selected))
+        if len(calls) == 1:
+            return [
+                ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+                ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1),
+                ParticipantResult(
+                    "c",
+                    False,
+                    "",
+                    "Timeout: `c` did not respond within 1s (prompt was 5 chars). ...",
+                    1,
+                ),
+            ]
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: tradeoff - ok", "", 1),
+            ParticipantResult("b", True, "RECOMMENDATION: tradeoff - ok", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    results, metadata = asyncio.run(
+        execute_council(
+            ["a", "b", "c"], {}, "question", tmp_path, {}, deliberate=True
+        )
+    )
+    # Round 1 ran all 3; round 2 ran only the two that didn't time out.
+    assert calls == [["a", "b", "c"], ["a", "b"]]
+    skip_event = next(
+        (
+            event
+            for event in metadata["progress_events"]
+            if event.get("event") == "deliberation_skip_participants"
+        ),
+        None,
+    )
+    assert skip_event is not None
+    assert skip_event["skipped"] == ["c"]
+
+
+def test_execute_council_does_not_reintroduce_timed_out_participant_in_round_3(
+    monkeypatch, tmp_path: Path
+):
+    """Regression for cumulative-exclusion bug. A participant that timed out in
+    round 1 must stay excluded across all subsequent rounds."""
+    calls: list[list[str]] = []
+
+    async def fake_run_participants(selected, *args, **kwargs):
+        calls.append(list(selected))
+        if len(calls) == 1:
+            return [
+                ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+                ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1),
+                ParticipantResult(
+                    "c",
+                    False,
+                    "",
+                    "Timeout: `c` did not respond within 1s ...",
+                    1,
+                ),
+            ]
+        # Every later round still has disagreement so the loop continues.
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+            ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    asyncio.run(
+        execute_council(
+            ["a", "b", "c"], {}, "q", tmp_path, {}, deliberate=True, max_rounds=3
+        )
+    )
+    # Round 1 ran [a, b, c]. Rounds 2 and 3 must NOT include c.
+    assert calls[0] == ["a", "b", "c"]
+    for round_call in calls[1:]:
+        assert "c" not in round_call
+
+
+def test_skipped_all_excluded_status_survives_after_a_round_ran(
+    monkeypatch, tmp_path: Path
+):
+    """Regression for Codex review point C: post-loop block must not overwrite
+    skipped_all_excluded when a deliberation round had already executed before
+    the abort. Force has_disagreement=True so the mid-loop branch is reachable."""
+    calls = 0
+
+    async def fake_run_participants(selected, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [
+                ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+                ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1),
+            ]
+        # Round 2: both time out, so on the next iteration cumulative_excluded
+        # covers all participants and the all-excluded branch fires.
+        return [
+            ParticipantResult("a", False, "", "Timeout: `a` ...", 1),
+            ParticipantResult("b", False, "", "Timeout: `b` ...", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    monkeypatch.setattr(orchestrator_module, "has_disagreement", lambda results: True)
+    _, metadata = asyncio.run(
+        execute_council(
+            ["a", "b"], {}, "q", tmp_path, {}, deliberate=True, max_rounds=3
+        )
+    )
+    # Round 1 and round 2 ran. Round 3 aborted with all-excluded.
+    assert calls == 2
+    assert metadata["rounds"] == 2
+    assert metadata["deliberated"] is True
+    # Bug would have flipped this to ran_max_rounds_unresolved.
+    assert metadata["deliberation_status"] == "skipped_all_excluded"
+
+
+def test_execute_council_aborts_deliberation_when_all_excluded(
+    monkeypatch, tmp_path: Path
+):
+    async def fake_run_participants(selected, *args, **kwargs):
+        return [
+            ParticipantResult(
+                "a",
+                False,
+                "",
+                "Timeout: `a` did not respond within 1s (prompt was 5 chars). ...",
+                1,
+            ),
+            ParticipantResult(
+                "b",
+                False,
+                "",
+                "PromptTooLarge: participant skipped before launch; ...",
+                1,
+            ),
+        ]
+
+    # Fabricate disagreement so deliberation would normally run.
+    monkeypatch.setattr(
+        orchestrator_module, "has_disagreement", lambda results: True
+    )
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(
+            ["a", "b"], {}, "question", tmp_path, {}, deliberate=True, max_rounds=2
+        )
+    )
+    assert metadata["deliberation_status"] == "skipped_all_excluded"
+
+
+def test_model_comparison_labels_timeout_distinctly():
+    from llm_council.deliberation import model_comparison
+
+    results = [
+        ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+        ParticipantResult(
+            "b",
+            False,
+            "",
+            "Timeout: `b` did not respond within 1s ...",
+            1,
+        ),
+        ParticipantResult("c", False, "", "OpenRouterEmptyResponse: missing", 1),
+    ]
+    lines = model_comparison(results)
+    assert any("b: timeout - " in line for line in lines)
+    assert any("c: error - " in line for line in lines)
+
+
+def test_cli_run_summary_dedupes_round_suffixed_timeout_names(tmp_path, capsys, monkeypatch):
+    """When the same participant times out in round 1 and round 2, the summary's
+    'Note: X timed out...' line should print the base name once, not 'b, b:round2'."""
+    from dataclasses import replace
+
+    timed = ParticipantResult(
+        name="b",
+        ok=False,
+        output="",
+        error="Timeout: `b` did not respond within 1s ...",
+        elapsed_seconds=1.0,
+    )
+    results = [
+        ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        timed,
+        replace(timed, name="b:round2"),
+    ]
+
+    async def fake_execute_council(*args, **kwargs):
+        return (
+            results,
+            {
+                "rounds": 2,
+                "deliberated": True,
+                "progress_events": [],
+                "deliberation_status": "ran_max_rounds_unresolved",
+            },
+        )
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    rc = main(["run", "--cwd", str(tmp_path), "--current", "claude", "x"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Summary line uses base name only, not 'b:round2'.
+    assert "Note: b timed out." in out
+    assert "b:round2" not in out.split("Note:")[1]
+
+
+def test_validate_config_rejects_negative_slow_warn_after_seconds():
+    from llm_council.config import validate_config
+
+    bad = {
+        "version": 1,
+        "participants": {
+            "x": {
+                "type": "cli",
+                "command": "echo",
+                "slow_warn_after_seconds": -1,
+            }
+        },
+        "modes": {"only": {"participants": ["x"]}},
+        "defaults": {"mode": "only"},
+    }
+    try:
+        validate_config(bad)
+    except ValueError as exc:
+        assert "slow_warn_after_seconds" in str(exc)
+    else:
+        raise AssertionError("expected validate_config to reject negative slow_warn_after_seconds")
+
+
+def test_default_config_ships_pinned_opus_version_participants():
+    """Temporary feature: claude_4_6 and claude_4_7 are pinned-model variants."""
+    config = load_config(None)
+    participants = config["participants"]
+    assert participants["claude_4_6"]["model"] == "claude-opus-4-6"
+    assert participants["claude_4_6"]["family"] == "claude"
+    assert participants["claude_4_7"]["model"] == "claude-opus-4-7"
+    assert participants["claude_4_7"]["family"] == "claude"
+
+
+def test_opus_versions_mode_resolves_to_both_pinned_participants():
+    config = load_config(None)
+    selected = select_participants(config, "opus-versions", current=None)
+    assert selected == ["claude_4_6", "claude_4_7"]
+
+
+def test_claude_4_6_cli_command_pins_model_via_flag():
+    """Regression: family=claude must add --model <id> when model is set."""
+    from llm_council.adapters import _build_cli_command
+
+    cfg = load_config(None)["participants"]["claude_4_6"]
+    cmd = _build_cli_command("claude_4_6", cfg, "prompt", Path("/tmp"))
+    assert "--model" in cmd
+    assert "claude-opus-4-6" in cmd
+    assert cmd[0] == "claude"
+
+
+def test_quick_mode_can_include_pinned_opus_variant_via_include():
+    config = load_config(None)
+    selected = select_participants(
+        config, "quick", current="claude", include=["claude_4_6"]
+    )
+    assert "claude_4_6" in selected
+    assert {"claude", "codex", "gemini"}.issubset(set(selected))
+
+
+def test_setup_wizard_writes_pinned_opus_participants_under_native_preset():
+    """Ensure `setup --preset tri-cli` produces a config that lets
+    `opus-versions` mode resolve."""
+    cfg = project_config(include_native=True, include_openrouter=False, include_local=False)
+    assert "claude_4_6" in cfg["participants"]
+    assert "claude_4_7" in cfg["participants"]
+    assert "opus-versions" in cfg["modes"]
+    assert cfg["modes"]["opus-versions"]["participants"] == [
+        "claude_4_6",
+        "claude_4_7",
+    ]
+
+
+def test_validate_config_accepts_float_slow_warn_after_seconds():
+    from llm_council.config import validate_config
+
+    ok = {
+        "version": 1,
+        "participants": {
+            "x": {
+                "type": "cli",
+                "command": "echo",
+                "slow_warn_after_seconds": 0.5,
+            }
+        },
+        "modes": {"only": {"participants": ["x"]}},
+        "defaults": {"mode": "only"},
+    }
+    validate_config(ok)  # must not raise
+
+
+def test_transcript_marks_timed_out_participant_distinctly(tmp_path: Path):
+    """Markdown should label timeouts as 'timeout', not 'error'."""
+    md = tmp_path / "out.md"
+    js = tmp_path / "out.json"
+    write_transcript(
+        md,
+        js,
+        question="x",
+        mode="quick",
+        current="claude",
+        participants=["claude"],
+        prompt="prompt",
+        results=[
+            ParticipantResult(
+                "claude",
+                False,
+                "",
+                "Timeout: `claude` did not respond within 240s (prompt was 100 chars). "
+                "Set `participants.claude.timeout: <seconds>` in `.llm-council.yaml`.",
+                240.5,
+            )
+        ],
+    )
+    text = md.read_text()
+    assert "### claude (timeout)" in text
+    assert "(error)" not in text  # Must not regress to error label.
+
+
 def test_openrouter_model_normalization():
     model = normalize_openrouter_model(
         {
@@ -1005,8 +1336,14 @@ def test_example_config_loads_exact_modes():
 def test_tri_cli_setup_loaded_config_does_not_restore_defaults(tmp_path: Path):
     write_setup_files(tmp_path, include_openrouter=False, include_local=False)
     config = load_config(tmp_path / ".llm-council.yaml")
-    assert set(config["participants"]) == {"claude", "codex", "gemini"}
-    assert set(config["modes"]) == {"quick", "peer-only", "us-only"}
+    assert set(config["participants"]) == {
+        "claude",
+        "codex",
+        "gemini",
+        "claude_4_6",
+        "claude_4_7",
+    }
+    assert set(config["modes"]) == {"quick", "peer-only", "us-only", "opus-versions"}
 
 
 def test_setup_interactive_uses_preset_and_suppression_flags(
@@ -1026,7 +1363,13 @@ def test_setup_interactive_uses_preset_and_suppression_flags(
     assert cmd_setup(args) == 0
 
     config = yaml.safe_load((tmp_path / ".llm-council.yaml").read_text())
-    assert set(config["participants"]) == {"claude", "codex", "gemini"}
+    assert set(config["participants"]) == {
+        "claude",
+        "codex",
+        "gemini",
+        "claude_4_6",
+        "claude_4_7",
+    }
     assert config["defaults"]["origin_policy"] == "us"
     assert not (tmp_path / ".mcp.json").exists()
     assert not (tmp_path / ".llm-council" / "instructions").exists()
@@ -1045,8 +1388,14 @@ def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path):
     assert cmd_setup(args) == 0
 
     config = yaml.safe_load((tmp_path / ".llm-council.yaml").read_text())
-    assert set(config["participants"]) == {"claude", "codex", "gemini"}
-    assert set(config["modes"]) == {"quick", "peer-only"}
+    assert set(config["participants"]) == {
+        "claude",
+        "codex",
+        "gemini",
+        "claude_4_6",
+        "claude_4_7",
+    }
+    assert set(config["modes"]) == {"quick", "peer-only", "opus-versions"}
     assert config["defaults"]["origin_policy"] == "us"
     assert not (tmp_path / ".mcp.json").exists()
     assert not (tmp_path / ".llm-council" / "instructions").exists()
@@ -1066,8 +1415,14 @@ def test_setup_yes_auto_selects_tri_cli_when_native_clis_exist(
     assert cmd_setup(args) == 0
 
     config = load_config(tmp_path / ".llm-council.yaml")
-    assert set(config["participants"]) == {"claude", "codex", "gemini"}
-    assert set(config["modes"]) == {"quick", "peer-only", "us-only"}
+    assert set(config["participants"]) == {
+        "claude",
+        "codex",
+        "gemini",
+        "claude_4_6",
+        "claude_4_7",
+    }
+    assert set(config["modes"]) == {"quick", "peer-only", "us-only", "opus-versions"}
     assert "Auto preset selected: tri-cli" in capsys.readouterr().out
 
 
