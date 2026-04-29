@@ -62,15 +62,16 @@ def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -
     family = cfg.get("family", name)
     if model:
         if family == "codex":
+            # Codex's exec subcommand takes the model via `-m`; the default
+            # args list starts with `exec` so we drop the duplicate when we
+            # synthesize `exec -m <model>`. If a custom config drops `exec`,
+            # we still emit the canonical pair, no double-`exec`.
             command.extend(["exec", "-m", str(model)])
-            # If args already start with exec, remove duplicate below.
             if args and args[0] == "exec":
                 args = args[1:]
-        elif family == "claude":
-            command.extend(["--model", str(model)])
-        elif family == "gemini":
-            command.extend(["--model", str(model)])
         else:
+            # claude, gemini, and any other family use the standard
+            # `--model <id>` flag.
             command.extend(["--model", str(model)])
 
     return command + args

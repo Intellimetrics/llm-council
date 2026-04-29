@@ -268,6 +268,42 @@ def test_cli_image_dry_run_shows_image_in_prompt(tmp_path: Path, capsys):
     assert "prompt_chars" in captured
 
 
+def test_build_cli_command_codex_dedups_exec_when_model_is_pinned():
+    """Regression for review point 8: Codex's exec subcommand needs
+    `-m <model>` and we must not emit `exec exec` when the default args
+    list already starts with `exec`."""
+    from llm_council.adapters import _build_cli_command
+
+    cfg = {
+        "command": "codex",
+        "family": "codex",
+        "args": ["exec", "--sandbox", "read-only", "-"],
+        "model": "gpt-5.1",
+    }
+    cmd = _build_cli_command("codex", cfg, "p", Path("/tmp"))
+    # Exactly one `exec` token and exactly one `-m gpt-5.1` pair.
+    assert cmd.count("exec") == 1
+    assert "-m" in cmd
+    assert cmd[cmd.index("-m") + 1] == "gpt-5.1"
+
+
+def test_build_cli_command_codex_without_exec_in_args_still_emits_canonical_pair():
+    """If a future config drops `exec` from default args, the synthesized
+    `exec -m <model>` still produces a valid command (no double-exec, no
+    missing exec)."""
+    from llm_council.adapters import _build_cli_command
+
+    cfg = {
+        "command": "codex",
+        "family": "codex",
+        "args": ["--sandbox", "read-only", "-"],
+        "model": "gpt-5.1",
+    }
+    cmd = _build_cli_command("codex", cfg, "p", Path("/tmp"))
+    assert cmd.count("exec") == 1
+    assert cmd[1:4] == ["exec", "-m", "gpt-5.1"]
+
+
 def test_image_mime_allowlist_covers_common_image_types():
     assert {"image/png", "image/jpeg", "image/webp", "image/gif"} <= IMAGE_MIME_ALLOWLIST
     assert "image/svg+xml" not in IMAGE_MIME_ALLOWLIST
