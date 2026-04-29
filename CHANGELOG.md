@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 - 2026-04-29
+
+Closes documentation and test-coverage gaps from the 0.3.1 review pass.
+
+- README now has a "What's New" section covering image passthrough, graceful timeouts, and the temporary Opus version variants. `docs/llm-council.md` gains "Images" and "Timeouts and slow warnings" sections plus an explicit mention of `opus-versions` in the Modes section.
+- Add a code comment in `run_participant` explaining that the CLI branch intentionally drops `image_manifest`: CLI subprocesses Read staged images from disk via the `## Images` prompt section, so `vision: true` on a CLI participant has no effect.
+- Add tests for: `claude_4_7` model-flag pin (symmetry with the existing `claude_4_6` test), the default 75% slow-warn threshold formula and its 30s floor, `sweep_old_inline_inputs` actually being invoked from `run_council`, and a non-dry-run MCP `run_council` that records the image manifest into both transcript markdown and JSON metadata.
+
 ## 0.3.1 - 2026-04-29
 
 Reviewer-driven follow-up. Two Claude council runs (4.6 and 4.7
