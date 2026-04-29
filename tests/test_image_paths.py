@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from llm_council.adapters import (
-    _build_user_content,
+    _build_user_content_async,
     _read_image_base64,
     run_participants,
 )
@@ -263,22 +263,26 @@ def test_image_mime_allowlist_covers_common_image_types():
 def test_build_user_content_returns_string_when_no_vision(tmp_path: Path):
     image = _make_png(tmp_path / "ui.png")
     manifest = build_image_manifest([str(image)], cwd=tmp_path)
-    content = _build_user_content("hello", manifest, {"vision": False})
+    content = asyncio.run(
+        _build_user_content_async("hello", manifest, {"vision": False})
+    )
     assert content == "hello"
 
 
 def test_build_user_content_returns_multimodal_array_for_vision(tmp_path: Path):
     image = _make_png(tmp_path / "ui.png")
     manifest = build_image_manifest([str(image)], cwd=tmp_path)
-    content = _build_user_content("hello", manifest, {"vision": True})
+    content = asyncio.run(
+        _build_user_content_async("hello", manifest, {"vision": True})
+    )
     assert isinstance(content, list)
     assert content[0] == {"type": "text", "text": "hello"}
     assert content[1]["type"] == "image_url"
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
-def test_build_user_content_no_manifest_returns_string(tmp_path: Path):
-    content = _build_user_content("hello", None, {"vision": True})
+def test_build_user_content_no_manifest_returns_string():
+    content = asyncio.run(_build_user_content_async("hello", None, {"vision": True}))
     assert content == "hello"
 
 

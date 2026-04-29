@@ -595,25 +595,6 @@ def _read_image_base64(entry: dict[str, Any]) -> str:
     return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
-def _build_user_content(
-    prompt: str,
-    image_manifest: list[dict[str, Any]] | None,
-    cfg: dict[str, Any],
-) -> Any:
-    if not (image_manifest and cfg.get("vision")):
-        return prompt
-    parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for entry in image_manifest:
-        b64 = _read_image_base64(entry)
-        parts.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{entry['mime']};base64,{b64}"},
-            }
-        )
-    return parts
-
-
 async def _build_user_content_async(
     prompt: str,
     image_manifest: list[dict[str, Any]] | None,

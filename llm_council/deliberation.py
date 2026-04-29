@@ -2,27 +2,9 @@
 
 from __future__ import annotations
 
-import re
-
-from llm_council.adapters import ParticipantResult
+from llm_council.adapters import RECOMMENDATION_RE, ParticipantResult
 
 MAX_DELIBERATION_PROMPT_CHARS = 80_000
-RECOMMENDATION_RE = re.compile(
-    r"""
-    ^\s*
-    (?:>\s*)?
-    (?:[-*]\s+)?
-    (?:\#{1,6}\s*)?
-    (?:\*\*)?
-    recommendation
-    (?:\*\*)?
-    \s*[:\-]\s*
-    (?:\*\*)?
-    \s*
-    (yes|no|tradeoff)\b
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
 
 
 def first_nonempty_line(text: str) -> str:
