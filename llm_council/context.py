@@ -122,9 +122,11 @@ def render_image_section(manifest: list[dict[str, Any]]) -> str:
         "## Images",
         "",
         (
-            "The host has staged the following images for council review. CLI "
-            "participants: open these paths with your Read tool to inspect "
-            "them. Refer to them by their relative path in your response."
+            "The host has staged the following images for council review. "
+            "If you are running as a CLI subprocess on the project filesystem, "
+            "open these paths with your file-read tool. If you received the "
+            "same images attached to this message (vision-capable hosted "
+            "models), refer to them by their relative path in your response."
         ),
         "",
     ]

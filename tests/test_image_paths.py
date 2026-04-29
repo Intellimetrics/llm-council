@@ -173,7 +173,10 @@ def test_build_prompt_includes_image_section(tmp_path: Path):
     )
     assert "## Images" in prompt
     assert "screenshot.png" in prompt
-    assert "Read tool" in prompt
+    # Audience-agnostic copy: CLI participants and vision-capable hosted
+    # participants both see the same section.
+    assert "file-read tool" in prompt
+    assert "vision-capable" in prompt
 
 
 def test_build_prompt_text_only_when_no_images(tmp_path: Path):
