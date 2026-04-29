@@ -21,6 +21,7 @@ from llm_council.budget import (
     mcp_budget_report,
 )
 from llm_council.context import IMAGE_MIME_ALLOWLIST
+from llm_council.defaults import DEFAULT_CONFIG
 from llm_council.config import (
     detect_current_agent,
     find_config,
@@ -38,6 +39,11 @@ from llm_council.transcript import latest_transcript, transcript_paths, write_tr
 from llm_council.update_check import check_for_update
 
 
+def _mode_description() -> str:
+    names = ", ".join(sorted(DEFAULT_CONFIG["modes"]))
+    return f"Council mode. Built-in choices: {names}."
+
+
 def council_run_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -45,7 +51,7 @@ def council_run_schema() -> dict[str, Any]:
             "question": {"type": "string", "minLength": 1},
             "mode": {
                 "type": "string",
-                "description": "Council mode such as quick, peer-only, plan, review, diverse, review-cheap, private-local.",
+                "description": _mode_description(),
             },
             "current": {"type": "string", "enum": ["claude", "codex", "gemini"]},
             "participants": {
@@ -146,7 +152,7 @@ def estimate_schema() -> dict[str, Any]:
             "question": {"type": "string", "minLength": 1},
             "mode": {
                 "type": "string",
-                "description": "Council mode such as quick, peer-only, plan, review, diverse, review-cheap, private-local.",
+                "description": _mode_description(),
             },
             "current": {"type": "string", "enum": ["claude", "codex", "gemini"]},
             "participants": {

@@ -73,6 +73,19 @@ def test_estimate_schema_accepts_image_paths():
     assert "image_paths" in schema["properties"]
 
 
+def test_schema_mode_description_lists_all_built_in_modes():
+    """Regression: mode description must include every DEFAULT_CONFIG mode so
+    new modes don't fall off (4.7 caught opus-versions missing from the
+    hardcoded list)."""
+    from llm_council.defaults import DEFAULT_CONFIG
+
+    desc_run = council_run_schema()["properties"]["mode"]["description"]
+    desc_estimate = estimate_schema()["properties"]["mode"]["description"]
+    for name in DEFAULT_CONFIG["modes"]:
+        assert name in desc_run, f"mode '{name}' missing from council_run schema description"
+        assert name in desc_estimate, f"mode '{name}' missing from estimate schema description"
+
+
 def test_resolve_image_path_returns_mime_and_size(tmp_path: Path):
     image = _make_png(tmp_path / "ui.png")
     resolved, mime, size = resolve_image_path(image, cwd=tmp_path)
