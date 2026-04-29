@@ -5,6 +5,11 @@ from __future__ import annotations
 from llm_council.adapters import RECOMMENDATION_RE, ParticipantResult
 
 MAX_DELIBERATION_PROMPT_CHARS = 80_000
+# Per-peer excerpt cap for deliberation rounds. Sized so a 3-peer council
+# fits inside MAX_DELIBERATION_PROMPT_CHARS even with the original prompt
+# and instructional preamble; raise if peer responses are getting cut off
+# in the second round.
+MAX_DELIBERATION_PEER_EXCERPT_CHARS = 20_000
 
 
 def first_nonempty_line(text: str) -> str:
@@ -90,7 +95,10 @@ def build_deliberation_prompt(original_prompt: str, results: list[ParticipantRes
     for result in results:
         if not result.ok:
             continue
-        excerpts.append(f"## {result.name}\n\n{result.output.strip()[:4000]}")
+        excerpts.append(
+            f"## {result.name}\n\n"
+            f"{result.output.strip()[:MAX_DELIBERATION_PEER_EXCERPT_CHARS]}"
+        )
     prompt = (
         f"{original_prompt}\n\n"
         "Second-round deliberation:\n"
