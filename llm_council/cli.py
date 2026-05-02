@@ -110,6 +110,18 @@ def build_parser() -> argparse.ArgumentParser:
             "transcript whose summary should be prepended to the new prompt."
         ),
     )
+    run.add_argument(
+        "--chunk-strategy",
+        dest="chunk_strategy",
+        choices=["fail", "head", "tail", "hash-aware"],
+        default="fail",
+        help=(
+            "How to handle a diff that pushes the prompt over max_prompt_chars. "
+            "Default `fail` preserves fail-fast behavior. `head`/`tail` keep "
+            "the first/last bytes that fit. `hash-aware` drops lower-relevance "
+            "files (per-file `diff --git` blocks) until the prompt fits."
+        ),
+    )
 
     sub.add_parser("list", help="List participants and modes")
     init = sub.add_parser("init", help="Write an example project config")
@@ -1076,6 +1088,23 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                         for v in violations
                     )
                 )
+        chunk_events: list[dict] = []
+
+        def _record_chunk_event(event: dict) -> None:
+            chunk_events.append(event)
+            dropped_files = event.get("dropped_files") or []
+            file_note = (
+                f"; dropped files: {', '.join(dropped_files)}" if dropped_files else ""
+            )
+            print(
+                f"warning: diff chunking applied (strategy={event.get('strategy')}, "
+                f"original={event.get('original_chars')} chars, "
+                f"chunked={event.get('chunked_chars')} chars, "
+                f"dropped={event.get('dropped_chars')} chars{file_note})",
+                file=sys.stderr,
+                flush=True,
+            )
+
         prompt = build_prompt(
             question,
             mode=mode,
@@ -1088,6 +1117,8 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             or MAX_PROMPT_CHARS,
             image_manifest=image_manifest or None,
             prior_context=prior_context,
+            chunk_strategy=getattr(args, "chunk_strategy", "fail"),
+            chunk_progress=_record_chunk_event,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -1146,6 +1177,18 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             }
             for entry in image_manifest
         ]
+    if chunk_events:
+        latest = chunk_events[-1]
+        metadata["diff_chunking"] = {
+            "strategy": latest.get("strategy"),
+            "original_chars": latest.get("original_chars"),
+            "chunked_chars": latest.get("chunked_chars"),
+            "dropped_chars": latest.get("dropped_chars"),
+            "dropped_files": list(latest.get("dropped_files") or []),
+        }
+        progress_events = metadata.setdefault("progress_events", [])
+        if isinstance(progress_events, list):
+            progress_events.append(latest)
 
     md_path, json_path = transcript_paths(out_dir, question)
     write_transcript(

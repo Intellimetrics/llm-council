@@ -5602,3 +5602,327 @@ def test_validate_config_rejects_out_of_range_convergence_thresholds(tmp_path: P
     with pytest.raises(ValueError, match="between 0.0 and 1.0"):
         load_config(cfg_path)
 
+
+# --- diff_chunking ---------------------------------------------------------
+
+
+from llm_council.diff_chunking import chunk_diff
+
+
+def _git_init_with_large_diff(
+    tmp_path: Path, *, files: dict[str, tuple[str, str]]
+) -> None:
+    """Initialize a git repo and stage edits across multiple files.
+
+    ``files`` maps relative path to (initial content, modified content).
+    """
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "test"], cwd=tmp_path, check=True
+    )
+    for relpath, (initial, _modified) in files.items():
+        path = tmp_path / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(initial, encoding="utf-8")
+        subprocess.run(["git", "add", relpath], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True)
+    for relpath, (_initial, modified) in files.items():
+        (tmp_path / relpath).write_text(modified, encoding="utf-8")
+        subprocess.run(["git", "add", relpath], cwd=tmp_path, check=True)
+
+
+def test_chunk_diff_head_truncates_and_marks(tmp_path: Path):
+    big = "diff --git a/big.py b/big.py\n--- a/big.py\n+++ b/big.py\n" + (
+        "+x\n" * 5_000
+    )
+    result = chunk_diff(big, strategy="head", budget=400, question="any")
+    assert result.triggered
+    assert result.chunked_chars <= 400
+    assert "[diff truncated after head: dropped" in result.text
+    assert result.dropped_chars == result.original_chars - len(
+        result.text.split("\n[diff truncated")[0]
+    ) or result.dropped_chars > 0
+    # Beginning preserved.
+    assert result.text.startswith("diff --git a/big.py b/big.py")
+
+
+def test_chunk_diff_tail_keeps_end(tmp_path: Path):
+    big = "diff --git a/big.py b/big.py\n--- a/big.py\n+++ b/big.py\n" + (
+        "+x\n" * 5_000
+    ) + "TAILMARKER\n"
+    result = chunk_diff(big, strategy="tail", budget=400, question="any")
+    assert result.triggered
+    assert result.chunked_chars <= 400
+    assert "[diff truncated before tail: dropped" in result.text
+    assert "TAILMARKER" in result.text
+
+
+def _make_multi_file_diff(file_specs: list[tuple[str, int]]) -> str:
+    """Build a synthetic unified diff with N files of given line counts."""
+
+    blocks = []
+    for path, n_lines in file_specs:
+        body = "\n".join(f"+line {i}" for i in range(n_lines))
+        block = (
+            f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n"
+            f"+++ b/{path}\n"
+            f"@@ -0,0 +1,{n_lines} @@\n"
+            f"{body}"
+        )
+        blocks.append(block)
+    return "\n".join(blocks)
+
+
+def test_chunk_diff_hash_aware_drops_low_relevance_files():
+    diff = _make_multi_file_diff(
+        [("alpha.py", 50), ("beta.py", 50), ("gamma.py", 50)]
+    )
+    # Set budget tight enough that not all three fit.
+    budget = len(diff) // 2
+    result = chunk_diff(
+        diff, strategy="hash-aware", budget=budget, question="review the code"
+    )
+    assert result.triggered
+    assert result.chunked_chars <= budget
+    assert result.dropped_files  # at least one dropped
+    # Marker must list dropped files.
+    for dropped in result.dropped_files:
+        assert dropped in result.text
+
+
+def test_chunk_diff_hash_aware_prioritizes_mentioned_files():
+    diff = _make_multi_file_diff(
+        [("alpha.py", 50), ("beta.py", 50), ("gamma.py", 50)]
+    )
+    budget = len(diff) // 2  # only ~half fits
+    result = chunk_diff(
+        diff,
+        strategy="hash-aware",
+        budget=budget,
+        question="please review the bug in gamma.py",
+    )
+    assert result.triggered
+    # gamma.py should NOT be dropped.
+    assert "gamma.py" not in result.dropped_files
+    assert "gamma.py" in result.text
+
+
+def test_build_prompt_default_fail_strategy_unchanged_when_fits(tmp_path: Path):
+    prompt = build_prompt(
+        "ok?",
+        mode="quick",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=False,
+        stdin_text=None,
+        chunk_strategy="fail",
+    )
+    assert "RECOMMENDATION: yes" in prompt
+    assert "[diff truncated" not in prompt
+
+
+def test_build_prompt_default_fail_strategy_truncates_oversize(tmp_path: Path):
+    big_question = "q" * 5_000
+    prompt = build_prompt(
+        big_question,
+        mode="quick",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=False,
+        stdin_text=None,
+        max_prompt_chars=2_000,
+    )
+    # Default fail strategy still hits the legacy truncation path because
+    # there's no diff to chunk.
+    assert "[llm-council prompt truncated at 2000" in prompt
+    assert len(prompt) <= 2_100
+
+
+def test_build_prompt_head_strategy_chunks_diff(tmp_path: Path):
+    _git_init_with_large_diff(
+        tmp_path,
+        files={
+            "a.py": ("hello\n", "hello\n" + ("xx\n" * 3_000)),
+            "b.py": ("world\n", "world\n" + ("yy\n" * 3_000)),
+        },
+    )
+    events: list[dict] = []
+    prompt = build_prompt(
+        "review the python files",
+        mode="quick",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=True,
+        stdin_text=None,
+        max_prompt_chars=4_000,
+        chunk_strategy="head",
+        chunk_progress=events.append,
+    )
+    assert len(prompt) <= 4_000
+    assert "[diff truncated after head: dropped" in prompt
+    assert events
+    assert events[-1]["strategy"] == "head"
+    assert events[-1]["dropped_chars"] > 0
+
+
+def test_build_prompt_hash_aware_drops_unrelated_files(tmp_path: Path):
+    _git_init_with_large_diff(
+        tmp_path,
+        files={
+            "alpha.py": ("a\n", "a\n" + ("aa\n" * 1_500)),
+            "beta.py": ("b\n", "b\n" + ("bb\n" * 1_500)),
+            "gamma.py": ("c\n", "c\n" + ("cc\n" * 1_500)),
+        },
+    )
+    events: list[dict] = []
+    prompt = build_prompt(
+        "review the bug in gamma.py please",
+        mode="quick",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=True,
+        stdin_text=None,
+        max_prompt_chars=8_000,
+        chunk_strategy="hash-aware",
+        chunk_progress=events.append,
+    )
+    assert len(prompt) <= 8_000
+    assert "gamma.py" in prompt
+    assert events
+    last = events[-1]
+    assert last["strategy"] == "hash-aware"
+    # gamma.py is the explicitly mentioned file: must not be dropped.
+    assert "gamma.py" not in last["dropped_files"]
+
+
+def test_build_prompt_chunking_preserves_question_and_response_format(tmp_path: Path):
+    _git_init_with_large_diff(
+        tmp_path,
+        files={"big.py": ("init\n", "init\n" + ("zz\n" * 5_000))},
+    )
+    prompt = build_prompt(
+        "what is wrong here?",
+        mode="quick",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=True,
+        stdin_text=None,
+        max_prompt_chars=3_000,
+        chunk_strategy="head",
+    )
+    # Question, persona, response-format guarantees survive chunking.
+    assert "what is wrong here?" in prompt
+    assert "RECOMMENDATION: yes" in prompt
+    assert "read-only participant" in prompt
+
+
+def test_build_prompt_chunking_preserves_continuation_context(tmp_path: Path):
+    _git_init_with_large_diff(
+        tmp_path,
+        files={"big.py": ("init\n", "init\n" + ("zz\n" * 5_000))},
+    )
+    prior = "Prior council context (run abc):\nsomething important from before"
+    prompt = build_prompt(
+        "continue",
+        mode="quick",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=True,
+        stdin_text=None,
+        max_prompt_chars=3_000,
+        chunk_strategy="head",
+        prior_context=prior,
+    )
+    assert "Prior council context (run abc)" in prompt
+    assert "something important from before" in prompt
+    assert len(prompt) <= 3_000
+
+
+def test_build_prompt_default_fail_with_oversize_diff_raises_for_continuation(
+    tmp_path: Path,
+):
+    _git_init_with_large_diff(
+        tmp_path,
+        files={"big.py": ("init\n", "init\n" + ("zz\n" * 5_000))},
+    )
+    prior = "Prior council context (run abc):\n" + ("p" * 100)
+    with pytest.raises(ValueError, match="Continuation prompt exceeds"):
+        build_prompt(
+            "q",
+            mode="quick",
+            cwd=tmp_path,
+            context_paths=[],
+            include_diff=True,
+            stdin_text=None,
+            max_prompt_chars=3_000,
+            prior_context=prior,
+            chunk_strategy="fail",
+        )
+
+
+def test_chunk_diff_rejects_unknown_strategy():
+    with pytest.raises(ValueError, match="Unknown chunk strategy"):
+        chunk_diff("anything", strategy="not-a-thing", budget=100, question="q")
+
+
+def test_build_prompt_rejects_unknown_chunk_strategy(tmp_path: Path):
+    with pytest.raises(ValueError, match="Unknown chunk_strategy"):
+        build_prompt(
+            "q",
+            mode="quick",
+            cwd=tmp_path,
+            context_paths=[],
+            include_diff=False,
+            stdin_text=None,
+            chunk_strategy="bogus",
+        )
+
+
+def test_chunk_diff_hash_aware_recognizes_bareword_paths():
+    diff = _make_multi_file_diff(
+        [("Makefile", 80), ("alpha.py", 80), ("beta.py", 80)]
+    )
+    budget = len(diff) // 2
+    result = chunk_diff(
+        diff,
+        strategy="hash-aware",
+        budget=budget,
+        question="please review the Makefile",
+    )
+    assert result.triggered
+    assert "Makefile" not in result.dropped_files
+    assert "Makefile" in result.text
+
+
+def test_chunk_diff_hash_aware_no_files_dropped_does_not_trigger_event():
+    # Build a diff that fits exactly at the budget so no files are dropped.
+    diff = _make_multi_file_diff([("a.py", 5), ("b.py", 5)])
+    result = chunk_diff(
+        diff,
+        strategy="hash-aware",
+        budget=len(diff) + 1_000,
+        question="anything",
+    )
+    # Original fit under budget, so the early-return path is taken.
+    assert not result.triggered
+    assert result.dropped_files == []
+
+
+def test_chunk_diff_hash_aware_falls_back_when_no_hunk_fits():
+    # Single huge file that exceeds the budget; expect a hash-aware result
+    # whose strategy field still reads "hash-aware" with a head-truncated body.
+    diff = _make_multi_file_diff([("huge.py", 4_000)])
+    result = chunk_diff(
+        diff, strategy="hash-aware", budget=400, question="review huge.py"
+    )
+    assert result.triggered
+    assert result.strategy == "hash-aware"
+    assert result.chunked_chars <= 400
+    # Marker from the head fallback should still appear.
+    assert "diff truncated" in result.text
+

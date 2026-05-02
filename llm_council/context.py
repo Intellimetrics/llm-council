@@ -6,13 +6,14 @@ import hashlib
 import mimetypes
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from llm_council.defaults import (
     DEFAULT_STANCE_PROMPTS,
     STANCE_INVARIANT_SUFFIX,
     VALID_STANCES,
 )
+from llm_council.diff_chunking import VALID_STRATEGIES, chunk_diff
 
 
 MAX_CONTEXT_FILE_CHARS = 120_000
@@ -146,13 +147,25 @@ def render_image_section(manifest: list[dict[str, Any]]) -> str:
 
 
 def read_git_diff(cwd: Path) -> str:
+    sections, _raw = _read_git_diff_sections(cwd)
+    return "\n".join(sections)
+
+
+def _read_git_diff_sections(cwd: Path) -> tuple[list[str], str]:
+    """Return (markdown sections, raw concatenated diff text).
+
+    The raw text is the union of staged and unstaged diff bodies (separated
+    by a blank line) so callers can apply chunking on the underlying unified
+    diff before it is re-wrapped in markdown.
+    """
+
     if not _git_ok(cwd, ["rev-parse", "--is-inside-work-tree"]):
-        return _git_diff_unavailable("not a git repository")
+        return [_git_diff_unavailable("not a git repository")], ""
 
     staged = _git_output(cwd, ["diff", "--cached", "--"])
     unstaged = _git_output(cwd, ["diff", "--"])
     if staged is None or unstaged is None:
-        return _git_diff_unavailable("git diff failed")
+        return [_git_diff_unavailable("git diff failed")], ""
 
     sections = ["## Git Diff"]
     if staged.strip():
@@ -163,7 +176,13 @@ def read_git_diff(cwd: Path) -> str:
         )
     if len(sections) == 1:
         sections.extend(["", "```diff", "[no diff]", "```"])
-    return "\n".join(sections)
+    raw_parts = [text.strip() for text in (staged, unstaged) if text and text.strip()]
+    raw = "\n\n".join(raw_parts)
+    return sections, raw
+
+
+def _wrap_chunked_diff(chunked_text: str) -> str:
+    return "\n".join(["## Git Diff", "", "```diff", chunked_text.strip("\n"), "```"])
 
 
 def _git_ok(cwd: Path, args: list[str]) -> bool:
@@ -318,8 +337,16 @@ def build_prompt(
     stances: dict[str, str] | None = None,
     participants: dict[str, dict[str, Any]] | None = None,
     prior_context: str | None = None,
+    chunk_strategy: str = "fail",
+    chunk_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
     """Build the read-only prompt sent to each participant."""
+
+    if chunk_strategy not in VALID_STRATEGIES:
+        raise ValueError(
+            f"Unknown chunk_strategy '{chunk_strategy}'. "
+            f"Expected one of: {', '.join(VALID_STRATEGIES)}"
+        )
 
     resolved_stances, resolved_participants = _resolve_stance_inputs(
         mode=mode,
@@ -328,15 +355,15 @@ def build_prompt(
         participants=participants,
     )
 
-    sections = [
+    head_sections = [
         "You are a read-only participant in an LLM council for a coding project.",
         "Do not edit files. Do not run write operations. If you need code changes, propose them as recommendations only.",
         f"Working directory: {cwd}",
         f"Council mode: {mode}",
     ]
     if prior_context:
-        sections.extend(["", prior_context.strip()])
-    sections.extend(
+        head_sections.extend(["", prior_context.strip()])
+    head_sections.extend(
         [
             "",
             "User question:",
@@ -351,8 +378,9 @@ def build_prompt(
     )
 
     context_sections: list[str] = []
-    # Images go first so the textual reference list survives prompt-size
-    # truncation; vision adapters read bytes from the manifest separately.
+    diff_section_index: int | None = None
+    diff_raw: str = ""
+    diff_default_section: str = ""
     manifest_for_render = image_manifest
     if manifest_for_render is None and image_paths:
         manifest_for_render = build_image_manifest(
@@ -361,7 +389,10 @@ def build_prompt(
     if manifest_for_render:
         context_sections.append(render_image_section(manifest_for_render))
     if include_diff:
-        context_sections.append(read_git_diff(cwd))
+        diff_lines, diff_raw = _read_git_diff_sections(cwd)
+        diff_default_section = "\n".join(diff_lines)
+        diff_section_index = len(context_sections)
+        context_sections.append(diff_default_section)
     for item in context_paths:
         context_sections.append(
             read_context_file(item, cwd=cwd, allow_outside_cwd=allow_outside_cwd)
@@ -369,18 +400,57 @@ def build_prompt(
     if stdin_text:
         context_sections.append("## Stdin Context\n\n```\n" + stdin_text + "\n```")
 
-    if context_sections:
-        sections.extend(["", "Context:", *context_sections])
-
+    stance_tail: list[str] = []
     if resolved_stances:
         stance_block = render_stance_section(
             resolved_stances, participants=resolved_participants
         )
         if stance_block:
-            sections.extend(["", stance_block])
+            stance_tail = ["", stance_block]
 
-    prompt = "\n".join(sections)
+    def assemble(ctx: list[str]) -> str:
+        sections = list(head_sections)
+        if ctx:
+            sections.extend(["", "Context:", *ctx])
+        sections.extend(stance_tail)
+        return "\n".join(sections)
+
+    prompt = assemble(context_sections)
     if max_prompt_chars is not None and len(prompt) > max_prompt_chars:
+        if (
+            chunk_strategy != "fail"
+            and include_diff
+            and diff_section_index is not None
+            and diff_raw
+        ):
+            empty_wrapper = _wrap_chunked_diff("")
+            rest_chars = len(prompt) - len(diff_default_section)
+            wrapper_overhead = len(empty_wrapper)
+            budget = max_prompt_chars - rest_chars - wrapper_overhead
+            if budget > 0:
+                chunk = chunk_diff(
+                    diff_raw,
+                    strategy=chunk_strategy,
+                    budget=budget,
+                    question=question,
+                )
+                if chunk.triggered:
+                    rebuilt = list(context_sections)
+                    rebuilt[diff_section_index] = _wrap_chunked_diff(chunk.text)
+                    rebuilt_prompt = assemble(rebuilt)
+                    if len(rebuilt_prompt) <= max_prompt_chars:
+                        if chunk_progress is not None:
+                            chunk_progress(
+                                {
+                                    "event": "diff_chunked",
+                                    "strategy": chunk.strategy,
+                                    "original_chars": chunk.original_chars,
+                                    "chunked_chars": chunk.chunked_chars,
+                                    "dropped_chars": chunk.dropped_chars,
+                                    "dropped_files": list(chunk.dropped_files),
+                                }
+                            )
+                        return rebuilt_prompt
         if prior_context:
             raise ValueError(
                 "Continuation prompt exceeds max_prompt_chars: "
