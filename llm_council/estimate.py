@@ -174,13 +174,30 @@ def estimate_council(
 
 def _openrouter_needs_catalog(cfg: dict[str, Any]) -> bool:
     return (
-        cfg.get("type") == "openrouter"
+        cfg.get("type") in ("openrouter", "openai_compatible")
+        and _is_openrouter_cfg(cfg)
         and not str(cfg.get("model") or "").endswith(":free")
         and (
             cfg.get("input_per_million") is None
             or cfg.get("output_per_million") is None
         )
     )
+
+
+def _is_openrouter_cfg(cfg: dict[str, Any]) -> bool:
+    if cfg.get("type") == "openrouter":
+        return True
+    if cfg.get("type") != "openai_compatible":
+        return False
+    base_url = str(cfg.get("base_url") or "")
+    if not base_url:
+        return False
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(base_url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
 
 
 def _estimate_participant_row(
@@ -194,7 +211,7 @@ def _estimate_participant_row(
 ) -> dict[str, Any]:
     participant_type = cfg.get("type") or "unknown"
     model = cfg.get("model") or "cli default"
-    if participant_type != "openrouter":
+    if participant_type not in ("openrouter", "openai_compatible"):
         note = (
             "Native CLI subscription or local runtime cost is external to "
             "llm-council."
@@ -223,7 +240,7 @@ def _estimate_participant_row(
         input_per_million = input_per_million or 0.0
         output_per_million = output_per_million or 0.0
         pricing_source = pricing_source or "free route"
-    elif input_per_million is None or output_per_million is None:
+    elif (input_per_million is None or output_per_million is None) and _is_openrouter_cfg(cfg):
         catalog = catalog_by_id.get(str(model), {})
         input_per_million = (
             input_per_million
@@ -240,7 +257,14 @@ def _estimate_participant_row(
 
     note = None
     if input_per_million is None or output_per_million is None:
-        note = "OpenRouter pricing unavailable; refresh catalog or configure prices."
+        if _is_openrouter_cfg(cfg):
+            note = "OpenRouter pricing unavailable; refresh catalog or configure prices."
+        else:
+            provider_label = cfg.get("provider_label") or "endpoint"
+            note = (
+                f"openai_compatible {provider_label} pricing not configured; "
+                "set input_per_million and output_per_million on the participant."
+            )
     return _row(
         name=name,
         participant_type=participant_type,
@@ -339,7 +363,7 @@ def _estimate_notes(rows: list[dict[str, Any]], catalog_error: str | None) -> li
         )
     if catalog_error:
         notes.append(f"OpenRouter catalog lookup failed: {catalog_error}")
-    elif any(row["type"] == "openrouter" for row in rows):
+    elif any(row["type"] in {"openrouter", "openai_compatible"} for row in rows):
         notes.append(
             "OpenRouter prices come from config or the live cached catalog; rerun with --no-cache before expensive work."
         )

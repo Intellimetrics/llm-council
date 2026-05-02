@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import copy
+import ipaddress
 import os
 import re
+import socket
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -14,6 +17,11 @@ from llm_council.defaults import DEFAULT_CONFIG, VALID_STANCES
 
 
 BASELINE_CLIS = ("claude", "codex", "gemini")
+OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+PARTICIPANT_TYPES = frozenset({"cli", "openrouter", "openai_compatible", "ollama"})
+OPENAI_COMPATIBLE_TYPES = frozenset({"openrouter", "openai_compatible"})
+_LOOPBACK_HOSTNAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
+_TRUSTED_PUBLIC_HOSTS = frozenset({"openrouter.ai"})
 BUILTIN_FULL_TRIAD_MODES = frozenset(
     {"quick", "plan", "review", "diverse", "us-only", "deliberate"}
 )
@@ -111,10 +119,10 @@ def validate_config(config: dict[str, Any]) -> None:
         if not isinstance(participant, dict):
             raise ValueError(f"Participant '{name}' must be a mapping")
         ptype = participant.get("type")
-        if ptype not in {"cli", "openrouter", "ollama"}:
+        if ptype not in PARTICIPANT_TYPES:
             raise ValueError(
                 f"Participant '{name}' has unsupported type '{ptype}'. "
-                "Expected cli, openrouter, or ollama."
+                "Expected cli, openrouter, openai_compatible, or ollama."
             )
         if ptype == "cli":
             if not participant.get("command"):
@@ -128,8 +136,10 @@ def validate_config(config: dict[str, Any]) -> None:
                 "cli_retry_stderr_patterns",
                 f"CLI participant '{name}'",
             )
-        if ptype in {"openrouter", "ollama"} and not participant.get("model"):
+        if ptype in {"openrouter", "openai_compatible", "ollama"} and not participant.get("model"):
             raise ValueError(f"Participant '{name}' must define model")
+        if ptype == "openai_compatible":
+            _validate_openai_compatible_participant(name, participant)
         _validate_positive_int(participant, "timeout", f"participant '{name}'")
         _validate_positive_int(participant, "max_prompt_chars", f"participant '{name}'")
         _validate_positive_number(
@@ -222,6 +232,145 @@ def validate_config(config: dict[str, Any]) -> None:
     _validate_positive_number(defaults, "mcp_max_estimated_cost_usd", "defaults")
 
 
+def _validate_openai_compatible_participant(name: str, participant: dict[str, Any]) -> None:
+    base_url = participant.get("base_url")
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise ValueError(
+            f"openai_compatible participant '{name}' must define base_url "
+            "(e.g. https://api.together.xyz/v1)"
+        )
+    extra_headers = participant.get("extra_headers")
+    if extra_headers is not None:
+        if not isinstance(extra_headers, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in extra_headers.items()
+        ):
+            raise ValueError(
+                f"openai_compatible participant '{name}' extra_headers must be a "
+                "mapping of string keys to string values"
+            )
+    allow_private = participant.get("allow_private", False)
+    if not isinstance(allow_private, bool):
+        raise ValueError(
+            f"openai_compatible participant '{name}' allow_private must be a boolean"
+        )
+    provider_label = participant.get("provider_label")
+    if provider_label is not None and (
+        not isinstance(provider_label, str) or not provider_label.strip()
+    ):
+        raise ValueError(
+            f"openai_compatible participant '{name}' provider_label must be a "
+            "non-empty string"
+        )
+    parsed = urlparse(base_url.strip())
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError(
+            f"openai_compatible participant '{name}' base_url is not a valid URL: "
+            f"{base_url!r}"
+        )
+    if allow_private:
+        return
+    _enforce_public_https_endpoint(name, parsed)
+
+
+def _enforce_public_https_endpoint(name: str, parsed: Any) -> None:
+    if parsed.scheme.lower() != "https":
+        raise ValueError(
+            f"openai_compatible participant '{name}' base_url must use https:// "
+            f"(got scheme {parsed.scheme!r}). Set `allow_private: true` on the "
+            "participant to opt in to private/non-https endpoints (e.g. local "
+            "Ollama, vLLM, LM Studio)."
+        )
+    if parsed.username or parsed.password:
+        raise ValueError(
+            f"openai_compatible participant '{name}' base_url must not contain "
+            "embedded credentials (user:pass@host). Use api_key_env and "
+            "extra_headers instead."
+        )
+    host = parsed.hostname
+    assert host is not None
+    normalized = host.lower().rstrip(".")
+    if not normalized:
+        raise ValueError(
+            f"openai_compatible participant '{name}' base_url has empty hostname"
+        )
+    if normalized in _LOOPBACK_HOSTNAMES:
+        raise ValueError(
+            f"openai_compatible participant '{name}' base_url host {host!r} is a "
+            "loopback hostname. Set `allow_private: true` on the participant to "
+            "opt in to private/non-https endpoints."
+        )
+    literal = _parse_ip_literal(host)
+    if literal is not None and _is_private_ip(literal):
+        raise ValueError(
+            f"openai_compatible participant '{name}' base_url host {host!r} is a "
+            "private/loopback/link-local IP literal. Set `allow_private: true` "
+            "on the participant to opt in (e.g. local Ollama, vLLM, LM Studio, "
+            "or other on-prem inference)."
+        )
+    if (
+        literal is None
+        and (
+            normalized in _TRUSTED_PUBLIC_HOSTS
+            or normalized.endswith("." + "openrouter.ai")
+        )
+    ):
+        return
+    addresses, resolution_error = _resolve_host_addresses(normalized)
+    if literal is None and resolution_error is not None:
+        raise ValueError(
+            f"openai_compatible participant '{name}' base_url host {host!r} "
+            f"could not be resolved to verify it is public ({resolution_error}); "
+            "refusing to allow it. Set `allow_private: true` on the participant "
+            "to skip this check."
+        )
+    for address in addresses:
+        ip = _parse_ip_literal(address)
+        if ip is not None and _is_private_ip(ip):
+            raise ValueError(
+                f"openai_compatible participant '{name}' base_url host {host!r} "
+                f"resolves to a private/loopback/link-local address ({address}). "
+                "Set `allow_private: true` on the participant to opt in (e.g. "
+                "local Ollama, vLLM, LM Studio, or other on-prem inference)."
+            )
+
+
+def _resolve_host_addresses(host: str) -> tuple[list[str], str | None]:
+    if _parse_ip_literal(host) is not None:
+        return [], None
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError as exc:
+        return [], str(exc) or type(exc).__name__
+    addresses: list[str] = []
+    for info in infos:
+        sockaddr = info[4]
+        if sockaddr:
+            addresses.append(str(sockaddr[0]))
+    return addresses, None
+
+
+def _parse_ip_literal(value: str) -> ipaddress._BaseAddress | None:
+    try:
+        ip = ipaddress.ip_address(value.split("%", 1)[0].strip("[]"))
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def _is_private_ip(ip: ipaddress._BaseAddress) -> bool:
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_unspecified
+        or ip.is_reserved
+    )
+
+
 def migrate_known_cli_defaults(config: dict[str, Any]) -> None:
     """Apply compatibility fixes for previously generated unsafe defaults."""
 
@@ -239,10 +388,21 @@ def migrate_known_cli_defaults(config: dict[str, Any]) -> None:
         and codex.get("args") == OLD_CODEX_APPROVAL_ARGS
     ):
         codex["args"] = list(DEFAULT_CONFIG["participants"]["codex"]["args"])
+    participants = config.get("participants", {})
+    if isinstance(participants, dict):
+        for participant in participants.values():
+            if not isinstance(participant, dict):
+                continue
+            if participant.get("type") != "openrouter":
+                continue
+            participant["type"] = "openai_compatible"
+            if not participant.get("base_url"):
+                participant["base_url"] = OPENROUTER_DEFAULT_BASE_URL
+            if not participant.get("api_key_env"):
+                participant["api_key_env"] = "OPENROUTER_API_KEY"
     modes = config.get("modes", {})
     if not isinstance(modes, dict):
         return
-    participants = config.get("participants", {})
     if (
         isinstance(participants, dict)
         and all(name in participants for name in BASELINE_CLIS)

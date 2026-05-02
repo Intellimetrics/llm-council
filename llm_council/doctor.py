@@ -6,6 +6,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -15,6 +16,21 @@ class Check:
     name: str
     ok: bool
     detail: str
+
+
+def _is_openrouter_participant(cfg: dict[str, Any]) -> bool:
+    if cfg.get("type") == "openrouter":
+        return True
+    if cfg.get("type") != "openai_compatible":
+        return False
+    base_url = str(cfg.get("base_url") or "")
+    if not base_url:
+        return False
+    try:
+        host = (urlparse(base_url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
 
 
 def check_environment(
@@ -43,7 +59,7 @@ def check_environment(
         {
             str(cfg.get("api_key_env") or "OPENROUTER_API_KEY")
             for cfg in participants.values()
-            if cfg.get("type") == "openrouter"
+            if _is_openrouter_participant(cfg)
         }
     )
     for key_env in openrouter_envs:

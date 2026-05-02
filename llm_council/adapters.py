@@ -11,10 +11,18 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import httpx
 
 from llm_council.context import IMAGE_MIME_ALLOWLIST
+
+
+OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_HEADERS = {
+    "HTTP-Referer": "https://github.com/Intellimetrics/llm-council",
+    "X-Title": "llm-council",
+}
 
 
 RECOMMENDATION_RE = re.compile(
@@ -312,7 +320,7 @@ async def _cleanup_timed_out_process(
         pass
 
 
-async def run_openrouter_participant(
+async def run_openai_compatible_participant(
     name: str,
     cfg: dict[str, Any],
     prompt: str,
@@ -333,6 +341,10 @@ async def run_openrouter_participant(
             model=model,
         )
 
+    base_url = str(cfg.get("base_url") or OPENROUTER_DEFAULT_BASE_URL).rstrip("/")
+    endpoint = f"{base_url}/chat/completions"
+    is_openrouter = _is_openrouter_endpoint(base_url)
+
     user_content = await _build_user_content_async(prompt, image_manifest, cfg)
     payload = {
         "model": model,
@@ -345,19 +357,14 @@ async def run_openrouter_participant(
         ],
         "usage": {"include": True},
     }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/Intellimetrics/llm-council",
-        "X-Title": "llm-council",
-    }
+    headers = _build_openai_compatible_headers(api_key, cfg, is_openrouter=is_openrouter)
     timeout = float(cfg.get("timeout") or 180)
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             response = await _request_with_retries(
                 client,
                 "POST",
-                "https://openrouter.ai/api/v1/chat/completions",
+                endpoint,
                 retries=_coerce_retries(cfg.get("retries"), default=2),
                 headers=headers,
                 json=payload,
@@ -419,11 +426,13 @@ async def run_openrouter_participant(
                     retry_payload = dict(payload)
                     retry_payload["messages"] = retry_messages
                     try:
-                        async with httpx.AsyncClient(timeout=timeout) as retry_client:
+                        async with httpx.AsyncClient(
+                            timeout=timeout, follow_redirects=False
+                        ) as retry_client:
                             retry_response = await _request_with_retries(
                                 retry_client,
                                 "POST",
-                                "https://openrouter.ai/api/v1/chat/completions",
+                                endpoint,
                                 retries=_coerce_retries(cfg.get("retries"), default=2),
                                 headers=headers,
                                 json=retry_payload,
@@ -474,6 +483,52 @@ async def run_openrouter_participant(
             elapsed_seconds=time.monotonic() - start,
             model=model,
         )
+
+
+async def run_openrouter_participant(
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    *,
+    image_manifest: list[dict[str, Any]] | None = None,
+) -> ParticipantResult:
+    return await run_openai_compatible_participant(
+        name, cfg, prompt, image_manifest=image_manifest
+    )
+
+
+_RESERVED_HEADER_LOWER = frozenset(
+    {"authorization", "content-type", "http-referer", "x-title"}
+)
+
+
+def _build_openai_compatible_headers(
+    api_key: str, cfg: dict[str, Any], *, is_openrouter: bool
+) -> dict[str, str]:
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if is_openrouter:
+        headers.update(OPENROUTER_HEADERS)
+    extra_headers = cfg.get("extra_headers") or {}
+    if isinstance(extra_headers, dict):
+        for key, value in extra_headers.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                continue
+            if key.lower() in _RESERVED_HEADER_LOWER:
+                continue
+            headers[key] = value
+    return headers
+
+
+def _is_openrouter_endpoint(base_url: str) -> bool:
+    try:
+        parsed = urlparse(base_url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
 
 
 def _serialize_openrouter_messages(messages: list[dict[str, Any]]) -> str:
@@ -775,8 +830,8 @@ async def run_participant(
         # therefore has no effect — the orchestrator's images_skipped check
         # treats CLI as always image-aware (orchestrator.py).
         return await run_cli_participant(name, cfg, prompt, cwd)
-    if ptype == "openrouter":
-        return await run_openrouter_participant(
+    if ptype in ("openrouter", "openai_compatible"):
+        return await run_openai_compatible_participant(
             name, cfg, prompt, image_manifest=image_manifest
         )
     if ptype == "ollama":

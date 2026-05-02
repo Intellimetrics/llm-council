@@ -4066,3 +4066,580 @@ def test_council_run_schema_advertises_min_quorum():
     assert "min_quorum" in schema["properties"]
     assert schema["properties"]["min_quorum"]["type"] == "integer"
     assert schema["properties"]["min_quorum"]["minimum"] == 1
+
+
+# --- openai_compatible participant type ---
+
+_OPENAI_COMPAT_BASE_PARTICIPANTS = {
+    "endpoint": {
+        "type": "openai_compatible",
+        "model": "provider/some-model",
+        "base_url": "https://api.together.xyz/v1",
+        "api_key_env": "TOGETHER_API_KEY",
+    }
+}
+
+
+def _write_openai_compat_config(
+    tmp_path: Path,
+    *,
+    base_url: str = "https://api.together.xyz/v1",
+    extra: dict | None = None,
+) -> Path:
+    participant: dict = {
+        "type": "openai_compatible",
+        "model": "provider/some-model",
+        "base_url": base_url,
+        "api_key_env": "PROVIDER_API_KEY",
+    }
+    if extra:
+        participant.update(extra)
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "replace_defaults": True,
+                "version": 1,
+                "participants": {"endpoint": participant},
+                "modes": {"quick": {"participants": ["endpoint"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://localhost:8080/v1",
+        "http://127.0.0.1/v1",
+        "http://169.254.169.254/v1",
+        "http://10.0.0.5/v1",
+        "http://[::1]/v1",
+        "http://[fe80::1]/v1",
+        "https://localhost/v1",
+        "https://127.0.0.1/v1",
+        "https://10.0.0.5/v1",
+    ],
+)
+def test_openai_compatible_ssrf_rejects_private_endpoints(tmp_path: Path, base_url: str):
+    path = _write_openai_compat_config(tmp_path, base_url=base_url)
+    with pytest.raises(ValueError, match="allow_private"):
+        load_config(path)
+
+
+def test_openai_compatible_ssrf_rejects_http_public(tmp_path: Path):
+    path = _write_openai_compat_config(tmp_path, base_url="http://api.together.xyz/v1")
+    with pytest.raises(ValueError, match="https"):
+        load_config(path)
+
+
+def test_openai_compatible_ssrf_accepts_public_https(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "llm_council.config.socket.getaddrinfo",
+        lambda *_a, **_k: [(0, 0, 0, "", ("8.8.8.8", 0))],
+    )
+    path = _write_openai_compat_config(tmp_path, base_url="https://api.together.xyz/v1")
+    config = load_config(path)
+    assert config["participants"]["endpoint"]["base_url"] == "https://api.together.xyz/v1"
+
+
+def test_openai_compatible_ssrf_rejects_dns_resolving_to_private(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "llm_council.config.socket.getaddrinfo",
+        lambda *_a, **_k: [(0, 0, 0, "", ("10.0.0.5", 0))],
+    )
+    path = _write_openai_compat_config(tmp_path, base_url="https://innocent.example.com/v1")
+    with pytest.raises(ValueError, match="resolves to a private"):
+        load_config(path)
+
+
+def test_openai_compatible_ssrf_fails_closed_on_dns_failure(tmp_path: Path, monkeypatch):
+    def boom(*_a, **_k):
+        raise OSError("Name or service not known")
+    monkeypatch.setattr("llm_council.config.socket.getaddrinfo", boom)
+    path = _write_openai_compat_config(tmp_path, base_url="https://unresolvable.example.com/v1")
+    with pytest.raises(ValueError, match="could not be resolved"):
+        load_config(path)
+
+
+def test_openai_compatible_ssrf_skips_dns_for_openrouter(tmp_path: Path, monkeypatch):
+    def boom(*_a, **_k):
+        raise OSError("Name or service not known")
+    monkeypatch.setattr("llm_council.config.socket.getaddrinfo", boom)
+    path = _write_openai_compat_config(
+        tmp_path, base_url="https://openrouter.ai/api/v1"
+    )
+    config = load_config(path)
+    assert config["participants"]["endpoint"]["base_url"] == "https://openrouter.ai/api/v1"
+
+
+def test_openai_compatible_ssrf_rejects_ipv4_mapped_ipv6(tmp_path: Path):
+    path = _write_openai_compat_config(tmp_path, base_url="https://[::ffff:7f00:1]/v1")
+    with pytest.raises(ValueError, match="allow_private"):
+        load_config(path)
+
+
+def test_openai_compatible_ssrf_rejects_embedded_credentials(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "llm_council.config.socket.getaddrinfo",
+        lambda *_a, **_k: [(0, 0, 0, "", ("8.8.8.8", 0))],
+    )
+    path = _write_openai_compat_config(
+        tmp_path, base_url="https://user:pass@api.together.xyz/v1"
+    )
+    with pytest.raises(ValueError, match="credentials"):
+        load_config(path)
+
+
+def test_openai_compatible_extra_headers_cannot_override_authorization(monkeypatch):
+    captured: dict = {}
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "model": "x/y",
+                "choices": [
+                    {
+                        "message": {"content": "RECOMMENDATION: yes - ok.\n\nMore."},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    async def fake_request(client, method, url, **kwargs):
+        captured["headers"] = dict(kwargs.get("headers") or {})
+        return FakeResponse()
+
+    monkeypatch.setenv("PROVIDER_KEY", "real-secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    asyncio.run(
+        adapters_module.run_openai_compatible_participant(
+            "endpoint",
+            {
+                "type": "openai_compatible",
+                "model": "x/y",
+                "base_url": "https://api.example.com/v1",
+                "api_key_env": "PROVIDER_KEY",
+                "extra_headers": {
+                    "Authorization": "Bearer attacker-supplied",
+                    "Content-Type": "text/plain",
+                    "HTTP-Referer": "https://attacker.example",
+                    "X-Title": "spoofed",
+                    "X-OK": "kept",
+                },
+            },
+            "prompt",
+        )
+    )
+
+    assert captured["headers"]["Authorization"] == "Bearer real-secret"
+    assert captured["headers"]["Content-Type"] == "application/json"
+    assert "HTTP-Referer" not in captured["headers"]
+    assert "X-Title" not in captured["headers"]
+    assert captured["headers"]["X-OK"] == "kept"
+
+
+def test_openrouter_trailing_dot_host_still_gets_referer(monkeypatch):
+    captured: dict = {}
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "model": "z-ai/glm-test",
+                "choices": [
+                    {
+                        "message": {"content": "RECOMMENDATION: yes - ok.\n\nMore."},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    async def fake_request(client, method, url, **kwargs):
+        captured["headers"] = dict(kwargs.get("headers") or {})
+        return FakeResponse()
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    asyncio.run(
+        adapters_module.run_openai_compatible_participant(
+            "router",
+            {
+                "type": "openai_compatible",
+                "model": "z-ai/glm-test",
+                "base_url": "https://openrouter.ai./api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+            },
+            "prompt",
+        )
+    )
+    assert captured["headers"].get("X-Title") == "llm-council"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://localhost:8080/v1",
+        "http://127.0.0.1/v1",
+        "http://169.254.169.254/v1",
+        "http://10.0.0.5/v1",
+        "https://localhost/v1",
+    ],
+)
+def test_openai_compatible_allow_private_unlocks_local(tmp_path: Path, base_url: str):
+    path = _write_openai_compat_config(
+        tmp_path, base_url=base_url, extra={"allow_private": True}
+    )
+    config = load_config(path)
+    assert config["participants"]["endpoint"]["base_url"] == base_url
+
+
+def test_openai_compatible_requires_base_url(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "replace_defaults": True,
+                "version": 1,
+                "participants": {
+                    "endpoint": {
+                        "type": "openai_compatible",
+                        "model": "provider/some-model",
+                    }
+                },
+                "modes": {"quick": {"participants": ["endpoint"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="base_url"):
+        load_config(path)
+
+
+def test_openai_compatible_extra_headers_must_be_string_map(tmp_path: Path):
+    path = _write_openai_compat_config(
+        tmp_path,
+        extra={"extra_headers": {"X-Foo": 123}},
+    )
+    with pytest.raises(ValueError, match="extra_headers"):
+        load_config(path)
+
+
+def test_openrouter_type_silently_migrates_to_openai_compatible(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "replace_defaults": True,
+                "version": 1,
+                "participants": {
+                    "remote": {
+                        "type": "openrouter",
+                        "model": "z-ai/glm-test",
+                        "api_key_env": "OPENROUTER_API_KEY",
+                    }
+                },
+                "modes": {"quick": {"participants": ["remote"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    remote = config["participants"]["remote"]
+    assert remote["type"] == "openai_compatible"
+    assert remote["base_url"] == "https://openrouter.ai/api/v1"
+    assert remote["api_key_env"] == "OPENROUTER_API_KEY"
+
+
+def test_openrouter_migration_preserves_explicit_base_url(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "replace_defaults": True,
+                "version": 1,
+                "participants": {
+                    "remote": {
+                        "type": "openrouter",
+                        "model": "z-ai/glm-test",
+                        "base_url": "https://openrouter.ai/api/v1",
+                    }
+                },
+                "modes": {"quick": {"participants": ["remote"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    remote = config["participants"]["remote"]
+    assert remote["type"] == "openai_compatible"
+    assert remote["base_url"] == "https://openrouter.ai/api/v1"
+
+
+def test_openrouter_request_includes_referer_header(monkeypatch):
+    captured: dict = {}
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "model": "z-ai/glm-test",
+                "choices": [
+                    {
+                        "message": {
+                            "content": "RECOMMENDATION: yes - fine.\n\nDetails."
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    async def fake_request(client, method, url, **kwargs):
+        captured["url"] = url
+        captured["headers"] = dict(kwargs.get("headers") or {})
+        return FakeResponse()
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openrouter_participant(
+            "glm",
+            {
+                "type": "openai_compatible",
+                "model": "z-ai/glm-test",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+            },
+            "prompt",
+        )
+    )
+    assert result.ok is True
+    assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert captured["headers"].get("HTTP-Referer", "").startswith(
+        "https://github.com/"
+    )
+    assert captured["headers"].get("X-Title") == "llm-council"
+
+
+def test_openai_compatible_non_openrouter_omits_referer(monkeypatch):
+    captured: dict = {}
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "model": "fireworks/test",
+                "choices": [
+                    {
+                        "message": {"content": "RECOMMENDATION: yes - ok.\n\nMore."},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    async def fake_request(client, method, url, **kwargs):
+        captured["url"] = url
+        captured["headers"] = dict(kwargs.get("headers") or {})
+        return FakeResponse()
+
+    monkeypatch.setenv("FIREWORKS_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        adapters_module.run_openai_compatible_participant(
+            "fireworks",
+            {
+                "type": "openai_compatible",
+                "model": "fireworks/test",
+                "base_url": "https://api.fireworks.ai/inference/v1",
+                "api_key_env": "FIREWORKS_KEY",
+                "extra_headers": {"X-Custom": "abc"},
+                "provider_label": "fireworks",
+            },
+            "prompt",
+        )
+    )
+
+    assert result.ok is True
+    assert captured["url"] == "https://api.fireworks.ai/inference/v1/chat/completions"
+    assert "HTTP-Referer" not in captured["headers"]
+    assert "X-Title" not in captured["headers"]
+    assert captured["headers"].get("X-Custom") == "abc"
+    assert captured["headers"].get("Authorization") == "Bearer secret"
+
+
+def test_openai_compatible_extra_headers_pass_through(monkeypatch):
+    captured: dict = {}
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "model": "fireworks/test",
+                "choices": [
+                    {
+                        "message": {"content": "RECOMMENDATION: yes - ok.\n\nMore."},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    async def fake_request(client, method, url, **kwargs):
+        captured["headers"] = dict(kwargs.get("headers") or {})
+        return FakeResponse()
+
+    monkeypatch.setenv("PROVIDER_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    asyncio.run(
+        adapters_module.run_openai_compatible_participant(
+            "endpoint",
+            {
+                "type": "openai_compatible",
+                "model": "provider/test",
+                "base_url": "https://api.example.com/v1",
+                "api_key_env": "PROVIDER_KEY",
+                "extra_headers": {
+                    "X-Account-Id": "acct_123",
+                    "X-Region": "us-east",
+                },
+            },
+            "prompt",
+        )
+    )
+
+    assert captured["headers"]["X-Account-Id"] == "acct_123"
+    assert captured["headers"]["X-Region"] == "us-east"
+
+
+def test_estimate_handles_openai_compatible_type(tmp_path: Path, capsys):
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "replace_defaults": True,
+                "version": 1,
+                "participants": {
+                    "endpoint": {
+                        "type": "openai_compatible",
+                        "model": "provider/some-model",
+                        "base_url": "https://api.together.xyz/v1",
+                        "api_key_env": "TOGETHER_API_KEY",
+                        "input_per_million": 0.5,
+                        "output_per_million": 1.5,
+                    }
+                },
+                "modes": {"quick": {"participants": ["endpoint"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(
+        [
+            "estimate",
+            "--cwd",
+            str(tmp_path),
+            "--config",
+            str(config_path),
+            "--mode",
+            "quick",
+            "--completion-tokens",
+            "100",
+            "--json",
+            "Review this",
+        ]
+    ) == 0
+
+    data = json.loads(capsys.readouterr().out)
+    row = data["rows"][0]
+    assert row["name"] == "endpoint"
+    assert row["type"] == "openai_compatible"
+    assert row["pricing_source"] == "config"
+    assert row["estimated_total_cost_usd"] > 0
+    assert data["known_total_usd"] == row["estimated_total_cost_usd"]
+
+
+def test_openai_compatible_subdomain_treated_as_openrouter(monkeypatch):
+    captured: dict = {}
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "model": "z-ai/glm-test",
+                "choices": [
+                    {
+                        "message": {"content": "RECOMMENDATION: yes - ok.\n\nMore."},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    async def fake_request(client, method, url, **kwargs):
+        captured["headers"] = dict(kwargs.get("headers") or {})
+        return FakeResponse()
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    asyncio.run(
+        adapters_module.run_openai_compatible_participant(
+            "router",
+            {
+                "type": "openai_compatible",
+                "model": "z-ai/glm-test",
+                "base_url": "https://api.openrouter.ai/api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+            },
+            "prompt",
+        )
+    )
+
+    assert captured["headers"].get("X-Title") == "llm-council"
+
+
+def test_openai_compatible_lookalike_host_does_not_get_openrouter_headers(monkeypatch):
+    captured: dict = {}
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "model": "z-ai/glm-test",
+                "choices": [
+                    {
+                        "message": {"content": "RECOMMENDATION: yes - ok.\n\nMore."},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    async def fake_request(client, method, url, **kwargs):
+        captured["headers"] = dict(kwargs.get("headers") or {})
+        return FakeResponse()
+
+    monkeypatch.setenv("LOOKALIKE_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    asyncio.run(
+        adapters_module.run_openai_compatible_participant(
+            "lookalike",
+            {
+                "type": "openai_compatible",
+                "model": "z-ai/glm-test",
+                "base_url": "https://openrouter.ai.evil.example.com/v1",
+                "api_key_env": "LOOKALIKE_KEY",
+            },
+            "prompt",
+        )
+    )
+
+    assert "HTTP-Referer" not in captured["headers"]
+    assert "X-Title" not in captured["headers"]

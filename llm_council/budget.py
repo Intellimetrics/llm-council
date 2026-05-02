@@ -158,7 +158,7 @@ def _first_configured(
 
 
 def _is_paid_hosted_participant(cfg: dict[str, Any]) -> bool:
-    if cfg.get("type") != "openrouter":
+    if cfg.get("type") not in ("openrouter", "openai_compatible"):
         return False
     model = str(cfg.get("model") or "")
     return not model.endswith(":free")
