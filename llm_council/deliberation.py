@@ -83,6 +83,19 @@ def recommendation_counts(results: list[ParticipantResult]) -> dict[str, int]:
     return counts
 
 
+def labeled_quorum_count(results: list[ParticipantResult]) -> int:
+    """Number of results that produced a usable trinary label."""
+    counts = recommendation_counts(results)
+    return counts["yes"] + counts["no"] + counts["tradeoff"]
+
+
+def default_min_quorum(participant_count: int) -> int:
+    """Default trust threshold: 2 if 3+ peers, else clamp to peer count."""
+    if participant_count >= 3:
+        return 2
+    return max(1, participant_count)
+
+
 def has_disagreement(results: list[ParticipantResult]) -> bool:
     counts = recommendation_counts(results)
     labeled_positions = [label for label in ("yes", "no", "tradeoff") if counts[label]]

@@ -187,6 +187,7 @@ def validate_config(config: dict[str, Any]) -> None:
         if mode.get("origin_policy") not in (None, "any", "us"):
             raise ValueError(f"Mode '{name}' origin_policy must be 'any' or 'us'")
         _validate_positive_int(mode, "max_rounds", f"mode '{name}'")
+        _validate_positive_int(mode, "min_quorum", f"mode '{name}'")
         stances = mode.get("stances")
         if stances is not None:
             if not isinstance(stances, dict):

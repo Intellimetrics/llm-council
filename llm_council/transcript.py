@@ -14,6 +14,8 @@ from llm_council.adapters import (
     is_timeout_error,
 )
 from llm_council.deliberation import (
+    default_min_quorum,
+    labeled_quorum_count,
     model_comparison,
     recommendation_counts,
     recommendation_label,
@@ -175,6 +177,77 @@ def remaining_disagreement_payload(
     }
 
 
+def _missing_label_reason(result: ParticipantResult) -> str:
+    if result.ok:
+        if recommendation_label(result.output) == "unknown":
+            return "missing label"
+        return "labeled"
+    if is_timeout_error(result.error):
+        return "timeout"
+    return "failed"
+
+
+def _participant_quorum_entry(result: ParticipantResult) -> dict[str, Any]:
+    if result.ok:
+        label = recommendation_label(result.output)
+        return {
+            "name": result.name,
+            "ok": True,
+            "label": None if label == "unknown" else label,
+            "reason": _missing_label_reason(result),
+        }
+    return {
+        "name": result.name,
+        "ok": False,
+        "label": None,
+        "reason": _missing_label_reason(result),
+        "error": _first_nonempty_line(result.error or ""),
+    }
+
+
+def quorum_summary(
+    final_results: list[ParticipantResult], metadata: dict[str, Any]
+) -> dict[str, Any]:
+    """Pure helper: derive labeled_quorum / min_quorum / degraded from results.
+
+    Prefers values stamped onto metadata by the orchestrator; falls back to
+    recomputing from final_results so transcripts written from older runs (or
+    raw test fixtures) remain coherent.
+    """
+    labeled = metadata.get("labeled_quorum")
+    if labeled is None:
+        labeled = labeled_quorum_count(final_results)
+    threshold = metadata.get("min_quorum")
+    if threshold is None:
+        threshold = default_min_quorum(len(final_results))
+    degraded = metadata.get("degraded")
+    if degraded is None:
+        degraded = labeled < threshold
+    return {
+        "labeled_quorum": int(labeled),
+        "min_quorum": int(threshold),
+        "degraded": bool(degraded),
+    }
+
+
+def degraded_consensus_payload(
+    final_results: list[ParticipantResult], metadata: dict[str, Any]
+) -> dict[str, Any] | None:
+    summary = quorum_summary(final_results, metadata)
+    if not summary["degraded"]:
+        return None
+    missing = [
+        _participant_quorum_entry(result)
+        for result in final_results
+        if _missing_label_reason(result) != "labeled"
+    ]
+    return {
+        "labeled_quorum": summary["labeled_quorum"],
+        "min_quorum": summary["min_quorum"],
+        "missing": missing,
+    }
+
+
 def write_transcript(
     markdown_path: Path,
     json_path: Path,
@@ -198,6 +271,13 @@ def write_transcript(
     token_total = sum(result.total_tokens or 0 for result in results)
     cost_total = sum(result.cost_usd or 0 for result in results)
     recommendations = recommendation_counts(final_results)
+    quorum = quorum_summary(final_results, metadata)
+    quorum_bullet = (
+        f"- Quorum: {quorum['labeled_quorum']} of {len(final_results)} peers "
+        f"labeled (min: {quorum['min_quorum']})"
+    )
+    if quorum["degraded"]:
+        quorum_bullet += " — **DEGRADED**"
     lines = [
         "# LLM Council Transcript",
         "",
@@ -214,6 +294,7 @@ def write_transcript(
         "- Recommendations (final round): "
         f"`{recommendations['yes']} yes / {recommendations['no']} no / "
         f"{recommendations['tradeoff']} tradeoff / {recommendations['unknown']} unknown`",
+        quorum_bullet,
         "",
         "## Question",
         "",
@@ -297,6 +378,37 @@ def write_transcript(
             )
         lines.append("")
 
+    degraded = degraded_consensus_payload(final_results, metadata)
+    if degraded is not None:
+        lines.extend(["## Degraded consensus", ""])
+        if degraded["missing"]:
+            lines.append(
+                f"**{degraded['labeled_quorum']} of {len(final_results)} peers produced a "
+                f"label, below the configured minimum of {degraded['min_quorum']}.** "
+                "Treat the recommendation above with caution: the surviving "
+                "peer(s) may not be representative of the council."
+            )
+            lines.append("")
+            lines.append("Peers that did not label:")
+            lines.append("")
+            for entry in degraded["missing"]:
+                reason = entry.get("reason") or "—"
+                detail = entry.get("error")
+                if detail:
+                    lines.append(f"- {entry['name']}: {reason} — {detail}")
+                else:
+                    lines.append(f"- {entry['name']}: {reason}")
+            lines.append("")
+        else:
+            lines.append(
+                f"**The configured `min_quorum` of {degraded['min_quorum']} exceeds "
+                f"the {degraded['labeled_quorum']} peer(s) that produced a label, "
+                "even though every selected peer responded.** This is a configuration "
+                "issue, not a participant failure: lower `min_quorum` or add more "
+                "peers if you want a non-degraded result."
+            )
+            lines.append("")
+
     fence = markdown_fence(prompt)
     lines.extend(["## Prompt Sent", "", f"{fence}text", prompt, fence, ""])
     markdown_path.write_text("\n".join(lines), encoding="utf-8")
@@ -312,6 +424,8 @@ def write_transcript(
     }
     if remaining is not None:
         json_payload["remaining_disagreement"] = remaining
+    if degraded is not None:
+        json_payload["degraded_consensus"] = degraded
     json_path.write_text(
         json.dumps(json_payload, indent=2) + "\n",
         encoding="utf-8",

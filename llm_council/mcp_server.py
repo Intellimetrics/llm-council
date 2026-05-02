@@ -102,6 +102,11 @@ def council_run_schema() -> dict[str, Any]:
                 "description": "Run an expensive second round if first-round responses disagree.",
             },
             "max_rounds": {"type": "integer", "minimum": 1, "maximum": 3},
+            "min_quorum": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Minimum label-producing peers in the final round before the result counts as trustworthy. Default: 2 when 2+ peers are configured, else equal to the peer count. If set higher than the configured peer count, the council will always be reported as degraded.",
+            },
             "origin_policy": {
                 "type": "string",
                 "enum": ["any", "us"],
@@ -322,6 +327,10 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         or config.get("defaults", {}).get("max_deliberation_rounds")
         or 2
     )
+    min_quorum_arg = arguments.get("min_quorum")
+    if min_quorum_arg is None:
+        min_quorum_arg = mode_cfg.get("min_quorum")
+    min_quorum_value = int(min_quorum_arg) if min_quorum_arg is not None else None
     budget = mcp_budget_report(
         config=config,
         participants=participants,
@@ -353,6 +362,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         deliberate=deliberate,
         max_rounds=max_rounds,
         image_manifest=image_manifest or None,
+        min_quorum=min_quorum_value,
     )
     if image_manifest:
         metadata["images"] = [

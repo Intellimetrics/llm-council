@@ -86,6 +86,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run an expensive second round if first-round responses disagree",
     )
     run.add_argument("--max-rounds", type=int, help="Maximum deliberation rounds")
+    run.add_argument(
+        "--min-quorum",
+        type=int,
+        default=None,
+        help=(
+            "Minimum label-producing peers in the final round before the "
+            "result is considered trustworthy. Default: 2 when 2+ peers "
+            "are configured, else equal to the peer count. Setting higher "
+            "than the configured peer count will always report the council "
+            "as degraded."
+        ),
+    )
 
     sub.add_parser("list", help="List participants and modes")
     init = sub.add_parser("init", help="Write an example project config")
@@ -942,6 +954,14 @@ def _print_progress_event(event: dict) -> None:
     if kind == "deliberation_finish":
         print(f"Deliberation: {event.get('status')} after {event.get('rounds')} rounds", flush=True)
         return
+    if kind == "degraded_consensus":
+        labeled = event.get("labeled_quorum")
+        threshold = event.get("min_quorum")
+        print(
+            f"Quorum: {labeled} of {threshold} required peers labeled — DEGRADED",
+            flush=True,
+        )
+        return
     if kind == "images_skipped":
         print(
             f"- {participant}: image attachments skipped ({event.get('reason')}; "
@@ -1054,6 +1074,13 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         or config.get("defaults", {}).get("max_deliberation_rounds")
         or 2
     )
+    min_quorum_value: int | None
+    if args.min_quorum is not None:
+        min_quorum_value = int(args.min_quorum)
+    elif mode_cfg.get("min_quorum") is not None:
+        min_quorum_value = int(mode_cfg["min_quorum"])
+    else:
+        min_quorum_value = None
     participant_cfg = config.get("participants", {})
     if not args.json:
         print(
@@ -1073,6 +1100,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         max_rounds=max_rounds,
         progress=None if args.json else _print_progress_event,
         image_manifest=image_manifest or None,
+        min_quorum=min_quorum_value,
     )
     if image_manifest:
         metadata["images"] = [

@@ -11,7 +11,12 @@ from llm_council.adapters import (
     is_timeout_error,
     run_participants,
 )
-from llm_council.deliberation import build_deliberation_prompt, has_disagreement
+from llm_council.deliberation import (
+    build_deliberation_prompt,
+    default_min_quorum,
+    has_disagreement,
+    labeled_quorum_count,
+)
 
 
 def _failed_for_deliberation(results: list[ParticipantResult]) -> set[str]:
@@ -35,6 +40,7 @@ async def execute_council(
     max_rounds: int = 2,
     progress: Callable[[dict[str, Any]], None] | None = None,
     image_manifest: list[dict[str, Any]] | None = None,
+    min_quorum: int | None = None,
 ) -> tuple[list[ParticipantResult], dict[str, Any]]:
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
 
@@ -188,6 +194,26 @@ async def execute_council(
                 "event": "deliberation_finish",
                 "rounds": metadata["rounds"],
                 "status": metadata["deliberation_status"],
+            }
+        )
+
+    effective_min_quorum = (
+        int(min_quorum) if min_quorum is not None else default_min_quorum(len(participants))
+    )
+    effective_min_quorum = max(1, effective_min_quorum)
+    final_labeled = labeled_quorum_count(round_results)
+    degraded = final_labeled < effective_min_quorum
+    metadata["min_quorum"] = effective_min_quorum
+    metadata["labeled_quorum"] = final_labeled
+    metadata["degraded"] = degraded
+    if degraded:
+        emit(
+            {
+                "event": "degraded_consensus",
+                "labeled_quorum": final_labeled,
+                "min_quorum": effective_min_quorum,
+                "participant_count": len(participants),
+                "round": metadata["rounds"],
             }
         )
 

@@ -34,7 +34,9 @@ from llm_council.context import read_context_file, read_git_diff
 from llm_council.defaults import DEFAULT_CONFIG
 from llm_council.deliberation import (
     build_deliberation_prompt,
+    default_min_quorum,
     has_disagreement,
+    labeled_quorum_count,
     model_comparison,
     recommendation_counts,
     recommendation_label,
@@ -3676,3 +3678,391 @@ def test_mcp_council_stats_tool(tmp_path: Path, monkeypatch):
 
     with pytest.raises(ValueError, match="positive integer"):
         run_stats({"working_directory": str(tmp_path), "since_days": 0})
+
+
+def test_default_min_quorum_scales_with_participant_count():
+    assert default_min_quorum(0) == 1
+    assert default_min_quorum(1) == 1
+    assert default_min_quorum(2) == 2
+    assert default_min_quorum(3) == 2
+    assert default_min_quorum(5) == 2
+
+
+def test_labeled_quorum_count_ignores_unknown_and_failed():
+    results = [
+        ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+        ParticipantResult("b", True, "I have no opinion.", "", 1),
+        ParticipantResult("c", False, "", "Timeout: c", 1),
+    ]
+    assert labeled_quorum_count(results) == 1
+
+
+def test_execute_council_metadata_full_quorum_not_degraded(monkeypatch, tmp_path: Path):
+    async def fake_run_participants(*args, **kwargs):
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+            ParticipantResult("b", True, "RECOMMENDATION: yes - ship", "", 1),
+            ParticipantResult("c", True, "RECOMMENDATION: yes - ship", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(["a", "b", "c"], {}, "q", tmp_path, {}, deliberate=False)
+    )
+    assert metadata["min_quorum"] == 2
+    assert metadata["labeled_quorum"] == 3
+    assert metadata["degraded"] is False
+    assert not any(
+        event.get("event") == "degraded_consensus"
+        for event in metadata["progress_events"]
+    )
+
+
+def test_execute_council_metadata_two_of_three_meets_default_quorum(
+    monkeypatch, tmp_path: Path
+):
+    async def fake_run_participants(*args, **kwargs):
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+            ParticipantResult("b", True, "RECOMMENDATION: yes - ship", "", 1),
+            ParticipantResult("c", False, "", "OpenRouterAuthError: 401", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(["a", "b", "c"], {}, "q", tmp_path, {}, deliberate=False)
+    )
+    assert metadata["min_quorum"] == 2
+    assert metadata["labeled_quorum"] == 2
+    assert metadata["degraded"] is False
+
+
+def test_execute_council_metadata_one_of_three_is_degraded(monkeypatch, tmp_path: Path):
+    async def fake_run_participants(*args, **kwargs):
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+            ParticipantResult("b", False, "", "OpenRouterAuthError: 401", 1),
+            ParticipantResult("c", False, "", "Timeout: `c` did not respond ...", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(["a", "b", "c"], {}, "q", tmp_path, {}, deliberate=False)
+    )
+    assert metadata["min_quorum"] == 2
+    assert metadata["labeled_quorum"] == 1
+    assert metadata["degraded"] is True
+    degraded_events = [
+        event
+        for event in metadata["progress_events"]
+        if event.get("event") == "degraded_consensus"
+    ]
+    assert len(degraded_events) == 1
+    assert degraded_events[0]["labeled_quorum"] == 1
+    assert degraded_events[0]["min_quorum"] == 2
+
+
+def test_execute_council_metadata_zero_labeled_is_degraded(monkeypatch, tmp_path: Path):
+    async def fake_run_participants(*args, **kwargs):
+        return [
+            ParticipantResult("a", False, "", "OpenRouterAuthError: 401", 1),
+            ParticipantResult("b", False, "", "Timeout: b", 1),
+            ParticipantResult("c", False, "", "Timeout: c", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(["a", "b", "c"], {}, "q", tmp_path, {}, deliberate=False)
+    )
+    assert metadata["min_quorum"] == 2
+    assert metadata["labeled_quorum"] == 0
+    assert metadata["degraded"] is True
+
+
+def test_execute_council_single_peer_mode_default_quorum_is_one(
+    monkeypatch, tmp_path: Path
+):
+    async def fake_run_participants(*args, **kwargs):
+        return [
+            ParticipantResult("solo", True, "RECOMMENDATION: yes - ship", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(["solo"], {}, "q", tmp_path, {}, deliberate=False)
+    )
+    assert metadata["min_quorum"] == 1
+    assert metadata["labeled_quorum"] == 1
+    assert metadata["degraded"] is False
+
+
+def test_execute_council_min_quorum_override_can_force_degraded(
+    monkeypatch, tmp_path: Path
+):
+    async def fake_run_participants(*args, **kwargs):
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+            ParticipantResult("b", True, "RECOMMENDATION: yes - ship", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(
+            ["a", "b"], {}, "q", tmp_path, {}, deliberate=False, min_quorum=3
+        )
+    )
+    assert metadata["min_quorum"] == 3
+    assert metadata["labeled_quorum"] == 2
+    assert metadata["degraded"] is True
+
+
+def test_write_transcript_emits_degraded_consensus_section(tmp_path: Path):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "deg.md"
+    json_path = out_dir / "deg.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="degraded run",
+        mode="quick",
+        current="codex",
+        participants=["a", "b", "c"],
+        prompt="prompt",
+        results=[
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1.0),
+            ParticipantResult("b", False, "", "OpenRouterAuthError: 401 unauthorized", 1.0),
+            ParticipantResult(
+                "c", False, "", "Timeout: `c` did not respond within 60s", 1.0
+            ),
+        ],
+        metadata={
+            "rounds": 1,
+            "deliberation_status": "skipped_no_labeled_disagreement",
+            "final_disagreement_detected": False,
+            "min_quorum": 2,
+            "labeled_quorum": 1,
+            "degraded": True,
+        },
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "- Quorum: 1 of 3 peers labeled (min: 2) — **DEGRADED**" in md
+    assert "## Degraded consensus" in md
+    assert "1 of 3 peers produced a label" in md
+    assert "- b: failed — OpenRouterAuthError: 401 unauthorized" in md
+    assert "- c: timeout — Timeout: `c` did not respond within 60s" in md
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    deg = payload["degraded_consensus"]
+    assert deg["labeled_quorum"] == 1
+    assert deg["min_quorum"] == 2
+    missing_names = [entry["name"] for entry in deg["missing"]]
+    assert missing_names == ["b", "c"]
+    reasons = {entry["name"]: entry["reason"] for entry in deg["missing"]}
+    assert reasons == {"b": "failed", "c": "timeout"}
+
+
+def test_write_transcript_full_quorum_no_degraded_section(tmp_path: Path):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "ok.md"
+    json_path = out_dir / "ok.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="full quorum",
+        mode="quick",
+        current="codex",
+        participants=["a", "b", "c"],
+        prompt="prompt",
+        results=[
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1.0),
+            ParticipantResult("b", True, "RECOMMENDATION: yes - ship", "", 1.0),
+            ParticipantResult("c", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        ],
+        metadata={
+            "rounds": 1,
+            "deliberation_status": "skipped_no_labeled_disagreement",
+            "final_disagreement_detected": False,
+            "min_quorum": 2,
+            "labeled_quorum": 3,
+            "degraded": False,
+        },
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "- Quorum: 3 of 3 peers labeled (min: 2)" in md
+    assert "DEGRADED" not in md
+    assert "## Degraded consensus" not in md
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert "degraded_consensus" not in payload
+
+
+def test_write_transcript_missing_label_marked_in_degraded_section(tmp_path: Path):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "label.md"
+    json_path = out_dir / "label.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="missing label",
+        mode="quick",
+        current="codex",
+        participants=["a", "b"],
+        prompt="prompt",
+        results=[
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1.0),
+            ParticipantResult("b", True, "I have no clear opinion.", "", 1.0),
+        ],
+        metadata={
+            "rounds": 1,
+            "deliberation_status": "skipped_no_labeled_disagreement",
+            "final_disagreement_detected": False,
+            "min_quorum": 2,
+            "labeled_quorum": 1,
+            "degraded": True,
+        },
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "## Degraded consensus" in md
+    assert "- b: missing label" in md
+
+
+def test_write_transcript_all_labeled_but_threshold_too_high_uses_config_wording(
+    tmp_path: Path,
+):
+    """Body wording branches when no peers are missing — the cause is a
+    threshold above the peer count, not a participant failure."""
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "tight.md"
+    json_path = out_dir / "tight.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="tight quorum",
+        mode="quick",
+        current="codex",
+        participants=["a", "b"],
+        prompt="prompt",
+        results=[
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1.0),
+            ParticipantResult("b", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        ],
+        metadata={
+            "rounds": 1,
+            "deliberation_status": "skipped_no_labeled_disagreement",
+            "final_disagreement_detected": False,
+            "min_quorum": 5,
+            "labeled_quorum": 2,
+            "degraded": True,
+        },
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "## Degraded consensus" in md
+    assert "configured `min_quorum` of 5 exceeds" in md
+    assert "Peers that did not label" not in md
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["degraded_consensus"]["missing"] == []
+
+
+def test_write_transcript_remaining_disagreement_and_degraded_coexist(tmp_path: Path):
+    """Regression: degraded consensus does not displace ## Remaining disagreement."""
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "both.md"
+    json_path = out_dir / "both.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="both surfaces",
+        mode="deliberate",
+        current="codex",
+        participants=["a", "b", "c"],
+        prompt="prompt",
+        results=[
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1.0),
+            ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1.0),
+            ParticipantResult("c", False, "", "OpenRouterAuthError: 401", 1.0),
+            ParticipantResult("a:round2", True, "RECOMMENDATION: yes - ship", "", 1.0),
+            ParticipantResult("b:round2", True, "RECOMMENDATION: no - wait", "", 1.0),
+        ],
+        metadata={
+            "rounds": 2,
+            "deliberation_status": "ran_max_rounds_unresolved",
+            "final_disagreement_detected": True,
+            "min_quorum": 3,
+            "labeled_quorum": 2,
+            "degraded": True,
+        },
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "## Remaining disagreement" in md
+    assert "## Degraded consensus" in md
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert "remaining_disagreement" in payload
+    assert "degraded_consensus" in payload
+
+
+def test_validate_config_rejects_non_positive_min_quorum(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "modes": {
+                    "quick": {
+                        "strategy": "other_cli_peers",
+                        "min_quorum": 0,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="min_quorum"):
+        load_config(str(path))
+
+
+def test_mode_min_quorum_threads_through_cli(monkeypatch, tmp_path: Path):
+    """Per-mode min_quorum override flows from config into execute_council."""
+    captured = {}
+
+    async def fake_execute_council(*args, **kwargs):
+        captured["min_quorum"] = kwargs.get("min_quorum")
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+            ParticipantResult("codex", True, "RECOMMENDATION: yes - ok", "", 1.0),
+            ParticipantResult("gemini", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_prompt", lambda *_a, **_k: "PROMPT")
+
+    config = {
+        "version": 1,
+        "transcripts_dir": str(tmp_path / "runs"),
+        "defaults": {"mode": "quick"},
+        "participants": {
+            "claude": {"type": "cli", "command": "claude"},
+            "codex": {"type": "cli", "command": "codex"},
+            "gemini": {"type": "cli", "command": "gemini"},
+        },
+        "modes": {
+            "quick": {
+                "participants": ["claude", "codex", "gemini"],
+                "min_quorum": 1,
+            }
+        },
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        ["run", "--cwd", str(tmp_path), "--mode", "quick", "--json", "test"]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0
+    assert captured["min_quorum"] == 1
+
+
+def test_council_run_schema_advertises_min_quorum():
+    schema = council_run_schema()
+    assert "min_quorum" in schema["properties"]
+    assert schema["properties"]["min_quorum"]["type"] == "integer"
+    assert schema["properties"]["min_quorum"]["minimum"] == 1
