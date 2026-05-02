@@ -29,7 +29,10 @@ from llm_council.policy import should_use_council
 from llm_council.setup_wizard import write_setup_files
 from llm_council.stats import compute_stats, format_stats_text
 from llm_council.transcript import (
+    find_transcript_by_id,
+    format_prior_council_context,
     latest_transcript,
+    normalize_run_id,
     transcript_paths,
     transcript_records,
     write_transcript,
@@ -96,6 +99,15 @@ def build_parser() -> argparse.ArgumentParser:
             "are configured, else equal to the peer count. Setting higher "
             "than the configured peer count will always report the council "
             "as degraded."
+        ),
+    )
+    run.add_argument(
+        "--continue",
+        dest="continue_id",
+        default=None,
+        help=(
+            "Run id (timestamp prefix or filename) of a prior council "
+            "transcript whose summary should be prepended to the new prompt."
         ),
     )
 
@@ -1025,6 +1037,27 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     stdin_text = sys.stdin.read() if args.stdin else None
+    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
+    if not out_dir.is_absolute():
+        out_dir = cwd / out_dir
+    parent_run_id: str | None = None
+    prior_context: str | None = None
+    continue_id = getattr(args, "continue_id", None)
+    if continue_id:
+        try:
+            normalize_run_id(continue_id)
+            prior_transcript = find_transcript_by_id(out_dir, continue_id)
+            prior_path = prior_transcript.get("_path")
+            parent_run_id = (
+                Path(str(prior_path)).stem
+                if prior_path
+                else normalize_run_id(continue_id)
+            )
+            prior_context = format_prior_council_context(
+                prior_transcript, run_id=parent_run_id
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
     try:
         image_manifest = (
             build_image_manifest(
@@ -1054,6 +1087,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             max_prompt_chars=config.get("defaults", {}).get("max_prompt_chars")
             or MAX_PROMPT_CHARS,
             image_manifest=image_manifest or None,
+            prior_context=prior_context,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -1113,9 +1147,6 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             for entry in image_manifest
         ]
 
-    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
-    if not out_dir.is_absolute():
-        out_dir = cwd / out_dir
     md_path, json_path = transcript_paths(out_dir, question)
     write_transcript(
         md_path,
@@ -1128,6 +1159,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         results=results,
         transparent=transparent,
         metadata=metadata,
+        parent_run_id=parent_run_id,
     )
 
     if args.json:

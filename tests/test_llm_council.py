@@ -66,8 +66,11 @@ from llm_council.setup_wizard import mcp_config, project_config, write_setup_fil
 from llm_council.transcript import (
     deliberation_summary,
     final_round_results,
+    find_transcript_by_id,
+    format_prior_council_context,
     latest_transcript,
     markdown_fence,
+    normalize_run_id,
     result_to_dict,
     safe_slug,
     transcript_records,
@@ -4643,3 +4646,432 @@ def test_openai_compatible_lookalike_host_does_not_get_openrouter_headers(monkey
 
     assert "HTTP-Referer" not in captured["headers"]
     assert "X-Title" not in captured["headers"]
+
+
+# --- Conversation threading via continuation_id ---
+
+
+def _write_prior_transcript(
+    out_dir: Path,
+    *,
+    run_id: str = "20260101_120000",
+    question: str = "Should we ship?",
+    results: list[ParticipantResult] | None = None,
+    metadata: dict | None = None,
+) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    md_path = out_dir / f"{run_id}_question.md"
+    json_path = out_dir / f"{run_id}_question.json"
+    if results is None:
+        results = [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ship now", "", 1.0),
+            ParticipantResult(
+                "codex", True, "RECOMMENDATION: tradeoff - depends on rollout", "", 1.0
+            ),
+            ParticipantResult("gemini", True, "RECOMMENDATION: yes - looks good", "", 1.0),
+        ]
+    write_transcript(
+        md_path,
+        json_path,
+        question=question,
+        mode="quick",
+        current="claude",
+        participants=[r.name.split(":round")[0] for r in results],
+        prompt="prompt",
+        results=results,
+        metadata=metadata or {"rounds": 1},
+    )
+    return json_path
+
+
+def test_normalize_run_id_accepts_prefix_and_filename():
+    assert normalize_run_id("20260101_120000") == "20260101_120000"
+    assert (
+        normalize_run_id("20260101_120000_question.json")
+        == "20260101_120000_question"
+    )
+    assert (
+        normalize_run_id("/some/abs/20260101_120000_question.md")
+        == "20260101_120000_question"
+    )
+
+
+def test_normalize_run_id_rejects_garbage():
+    with pytest.raises(ValueError, match="run id"):
+        normalize_run_id("")
+    with pytest.raises(ValueError, match="YYYYMMDD"):
+        normalize_run_id("not-a-timestamp")
+
+
+def test_find_transcript_by_id_finds_by_prefix(tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    json_path = _write_prior_transcript(out_dir, run_id="20260202_010203")
+    loaded = find_transcript_by_id(out_dir, "20260202_010203")
+    assert loaded["question"] == "Should we ship?"
+    assert loaded["_path"] == str(json_path)
+
+
+def test_find_transcript_by_id_accepts_full_filename(tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    json_path = _write_prior_transcript(out_dir, run_id="20260202_010203")
+    loaded = find_transcript_by_id(out_dir, json_path.name)
+    assert loaded["question"] == "Should we ship?"
+
+
+def test_find_transcript_by_id_raises_when_missing(tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    out_dir.mkdir(parents=True)
+    with pytest.raises(FileNotFoundError, match="No council transcript"):
+        find_transcript_by_id(out_dir, "20260101_120000")
+
+
+def test_format_prior_council_context_simple_run(tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    _write_prior_transcript(out_dir, run_id="20260101_120000")
+    transcript = find_transcript_by_id(out_dir, "20260101_120000")
+    block = format_prior_council_context(transcript)
+    assert block.startswith("Prior council context (run 20260101_120000_question):")
+    assert "Question: Should we ship?" in block
+    assert "Recommendations (final round): 2 yes / 0 no / 1 tradeoff / 0 unknown" in block
+    assert "- claude: yes — ship now" in block
+    assert "- codex: tradeoff — depends on rollout" in block
+    assert "- gemini: yes — looks good" in block
+    # Block must not duplicate the RECOMMENDATION: prefix.
+    assert "RECOMMENDATION: yes" not in block
+
+
+def test_format_prior_council_context_multi_round_uses_final_labels(tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    results = [
+        ParticipantResult("claude", True, "RECOMMENDATION: yes - r1", "", 1.0),
+        ParticipantResult("codex", True, "RECOMMENDATION: no - r1", "", 1.0),
+        ParticipantResult("claude:round2", True, "RECOMMENDATION: tradeoff - r2", "", 1.0),
+        ParticipantResult("codex:round2", True, "RECOMMENDATION: tradeoff - r2", "", 1.0),
+    ]
+    _write_prior_transcript(
+        out_dir,
+        run_id="20260303_010101",
+        results=results,
+        metadata={"rounds": 2, "deliberation_status": "ran_no_labeled_disagreement"},
+    )
+    transcript = find_transcript_by_id(out_dir, "20260303_010101")
+    block = format_prior_council_context(transcript, run_id="20260303_010101")
+    # Only final-round (round2) entries should appear, with the :round2 suffix stripped.
+    assert "Recommendations (final round): 0 yes / 0 no / 2 tradeoff / 0 unknown" in block
+    assert "- claude: tradeoff — r2" in block
+    assert "- codex: tradeoff — r2" in block
+    # Round 1 yes/no must not show up as separate lines.
+    assert "yes — r1" not in block
+    assert "no — r1" not in block
+
+
+def test_format_prior_council_context_includes_remaining_disagreement(tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    results = [
+        ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1.0),
+        ParticipantResult("a:round2", True, "RECOMMENDATION: yes - still ship", "", 1.0),
+        ParticipantResult("b:round2", True, "RECOMMENDATION: no - still wait", "", 1.0),
+    ]
+    _write_prior_transcript(
+        out_dir,
+        run_id="20260404_010101",
+        results=results,
+        metadata={
+            "rounds": 2,
+            "deliberation_status": "ran_max_rounds_unresolved",
+            "final_disagreement_detected": True,
+        },
+    )
+    transcript = find_transcript_by_id(out_dir, "20260404_010101")
+    block = format_prior_council_context(transcript)
+    assert "max deliberation rounds without convergence" in block
+    assert "- a: yes — still ship" in block
+    assert "- b: no — still wait" in block
+
+
+def test_format_prior_council_context_caps_long_peer_rationale(tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    long_rationale = "x" * 4000
+    results = [
+        ParticipantResult(
+            "claude", True, f"RECOMMENDATION: yes - {long_rationale}", "", 1.0
+        ),
+    ]
+    _write_prior_transcript(out_dir, run_id="20260606_010101", results=results)
+    transcript = find_transcript_by_id(out_dir, "20260606_010101")
+    block = format_prior_council_context(transcript)
+    # The rendered peer line should never exceed a few hundred chars.
+    peer_line = next(line for line in block.splitlines() if line.startswith("- claude"))
+    assert len(peer_line) < 500
+    assert peer_line.endswith("...")
+
+
+def test_format_prior_council_context_marks_degraded(tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    results = [
+        ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        ParticipantResult("b", False, "", "boom", 1.0),
+        ParticipantResult("c", False, "", "kaboom", 1.0),
+    ]
+    _write_prior_transcript(
+        out_dir,
+        run_id="20260505_010101",
+        results=results,
+        metadata={
+            "rounds": 1,
+            "labeled_quorum": 1,
+            "min_quorum": 2,
+            "degraded": True,
+        },
+    )
+    transcript = find_transcript_by_id(out_dir, "20260505_010101")
+    block = format_prior_council_context(transcript)
+    assert "[Note: prior run was degraded — 1 of 2 required peers labeled.]" in block
+    assert "- a: yes — ship" in block
+    # Failed peers should still appear with unknown label and their error line.
+    assert "- b: unknown — error: boom" in block
+
+
+def test_build_prompt_prepends_prior_context(tmp_path: Path):
+    prior = "Prior council context (run abc):\n\nQuestion: previous\n\nRecommendations (final round): 1 yes / 0 no / 0 tradeoff / 0 unknown\n- claude: yes — ok"
+    prompt = build_prompt(
+        "what next?",
+        mode="quick",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=False,
+        stdin_text=None,
+        prior_context=prior,
+    )
+    assert "Prior council context (run abc):" in prompt
+    prior_idx = prompt.index("Prior council context")
+    question_idx = prompt.index("User question:")
+    assert prior_idx < question_idx
+    # Read-only invariant intact.
+    assert "RECOMMENDATION: yes" in prompt
+
+
+def test_build_prompt_continuation_fails_fast_on_overflow(tmp_path: Path):
+    # Inflate the new question so the prepended block + question blow the cap.
+    prior = "Prior council context (run xyz):\n" + ("p" * 5_000)
+    big_question = "q" * 10_000
+    with pytest.raises(ValueError, match="Continuation prompt exceeds"):
+        build_prompt(
+            big_question,
+            mode="quick",
+            cwd=tmp_path,
+            context_paths=[],
+            include_diff=False,
+            stdin_text=None,
+            max_prompt_chars=8_000,
+            prior_context=prior,
+        )
+
+
+def test_write_transcript_records_and_chains_parent_run_id(tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    parent_id = "20260606_120000_first"
+    md1 = out_dir / f"{parent_id}.md"
+    json1 = out_dir / f"{parent_id}.json"
+    write_transcript(
+        md1,
+        json1,
+        question="first",
+        mode="quick",
+        current="claude",
+        participants=["claude"],
+        prompt="p",
+        results=[ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0)],
+    )
+    md2 = out_dir / "20260606_130000_second.md"
+    json2 = out_dir / "20260606_130000_second.json"
+    write_transcript(
+        md2,
+        json2,
+        question="second",
+        mode="quick",
+        current="claude",
+        participants=["claude"],
+        prompt="p",
+        results=[ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0)],
+        parent_run_id=parent_id,
+    )
+    payload = json.loads(json2.read_text(encoding="utf-8"))
+    assert payload["parent_run_id"] == parent_id
+    assert "Parent run: `" + parent_id + "`" in md2.read_text(encoding="utf-8")
+    # And we can chain through: load by parent id, format, build new prompt.
+    chained = find_transcript_by_id(out_dir, parent_id)
+    block = format_prior_council_context(chained, run_id=parent_id)
+    assert "Prior council context (run " + parent_id in block
+
+
+def test_cli_run_continue_threads_parent_id_into_transcript(monkeypatch, tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    parent_id = "20260707_120000"
+    _write_prior_transcript(out_dir, run_id=parent_id, question="prior question")
+
+    captured: dict = {}
+
+    async def fake_execute_council(*args, **kwargs):
+        captured["prompt"] = args[2] if len(args) >= 3 else kwargs.get("prompt")
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+
+    config = {
+        "version": 1,
+        "transcripts_dir": str(out_dir),
+        "defaults": {"mode": "quick"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {"quick": {"participants": ["claude"], "min_quorum": 1}},
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "--current",
+            "claude",
+            "--continue",
+            parent_id,
+            "--json",
+            "follow up",
+        ]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0
+    assert "Prior council context (run " in captured["prompt"]
+    assert "Question: prior question" in captured["prompt"]
+
+    # New transcript should record parent_run_id; prior must not.
+    payloads = [
+        json.loads(p.read_text(encoding="utf-8")) for p in out_dir.glob("*.json")
+    ]
+    chained = [p for p in payloads if "parent_run_id" in p]
+    assert len(chained) == 1
+    assert chained[0]["parent_run_id"].startswith(parent_id)
+
+
+def test_cli_run_continue_missing_id_errors(monkeypatch, tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    out_dir.mkdir(parents=True)
+    config = {
+        "version": 1,
+        "transcripts_dir": str(out_dir),
+        "defaults": {"mode": "quick"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {"quick": {"participants": ["claude"], "min_quorum": 1}},
+    }
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "--current",
+            "claude",
+            "--continue",
+            "20260101_000000",
+            "follow up",
+        ]
+    )
+    with pytest.raises(SystemExit, match="No council transcript"):
+        cli_module.cmd_run(args)
+
+
+def test_council_run_schema_advertises_continuation_id():
+    schema = council_run_schema()
+    assert "continuation_id" in schema["properties"]
+    assert schema["properties"]["continuation_id"]["type"] == "string"
+
+
+def test_mcp_run_council_threads_continuation_id(monkeypatch, tmp_path: Path):
+    from llm_council import mcp_server as mcp_module
+
+    out_dir = tmp_path / "runs"
+    parent_id = "20260808_120000"
+    _write_prior_transcript(out_dir, run_id=parent_id, question="prior mcp question")
+
+    captured: dict = {}
+
+    async def fake_execute_council(*args, **kwargs):
+        captured["prompt"] = args[2] if len(args) >= 3 else kwargs.get("prompt")
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    config = {
+        "version": 1,
+        "transcripts_dir": str(out_dir),
+        "defaults": {"mode": "quick"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {"quick": {"participants": ["claude"], "min_quorum": 1}},
+    }
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    monkeypatch.setattr(mcp_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(mcp_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(mcp_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(mcp_module, "find_config", lambda *_a, **_k: None)
+    monkeypatch.setattr(mcp_module, "select_participants", lambda *_a, **_k: ["claude"])
+    monkeypatch.setattr(mcp_module, "enforce_mcp_budget", lambda *_a, **_k: None)
+
+    result = asyncio.run(
+        mcp_module.run_council(
+            {
+                "question": "follow up question",
+                "continuation_id": parent_id,
+                "working_directory": str(tmp_path),
+            }
+        )
+    )
+    assert "Prior council context (run " in captured["prompt"]
+    transcript_path = Path(result["json"])
+    payload = json.loads(transcript_path.read_text(encoding="utf-8"))
+    assert payload["parent_run_id"].startswith(parent_id)
+    # New JSON transcript should be distinct from the prior one.
+    assert transcript_path.name != f"{parent_id}_question.json"
+
+
+def test_mcp_run_council_continuation_missing_errors(monkeypatch, tmp_path: Path):
+    from llm_council import mcp_server as mcp_module
+
+    out_dir = tmp_path / "runs"
+    out_dir.mkdir(parents=True)
+    config = {
+        "version": 1,
+        "transcripts_dir": str(out_dir),
+        "defaults": {"mode": "quick"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {"quick": {"participants": ["claude"], "min_quorum": 1}},
+    }
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    monkeypatch.setattr(mcp_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(mcp_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(mcp_module, "find_config", lambda *_a, **_k: None)
+    monkeypatch.setattr(mcp_module, "select_participants", lambda *_a, **_k: ["claude"])
+
+    with pytest.raises(FileNotFoundError, match="No council transcript"):
+        asyncio.run(
+            mcp_module.run_council(
+                {
+                    "question": "follow up",
+                    "continuation_id": "20259999_000000",
+                    "working_directory": str(tmp_path),
+                }
+            )
+        )

@@ -317,6 +317,7 @@ def build_prompt(
     image_manifest: list[dict[str, Any]] | None = None,
     stances: dict[str, str] | None = None,
     participants: dict[str, dict[str, Any]] | None = None,
+    prior_context: str | None = None,
 ) -> str:
     """Build the read-only prompt sent to each participant."""
 
@@ -332,16 +333,22 @@ def build_prompt(
         "Do not edit files. Do not run write operations. If you need code changes, propose them as recommendations only.",
         f"Working directory: {cwd}",
         f"Council mode: {mode}",
-        "",
-        "User question:",
-        question.strip(),
-        "",
-        "Response format:",
-        "- Start with `RECOMMENDATION: yes - ...`, `RECOMMENDATION: no - ...`, or `RECOMMENDATION: tradeoff - ...`.",
-        "- List the strongest reasons.",
-        "- List concrete risks or things to verify.",
-        "- Keep implementation suggestions read-only unless explicitly asked to write code.",
     ]
+    if prior_context:
+        sections.extend(["", prior_context.strip()])
+    sections.extend(
+        [
+            "",
+            "User question:",
+            question.strip(),
+            "",
+            "Response format:",
+            "- Start with `RECOMMENDATION: yes - ...`, `RECOMMENDATION: no - ...`, or `RECOMMENDATION: tradeoff - ...`.",
+            "- List the strongest reasons.",
+            "- List concrete risks or things to verify.",
+            "- Keep implementation suggestions read-only unless explicitly asked to write code.",
+        ]
+    )
 
     context_sections: list[str] = []
     # Images go first so the textual reference list survives prompt-size
@@ -374,6 +381,14 @@ def build_prompt(
 
     prompt = "\n".join(sections)
     if max_prompt_chars is not None and len(prompt) > max_prompt_chars:
+        if prior_context:
+            raise ValueError(
+                "Continuation prompt exceeds max_prompt_chars: "
+                f"{len(prompt)} > {max_prompt_chars}. The prior council "
+                "context is preserved verbatim by design. Drop --context/--diff, "
+                "shorten the new question, or run without --continue / "
+                "continuation_id."
+            )
         prompt = (
             prompt[:max_prompt_chars]
             + "\n\n[llm-council prompt truncated at "

@@ -36,7 +36,14 @@ from llm_council.model_catalog import fetch_openrouter_models
 from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
 from llm_council.stats import compute_stats
-from llm_council.transcript import latest_transcript, transcript_paths, write_transcript
+from llm_council.transcript import (
+    find_transcript_by_id,
+    format_prior_council_context,
+    latest_transcript,
+    normalize_run_id,
+    transcript_paths,
+    write_transcript,
+)
 from llm_council.update_check import check_for_update
 
 
@@ -111,6 +118,14 @@ def council_run_schema() -> dict[str, Any]:
                 "type": "string",
                 "enum": ["any", "us"],
                 "description": "Set to 'us' to allow only US-origin participants.",
+            },
+            "continuation_id": {
+                "type": "string",
+                "description": (
+                    "Run id (timestamp prefix or filename) of a prior council "
+                    "transcript whose summary should be prepended to the new "
+                    "prompt. The new transcript records this as parent_run_id."
+                ),
             },
         },
         "required": ["question"],
@@ -286,6 +301,21 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
     if not transcripts_root.is_absolute():
         transcripts_root = cwd / transcripts_root
     md_path, json_path = transcript_paths(transcripts_root, question)
+    parent_run_id: str | None = None
+    prior_context: str | None = None
+    continuation_id = arguments.get("continuation_id")
+    if continuation_id:
+        normalize_run_id(continuation_id)
+        prior_transcript = find_transcript_by_id(transcripts_root, continuation_id)
+        prior_path = prior_transcript.get("_path")
+        parent_run_id = (
+            Path(str(prior_path)).stem
+            if prior_path
+            else normalize_run_id(continuation_id)
+        )
+        prior_context = format_prior_council_context(
+            prior_transcript, run_id=parent_run_id
+        )
     sweep_old_inline_inputs(cwd)
     inline_staged = _stage_inline_images(arguments.get("images"), cwd, md_path.stem)
     image_path_inputs = list(arguments.get("image_paths") or []) + inline_staged
@@ -314,6 +344,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         max_prompt_chars=config.get("defaults", {}).get("max_prompt_chars")
         or MAX_PROMPT_CHARS,
         image_manifest=image_manifest or None,
+        prior_context=prior_context,
     )
 
     mode_cfg = config.get("modes", {}).get(mode, {})
@@ -379,6 +410,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         results=results,
         transparent=transparent,
         metadata=metadata,
+        parent_run_id=parent_run_id,
     )
     return {
         "mode": mode,

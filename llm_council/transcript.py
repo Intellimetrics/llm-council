@@ -37,6 +37,219 @@ def transcript_paths(base_dir: Path, question: str) -> tuple[Path, Path]:
     return base_dir / f"{stem}.md", base_dir / f"{stem}.json"
 
 
+_RUN_ID_RE = re.compile(r"^\d{8}_\d{6}")
+
+
+def normalize_run_id(value: str) -> str:
+    """Strip directory and known suffixes; require the timestamp prefix."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("run id is empty")
+    raw = Path(raw).name
+    for suffix in (".json", ".md"):
+        if raw.endswith(suffix):
+            raw = raw[: -len(suffix)]
+            break
+    match = _RUN_ID_RE.match(raw)
+    if not match:
+        raise ValueError(
+            f"run id '{value}' does not start with a YYYYMMDD_HHMMSS prefix"
+        )
+    return raw
+
+
+def find_transcript_by_id(base_dir: Path, run_id: str) -> dict[str, Any]:
+    """Locate a JSON transcript by run-id prefix or filename and load it.
+
+    Accepts either the bare timestamp prefix (``20260502_062608``) or a
+    full filename (``20260502_062608_question.json`` / ``.md``). Raises
+    ``FileNotFoundError`` if no JSON transcript matches.
+    """
+
+    normalized = normalize_run_id(run_id)
+    candidates = sorted(base_dir.glob(f"{normalized}*.json"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No council transcript matching run id '{run_id}' was found in "
+            f"{base_dir}. Run `llm-council transcripts list` to see available ids."
+        )
+    if len(candidates) > 1:
+        for candidate in candidates:
+            if candidate.stem == normalized:
+                return _load_transcript_json(candidate)
+        names = ", ".join(c.name for c in candidates)
+        raise ValueError(
+            f"Run id '{run_id}' matches multiple transcripts ({names}); "
+            "supply the full filename or a longer prefix."
+        )
+    return _load_transcript_json(candidates[0])
+
+
+def _load_transcript_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Unable to read transcript JSON at {path}: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Transcript JSON at {path} is not an object")
+    data.setdefault("_path", str(path))
+    return data
+
+
+_PRIOR_QUESTION_MAX_CHARS = 2000
+_PRIOR_PEER_SUMMARY_MAX_CHARS = 240
+
+
+def _final_round_label(name: str) -> str:
+    return ROUND_SUFFIX_RE.sub("", name)
+
+
+def _strip_recommendation_from_summary(summary: str) -> str:
+    return _strip_recommendation_prefix(summary or "").strip()
+
+
+def _select_final_round_records(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not results:
+        return []
+    rounds = []
+    for result in results:
+        match = ROUND_SUFFIX_RE.search(str(result.get("name") or ""))
+        rounds.append(int(match.group(1)) if match else 1)
+    final_round = max(rounds) if rounds else 1
+    return [
+        result
+        for result, round_no in zip(results, rounds)
+        if round_no == final_round
+    ]
+
+
+def _summarize_record_label(record: dict[str, Any]) -> tuple[str, str, bool]:
+    output = str(record.get("output") or "")
+    if record.get("ok") and output:
+        label = recommendation_label(output)
+        line = recommendation_line(output)
+        summary = _strip_recommendation_from_summary(line)
+        return label, _cap_peer_summary(summary), False
+    error = str(record.get("error") or "")
+    summary = _first_nonempty_line(error)
+    return "unknown", _cap_peer_summary(summary), True
+
+
+def _cap_peer_summary(text: str) -> str:
+    cleaned = (text or "").strip()
+    if len(cleaned) <= _PRIOR_PEER_SUMMARY_MAX_CHARS:
+        return cleaned
+    return cleaned[: _PRIOR_PEER_SUMMARY_MAX_CHARS - 3].rstrip() + "..."
+
+
+def format_prior_council_context(
+    transcript: dict[str, Any],
+    *,
+    run_id: str | None = None,
+) -> str:
+    """Render a compact 'Prior council context' block for prompt prepending.
+
+    The block summarizes the prior question, the final-round labels and a
+    one-line rationale per peer, plus notes pulled from
+    ``remaining_disagreement`` and ``degraded_consensus`` payloads when the
+    prior run recorded them.
+    """
+
+    if not isinstance(transcript, dict):
+        raise ValueError("transcript must be a dict loaded from JSON")
+    if run_id is None:
+        path = transcript.get("_path")
+        if path:
+            run_id = Path(str(path)).stem
+        else:
+            run_id = "unknown"
+    question = str(transcript.get("question") or "").strip()
+    truncated_question = question
+    if len(truncated_question) > _PRIOR_QUESTION_MAX_CHARS:
+        truncated_question = (
+            truncated_question[:_PRIOR_QUESTION_MAX_CHARS].rstrip()
+            + "...[truncated]"
+        )
+
+    results = transcript.get("results") or []
+    if not isinstance(results, list):
+        results = []
+    final_records = _select_final_round_records(results)
+
+    counts = {"yes": 0, "no": 0, "tradeoff": 0, "unknown": 0}
+    peer_lines: list[str] = []
+    for record in final_records:
+        if not isinstance(record, dict):
+            continue
+        name = str(record.get("name") or "?")
+        display_name = _final_round_label(name)
+        label, summary, is_error = _summarize_record_label(record)
+        counts[label if label in counts else "unknown"] += 1
+        if is_error:
+            rendered_summary = (
+                f"error: {summary}" if summary else "error: no detail recorded"
+            )
+        else:
+            rendered_summary = summary or "no rationale recorded"
+        peer_lines.append(f"- {display_name}: {label} — {rendered_summary}")
+
+    remaining = transcript.get("remaining_disagreement")
+    if isinstance(remaining, dict):
+        rem_participants = remaining.get("participants") or []
+        for entry in rem_participants:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "?")
+            display_name = _final_round_label(name)
+            already = any(
+                line.startswith(f"- {display_name}: ") for line in peer_lines
+            )
+            if already:
+                continue
+            label = entry.get("label") or "unknown"
+            summary = (entry.get("summary") or "").strip() or "no rationale recorded"
+            peer_lines.append(f"- {display_name}: {label} — {summary}")
+
+    degraded = transcript.get("degraded_consensus")
+    is_degraded = isinstance(degraded, dict)
+
+    lines: list[str] = [f"Prior council context (run {run_id}):", ""]
+    if truncated_question:
+        lines.append(f"Question: {truncated_question}")
+        lines.append("")
+    summary_line = (
+        "Recommendations (final round): "
+        f"{counts['yes']} yes / {counts['no']} no / "
+        f"{counts['tradeoff']} tradeoff / {counts['unknown']} unknown"
+    )
+    lines.append(summary_line)
+    if peer_lines:
+        lines.extend(peer_lines)
+    else:
+        lines.append("- (no participant responses recorded)")
+    if is_degraded:
+        labeled = degraded.get("labeled_quorum")
+        threshold = degraded.get("min_quorum")
+        lines.extend(
+            [
+                "",
+                "[Note: prior run was degraded — "
+                f"{labeled} of {threshold} required peers labeled.]",
+            ]
+        )
+    if isinstance(remaining, dict) and remaining.get("ran_max_rounds_unresolved"):
+        lines.extend(
+            [
+                "",
+                "[Note: prior run reached max deliberation rounds without convergence.]",
+            ]
+        )
+    return "\n".join(lines).rstrip()
+
+
 def latest_transcript(base_dir: Path, *, suffix: str = ".md") -> Path | None:
     matches = sorted(
         _existing_paths(base_dir.glob(f"*{suffix}")), key=lambda item: item[1]
@@ -260,6 +473,7 @@ def write_transcript(
     results: list[ParticipantResult],
     transparent: bool = False,
     metadata: dict[str, Any] | None = None,
+    parent_run_id: str | None = None,
 ) -> None:
     markdown_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -291,6 +505,11 @@ def write_transcript(
         f"- Cost reported: `${cost_total:.6f}`",
         f"- Rounds: `{metadata.get('rounds', 1)}`",
         f"- Deliberation: {deliberation_summary(metadata)}",
+        *(
+            [f"- Parent run: `{parent_run_id}`"]
+            if parent_run_id
+            else []
+        ),
         "- Recommendations (final round): "
         f"`{recommendations['yes']} yes / {recommendations['no']} no / "
         f"{recommendations['tradeoff']} tradeoff / {recommendations['unknown']} unknown`",
@@ -422,6 +641,8 @@ def write_transcript(
         "metadata": metadata,
         "results": [result_to_dict(result) for result in results],
     }
+    if parent_run_id:
+        json_payload["parent_run_id"] = parent_run_id
     if remaining is not None:
         json_payload["remaining_disagreement"] = remaining
     if degraded is not None:
