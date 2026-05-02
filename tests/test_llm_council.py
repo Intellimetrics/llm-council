@@ -5726,21 +5726,18 @@ def test_build_prompt_default_fail_strategy_unchanged_when_fits(tmp_path: Path):
     assert "[diff truncated" not in prompt
 
 
-def test_build_prompt_default_fail_strategy_truncates_oversize(tmp_path: Path):
+def test_build_prompt_default_fail_strategy_raises_on_oversize(tmp_path: Path):
     big_question = "q" * 5_000
-    prompt = build_prompt(
-        big_question,
-        mode="quick",
-        cwd=tmp_path,
-        context_paths=[],
-        include_diff=False,
-        stdin_text=None,
-        max_prompt_chars=2_000,
-    )
-    # Default fail strategy still hits the legacy truncation path because
-    # there's no diff to chunk.
-    assert "[llm-council prompt truncated at 2000" in prompt
-    assert len(prompt) <= 2_100
+    with pytest.raises(ValueError, match=r"Prompt exceeds max_prompt_chars"):
+        build_prompt(
+            big_question,
+            mode="quick",
+            cwd=tmp_path,
+            context_paths=[],
+            include_diff=False,
+            stdin_text=None,
+            max_prompt_chars=2_000,
+        )
 
 
 def test_build_prompt_head_strategy_chunks_diff(tmp_path: Path):
@@ -6929,3 +6926,702 @@ def test_resolve_ttl_seconds_treats_non_positive_as_default():
     assert cache_module.resolve_ttl_seconds(
         {"defaults": {"cache_ttl_hours": -5}}, None
     ) == cache_module.DEFAULT_TTL_SECONDS
+
+
+# --- v0.4.0 ship-blocker regression tests ---
+
+
+def test_build_prompt_stance_section_precedes_context(tmp_path: Path):
+    """Bug 2 / 3: stance must come BEFORE Context: so round-2 strip and hard
+    truncation cannot drop it."""
+    ctx_file = tmp_path / "ctx.md"
+    ctx_file.write_text("## Some Context\n\nstuff", encoding="utf-8")
+    prompt = build_prompt(
+        "Q?",
+        mode="consensus",
+        cwd=tmp_path,
+        context_paths=["ctx.md"],
+        include_diff=False,
+        stdin_text=None,
+        stances={"claude": "for", "codex": "against"},
+        participants={
+            "claude": {"family": "claude"},
+            "codex": {"family": "codex"},
+        },
+    )
+    stance_idx = prompt.index("Stance Assignments")
+    context_idx = prompt.index("\nContext:\n")
+    assert stance_idx < context_idx, (
+        "stance must precede Context: marker so deliberation strip preserves it"
+    )
+
+
+def test_build_deliberation_prompt_preserves_stance_after_strip(tmp_path: Path):
+    """Bug 2: round-2 _strip_context_payload used to drop stance_tail along
+    with Context:. With stance before Context:, the strip preserves it."""
+    from llm_council.deliberation import _strip_context_payload
+
+    original = build_prompt(
+        "Q?",
+        mode="consensus",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=False,
+        stdin_text="round-1 only payload that should drop",
+        stances={"claude": "for", "codex": "against"},
+        participants={
+            "claude": {"family": "claude"},
+            "codex": {"family": "codex"},
+        },
+    )
+    assert "Stance Assignments" in original
+    assert "round-1 only payload" in original
+    stripped = _strip_context_payload(original)
+    assert "Stance Assignments" in stripped, (
+        "round-2 deliberation must keep the stance assignments"
+    )
+    assert "round-1 only payload" not in stripped
+
+
+def test_build_prompt_fail_strategy_raises_on_overflow_with_diff(tmp_path: Path):
+    """Bug 4: --chunk-strategy fail must raise on overflow rather than
+    silently truncating the diff."""
+    _git_init_with_large_diff(
+        tmp_path,
+        files={"a.py": ("hello\n", "hello\n" + ("xx\n" * 5_000))},
+    )
+    with pytest.raises(ValueError, match=r"Prompt exceeds max_prompt_chars"):
+        build_prompt(
+            "review",
+            mode="quick",
+            cwd=tmp_path,
+            context_paths=[],
+            include_diff=True,
+            stdin_text=None,
+            max_prompt_chars=2_000,
+            chunk_strategy="fail",
+        )
+
+
+def test_build_prompt_chunk_strategy_too_tight_raises(tmp_path: Path):
+    """Bug 4 corollary: head/tail/hash-aware also raise (instead of silent
+    truncation) when non-diff context alone exceeds budget."""
+    big_question = "q" * 5_000
+    with pytest.raises(ValueError, match=r"could not produce a fitting prompt"):
+        build_prompt(
+            big_question,
+            mode="quick",
+            cwd=tmp_path,
+            context_paths=[],
+            include_diff=False,
+            stdin_text=None,
+            max_prompt_chars=2_000,
+            chunk_strategy="head",
+        )
+
+
+def test_retry_enabled_respects_explicit_zero_retries():
+    """Bug 5: _retry_enabled returns False when retries is explicitly 0,
+    so the application-level repair retry honors the user's no-retries
+    setting (commit 45b44ee)."""
+    from llm_council.adapters import _retry_enabled
+
+    assert _retry_enabled({}) is True
+    assert _retry_enabled({"retries": 1}) is True
+    assert _retry_enabled({"retries": 0}) is False
+    assert _retry_enabled({"retry_on_missing_label": False}) is False
+    assert _retry_enabled({"retry_on_missing_label": True, "retries": 0}) is False
+    assert _retry_enabled({"retry_on_missing_label": True, "retries": 2}) is True
+
+
+def test_cmd_run_passes_consensus_stances_when_no_project_yaml(
+    monkeypatch, tmp_path: Path
+):
+    """Bug 1: --mode consensus without a .llm-council.yaml on disk must still
+    deliver assigned stances — the merged config (from defaults) carries them
+    and the CLI must forward them to build_prompt explicitly."""
+    captured: dict = {}
+
+    def fake_build_prompt(*_args, **kwargs):
+        captured.update(kwargs)
+        return "PROMPT"
+
+    async def fake_execute_council(*args, **kwargs):
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+            ParticipantResult("codex", True, "RECOMMENDATION: no - bad", "", 1.0),
+            ParticipantResult("gemini", True, "RECOMMENDATION: tradeoff - meh", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_prompt", fake_build_prompt)
+
+    config = {
+        "version": 1,
+        "transcripts_dir": str(tmp_path / "runs"),
+        "defaults": {"mode": "consensus"},
+        "participants": {
+            "claude": {"type": "cli", "command": "claude"},
+            "codex": {"type": "cli", "command": "codex"},
+            "gemini": {"type": "cli", "command": "gemini"},
+        },
+        "modes": {
+            "consensus": {
+                "participants": ["claude", "codex", "gemini"],
+                "stances": {
+                    "claude": "for",
+                    "codex": "against",
+                    "gemini": "neutral",
+                },
+            }
+        },
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    # No project YAML on disk — this is the regression scenario.
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        ["run", "--cwd", str(tmp_path), "--mode", "consensus", "--json", "test"]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0
+    assert captured.get("stances") == {
+        "claude": "for",
+        "codex": "against",
+        "gemini": "neutral",
+    }
+    assert captured.get("participants") == config["participants"]
+
+
+# --- batch B observability fixes ---
+
+
+def test_result_to_dict_emits_stance_when_assigned():
+    from llm_council.transcript import result_to_dict
+
+    result = ParticipantResult(
+        "claude", True, "RECOMMENDATION: yes - ok", "", 1.0, stance="for"
+    )
+    payload = result_to_dict(result)
+    assert payload["stance"] == "for"
+
+
+def test_result_to_dict_omits_stance_when_none():
+    from llm_council.transcript import result_to_dict
+
+    result = ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0)
+    payload = result_to_dict(result)
+    assert "stance" not in payload
+
+
+def test_result_to_dict_emits_repair_retry_recovered():
+    from llm_council.transcript import result_to_dict
+
+    result = ParticipantResult(
+        "claude",
+        True,
+        "RECOMMENDATION: yes",
+        "",
+        1.0,
+        repair_retry_recovered=True,
+    )
+    payload = result_to_dict(result)
+    assert payload["repair_retry_recovered"] is True
+
+
+def test_execute_council_stamps_stance_on_results(monkeypatch, tmp_path: Path):
+    """Bug A2-medium: assigned stance must land on each ParticipantResult so
+    downstream code (transcript, --json stdout) can surface it."""
+    from llm_council.orchestrator import execute_council
+
+    async def fake_run_participants(
+        selected, cfg, prompt, cwd, **_kwargs
+    ):
+        return [
+            ParticipantResult(name, True, "RECOMMENDATION: yes - ok", "", 1.0)
+            for name in selected
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    config = {"defaults": {"max_concurrency": 4}}
+    participants = ["claude", "codex", "gemini"]
+    cfg = {name: {"type": "cli"} for name in participants}
+    stances = {"claude": "for", "codex": "against", "gemini": "neutral"}
+
+    results, metadata = asyncio.run(
+        execute_council(
+            participants,
+            cfg,
+            "prompt",
+            tmp_path,
+            config,
+            stances=stances,
+        )
+    )
+    by_name = {r.name: r for r in results}
+    assert by_name["claude"].stance == "for"
+    assert by_name["codex"].stance == "against"
+    assert by_name["gemini"].stance == "neutral"
+    assert metadata["stances"] == stances
+
+
+def test_run_participants_progress_finish_includes_retry_recovery_flags(
+    monkeypatch, tmp_path: Path
+):
+    """A1 dogfood: participant_finish events must include
+    recovered_after_launch_retry and repair_retry_recovered so streaming
+    UIs can render `(retry recovered)` inline."""
+    from llm_council.adapters import run_participants
+
+    events: list[dict] = []
+
+    async def fake_run_participant(name, cfg, prompt, cwd, **kwargs):
+        return ParticipantResult(
+            name=name,
+            ok=True,
+            output="RECOMMENDATION: yes - ok",
+            error="",
+            elapsed_seconds=0.5,
+            recovered_after_launch_retry=True,
+            repair_retry_recovered=True,
+        )
+
+    monkeypatch.setattr(adapters_module, "run_participant", fake_run_participant)
+    asyncio.run(
+        run_participants(
+            ["claude"],
+            {"claude": {"type": "cli"}},
+            "prompt",
+            tmp_path,
+            progress=events.append,
+        )
+    )
+    finish = next(e for e in events if e["event"] == "participant_finish")
+    assert finish["recovered_after_launch_retry"] is True
+    assert finish["repair_retry_recovered"] is True
+
+
+def test_write_transcript_includes_round_2_prompt(tmp_path: Path):
+    """A2 dogfood: round-2 deliberation prompt must appear in markdown so
+    operators can audit what context peers got."""
+    out_dir = tmp_path / "runs"
+    md_path = out_dir / "test.md"
+    json_path = out_dir / "test.json"
+    results = [
+        ParticipantResult("claude", True, "RECOMMENDATION: yes", "", 1.0),
+        ParticipantResult("claude:round2", True, "RECOMMENDATION: yes", "", 1.0),
+    ]
+    write_transcript(
+        md_path,
+        json_path,
+        question="q",
+        mode="deliberate",
+        current="claude",
+        participants=["claude"],
+        prompt="ROUND_1_PROMPT",
+        results=results,
+        metadata={
+            "rounds": 2,
+            "deliberated": True,
+            "deliberation_prompts": {"2": "ROUND_2_PROMPT_BODY"},
+        },
+    )
+    content = md_path.read_text(encoding="utf-8")
+    assert "## Prompt Sent" in content
+    assert "ROUND_1_PROMPT" in content
+    assert "## Round 2 Prompt" in content
+    assert "ROUND_2_PROMPT_BODY" in content
+
+
+def test_parse_since_arg_accepts_integer_days():
+    from llm_council.cli import _parse_since_arg
+
+    assert _parse_since_arg("7") == 7
+    assert _parse_since_arg("30") == 30
+
+
+def test_parse_since_arg_accepts_iso_date():
+    from llm_council.cli import _parse_since_arg
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).date()
+    yesterday_iso = today.replace().isoformat()
+    days = _parse_since_arg(yesterday_iso)
+    assert days == 0
+    # Far-past date must produce a positive day count.
+    assert _parse_since_arg("2020-01-01") > 365
+
+
+def test_parse_since_arg_rejects_garbage():
+    from llm_council.cli import _parse_since_arg
+
+    with pytest.raises(argparse.ArgumentTypeError, match="ISO date"):
+        _parse_since_arg("not-a-date")
+
+
+# --- batch C: agent-friendliness, budget, taxonomy, threading-safety ---
+
+
+def test_question_flag_alias_accepted():
+    """Bug A2 dogfood: --question alias must work alongside the positional."""
+    args = build_parser().parse_args(
+        ["run", "--cwd", ".", "--mode", "quick", "--question", "explain X"]
+    )
+    assert args.question == []
+    assert args.question_flag == "explain X"
+
+
+def test_question_flag_and_positional_conflict_errors():
+    """Passing both should fail loudly, not silently pick one."""
+    with pytest.raises(SystemExit, match="positional argument OR via --question"):
+        cli_module._question_from_args(["positional", "text"], flag_value="alias text")
+
+
+def test_parse_stance_args_validates_value():
+    from llm_council.cli import _parse_stance_args
+
+    assert _parse_stance_args([]) == {}
+    assert _parse_stance_args(["claude=for", "codex=against"]) == {
+        "claude": "for",
+        "codex": "against",
+    }
+    with pytest.raises(SystemExit, match="must be of the form peer="):
+        _parse_stance_args(["bare-no-equals"])
+    with pytest.raises(SystemExit, match="must be one of"):
+        _parse_stance_args(["claude=heretic"])
+
+
+def test_classify_error_recognizes_known_prefixes():
+    from llm_council.adapters import (
+        ERROR_KIND_CONTEXT_OVERFLOW,
+        ERROR_KIND_DOWNSTREAM,
+        ERROR_KIND_INVALID_RESPONSE,
+        ERROR_KIND_PROMPT_TOO_LARGE,
+        ERROR_KIND_TIMEOUT,
+        ERROR_KIND_UNKNOWN,
+        classify_error,
+    )
+
+    assert classify_error("") is None
+    assert classify_error("Timeout: claude did not respond...") == ERROR_KIND_TIMEOUT
+    assert (
+        classify_error("ContextOverflowExcluded: estimated 999 prompt tokens")
+        == ERROR_KIND_CONTEXT_OVERFLOW
+    )
+    assert (
+        classify_error("PromptTooLarge: participant skipped before launch")
+        == ERROR_KIND_PROMPT_TOO_LARGE
+    )
+    assert (
+        classify_error("InvalidParticipantResponse: missing required RECOMMENDATION")
+        == ERROR_KIND_INVALID_RESPONSE
+    )
+    assert classify_error("HTTPStatusError: 503") == ERROR_KIND_DOWNSTREAM
+    assert classify_error("ConnectError: connection refused") == ERROR_KIND_DOWNSTREAM
+    assert classify_error("Some entirely unknown error") == ERROR_KIND_UNKNOWN
+
+
+def test_count_continuation_depth_walks_parent_chain(tmp_path: Path):
+    """Each transcript records parent_run_id; the helper walks the chain."""
+    from llm_council.transcript import count_continuation_depth
+
+    out_dir = tmp_path / "runs"
+    out_dir.mkdir()
+
+    def _write(stem: str, parent: str | None) -> None:
+        payload = {
+            "question": "q",
+            "mode": "quick",
+            "current": None,
+            "participants": ["a"],
+            "prompt": "p",
+            "metadata": {"rounds": 1},
+            "results": [],
+        }
+        if parent:
+            payload["parent_run_id"] = parent
+        (out_dir / f"{stem}.json").write_text(json.dumps(payload), encoding="utf-8")
+        (out_dir / f"{stem}.md").write_text(f"# {stem}", encoding="utf-8")
+
+    _write("20260101_000000_root", None)
+    _write("20260102_000000_child", "20260101_000000_root")
+    _write("20260103_000000_grandchild", "20260102_000000_child")
+
+    assert count_continuation_depth(out_dir, "20260101_000000_root") == 0
+    assert count_continuation_depth(out_dir, "20260102_000000_child") == 1
+    assert count_continuation_depth(out_dir, "20260103_000000_grandchild") == 2
+
+
+def test_count_continuation_depth_breaks_on_cycle(tmp_path: Path):
+    """A pathological cycle (corrupt transcripts referencing each other) must
+    not hang the walker."""
+    from llm_council.transcript import count_continuation_depth
+
+    out_dir = tmp_path / "runs"
+    out_dir.mkdir()
+    for stem, parent in (
+        ("20260101_000000_a", "20260102_000000_b"),
+        ("20260102_000000_b", "20260101_000000_a"),
+    ):
+        payload = {
+            "question": "q",
+            "mode": "quick",
+            "current": None,
+            "participants": ["a"],
+            "prompt": "p",
+            "metadata": {},
+            "results": [],
+            "parent_run_id": parent,
+        }
+        (out_dir / f"{stem}.json").write_text(json.dumps(payload), encoding="utf-8")
+        (out_dir / f"{stem}.md").write_text("# x", encoding="utf-8")
+    depth = count_continuation_depth(out_dir, "20260101_000000_a", max_depth=10)
+    assert depth < 10  # cycle short-circuited via visited set
+
+
+def test_transcripts_prune_dry_run(tmp_path: Path, capsys):
+    out_dir = tmp_path / "runs"
+    out_dir.mkdir()
+    for stem in ("a", "b", "c"):
+        (out_dir / f"{stem}.json").write_text("{}", encoding="utf-8")
+        (out_dir / f"{stem}.md").write_text("# x", encoding="utf-8")
+
+    args = argparse.Namespace(
+        cwd=str(tmp_path),
+        keep_last=1,
+        keep_since=None,
+        apply=False,
+        json=False,
+    )
+    rc = cli_module._cmd_transcripts_prune(args, out_dir)
+    captured = capsys.readouterr().out
+    assert rc == 0
+    assert "would remove" in captured
+    # Nothing actually deleted in dry-run.
+    assert sorted(p.name for p in out_dir.glob("*.json")) == ["a.json", "b.json", "c.json"]
+
+
+def test_transcripts_prune_apply_keeps_last(tmp_path: Path, capsys):
+    import time
+
+    out_dir = tmp_path / "runs"
+    out_dir.mkdir()
+    paths = []
+    for stem in ("oldest", "middle", "newest"):
+        json_path = out_dir / f"{stem}.json"
+        md_path = out_dir / f"{stem}.md"
+        json_path.write_text("{}", encoding="utf-8")
+        md_path.write_text("# x", encoding="utf-8")
+        paths.append(json_path)
+        time.sleep(0.01)
+    args = argparse.Namespace(
+        cwd=str(tmp_path),
+        keep_last=1,
+        keep_since=None,
+        apply=True,
+        json=False,
+    )
+    cli_module._cmd_transcripts_prune(args, out_dir)
+    remaining = sorted(p.name for p in out_dir.glob("*.json"))
+    assert remaining == ["newest.json"]
+    # Sibling .md is also pruned.
+    assert sorted(p.name for p in out_dir.glob("*.md")) == ["newest.md"]
+
+
+def test_transcripts_prune_requires_retention_policy(tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    out_dir.mkdir()
+    args = argparse.Namespace(
+        cwd=str(tmp_path),
+        keep_last=None,
+        keep_since=None,
+        apply=False,
+        json=False,
+    )
+    with pytest.raises(SystemExit, match="requires --keep-last"):
+        cli_module._cmd_transcripts_prune(args, out_dir)
+
+
+def test_council_run_output_schema_advertises_typed_fields():
+    from llm_council.mcp_server import council_run_output_schema
+
+    schema = council_run_output_schema()
+    props = schema["properties"]
+    assert props["recommendation"]["enum"] == ["yes", "no", "tradeoff", "unknown"]
+    assert props["agreement_count"]["type"] == "integer"
+    assert props["degraded"]["type"] == "boolean"
+    assert "transcript" in props and "results" in props
+    item_props = props["results"]["items"]["properties"]
+    assert "stance" in item_props
+    assert "error_kind" in item_props
+    assert "from_cache" in item_props
+
+
+def test_council_run_schema_includes_stances_and_budget_args():
+    schema = council_run_schema()
+    props = schema["properties"]
+    assert "stances" in props
+    assert props["stances"]["additionalProperties"]["enum"] == [
+        "for",
+        "against",
+        "neutral",
+    ]
+    assert "max_cost_usd" in props
+    assert "max_tokens" in props
+
+
+def test_cmd_run_refuses_when_max_cost_exceeded(monkeypatch, tmp_path: Path):
+    """Bug Track-C #2: pre-flight estimate over --max-cost-usd refuses
+    before any subprocess or HTTP call."""
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_prompt", lambda *_a, **_k: "PROMPT")
+
+    def fake_estimate(**_kwargs):
+        return {
+            "known_total_usd": 5.0,
+            "rows": [
+                {"estimated_input_tokens": 1000, "estimated_output_tokens": 500},
+            ],
+        }
+
+    monkeypatch.setattr(cli_module, "estimate_council", fake_estimate)
+    config = {
+        "version": 1,
+        "transcripts_dir": str(tmp_path / "runs"),
+        "defaults": {"mode": "quick"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {"quick": {"participants": ["claude"]}},
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "--max-cost-usd",
+            "1.0",
+            "--json",
+            "test",
+        ]
+    )
+    with pytest.raises(SystemExit, match="exceeds --max-cost-usd"):
+        cli_module.cmd_run(args)
+
+
+def test_cli_stance_flag_overrides_mode_stance(monkeypatch, tmp_path: Path):
+    """--stance peer=for overrides whatever the mode declared, and forwards
+    the merged map into both build_prompt and execute_council."""
+    captured: dict = {}
+
+    def fake_build_prompt(*_args, **kwargs):
+        captured["build_prompt_stances"] = kwargs.get("stances")
+        return "PROMPT"
+
+    async def fake_execute_council(*_args, **kwargs):
+        captured["execute_stances"] = kwargs.get("stances")
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_prompt", fake_build_prompt)
+
+    config = {
+        "version": 1,
+        "transcripts_dir": str(tmp_path / "runs"),
+        "defaults": {"mode": "consensus"},
+        "participants": {
+            "claude": {"type": "cli", "command": "claude"},
+            "codex": {"type": "cli", "command": "codex"},
+        },
+        "modes": {
+            "consensus": {
+                "participants": ["claude", "codex"],
+                "stances": {"claude": "neutral", "codex": "neutral"},
+            }
+        },
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "consensus",
+            "--stance",
+            "claude=for",
+            "--json",
+            "test",
+        ]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0
+    # Mode stance for codex preserved; CLI override for claude wins.
+    assert captured["build_prompt_stances"]["claude"] == "for"
+    assert captured["build_prompt_stances"]["codex"] == "neutral"
+    assert captured["execute_stances"]["claude"] == "for"
+
+
+def test_cmd_run_uses_min_per_participant_max_prompt_chars(
+    monkeypatch, tmp_path: Path
+):
+    """Bug 6: when participants advertise tighter max_prompt_chars than the
+    global default, build_prompt must chunk against the smallest peer cap so
+    adapters don't reject the chunked prompt at launch."""
+    captured: dict = {}
+
+    def fake_build_prompt(*_args, **kwargs):
+        captured.update(kwargs)
+        return "PROMPT"
+
+    async def fake_execute_council(*args, **kwargs):
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_prompt", fake_build_prompt)
+
+    config = {
+        "version": 1,
+        "transcripts_dir": str(tmp_path / "runs"),
+        "defaults": {"mode": "quick", "max_prompt_chars": 200_000},
+        "participants": {
+            "claude": {
+                "type": "cli",
+                "command": "claude",
+                "max_prompt_chars": 50_000,
+            },
+            "codex": {
+                "type": "cli",
+                "command": "codex",
+                "max_prompt_chars": 80_000,
+            },
+        },
+        "modes": {
+            "quick": {"participants": ["claude", "codex"]},
+        },
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        ["run", "--cwd", str(tmp_path), "--mode", "quick", "--json", "test"]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0
+    assert captured.get("max_prompt_chars") == 50_000

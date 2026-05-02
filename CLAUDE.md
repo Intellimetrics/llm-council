@@ -50,7 +50,8 @@ the same core:
 1. `cli.py` (`main` -> `llm-council` script)
 2. `mcp_server.py` (`llm-council mcp-server`, exposing `council_run`,
    `council_estimate`, `council_recommend`, `council_doctor`,
-   `council_list_modes`, `council_last_transcript`, `council_models`)
+   `council_list_modes`, `council_last_transcript`, `council_models`,
+   `council_stats`)
 
 Both flow through the same pipeline:
 
@@ -122,3 +123,65 @@ Key modules:
 - **Version bumps.** `__version__` in `llm_council/__init__.py` and the
   `version` in `pyproject.toml` and the README badge are kept in sync, with
   a matching `CHANGELOG.md` entry. Releases are tagged `vX.Y.Z`.
+
+## Failure taxonomy
+
+`adapters.classify_error(error)` maps any non-empty result.error to a stable
+machine-readable kind (also surfaced as `error_kind` in transcripts and
+`--json` stdout). Add new kinds explicitly here when introducing a new
+failure path; do not let strings drift.
+
+| `error_kind`         | When                                                                                |
+|----------------------|-------------------------------------------------------------------------------------|
+| `timeout`            | Participant exceeded its `timeout`. Prefix: `Timeout:` or `TimeoutError:`           |
+| `context_overflow`   | Estimated tokens exceed `max_context_tokens`. Prefix: `ContextOverflowExcluded:`    |
+| `prompt_too_large`   | Prompt skipped before launch (per-participant `max_prompt_chars`)                    |
+| `invalid_response`   | CLI/HTTP succeeded but lacked `RECOMMENDATION:` label after one repair retry         |
+| `downstream_error`   | httpx / hosted-API failures (HTTPStatusError, ConnectError, ReadTimeout, etc.)       |
+| `unknown`            | Non-empty error that did not match any known prefix — file a dogfood note            |
+
+## Custom CLI participant: minimal template
+
+When defining a one-off CLI participant (in `.llm-council.yaml` or a temp
+config) the deep-merge from `defaults.py` only fills keys that exist on a
+built-in baseline. For an entirely new family, you generally need:
+
+```yaml
+participants:
+  my_cli:
+    type: cli              # required: routes through the CLI adapter
+    family: my_cli         # required when a participant doesn't share a baseline
+    origin: us             # `us` | `china` | `unknown` — origin filtering
+    command: my-cli        # binary on PATH (or absolute path)
+    args: ["--flag"]       # optional; uses {prompt}/{cwd} template substitution
+    model: my-model        # optional model identifier
+    timeout: 240           # seconds before the participant is killed
+    max_prompt_chars: 120000  # per-peer prompt cap (chunking targets this)
+    read_only: true        # required: enforces the read-only invariant
+    stdin_prompt: true     # whether the prompt is delivered via stdin (default)
+                           # vs. {prompt} arg substitution
+```
+
+Forget `family` and the participant works but config validation may flag it
+as orphaned. Forget `stdin_prompt: true` and an unsubstituted-`{prompt}`
+arg gets shipped as literal text. Forget `read_only` and the read-only
+invariant is silently bypassed.
+
+## Continuation chain depth
+
+`continuation_id` (CLI `--continue`) prepends a summary of the prior
+transcript. Each link summarizes only its immediate parent (not the full
+history), so depth growth is linear, not exponential. Still, the default
+`max_continuation_depth` of 5 caps how many parents can chain before the
+run is refused — set `defaults.max_continuation_depth: <N>` in
+`.llm-council.yaml` to override.
+
+## Run-level budget caps
+
+`--max-cost-usd` and `--max-tokens` (CLI) / `max_cost_usd`,
+`max_tokens` (MCP `council_run`) gate the run on the **pre-flight
+estimate** before any subprocess or HTTP call is made. The estimate sums
+known `cost_usd` per participant from the OpenRouter catalog; free/local
+peers count as $0 and unknown-cost peers (catalog miss) cannot be
+enforced — those raise no error but are visible in the estimate. Use
+`llm-council estimate ...` for a per-peer breakdown when a cap fails.

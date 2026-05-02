@@ -8,7 +8,9 @@ import json
 import os
 import shutil
 import sys
+from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from llm_council import __version__
 from llm_council.config import (
@@ -18,6 +20,7 @@ from llm_council.config import (
     parse_csv,
     select_participants,
 )
+from llm_council.adapters import classify_error
 from llm_council.budget import image_attachment_violations
 from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_prompt
 from llm_council.doctor import check_environment, checks_to_dict
@@ -29,6 +32,8 @@ from llm_council.policy import should_use_council
 from llm_council.setup_wizard import write_setup_files
 from llm_council.stats import compute_stats, format_stats_text
 from llm_council.transcript import (
+    DEFAULT_MAX_CONTINUATION_DEPTH,
+    count_continuation_depth,
     find_transcript_by_id,
     format_prior_council_context,
     latest_transcript,
@@ -51,6 +56,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="Run a council prompt")
     run.add_argument("question", nargs="*", help="Question or prompt")
+    run.add_argument(
+        "--question",
+        dest="question_flag",
+        default=None,
+        help=(
+            "Question text. Alias for the positional argument; useful when "
+            "the question contains characters that make positional parsing "
+            "awkward, or when matching the MCP `council_run` arg name."
+        ),
+    )
     run.add_argument("--config", help="Path to config YAML")
     run.add_argument("--mode", default=None, help="Council mode")
     run.add_argument("--current", choices=["claude", "codex", "gemini"])
@@ -119,6 +134,40 @@ def build_parser() -> argparse.ArgumentParser:
             "Per-participant on-disk result cache keyed on prompt+config. "
             "`on` reads and writes (default). `off` skips both. `refresh` "
             "ignores the read but still writes."
+        ),
+    )
+    run.add_argument(
+        "--stance",
+        action="append",
+        default=[],
+        metavar="PEER=for|against|neutral",
+        help=(
+            "Override or extend stance assignment for one peer. Repeatable: "
+            "`--stance claude=for --stance codex=against`. Adds an "
+            "ethical-override clause to the peer's prompt to attack "
+            "groupthink. Useful with `--mode consensus` or any mode where "
+            "you want to inject roles without forking the mode config."
+        ),
+    )
+    run.add_argument(
+        "--max-cost-usd",
+        type=float,
+        default=None,
+        help=(
+            "Hard ceiling on the council's pre-flight estimated cost in USD. "
+            "If the estimate exceeds this, the run is refused before any "
+            "subprocess or HTTP call. Free/local participants count as $0; "
+            "if the catalog is unavailable, the cap is informational only "
+            "(unknown costs cannot be enforced)."
+        ),
+    )
+    run.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Hard ceiling on estimated prompt+completion tokens across all "
+            "participants and budgeted rounds. Refuses the run if exceeded."
         ),
     )
     run.add_argument(
@@ -280,6 +329,32 @@ def build_parser() -> argparse.ArgumentParser:
         "summary", help="Summarize transcript totals"
     )
     transcripts_summary.add_argument("--cwd", default=".", help="Working directory")
+    transcripts_prune = transcripts_sub.add_parser(
+        "prune",
+        help="Delete old transcripts (paired md+json) by count or age",
+    )
+    transcripts_prune.add_argument("--cwd", default=".", help="Working directory")
+    transcripts_prune.add_argument(
+        "--keep-last",
+        type=int,
+        default=None,
+        help="Keep only the N most recent transcripts; older are pruned",
+    )
+    transcripts_prune.add_argument(
+        "--keep-since",
+        type=_parse_since_arg,
+        default=None,
+        help=(
+            "Keep only transcripts newer than the cutoff (integer days back "
+            "or ISO date YYYY-MM-DD); older are pruned"
+        ),
+    )
+    transcripts_prune.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually delete; default is dry-run reporting what would go",
+    )
+    transcripts_prune.add_argument("--json", action="store_true", help="Print JSON")
 
     stats = sub.add_parser(
         "stats", help="Aggregate per-participant metrics over recorded transcripts"
@@ -287,9 +362,12 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument("--cwd", default=".", help="Working directory")
     stats.add_argument(
         "--since",
-        type=int,
+        type=_parse_since_arg,
         default=None,
-        help="Only consider transcripts within the last N days",
+        help=(
+            "Only consider transcripts within the last N days (e.g. `7`) "
+            "or since an absolute ISO date (e.g. `2026-04-01`)"
+        ),
     )
     stats.add_argument(
         "--participant",
@@ -318,8 +396,78 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _question_from_args(parts: list[str]) -> str:
-    question = " ".join(parts).strip()
+def _parse_stance_args(values: list[str]) -> dict[str, str]:
+    """Parse repeated `--stance peer=for|against|neutral` flags.
+
+    Empty input returns an empty dict so callers can compose with the mode's
+    stance map. Validation of stance values is left to render_stance_section,
+    which already raises on unknown stances.
+    """
+    from llm_council.defaults import VALID_STANCES
+
+    parsed: dict[str, str] = {}
+    for item in values:
+        text = (item or "").strip()
+        if not text:
+            continue
+        if "=" not in text:
+            raise SystemExit(
+                f"--stance must be of the form peer=for|against|neutral, got '{item}'"
+            )
+        peer, _, stance = text.partition("=")
+        peer = peer.strip()
+        stance = stance.strip().lower()
+        if not peer:
+            raise SystemExit(f"--stance peer name is empty in '{item}'")
+        if stance not in VALID_STANCES:
+            raise SystemExit(
+                f"--stance value '{stance}' for peer '{peer}' must be one of "
+                f"{', '.join(VALID_STANCES)}"
+            )
+        parsed[peer] = stance
+    return parsed
+
+
+def _parse_since_arg(raw: str) -> int:
+    """Accept either an integer (days back) or an ISO date (YYYY-MM-DD).
+
+    Returns the equivalent `since_days` integer for compute_stats. ISO dates
+    must be in the past; future dates are rejected via the cmd_stats
+    `args.since <= 0` check below.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        raise argparse.ArgumentTypeError("--since cannot be empty")
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        cutoff = date.fromisoformat(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--since must be an integer (days back) or ISO date "
+            f"(YYYY-MM-DD): got '{raw}' ({exc})"
+        ) from exc
+    today = datetime.now(timezone.utc).date()
+    return (today - cutoff).days
+
+
+def _question_from_args(parts: list[str], flag_value: str | None = None) -> str:
+    """Resolve the question text from positional parts or the --question alias.
+
+    Positional and --question are mutually exclusive; passing both is rejected
+    so a future contributor doesn't accidentally pass conflicting strings and
+    silently ship the wrong one.
+    """
+    positional = " ".join(parts).strip()
+    flag = (flag_value or "").strip()
+    if positional and flag:
+        raise SystemExit(
+            "question may be passed as a positional argument OR via "
+            "--question, not both"
+        )
+    question = positional or flag
     if not question:
         raise SystemExit("question is required")
     return question
@@ -859,7 +1007,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
     config = load_config(find_config(cwd), search=False)
     out_dir = _transcript_dir(cwd, config)
     if args.since is not None and args.since <= 0:
-        raise SystemExit("--since must be a positive integer")
+        raise SystemExit("--since must be a positive integer or ISO date in the past")
     stats = compute_stats(
         out_dir,
         participant=args.participant,
@@ -921,7 +1069,87 @@ def cmd_transcripts(args: argparse.Namespace) -> int:
         print(f"cost_usd: ${cost:.6f}")
         return 0
 
+    if args.transcripts_command == "prune":
+        return _cmd_transcripts_prune(args, out_dir)
+
     raise SystemExit(f"Unknown transcripts subcommand: {args.transcripts_command}")
+
+
+def _cmd_transcripts_prune(args: argparse.Namespace, out_dir: Path) -> int:
+    if args.keep_last is None and args.keep_since is None:
+        raise SystemExit(
+            "transcripts prune requires --keep-last N and/or --keep-since "
+            "<days_or_iso_date>; refusing to act with no retention policy"
+        )
+    if args.keep_last is not None and args.keep_last < 0:
+        raise SystemExit("--keep-last must be non-negative")
+    if args.keep_since is not None and args.keep_since < 0:
+        raise SystemExit("--keep-since must be a positive integer or past ISO date")
+
+    if not out_dir.exists():
+        message = f"No transcripts directory at {out_dir}"
+        if args.json:
+            print(json.dumps({"pruned": [], "kept": [], "message": message}))
+        else:
+            print(message)
+        return 0
+
+    json_paths = sorted(out_dir.glob("*.json"))
+    indexed: list[tuple[Path, float]] = [(p, p.stat().st_mtime) for p in json_paths]
+    indexed.sort(key=lambda item: item[1], reverse=True)
+
+    keep_set: set[Path] = set()
+    if args.keep_last is not None:
+        for path, _mtime in indexed[: args.keep_last]:
+            keep_set.add(path)
+    if args.keep_since is not None:
+        import time as _time
+
+        cutoff = _time.time() - args.keep_since * 86400
+        for path, mtime in indexed:
+            if mtime >= cutoff:
+                keep_set.add(path)
+
+    pruned: list[dict[str, Any]] = []
+    kept: list[dict[str, Any]] = []
+    for path, mtime in indexed:
+        sibling_md = path.with_suffix(".md")
+        record = {
+            "json": str(path),
+            "markdown": str(sibling_md) if sibling_md.exists() else None,
+            "mtime": mtime,
+        }
+        if path in keep_set:
+            kept.append(record)
+            continue
+        pruned.append(record)
+        if args.apply:
+            try:
+                path.unlink(missing_ok=True)
+                if sibling_md.exists():
+                    sibling_md.unlink()
+            except OSError as exc:
+                raise SystemExit(f"failed to remove {path}: {exc}") from exc
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "pruned": pruned,
+                    "kept_count": len(kept),
+                    "applied": args.apply,
+                },
+                indent=2,
+            )
+        )
+    else:
+        verb = "removed" if args.apply else "would remove"
+        print(f"transcripts {verb}: {len(pruned)} (kept {len(kept)})")
+        for record in pruned:
+            print(f"  - {record['json']}")
+        if not args.apply and pruned:
+            print("re-run with --apply to actually delete")
+    return 0
 
 
 def _fmt_cost(value: float | None) -> str:
@@ -1040,7 +1268,9 @@ def cmd_models(args: argparse.Namespace) -> int:
 
 async def cmd_run_async(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).resolve()
-    question = _question_from_args(args.question)
+    question = _question_from_args(
+        args.question, flag_value=getattr(args, "question_flag", None)
+    )
     load_project_env(cwd)
     try:
         config = load_config(args.config or find_config(cwd), search=False)
@@ -1071,6 +1301,20 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     if continue_id:
         try:
             normalize_run_id(continue_id)
+            max_depth = int(
+                config.get("defaults", {}).get(
+                    "max_continuation_depth", DEFAULT_MAX_CONTINUATION_DEPTH
+                )
+            )
+            depth = count_continuation_depth(out_dir, continue_id)
+            if depth >= max_depth:
+                raise SystemExit(
+                    f"Continuation chain depth ({depth} parents) reaches the "
+                    f"configured limit of {max_depth}. Each link summarizes "
+                    "its predecessor, so deep chains eat into MAX_PROMPT_CHARS "
+                    "without adding new signal. Start a fresh run, or raise "
+                    "`defaults.max_continuation_depth` in `.llm-council.yaml`."
+                )
             prior_transcript = find_transcript_by_id(out_dir, continue_id)
             prior_path = prior_transcript.get("_path")
             parent_run_id = (
@@ -1118,6 +1362,32 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                 flush=True,
             )
 
+        participant_cfg = config.get("participants", {})
+        if not isinstance(participant_cfg, dict):
+            participant_cfg = {}
+        mode_cfg = config.get("modes", {}).get(mode, {})
+        if not isinstance(mode_cfg, dict):
+            mode_cfg = {}
+        mode_stances = mode_cfg.get("stances")
+        cli_stance_overrides = _parse_stance_args(getattr(args, "stance", []) or [])
+        if cli_stance_overrides:
+            base = dict(mode_stances) if isinstance(mode_stances, dict) else {}
+            base.update(cli_stance_overrides)
+            mode_stances = base
+        default_max = (
+            config.get("defaults", {}).get("max_prompt_chars") or MAX_PROMPT_CHARS
+        )
+        # Chunk against the tightest budget any selected peer enforces, not
+        # the global default — adapters re-check per-participant before
+        # launch, so a prompt sized to the global default would still be
+        # rejected by stricter peers.
+        peer_caps = [
+            int(participant_cfg.get(name, {}).get("max_prompt_chars"))
+            for name in participants
+            if isinstance(participant_cfg.get(name), dict)
+            and participant_cfg.get(name, {}).get("max_prompt_chars")
+        ]
+        effective_max = min([int(default_max), *peer_caps]) if peer_caps else int(default_max)
         prompt = build_prompt(
             question,
             mode=mode,
@@ -1126,9 +1396,10 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             include_diff=args.diff,
             stdin_text=stdin_text,
             allow_outside_cwd=args.allow_outside_cwd,
-            max_prompt_chars=config.get("defaults", {}).get("max_prompt_chars")
-            or MAX_PROMPT_CHARS,
+            max_prompt_chars=effective_max,
             image_manifest=image_manifest or None,
+            stances=mode_stances if isinstance(mode_stances, dict) else None,
+            participants=participant_cfg or None,
             prior_context=prior_context,
             chunk_strategy=getattr(args, "chunk_strategy", "fail"),
             chunk_progress=_record_chunk_event,
@@ -1160,6 +1431,51 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     else:
         min_quorum_value = None
     participant_cfg = config.get("participants", {})
+
+    max_cost_usd = getattr(args, "max_cost_usd", None)
+    max_tokens = getattr(args, "max_tokens", None)
+    if max_cost_usd is not None or max_tokens is not None:
+        try:
+            preflight = estimate_council(
+                config=config,
+                cwd=cwd,
+                question=question,
+                mode=mode,
+                current=current,
+                explicit=parse_csv(args.participants),
+                include=parse_csv(args.include),
+                origin_policy=args.origin_policy,
+                context_paths=args.context,
+                include_diff=args.diff,
+                stdin_text=stdin_text,
+                allow_outside_cwd=args.allow_outside_cwd,
+                deliberate=deliberate,
+                max_rounds=max_rounds,
+                use_cache=True,
+                image_paths=args.image,
+            )
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"failed to compute pre-flight estimate: {exc}") from exc
+        cost_total = float(preflight.get("known_total_usd") or 0.0)
+        token_rows = preflight.get("rows") or []
+        token_total = sum(
+            int(row.get("estimated_input_tokens") or 0)
+            + int(row.get("estimated_output_tokens") or 0)
+            for row in token_rows
+        )
+        if max_cost_usd is not None and cost_total > float(max_cost_usd):
+            raise SystemExit(
+                f"Pre-flight estimate ${cost_total:.6f} exceeds --max-cost-usd "
+                f"${float(max_cost_usd):.6f}. Free/local peers count as $0; "
+                "drop expensive peers, raise the cap, or run `llm-council "
+                "estimate ...` for a per-peer breakdown."
+            )
+        if max_tokens is not None and token_total > int(max_tokens):
+            raise SystemExit(
+                f"Pre-flight estimate {token_total} tokens exceeds --max-tokens "
+                f"{int(max_tokens)}. Drop --diff/--context, narrow the question, "
+                "or raise the cap."
+            )
     if not args.json:
         print(
             f"Council starting: mode={mode}, current={current or 'unknown'}, "
@@ -1181,6 +1497,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         min_quorum=min_quorum_value,
         mode=mode,
         cache_mode=getattr(args, "cache_mode", "on"),
+        stances=mode_stances if isinstance(mode_stances, dict) else None,
     )
     if image_manifest:
         metadata["images"] = [
@@ -1233,9 +1550,14 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                             "ok": result.ok,
                             "elapsed_seconds": round(result.elapsed_seconds, 3),
                             "error": result.error,
+                            "error_kind": classify_error(result.error),
                             "model": result.model,
                             "total_tokens": result.total_tokens,
                             "cost_usd": result.cost_usd,
+                            "from_cache": result.from_cache,
+                            "recovered_after_launch_retry": result.recovered_after_launch_retry,
+                            "repair_retry_recovered": result.repair_retry_recovered,
+                            "stance": result.stance,
                         }
                         for result in results
                     ],

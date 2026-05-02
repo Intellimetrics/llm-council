@@ -410,9 +410,13 @@ def build_prompt(
 
     def assemble(ctx: list[str]) -> str:
         sections = list(head_sections)
+        # Stance must precede Context: so that (a) the round-2 deliberation
+        # `_strip_context_payload` (rfind on `\n\nContext:\n`) does not also
+        # strip the stance block, and (b) hard end-truncation falls on
+        # context, not on the stance assignments.
+        sections.extend(stance_tail)
         if ctx:
             sections.extend(["", "Context:", *ctx])
-        sections.extend(stance_tail)
         return "\n".join(sections)
 
     prompt = assemble(context_sections)
@@ -459,10 +463,21 @@ def build_prompt(
                 "shorten the new question, or run without --continue / "
                 "continuation_id."
             )
-        prompt = (
-            prompt[:max_prompt_chars]
-            + "\n\n[llm-council prompt truncated at "
-            + str(max_prompt_chars)
-            + " characters]\n"
+        # Fail-fast on overflow. Silently truncating the tail used to drop
+        # stance assignments and let the council answer from a partial diff
+        # without surfacing it; both modes need the caller to know.
+        if chunk_strategy == "fail":
+            raise ValueError(
+                f"Prompt exceeds max_prompt_chars: {len(prompt)} > "
+                f"{max_prompt_chars}. Either pass --chunk-strategy "
+                "{head|tail|hash-aware} to attempt chunking, raise "
+                "max_prompt_chars in config, or shorten --diff/--context."
+            )
+        raise ValueError(
+            f"Prompt exceeds max_prompt_chars: {len(prompt)} > "
+            f"{max_prompt_chars}. Chunk strategy '{chunk_strategy}' "
+            "could not produce a fitting prompt — non-diff context "
+            "(files, stdin, prior council context) alone exceeds the "
+            "budget. Raise max_prompt_chars or drop --context/--diff."
         )
     return prompt

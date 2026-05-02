@@ -37,6 +37,8 @@ from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
 from llm_council.stats import compute_stats
 from llm_council.transcript import (
+    DEFAULT_MAX_CONTINUATION_DEPTH,
+    count_continuation_depth,
     find_transcript_by_id,
     format_prior_council_context,
     latest_transcript,
@@ -127,9 +129,126 @@ def council_run_schema() -> dict[str, Any]:
                     "prompt. The new transcript records this as parent_run_id."
                 ),
             },
+            "stances": {
+                "type": "object",
+                "description": (
+                    "Override or extend stance assignment for one or more "
+                    "peers — keys are participant names, values are "
+                    "for/against/neutral. Adds an ethical-override clause to "
+                    "the peer's prompt to attack groupthink. Composes with "
+                    "any stances already declared by the mode."
+                ),
+                "additionalProperties": {
+                    "type": "string",
+                    "enum": ["for", "against", "neutral"],
+                },
+            },
+            "max_cost_usd": {
+                "type": "number",
+                "minimum": 0,
+                "description": (
+                    "Hard ceiling on the council's pre-flight estimated cost "
+                    "in USD. If exceeded, the run is refused before any "
+                    "subprocess or HTTP call."
+                ),
+            },
+            "max_tokens": {
+                "type": "integer",
+                "minimum": 0,
+                "description": (
+                    "Hard ceiling on estimated prompt+completion tokens "
+                    "across all participants and budgeted rounds."
+                ),
+            },
         },
         "required": ["question"],
         "additionalProperties": False,
+    }
+
+
+def council_run_output_schema() -> dict[str, Any]:
+    """JSON schema describing council_run's structured response.
+
+    Advertised so callers can branch on typed fields rather than parsing the
+    text content. The shape mirrors what `run_council` returns and is kept
+    in sync by the regression tests.
+    """
+
+    return {
+        "type": "object",
+        "properties": {
+            "recommendation": {
+                "type": "string",
+                "enum": ["yes", "no", "tradeoff", "unknown"],
+                "description": (
+                    "Majority label across the final round. `unknown` when "
+                    "no peer produced a usable label."
+                ),
+            },
+            "agreement_count": {
+                "type": "integer",
+                "description": "Final-round peers that match `recommendation`.",
+            },
+            "total_labeled": {
+                "type": "integer",
+                "description": "Final-round peers that produced any label.",
+            },
+            "degraded": {
+                "type": "boolean",
+                "description": (
+                    "True when fewer than `min_quorum` peers labeled, so the "
+                    "headline recommendation should be treated with caution."
+                ),
+            },
+            "rounds": {"type": "integer"},
+            "deliberated": {"type": "boolean"},
+            "mode": {"type": "string"},
+            "current": {"type": ["string", "null"]},
+            "participants": {"type": "array", "items": {"type": "string"}},
+            "transcript": {
+                "type": "string",
+                "description": "Filesystem path to the markdown transcript.",
+            },
+            "json": {
+                "type": "string",
+                "description": "Filesystem path to the JSON transcript.",
+            },
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "ok": {"type": "boolean"},
+                        "label": {
+                            "type": ["string", "null"],
+                            "enum": ["yes", "no", "tradeoff", "unknown", None],
+                        },
+                        "stance": {"type": ["string", "null"]},
+                        "elapsed_seconds": {"type": "number"},
+                        "error": {"type": "string"},
+                        "error_kind": {"type": ["string", "null"]},
+                        "model": {"type": ["string", "null"]},
+                        "total_tokens": {"type": ["integer", "null"]},
+                        "cost_usd": {"type": ["number", "null"]},
+                        "from_cache": {"type": "boolean"},
+                        "recovered_after_launch_retry": {"type": "boolean"},
+                        "repair_retry_recovered": {"type": "boolean"},
+                    },
+                    "required": ["name", "ok", "label"],
+                },
+            },
+            "metadata": {"type": "object"},
+        },
+        "required": [
+            "recommendation",
+            "agreement_count",
+            "total_labeled",
+            "degraded",
+            "rounds",
+            "participants",
+            "results",
+        ],
     }
 
 
@@ -306,6 +425,20 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
     continuation_id = arguments.get("continuation_id")
     if continuation_id:
         normalize_run_id(continuation_id)
+        max_depth = int(
+            config.get("defaults", {}).get(
+                "max_continuation_depth", DEFAULT_MAX_CONTINUATION_DEPTH
+            )
+        )
+        depth = count_continuation_depth(transcripts_root, continuation_id)
+        if depth >= max_depth:
+            raise ValueError(
+                f"Continuation chain depth ({depth} parents) reaches the "
+                f"configured limit of {max_depth}. Each link summarizes its "
+                "predecessor, so deep chains eat into MAX_PROMPT_CHARS "
+                "without adding new signal. Start a fresh run, or raise "
+                "`defaults.max_continuation_depth` in `.llm-council.yaml`."
+            )
         prior_transcript = find_transcript_by_id(transcripts_root, continuation_id)
         prior_path = prior_transcript.get("_path")
         parent_run_id = (
@@ -333,6 +466,31 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
                 for item in image_violations
             )
         )
+    participant_cfg_for_prompt = config.get("participants", {})
+    if not isinstance(participant_cfg_for_prompt, dict):
+        participant_cfg_for_prompt = {}
+    mode_cfg = config.get("modes", {}).get(mode, {})
+    if not isinstance(mode_cfg, dict):
+        mode_cfg = {}
+    mode_stances = mode_cfg.get("stances")
+    arg_stances = arguments.get("stances")
+    if isinstance(arg_stances, dict) and arg_stances:
+        base = dict(mode_stances) if isinstance(mode_stances, dict) else {}
+        for peer, stance in arg_stances.items():
+            if not isinstance(peer, str) or not isinstance(stance, str):
+                continue
+            base[peer] = stance.lower()
+        mode_stances = base
+    default_max = (
+        config.get("defaults", {}).get("max_prompt_chars") or MAX_PROMPT_CHARS
+    )
+    peer_caps = [
+        int(participant_cfg_for_prompt.get(name, {}).get("max_prompt_chars"))
+        for name in participants
+        if isinstance(participant_cfg_for_prompt.get(name), dict)
+        and participant_cfg_for_prompt.get(name, {}).get("max_prompt_chars")
+    ]
+    effective_max = min([int(default_max), *peer_caps]) if peer_caps else int(default_max)
     prompt = build_prompt(
         question,
         mode=mode,
@@ -341,13 +499,12 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         include_diff=bool(arguments.get("include_diff")),
         stdin_text=None,
         allow_outside_cwd=False,
-        max_prompt_chars=config.get("defaults", {}).get("max_prompt_chars")
-        or MAX_PROMPT_CHARS,
+        max_prompt_chars=effective_max,
         image_manifest=image_manifest or None,
+        stances=mode_stances if isinstance(mode_stances, dict) else None,
+        participants=participant_cfg_for_prompt or None,
         prior_context=prior_context,
     )
-
-    mode_cfg = config.get("modes", {}).get(mode, {})
     transparent = bool(
         arguments.get("transparent") or config.get("defaults", {}).get("transparent")
     )
@@ -383,6 +540,48 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         }
 
     enforce_mcp_budget(budget)
+
+    max_cost_usd = arguments.get("max_cost_usd")
+    max_tokens = arguments.get("max_tokens")
+    if max_cost_usd is not None or max_tokens is not None:
+        try:
+            preflight = estimate_council(
+                config=config,
+                cwd=cwd,
+                question=question,
+                mode=mode,
+                current=current,
+                explicit=arguments.get("participants"),
+                include=arguments.get("include"),
+                origin_policy=arguments.get("origin_policy"),
+                context_paths=arguments.get("context_files") or [],
+                include_diff=bool(arguments.get("include_diff")),
+                allow_outside_cwd=False,
+                deliberate=deliberate,
+                max_rounds=max_rounds,
+                use_cache=True,
+                image_paths=image_path_inputs or None,
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"failed to compute pre-flight estimate: {exc}") from exc
+        cost_total = float(preflight.get("known_total_usd") or 0.0)
+        token_rows = preflight.get("rows") or []
+        token_total = sum(
+            int(row.get("estimated_input_tokens") or 0)
+            + int(row.get("estimated_output_tokens") or 0)
+            for row in token_rows
+        )
+        if max_cost_usd is not None and cost_total > float(max_cost_usd):
+            raise ValueError(
+                f"Pre-flight estimate ${cost_total:.6f} exceeds max_cost_usd "
+                f"${float(max_cost_usd):.6f}; refused before any participant "
+                "was invoked."
+            )
+        if max_tokens is not None and token_total > int(max_tokens):
+            raise ValueError(
+                f"Pre-flight estimate {token_total} tokens exceeds max_tokens "
+                f"{int(max_tokens)}; refused before any participant was invoked."
+            )
     cfg = config.get("participants", {})
     results, metadata = await execute_council(
         participants,
@@ -394,6 +593,8 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         max_rounds=max_rounds,
         image_manifest=image_manifest or None,
         min_quorum=min_quorum_value,
+        mode=mode,
+        stances=mode_stances if isinstance(mode_stances, dict) else None,
     )
     if image_manifest:
         metadata["images"] = [
@@ -412,25 +613,65 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         metadata=metadata,
         parent_run_id=parent_run_id,
     )
+    from llm_council.adapters import classify_error
+    from llm_council.deliberation import (
+        labeled_quorum_count,
+        recommendation_counts,
+        recommendation_label,
+    )
+    from llm_council.transcript import final_round_results
+
+    final = final_round_results(results)
+    counts = recommendation_counts(final)
+    labeled_total = labeled_quorum_count(final)
+    if labeled_total == 0:
+        recommendation = "unknown"
+        agreement = 0
+    else:
+        recommendation = max(
+            ("yes", "no", "tradeoff"), key=lambda label: counts[label]
+        )
+        agreement = counts[recommendation]
+    structured_results = []
+    for result in results:
+        label = (
+            recommendation_label(result.output)
+            if result.ok and result.output
+            else None
+        )
+        structured_results.append(
+            {
+                "name": result.name,
+                "ok": result.ok,
+                "label": label,
+                "stance": result.stance,
+                "elapsed_seconds": round(result.elapsed_seconds, 3),
+                "error": result.error,
+                "error_kind": classify_error(result.error),
+                "model": result.model,
+                "total_tokens": result.total_tokens,
+                "cost_usd": result.cost_usd,
+                "from_cache": bool(result.from_cache),
+                "recovered_after_launch_retry": bool(
+                    result.recovered_after_launch_retry
+                ),
+                "repair_retry_recovered": bool(result.repair_retry_recovered),
+            }
+        )
     return {
+        "recommendation": recommendation,
+        "agreement_count": agreement,
+        "total_labeled": labeled_total,
+        "degraded": bool(metadata.get("degraded")),
+        "rounds": int(metadata.get("rounds") or 1),
+        "deliberated": bool(metadata.get("deliberated")),
         "mode": mode,
         "current": current,
         "participants": participants,
         "metadata": metadata,
         "transcript": str(md_path),
         "json": str(json_path),
-        "results": [
-            {
-                "name": result.name,
-                "ok": result.ok,
-                "elapsed_seconds": round(result.elapsed_seconds, 3),
-                "error": result.error,
-                "model": result.model,
-                "total_tokens": result.total_tokens,
-                "cost_usd": result.cost_usd,
-            }
-            for result in results
-        ],
+        "results": structured_results,
     }
 
 
@@ -576,13 +817,27 @@ async def _serve() -> None:
 
     app = Server("llm-council")
 
+    def _tool(**kwargs: Any) -> Tool:
+        """Build a Tool, dropping outputSchema if the installed mcp SDK is too old.
+
+        outputSchema landed in MCP spec 2025-06; older `mcp` packages reject
+        the kwarg. We try first with outputSchema, then fall back so old envs
+        still get the tool, just without the typed advertisement.
+        """
+        try:
+            return Tool(**kwargs)
+        except TypeError:
+            kwargs.pop("outputSchema", None)
+            return Tool(**kwargs)
+
     @app.list_tools()
     async def list_tools() -> list[Tool]:
         return [
-            Tool(
+            _tool(
                 name="council_run",
                 description="Run a read-only multi-agent council.",
                 inputSchema=council_run_schema(),
+                outputSchema=council_run_output_schema(),
             ),
             Tool(
                 name="council_recommend",

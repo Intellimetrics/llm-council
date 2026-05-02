@@ -122,6 +122,7 @@ async def execute_council(
     min_quorum: int | None = None,
     mode: str | None = None,
     cache_mode: str = "on",
+    stances: dict[str, str] | None = None,
 ) -> tuple[list[ParticipantResult], dict[str, Any]]:
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
     convergence_thresholds = _resolve_convergence_thresholds(config, mode)
@@ -217,6 +218,7 @@ async def execute_council(
     cumulative_excluded: set[str] = set()
     aborted_all_excluded = False
     convergence_by_round: dict[int, list[dict[str, Any]]] = {}
+    deliberation_prompts: dict[int, str] = {}
     while deliberate and max_rounds > round_number and has_disagreement(round_results):
         cumulative_excluded.update(_failed_for_deliberation(round_results))
         deliberation_participants = [
@@ -243,6 +245,7 @@ async def execute_council(
             )
             break
         next_prompt, truncated_peers = build_deliberation_prompt(prompt, round_results)
+        deliberation_prompts[round_number + 1] = next_prompt
         for peer_name in truncated_peers:
             emit(
                 {
@@ -319,6 +322,12 @@ async def execute_council(
         }
         metadata["convergence_thresholds"] = convergence_thresholds
 
+    if deliberation_prompts:
+        metadata["deliberation_prompts"] = {
+            str(round_no): text
+            for round_no, text in sorted(deliberation_prompts.items())
+        }
+
     effective_min_quorum = (
         int(min_quorum) if min_quorum is not None else default_min_quorum(len(participants))
     )
@@ -338,6 +347,14 @@ async def execute_council(
                 "round": metadata["rounds"],
             }
         )
+
+    if stances:
+        metadata["stances"] = dict(stances)
+        for idx, result in enumerate(results):
+            base_name = result.name.split(":round", 1)[0]
+            assigned = stances.get(base_name)
+            if assigned is not None:
+                results[idx] = replace(result, stance=assigned)
 
     emit(
         {

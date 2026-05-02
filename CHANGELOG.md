@@ -1,5 +1,143 @@
 # Changelog
 
+## 0.4.0 - 2026-05-02
+
+This release pairs structural fixes for the consensus-stance feature with ergonomics, observability, and budget improvements surfaced during end-to-end testing of the v0.4.0 surface.
+
+### Reliability and recovery
+
+- Repair-retry on missing `RECOMMENDATION:` label for CLI, OpenRouter, and
+  Ollama participants — a peer that drops the label gets a single targeted
+  retry asking only for the label.
+- Launch-retry CLI participants when stderr matches a configured
+  `cli_retry_stderr_patterns` regex list (transient ECONNRESETs, daemon
+  restarts, etc.). Both retries surface as `recovered_after_launch_retry`
+  / `repair_retry_recovered` fields on the result and on the
+  `participant_finish` progress event.
+- Honor `retries: 0` everywhere — previously `int(cfg.get("retries") or N)`
+  silently coerced 0 → N (HTTP) and `_retry_enabled` ignored it (repair
+  retry); both are fixed.
+- Failure taxonomy: every result now carries an `error_kind` field
+  (`timeout`, `context_overflow`, `prompt_too_large`, `invalid_response`,
+  `downstream_error`, `unknown`) so callers can branch without parsing
+  human-facing strings. Documented in CLAUDE.md.
+
+### Deliberation and consensus
+
+- Slim round-2 deliberation prompt: the bulky `Context:` block is dropped
+  on round 2+ since peers reasoned over it in round 1. Per-peer excerpts
+  are truncated at line boundaries and label lines are capped.
+- `## Remaining disagreement` markdown section + `remaining_disagreement`
+  JSON field whenever the final round still has conflicting labels.
+- New `consensus` mode with assigned-stance prompting (for/against/neutral)
+  and an unconditional ethical-override clause that prevents any peer from
+  defending a harmful proposal. Stances now stamp on each result and on
+  `metadata.stances` in the transcript.
+- `--stance peer=for|against|neutral` CLI flag and `stances` MCP arg let
+  callers override or extend stance assignments per-call without forking
+  the mode config.
+- Convergence detector: per-round Jaccard token-set similarity between
+  successive deliberation rounds (states: converged / refining / diverging
+  / insufficient when the response is too short to classify).
+- Degraded consensus: when fewer than `min_quorum` peers produce a label
+  in the final round, the result is marked degraded with a clear
+  `## Degraded consensus` section and `degraded_consensus` JSON payload.
+  `--min-quorum` CLI flag and `min_quorum` MCP arg.
+
+### Stance bug fixes (the v0.4.0 ship blockers)
+
+The headline consensus-stance feature broke in three independent ways
+that the council itself caught during the review pass:
+
+- Stance was silently dropped when no `.llm-council.yaml` existed on disk
+  (CLI/MCP didn't pass `mode_cfg["stances"]` to `build_prompt`; the
+  fallback YAML lookup returned `({}, {})` for fresh installs).
+- Round-2 `_strip_context_payload` truncated everything from
+  `\n\nContext:\n` onward, including the `stance_tail` that lived after
+  it — so multi-round consensus lost stance after round 1.
+- Hard end-truncation chopped `stance_tail` when the prompt exceeded
+  `max_prompt_chars`.
+
+Fix: stance now precedes `Context:` in `build_prompt.assemble()`, both
+the strip path and the truncation path leave it intact, and CLI/MCP
+forward `mode_stances` from the merged config explicitly.
+
+### Scale
+
+- Optional `--diff` chunking strategies: `head`, `tail`, `hash-aware`
+  (splits on `^diff --git ` boundaries and prefers files mentioned in the
+  question). `fail` (the default) now actually raises on overflow instead
+  of silently truncating — the prior behavior could have the council
+  answer from a partial diff with no signal to the caller.
+- Per-participant context-window budget: peers with a
+  `max_context_tokens` smaller than the chunked prompt are excluded
+  gracefully via a `context_overflow_excluded` event, the rest of the
+  council still runs.
+- On-disk per-participant result cache keyed on
+  `sha256(name + canonical(cfg) + prompt + image_manifest)`, with a
+  `CACHE_SCHEMA_VERSION` and TTL. `--cache {on|off|refresh}` flag.
+- Chunking budget mismatch fix: chunking now targets the smallest
+  per-peer `max_prompt_chars`, not the global default — adapters used to
+  reject the chunked prompt at launch when peers had stricter caps.
+
+### Threading and continuation
+
+- Conversation threading via `--continue <run_id>` (CLI) /
+  `continuation_id` (MCP). Prepends a `Prior council context` summary of
+  the prior transcript to the new prompt; the new transcript records
+  `parent_run_id`.
+- Continuation depth cap (default 5) so chained `--continue` runs cannot
+  silently eat into `MAX_PROMPT_CHARS`. Configurable via
+  `defaults.max_continuation_depth`.
+
+### Transcripts and observability
+
+- `## Round 2 Prompt` (and beyond) section in the markdown transcript +
+  `metadata.deliberation_prompts` in JSON, so an operator can audit
+  exactly what context peers got each round.
+- `from_cache`, `recovered_after_launch_retry`, `repair_retry_recovered`,
+  `stance`, and `error_kind` all surface in both the on-disk transcript
+  JSON and the `--json` stdout summary.
+- `transcripts prune --keep-last N --keep-since DATE` subcommand
+  (dry-run by default; `--apply` to actually delete) for cleanup.
+- `llm-council stats` aggregator: per-participant runs, success rate,
+  recommendation distribution, tokens, cost, last-used time. CLI + MCP
+  tool. `--since` accepts both integer days back and ISO date.
+
+### Configuration and deployment
+
+- `openai_compatible` participant type with SSRF-defended `base_url`
+  validation (https-only, reject IP-private/loopback/link-local, reject
+  reserved-key headers). `type: openrouter` silently migrates to
+  `openai_compatible + base_url: https://openrouter.ai/api/v1` for
+  backwards compatibility.
+- Run-level budget caps: `--max-cost-usd` and `--max-tokens` (CLI) /
+  `max_cost_usd`, `max_tokens` (MCP) gate on the pre-flight estimate
+  before any subprocess or HTTP call. `estimate` was previously advisory.
+- Structured `council_run` outputSchema advertised on the MCP tool with
+  typed `recommendation` (yes/no/tradeoff/unknown), `agreement_count`,
+  `total_labeled`, `degraded`, `rounds`, `participants`, and per-peer
+  records — agents no longer have to grep markdown for `RECOMMENDATION:`.
+  Falls back gracefully on older `mcp` SDK versions that don't accept
+  the `outputSchema` kwarg.
+
+### CLI ergonomics
+
+- `--question` flag as alias for the positional question, matching the
+  MCP `council_run` arg name (mutually exclusive with the positional).
+- New `council_stats` CLI subcommand and MCP tool.
+- `consensus` mode added to default-config modes alongside the existing
+  `quick` / `peer-only` / `plan` / `review` / `diverse` / `private-local`
+  / `us-only` / `deliberate`.
+
+### Documentation
+
+- CLAUDE.md gains sections for the failure taxonomy, custom CLI
+  participant minimal template, continuation-chain depth cap, and
+  run-level budget caps.
+- `docs/dogfood-issues.md` tracks every friction encountered while using
+  llm-council on llm-council.
+
 ## 0.3.2 - 2026-04-29
 
 Closes documentation and test-coverage gaps from the 0.3.1 review pass.

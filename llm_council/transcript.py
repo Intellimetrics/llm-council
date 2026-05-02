@@ -88,6 +88,37 @@ def find_transcript_by_id(base_dir: Path, run_id: str) -> dict[str, Any]:
     return _load_transcript_json(candidates[0])
 
 
+DEFAULT_MAX_CONTINUATION_DEPTH = 5
+
+
+def count_continuation_depth(base_dir: Path, run_id: str, *, max_depth: int = 32) -> int:
+    """Walk parent_run_id chain backwards and return the depth.
+
+    Depth 1 means "this run has one parent" (i.e., it would be the second
+    link in the chain when resumed). The traversal is bounded by
+    ``max_depth`` so a corrupt cycle can't hang the caller.
+    """
+
+    visited: set[str] = set()
+    current = run_id
+    depth = 0
+    while current and depth < max_depth:
+        normalized = normalize_run_id(current)
+        if normalized in visited:
+            break
+        visited.add(normalized)
+        try:
+            transcript = find_transcript_by_id(base_dir, normalized)
+        except (FileNotFoundError, ValueError):
+            break
+        parent = transcript.get("parent_run_id")
+        if not parent:
+            break
+        depth += 1
+        current = str(parent)
+    return depth
+
+
 def _load_transcript_json(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -313,8 +344,17 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
     }
     if result.recovered_after_launch_retry:
         payload["recovered_after_launch_retry"] = True
+    if result.repair_retry_recovered:
+        payload["repair_retry_recovered"] = True
     if result.from_cache:
         payload["from_cache"] = True
+    if result.stance is not None:
+        payload["stance"] = result.stance
+    from llm_council.adapters import classify_error
+
+    error_kind = classify_error(result.error)
+    if error_kind is not None:
+        payload["error_kind"] = error_kind
     return payload
 
 
@@ -712,6 +752,24 @@ def write_transcript(
 
     fence = markdown_fence(prompt)
     lines.extend(["## Prompt Sent", "", f"{fence}text", prompt, fence, ""])
+
+    deliberation_prompts = metadata.get("deliberation_prompts")
+    if isinstance(deliberation_prompts, dict):
+        for round_key in sorted(deliberation_prompts.keys()):
+            text = deliberation_prompts[round_key]
+            if not isinstance(text, str) or not text:
+                continue
+            round_fence = markdown_fence(text)
+            lines.extend(
+                [
+                    f"## Round {round_key} Prompt",
+                    "",
+                    f"{round_fence}text",
+                    text,
+                    round_fence,
+                    "",
+                ]
+            )
     markdown_path.write_text("\n".join(lines), encoding="utf-8")
 
     json_payload: dict[str, Any] = {

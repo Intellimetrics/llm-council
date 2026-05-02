@@ -76,7 +76,9 @@ class ParticipantResult:
     total_tokens: int | None = None
     cost_usd: float | None = None
     recovered_after_launch_retry: bool = False
+    repair_retry_recovered: bool = False
     from_cache: bool = False
+    stance: str | None = None
 
 
 @dataclass
@@ -445,6 +447,7 @@ def _merge_cli_retry(
             elapsed_seconds=retry.elapsed_seconds,
             command=retry.command,
             model=retry.model,
+            repair_retry_recovered=True,
         )
     if retry.error.startswith("InvalidParticipantResponse: missing required") and retry.output:
         merged_output = _format_retry_transcript(
@@ -841,6 +844,7 @@ def _resolve_openrouter_retry(
         completion_tokens=_int_or_none(combined_usage.get("completion_tokens")),
         total_tokens=_int_or_none(combined_usage.get("total_tokens")),
         cost_usd=_float_or_none(combined_usage.get("cost")),
+        repair_retry_recovered=True,
     )
 
 
@@ -1008,6 +1012,7 @@ async def _run_ollama_inner(
                                 error="",
                                 elapsed_seconds=time.monotonic() - start,
                                 model=model,
+                                repair_retry_recovered=True,
                             )
             return ParticipantResult(
                 name=name,
@@ -1200,6 +1205,8 @@ async def run_participants(
                         "total_tokens": result.total_tokens,
                         "cost_usd": result.cost_usd,
                         "from_cache": result.from_cache,
+                        "recovered_after_launch_retry": result.recovered_after_launch_retry,
+                        "repair_retry_recovered": result.repair_retry_recovered,
                     }
                 )
             return result
@@ -1258,7 +1265,14 @@ def _response_validation_error(output: str, cfg: dict[str, Any]) -> str:
 
 
 def _retry_enabled(cfg: dict[str, Any]) -> bool:
-    return cfg.get("retry_on_missing_label", True) is not False
+    if cfg.get("retry_on_missing_label", True) is False:
+        return False
+    # An explicit `retries: 0` is the user saying "no extra calls of any
+    # kind"; respect that for the application-level repair retry too,
+    # otherwise the cost regression undoes commit 45b44ee.
+    if "retries" in cfg and _coerce_retries(cfg.get("retries"), default=1) == 0:
+        return False
+    return True
 
 
 def _is_label_only_failure(output: str, cfg: dict[str, Any]) -> bool:
@@ -1324,6 +1338,67 @@ def _format_timeout_error(name: str, timeout: int, prompt_chars: int) -> str:
 
 def is_timeout_error(error: str) -> bool:
     return error.startswith("Timeout:") or error.startswith("TimeoutError:")
+
+
+# Stable, machine-readable classification of result errors. Callers can
+# branch on `error_kind` instead of pattern-matching the human-facing
+# `error` string. Keep the enum closed so consumers can rely on a fixed
+# set of values; add new kinds explicitly when a new failure path is
+# introduced rather than letting strings drift.
+ERROR_KIND_TIMEOUT = "timeout"
+ERROR_KIND_CONTEXT_OVERFLOW = "context_overflow"
+ERROR_KIND_PROMPT_TOO_LARGE = "prompt_too_large"
+ERROR_KIND_INVALID_RESPONSE = "invalid_response"
+ERROR_KIND_DOWNSTREAM = "downstream_error"
+ERROR_KIND_UNKNOWN = "unknown"
+
+KNOWN_ERROR_KINDS = frozenset(
+    {
+        ERROR_KIND_TIMEOUT,
+        ERROR_KIND_CONTEXT_OVERFLOW,
+        ERROR_KIND_PROMPT_TOO_LARGE,
+        ERROR_KIND_INVALID_RESPONSE,
+        ERROR_KIND_DOWNSTREAM,
+        ERROR_KIND_UNKNOWN,
+    }
+)
+
+
+def classify_error(error: str) -> str | None:
+    """Return a stable error_kind for non-empty error strings, else None.
+
+    Empty errors (success) map to None so result_to_dict can omit the
+    field. Any non-empty error that does not match a known prefix falls
+    through to ``unknown`` rather than silently returning None — that lets
+    consumers detect "we need to add a new kind" instead of mistaking an
+    unclassified failure for success.
+    """
+    if not error:
+        return None
+    if error.startswith("Timeout:") or error.startswith("TimeoutError:"):
+        return ERROR_KIND_TIMEOUT
+    if error.startswith(CONTEXT_OVERFLOW_ERROR_PREFIX):
+        return ERROR_KIND_CONTEXT_OVERFLOW
+    if error.startswith("PromptTooLarge:"):
+        return ERROR_KIND_PROMPT_TOO_LARGE
+    if error.startswith("InvalidParticipantResponse:"):
+        return ERROR_KIND_INVALID_RESPONSE
+    # httpx + downstream-API errors funnel through f"{type(exc).__name__}: ..."
+    # in the openrouter / ollama paths; we don't try to introspect those
+    # further here, just classify them as `downstream_error` so callers can
+    # distinguish "their service blew up" from "our validation rejected it".
+    downstream_markers = (
+        "HTTPStatusError",
+        "ConnectError",
+        "ReadTimeout",
+        "RemoteProtocolError",
+        "ReadError",
+        "WriteError",
+        "ProxyError",
+    )
+    if any(marker in error for marker in downstream_markers):
+        return ERROR_KIND_DOWNSTREAM
+    return ERROR_KIND_UNKNOWN
 
 
 def _read_image_base64(entry: dict[str, Any]) -> str:
