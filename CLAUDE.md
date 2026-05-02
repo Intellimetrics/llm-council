@@ -70,7 +70,7 @@ Key modules:
   via `config.deep_merge`. The set of legal participant types (`cli`,
   `openrouter`, `ollama`) and built-in modes (`quick`, `peer-only`, `plan`,
   `review`, `review-cheap`, `diverse`, `private-local`, `us-only`,
-  `deliberate`) live here.
+  `deliberate`, plus the temporary `opus-versions`) live here.
 - `config.py` — config discovery (`find_config` walks up from cwd looking for
   `.llm-council.yaml` etc.), validation, the `other_cli_peers` strategy used by
   most modes, `detect_current_agent` (parent-process walk on `/proc`), and
@@ -82,9 +82,13 @@ Key modules:
   Ollama hits a local `/api/chat`. Successful CLI output without a
   `RECOMMENDATION: yes|no|tradeoff` label is treated as failure
   (`_response_validation_error`).
-- `orchestrator.py` — runs round 1, then optional deliberation rounds. Emits
-  `progress_events` consumed both by the CLI's stream output and by the MCP
-  tool's `metadata.progress_events` field.
+- `orchestrator.py` — runs round 1, then optional deliberation rounds (helpers
+  live in `deliberation.py`). Emits `progress_events` consumed both by the
+  CLI's stream output and by the MCP tool's `metadata.progress_events` field.
+- `policy.py` — `should_use_council` heuristic callers use to decide whether
+  invoking the council is worth the cost for a given request.
+- `update_check.py` — backs `llm-council doctor --check-update` and the
+  startup version nag.
 - `context.py` — builds the user-facing prompt and enforces `MAX_PROMPT_CHARS`.
 - `setup_wizard.py` — writes `.llm-council.yaml`, `.mcp.json`, and the
   per-CLI instruction snippets in `.llm-council/instructions/`. Setup is
