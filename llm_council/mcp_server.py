@@ -35,6 +35,7 @@ from llm_council.estimate import estimate_council
 from llm_council.model_catalog import fetch_openrouter_models
 from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
+from llm_council.stats import compute_stats
 from llm_council.transcript import latest_transcript, transcript_paths, write_transcript
 from llm_council.update_check import check_for_update
 
@@ -224,6 +225,25 @@ def doctor_schema() -> dict[str, Any]:
             "probe_openrouter": {"type": "boolean", "default": False},
             "probe_ollama": {"type": "boolean", "default": False},
             "check_update": {"type": "boolean", "default": False},
+        },
+        "additionalProperties": False,
+    }
+
+
+def stats_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "working_directory": {"type": "string"},
+            "since_days": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Only consider transcripts within the last N days.",
+            },
+            "participant": {
+                "type": "string",
+                "description": "Filter the per-participant view to one peer.",
+            },
         },
         "additionalProperties": False,
     }
@@ -469,6 +489,28 @@ def list_models(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"models": models[:limit]}
 
 
+def run_stats(arguments: dict[str, Any]) -> dict[str, Any]:
+    cwd = _resolve_working_directory(arguments)
+    load_project_env(cwd)
+    config = load_config(find_config(cwd), search=False)
+    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
+    if not out_dir.is_absolute():
+        out_dir = cwd / out_dir
+    since_days = arguments.get("since_days")
+    if since_days is not None:
+        since_days = int(since_days)
+        if since_days <= 0:
+            raise ValueError("since_days must be a positive integer")
+    participant = arguments.get("participant")
+    if participant is not None and not isinstance(participant, str):
+        raise ValueError("participant must be a string")
+    return compute_stats(
+        out_dir,
+        participant=participant or None,
+        since_days=since_days,
+    )
+
+
 def list_modes(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
@@ -534,6 +576,15 @@ async def _serve() -> None:
                 description="List cached OpenRouter models with optional filter/origin.",
                 inputSchema=models_schema(),
             ),
+            Tool(
+                name="council_stats",
+                description=(
+                    "Aggregate per-participant metrics across recorded "
+                    "transcripts: run count, success rate, recommendation "
+                    "label distribution, tokens, cost, and last-used time."
+                ),
+                inputSchema=stats_schema(),
+            ),
         ]
 
     @app.call_tool()
@@ -558,6 +609,8 @@ async def _serve() -> None:
             result = run_doctor(arguments)
         elif name == "council_models":
             result = list_models(arguments)
+        elif name == "council_stats":
+            result = run_stats(arguments)
         else:
             raise ValueError(f"Unknown tool: {name}")
         return [TextContent(type="text", text=json.dumps(result, indent=2))]

@@ -27,6 +27,7 @@ from llm_council.model_catalog import fetch_openrouter_models
 from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
 from llm_council.setup_wizard import write_setup_files
+from llm_council.stats import compute_stats, format_stats_text
 from llm_council.transcript import (
     latest_transcript,
     transcript_paths,
@@ -232,6 +233,23 @@ def build_parser() -> argparse.ArgumentParser:
         "summary", help="Summarize transcript totals"
     )
     transcripts_summary.add_argument("--cwd", default=".", help="Working directory")
+
+    stats = sub.add_parser(
+        "stats", help="Aggregate per-participant metrics over recorded transcripts"
+    )
+    stats.add_argument("--cwd", default=".", help="Working directory")
+    stats.add_argument(
+        "--since",
+        type=int,
+        default=None,
+        help="Only consider transcripts within the last N days",
+    )
+    stats.add_argument(
+        "--participant",
+        default=None,
+        help="Filter the per-participant table to one peer",
+    )
+    stats.add_argument("--json", action="store_true", help="Print JSON")
 
     sub.add_parser("mcp-server", help="Run llm-council MCP server over stdio")
 
@@ -788,6 +806,25 @@ def _transcript_dir(cwd: Path, config: dict) -> Path:
     return out_dir if out_dir.is_absolute() else cwd / out_dir
 
 
+def cmd_stats(args: argparse.Namespace) -> int:
+    cwd = Path(args.cwd).resolve()
+    load_project_env(cwd)
+    config = load_config(find_config(cwd), search=False)
+    out_dir = _transcript_dir(cwd, config)
+    if args.since is not None and args.since <= 0:
+        raise SystemExit("--since must be a positive integer")
+    stats = compute_stats(
+        out_dir,
+        participant=args.participant,
+        since_days=args.since,
+    )
+    if args.json:
+        print(json.dumps(stats, indent=2))
+    else:
+        print(format_stats_text(stats))
+    return 0
+
+
 def cmd_transcripts(args: argparse.Namespace) -> int:
     if not args.transcripts_command:
         raise SystemExit("transcripts subcommand is required")
@@ -1153,6 +1190,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_last(args)
     if args.command == "transcripts":
         return cmd_transcripts(args)
+    if args.command == "stats":
+        return cmd_stats(args)
     if args.command == "models":
         return cmd_models(args)
     if args.command == "mcp-server":

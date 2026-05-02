@@ -3045,3 +3045,298 @@ def test_transcripts_cli_limit_zero_and_relative_show(tmp_path: Path, capsys):
     )
     assert cmd_transcripts(args) == 0
     assert "LLM Council Transcript" in capsys.readouterr().out
+
+
+def _write_synth_transcript(
+    out_dir: Path,
+    name: str,
+    payload: dict,
+    *,
+    mtime: float | None = None,
+) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{name}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    if mtime is not None:
+        import os as _os
+
+        _os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_stats_aggregate_per_participant_metrics(tmp_path: Path):
+    from llm_council.stats import compute_stats
+
+    out_dir = tmp_path / ".llm-council" / "runs"
+    _write_synth_transcript(
+        out_dir,
+        "run1",
+        {
+            "mode": "quick",
+            "results": [
+                {
+                    "name": "claude",
+                    "ok": True,
+                    "elapsed_seconds": 10.0,
+                    "output": "RECOMMENDATION: yes - go",
+                    "total_tokens": 100,
+                    "cost_usd": 0.01,
+                },
+                {
+                    "name": "codex",
+                    "ok": True,
+                    "elapsed_seconds": 5.0,
+                    "output": "RECOMMENDATION: no - stop",
+                },
+            ],
+        },
+    )
+    _write_synth_transcript(
+        out_dir,
+        "run2",
+        {
+            "mode": "review",
+            "results": [
+                {
+                    "name": "claude",
+                    "ok": True,
+                    "elapsed_seconds": 20.0,
+                    "output": "no recommendation label here",
+                    "total_tokens": 50,
+                    "cost_usd": 0.005,
+                },
+                {
+                    "name": "gemini",
+                    "ok": False,
+                    "elapsed_seconds": 1.0,
+                    "output": "",
+                    "error": "boom",
+                },
+            ],
+        },
+    )
+
+    stats = compute_stats(out_dir)
+    assert stats["transcripts_considered"] == 2
+    assert stats["total_runs"] == 4
+    assert stats["total_successes"] == 3
+    assert stats["mode_counts"] == {"quick": 1, "review": 1}
+
+    by_name = {row["name"]: row for row in stats["participants"]}
+    assert set(by_name) == {"claude", "codex", "gemini"}
+
+    claude = by_name["claude"]
+    assert claude["runs"] == 2
+    assert claude["successes"] == 2
+    assert claude["success_rate"] == 1.0
+    assert claude["avg_elapsed_seconds"] == 15.0
+    assert claude["label_counts"] == {"yes": 1, "no": 0, "tradeoff": 0, "unknown": 1}
+    assert claude["invalid_label_runs"] == 1
+    assert claude["invalid_label_rate"] == 0.5
+    assert claude["tokens_total"] == 150
+    assert claude["tokens_runs"] == 2
+    assert abs(claude["cost_total"] - 0.015) < 1e-9
+    assert claude["cost_runs"] == 2
+
+    codex = by_name["codex"]
+    assert codex["runs"] == 1
+    assert codex["tokens_total"] is None
+    assert codex["cost_total"] is None
+    assert codex["label_counts"]["no"] == 1
+
+    gemini = by_name["gemini"]
+    assert gemini["runs"] == 1
+    assert gemini["successes"] == 0
+    assert gemini["success_rate"] == 0.0
+    assert gemini["label_counts"] == {"yes": 0, "no": 0, "tradeoff": 0, "unknown": 0}
+    assert gemini["invalid_label_runs"] == 0
+
+
+def test_stats_filters_by_participant_and_since(tmp_path: Path, monkeypatch):
+    from llm_council.stats import compute_stats
+
+    out_dir = tmp_path / ".llm-council" / "runs"
+    now = 1_700_000_000.0
+    old_mtime = now - 10 * 86400
+    new_mtime = now - 1 * 86400
+    _write_synth_transcript(
+        out_dir,
+        "old",
+        {
+            "mode": "quick",
+            "results": [
+                {
+                    "name": "claude",
+                    "ok": True,
+                    "elapsed_seconds": 1.0,
+                    "output": "RECOMMENDATION: yes - x",
+                }
+            ],
+        },
+        mtime=old_mtime,
+    )
+    _write_synth_transcript(
+        out_dir,
+        "new",
+        {
+            "mode": "quick",
+            "results": [
+                {
+                    "name": "claude",
+                    "ok": True,
+                    "elapsed_seconds": 2.0,
+                    "output": "RECOMMENDATION: tradeoff - y",
+                },
+                {
+                    "name": "codex",
+                    "ok": True,
+                    "elapsed_seconds": 3.0,
+                    "output": "RECOMMENDATION: no - z",
+                },
+            ],
+        },
+        mtime=new_mtime,
+    )
+
+    full = compute_stats(out_dir, now=now)
+    assert full["transcripts_considered"] == 2
+    assert full["total_runs"] == 3
+
+    recent = compute_stats(out_dir, since_days=2, now=now)
+    assert recent["transcripts_considered"] == 1
+    assert recent["total_runs"] == 2
+
+    only_claude = compute_stats(out_dir, participant="claude", now=now)
+    assert [row["name"] for row in only_claude["participants"]] == ["claude"]
+    assert only_claude["total_runs"] == 3
+
+
+def test_stats_uses_only_final_round_for_deliberation(tmp_path: Path):
+    from llm_council.stats import compute_stats
+
+    out_dir = tmp_path / ".llm-council" / "runs"
+    _write_synth_transcript(
+        out_dir,
+        "delib",
+        {
+            "mode": "deliberate",
+            "results": [
+                {
+                    "name": "claude",
+                    "ok": True,
+                    "elapsed_seconds": 1.0,
+                    "output": "RECOMMENDATION: yes - first",
+                },
+                {
+                    "name": "claude:round2",
+                    "ok": True,
+                    "elapsed_seconds": 2.0,
+                    "output": "RECOMMENDATION: tradeoff - final",
+                },
+            ],
+        },
+    )
+
+    stats = compute_stats(out_dir)
+    assert stats["total_runs"] == 1
+    row = stats["participants"][0]
+    assert row["name"] == "claude"
+    assert row["label_counts"]["tradeoff"] == 1
+    assert row["label_counts"]["yes"] == 0
+    assert row["avg_elapsed_seconds"] == 1.5
+
+
+def test_stats_cli_reports_against_real_records(tmp_path: Path, capsys):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    _write_synth_transcript(
+        out_dir,
+        "cli-run",
+        {
+            "mode": "quick",
+            "results": [
+                {
+                    "name": "claude",
+                    "ok": True,
+                    "elapsed_seconds": 4.0,
+                    "output": "RECOMMENDATION: yes - ok",
+                    "total_tokens": 42,
+                    "cost_usd": 0.001,
+                }
+            ],
+        },
+    )
+    parser = build_parser()
+    args = parser.parse_args(["stats", "--cwd", str(tmp_path)])
+    from llm_council.cli import cmd_stats
+
+    assert cmd_stats(args) == 0
+    out = capsys.readouterr().out
+    assert "transcripts: 1" in out
+    assert "claude" in out
+    assert "100%" in out
+
+    args = parser.parse_args(["stats", "--cwd", str(tmp_path), "--json"])
+    assert cmd_stats(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["total_runs"] == 1
+    assert payload["participants"][0]["name"] == "claude"
+
+
+def test_stats_cli_rejects_non_positive_since(tmp_path: Path):
+    parser = build_parser()
+    args = parser.parse_args(
+        ["stats", "--cwd", str(tmp_path), "--since", "0"]
+    )
+    from llm_council.cli import cmd_stats
+
+    with pytest.raises(SystemExit, match="positive integer"):
+        cmd_stats(args)
+
+
+def test_mcp_council_stats_tool(tmp_path: Path, monkeypatch):
+    from llm_council.mcp_server import run_stats, stats_schema
+
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    out_dir = tmp_path / ".llm-council" / "runs"
+    _write_synth_transcript(
+        out_dir,
+        "mcp-run",
+        {
+            "mode": "quick",
+            "results": [
+                {
+                    "name": "claude",
+                    "ok": True,
+                    "elapsed_seconds": 3.0,
+                    "output": "RECOMMENDATION: tradeoff - mixed",
+                },
+                {
+                    "name": "codex",
+                    "ok": True,
+                    "elapsed_seconds": 4.0,
+                    "output": "no label here",
+                },
+            ],
+        },
+    )
+
+    schema = stats_schema()
+    assert schema["properties"]["since_days"]["type"] == "integer"
+    assert schema["properties"]["participant"]["type"] == "string"
+    assert schema["additionalProperties"] is False
+
+    result = run_stats({"working_directory": str(tmp_path)})
+    assert result["transcripts_considered"] == 1
+    assert result["total_runs"] == 2
+    assert result["total_successes"] == 2
+    by_name = {r["name"]: r for r in result["participants"]}
+    assert by_name["claude"]["label_counts"]["tradeoff"] == 1
+    assert by_name["codex"]["invalid_label_rate"] == 1.0
+
+    filtered = run_stats(
+        {"working_directory": str(tmp_path), "participant": "claude"}
+    )
+    assert [r["name"] for r in filtered["participants"]] == ["claude"]
+
+    with pytest.raises(ValueError, match="positive integer"):
+        run_stats({"working_directory": str(tmp_path), "since_days": 0})
