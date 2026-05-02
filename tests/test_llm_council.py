@@ -1189,9 +1189,183 @@ def test_disagreement_requires_labeled_positions():
 
 def test_deliberation_prompt_is_capped():
     result = ParticipantResult("a", True, "x" * 100_000, "", 1)
-    prompt = build_deliberation_prompt("question" * 20_000, [result])
+    prompt, truncated = build_deliberation_prompt("question" * 20_000, [result])
     assert len(prompt) < 90_000
     assert "truncated" in prompt
+    assert truncated == ["a"]
+
+
+def test_deliberation_prompt_strips_context_but_keeps_question():
+    """Round 2 omits the bulky Context: section but keeps the question text.
+
+    Hosted (stateless) peers need the user's task wording (including any
+    output constraints) to engage substantively; only the diff/file payload
+    that they reasoned over in round 1 should be dropped.
+    """
+    diff_blob = "DIFF_PAYLOAD_LINE\n" * 5000
+    original_prompt = (
+        "You are a read-only participant in an LLM council for a coding project.\n"
+        "Working directory: /tmp\n"
+        "Council mode: review\n"
+        "\n"
+        "User question:\n"
+        "MARKER_QUESTION_TEXT please review this diff\n"
+        "\n"
+        "Response format:\n"
+        "- Start with `RECOMMENDATION: yes - ...`...\n"
+        "\n"
+        "Context:\n"
+        "## Git Diff\n\n```diff\n"
+        + diff_blob
+        + "```\n"
+    )
+    results = [
+        ParticipantResult("a", True, "RECOMMENDATION: yes - ship it\n\nReasons.", "", 1),
+        ParticipantResult("b", True, "RECOMMENDATION: no - hold off\n\nRisks.", "", 1),
+    ]
+    prompt, truncated = build_deliberation_prompt(original_prompt, results)
+    assert "DIFF_PAYLOAD_LINE" not in prompt
+    assert "MARKER_QUESTION_TEXT" in prompt
+    assert "Second-round deliberation" in prompt
+    assert "RECOMMENDATION: yes" in prompt
+    assert "RECOMMENDATION: no" in prompt
+    assert "## a" in prompt and "## b" in prompt
+    assert truncated == []
+    assert len(prompt) < len(original_prompt) // 4
+
+
+def test_deliberation_prompt_uses_last_context_marker():
+    """If a user question quotes ``\\n\\nContext:\\n``, only the trailing real one strips."""
+    original_prompt = (
+        "User question:\n"
+        "Why does the docs example contain `\n\nContext:\n` (escaped marker)?\n"
+        "\n"
+        "Response format:\n- ...\n"
+        "\n"
+        "Context:\n"
+        "## Git Diff\n\n```diff\nDIFF_BLOB\n```\n"
+    )
+    results = [
+        ParticipantResult("a", True, "RECOMMENDATION: yes - ok", "", 1),
+        ParticipantResult("b", True, "RECOMMENDATION: no - bad", "", 1),
+    ]
+    prompt, _ = build_deliberation_prompt(original_prompt, results)
+    assert "DIFF_BLOB" not in prompt
+    assert "escaped marker" in prompt
+
+
+def test_deliberation_recommendation_label_is_capped():
+    """Long first lines must not bloat the pointer label list."""
+    from llm_council.deliberation import MAX_RECOMMENDATION_LABEL_CHARS
+
+    huge_label_line = "RECOMMENDATION: tradeoff - " + ("z" * 800)
+    results = [
+        ParticipantResult("a", True, huge_label_line + "\n\nbody", "", 1),
+        ParticipantResult("b", True, "RECOMMENDATION: no - hold", "", 1),
+    ]
+    prompt, _ = build_deliberation_prompt("q", results)
+    label_section = prompt.split("Peer RECOMMENDATION labels", 1)[1].split(
+        "Original task:", 1
+    )[0]
+    a_lines = [line for line in label_section.splitlines() if line.startswith("- a:")]
+    assert len(a_lines) == 1
+    assert len(a_lines[0]) <= MAX_RECOMMENDATION_LABEL_CHARS + 10
+    assert a_lines[0].endswith("...")
+
+
+def test_deliberation_prompt_handles_prompt_without_context_section():
+    """When the original prompt has no Context: section, keep it intact."""
+    original_prompt = "User question:\nshould we use tabs?\n\nResponse format:\n- ...\n"
+    results = [
+        ParticipantResult("a", True, "RECOMMENDATION: yes - tabs", "", 1),
+        ParticipantResult("b", True, "RECOMMENDATION: no - spaces", "", 1),
+    ]
+    prompt, _ = build_deliberation_prompt(original_prompt, results)
+    assert "should we use tabs?" in prompt
+
+
+def test_deliberation_excerpt_truncates_at_line_boundary():
+    from llm_council.deliberation import MAX_DELIBERATION_PEER_EXCERPT_CHARS
+
+    line = "x" * 200 + "\n"
+    repeats = (MAX_DELIBERATION_PEER_EXCERPT_CHARS // len(line)) + 50
+    body = line * repeats + "tail-without-newline-suffix"
+    result = ParticipantResult("a", True, body, "", 1)
+    prompt, truncated = build_deliberation_prompt("q", [result])
+    assert truncated == ["a"]
+    excerpt_section = prompt.split("## a\n\n", 1)[1]
+    excerpt_body = excerpt_section.split("\n\n## ", 1)[0]
+    assert excerpt_body.endswith("x" * 200), (
+        "expected excerpt to end at a complete line boundary"
+    )
+    assert "tail-without-newline-suffix" not in excerpt_body
+
+
+def test_deliberation_excerpt_falls_back_when_only_early_newline():
+    """Header-then-monolith bodies should not lose most of the budget."""
+    from llm_council.deliberation import (
+        MAX_DELIBERATION_PEER_EXCERPT_CHARS,
+        _truncate_at_line_boundary,
+    )
+
+    body = "intro\n" + ("x" * (MAX_DELIBERATION_PEER_EXCERPT_CHARS * 2))
+    out, was_truncated = _truncate_at_line_boundary(
+        body, MAX_DELIBERATION_PEER_EXCERPT_CHARS
+    )
+    assert was_truncated is True
+    assert len(out) >= MAX_DELIBERATION_PEER_EXCERPT_CHARS // 2
+
+
+def test_deliberation_truncated_event_fires_only_when_truncating(
+    monkeypatch, tmp_path: Path
+):
+    long_blob = "y" * 30_000
+    calls = 0
+
+    async def fake_run_participants(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [
+                ParticipantResult("a", True, "RECOMMENDATION: yes - ship\n" + long_blob, "", 1),
+                ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1),
+            ]
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: tradeoff - ok", "", 1),
+            ParticipantResult("b", True, "RECOMMENDATION: tradeoff - ok", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(["a", "b"], {}, "q", tmp_path, {}, deliberate=True)
+    )
+    truncation_events = [
+        e for e in metadata["progress_events"] if e.get("event") == "truncated_for_deliberation"
+    ]
+    assert len(truncation_events) == 1
+    assert truncation_events[0]["participant"] == "a"
+    assert truncation_events[0]["round"] == 2
+
+
+def test_deliberation_truncated_event_absent_when_no_truncation(
+    monkeypatch, tmp_path: Path
+):
+    async def fake_run_participants(*args, **kwargs):
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+            ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(
+            ["a", "b"], {}, "q", tmp_path, {}, deliberate=True, max_rounds=2
+        )
+    )
+    truncation_events = [
+        e for e in metadata["progress_events"] if e.get("event") == "truncated_for_deliberation"
+    ]
+    assert truncation_events == []
 
 
 def test_deliberation_summary():

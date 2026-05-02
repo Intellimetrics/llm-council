@@ -138,7 +138,15 @@ async def execute_council(
                 }
             )
             break
-        next_prompt = build_deliberation_prompt(prompt, round_results)
+        next_prompt, truncated_peers = build_deliberation_prompt(prompt, round_results)
+        for peer_name in truncated_peers:
+            emit(
+                {
+                    "event": "truncated_for_deliberation",
+                    "round": round_number + 1,
+                    "participant": peer_name,
+                }
+            )
         emit({"event": "deliberation_round_start", "round": round_number + 1})
         next_results = await run_participants(
             deliberation_participants,
