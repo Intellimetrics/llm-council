@@ -131,6 +131,12 @@ def validate_config(config: dict[str, Any]) -> None:
         )
         if "vision" in participant and not isinstance(participant["vision"], bool):
             raise ValueError(f"Participant '{name}' vision must be a boolean")
+        if "retry_on_missing_label" in participant and not isinstance(
+            participant["retry_on_missing_label"], bool
+        ):
+            raise ValueError(
+                f"Participant '{name}' retry_on_missing_label must be a boolean"
+            )
 
     modes = config.get("modes")
     if not isinstance(modes, dict) or not modes:

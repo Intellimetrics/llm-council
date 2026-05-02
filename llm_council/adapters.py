@@ -34,6 +34,13 @@ RECOMMENDATION_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+REPAIR_RETRY_INSTRUCTION = (
+    "Your previous response was missing the required label. "
+    "Please re-emit your response beginning with a single line of the form "
+    "`RECOMMENDATION: yes|no|tradeoff - <one-line rationale>` followed by your "
+    "reasoning. Do not change your reasoning, only add the missing label."
+)
+
 
 @dataclass
 class ParticipantResult:
@@ -81,6 +88,30 @@ async def run_cli_participant(
     name: str, cfg: dict[str, Any], prompt: str, cwd: Path
 ) -> ParticipantResult:
     start = time.monotonic()
+    result = await _run_cli_once(name, cfg, prompt, cwd, start=start)
+    if (
+        not result.ok
+        and _retry_enabled(cfg)
+        and result.error.startswith("InvalidParticipantResponse: missing required")
+        and _is_label_only_failure(result.output, cfg)
+    ):
+        retry_prompt = _build_cli_retry_prompt(prompt, result.output)
+        max_prompt_chars = cfg.get("max_prompt_chars")
+        if max_prompt_chars is not None and len(retry_prompt) > int(max_prompt_chars):
+            return result
+        retry_result = await _run_cli_once(name, cfg, retry_prompt, cwd, start=start)
+        return _merge_cli_retry(result, retry_result)
+    return result
+
+
+async def _run_cli_once(
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    cwd: Path,
+    *,
+    start: float,
+) -> ParticipantResult:
     timeout = int(cfg.get("timeout") or 240)
     command = _build_cli_command(name, cfg, prompt, cwd)
     max_prompt_chars = cfg.get("max_prompt_chars")
@@ -154,6 +185,54 @@ async def run_cli_participant(
             command=redact_prompt_args(command, prompt),
             model=cfg.get("model"),
         )
+
+
+def _build_cli_retry_prompt(original_prompt: str, prior_response: str) -> str:
+    return (
+        f"{original_prompt}\n\n"
+        "--- Your previous response (first attempt) ---\n"
+        f"{prior_response.strip()}\n\n"
+        f"{REPAIR_RETRY_INSTRUCTION}"
+    )
+
+
+def _merge_cli_retry(
+    original: ParticipantResult, retry: ParticipantResult
+) -> ParticipantResult:
+    if retry.ok:
+        merged_output = _format_retry_transcript(
+            original_output=original.output,
+            retry_output=retry.output,
+            recovered=True,
+        )
+        return ParticipantResult(
+            name=retry.name,
+            ok=True,
+            output=merged_output,
+            error="",
+            elapsed_seconds=retry.elapsed_seconds,
+            command=retry.command,
+            model=retry.model,
+        )
+    if retry.error.startswith("InvalidParticipantResponse: missing required") and retry.output:
+        merged_output = _format_retry_transcript(
+            original_output=original.output,
+            retry_output=retry.output,
+            recovered=False,
+        )
+        return ParticipantResult(
+            name=retry.name,
+            ok=False,
+            output=merged_output,
+            error=(
+                "InvalidParticipantResponse: missing required RECOMMENDATION label "
+                "after one repair retry"
+            ),
+            elapsed_seconds=retry.elapsed_seconds,
+            command=retry.command,
+            model=retry.model,
+        )
+    return original
 
 
 async def _cleanup_timed_out_process(
@@ -268,8 +347,50 @@ async def run_openrouter_participant(
                 total_tokens=_int_or_none(usage.get("total_tokens")),
                 cost_usd=_float_or_none(usage.get("cost")),
             )
+        finish_reason = choice.get("finish_reason")
         validation_error = _response_validation_error(content, cfg)
         if validation_error:
+            should_retry = (
+                _retry_enabled(cfg)
+                and finish_reason != "length"
+                and _is_label_only_failure(content, cfg)
+            )
+            if should_retry:
+                retry_messages = list(payload["messages"]) + [
+                    {"role": "assistant", "content": content},
+                    {"role": "user", "content": REPAIR_RETRY_INSTRUCTION},
+                ]
+                retry_serialized = _serialize_openrouter_messages(retry_messages)
+                max_prompt_chars = cfg.get("max_prompt_chars")
+                if (
+                    max_prompt_chars is None
+                    or len(retry_serialized) <= int(max_prompt_chars)
+                ):
+                    retry_payload = dict(payload)
+                    retry_payload["messages"] = retry_messages
+                    try:
+                        async with httpx.AsyncClient(timeout=timeout) as retry_client:
+                            retry_response = await _request_with_retries(
+                                retry_client,
+                                "POST",
+                                "https://openrouter.ai/api/v1/chat/completions",
+                                retries=_coerce_retries(cfg.get("retries"), default=2),
+                                headers=headers,
+                                json=retry_payload,
+                            )
+                            retry_data = retry_response.json()
+                    except Exception:
+                        retry_data = None
+                    if retry_data is not None:
+                        return _resolve_openrouter_retry(
+                            name=name,
+                            original_content=content,
+                            original_usage=usage,
+                            retry_data=retry_data,
+                            cfg=cfg,
+                            start=start,
+                            fallback_model=model,
+                        )
             return ParticipantResult(
                 name=name,
                 ok=False,
@@ -305,6 +426,136 @@ async def run_openrouter_participant(
         )
 
 
+def _serialize_openrouter_messages(messages: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+    return "\n".join(parts)
+
+
+def _resolve_openrouter_retry(
+    *,
+    name: str,
+    original_content: str,
+    original_usage: dict[str, Any],
+    retry_data: dict[str, Any],
+    cfg: dict[str, Any],
+    start: float,
+    fallback_model: Any,
+) -> ParticipantResult:
+    retry_usage = retry_data.get("usage") or {}
+    combined_usage = _combine_openrouter_usage(original_usage, retry_usage)
+    retry_choices = retry_data.get("choices") or []
+    retry_choice = retry_choices[0] if retry_choices else {}
+    retry_message = retry_choice.get("message") or {}
+    retry_content = _message_content_text(retry_message.get("content"))
+    if not retry_content:
+        retry_content = _message_content_text(retry_message.get("reasoning"))
+    retry_finish = retry_choice.get("finish_reason")
+    model_id = retry_data.get("model") or fallback_model
+    if retry_data.get("error") or not retry_content or not retry_content.strip():
+        return ParticipantResult(
+            name=name,
+            ok=False,
+            output=original_content.strip(),
+            error=(
+                "InvalidParticipantResponse: missing required RECOMMENDATION label "
+                "after one repair retry"
+            ),
+            elapsed_seconds=time.monotonic() - start,
+            model=model_id,
+            prompt_tokens=_int_or_none(combined_usage.get("prompt_tokens")),
+            completion_tokens=_int_or_none(combined_usage.get("completion_tokens")),
+            total_tokens=_int_or_none(combined_usage.get("total_tokens")),
+            cost_usd=_float_or_none(combined_usage.get("cost")),
+        )
+    if retry_finish == "length":
+        merged_output = _format_retry_transcript(
+            original_output=original_content,
+            retry_output=retry_content,
+            recovered=False,
+        )
+        return ParticipantResult(
+            name=name,
+            ok=False,
+            output=merged_output,
+            error=(
+                "InvalidParticipantResponse: retry response was truncated "
+                "(finish_reason=length); cannot trust label"
+            ),
+            elapsed_seconds=time.monotonic() - start,
+            model=model_id,
+            prompt_tokens=_int_or_none(combined_usage.get("prompt_tokens")),
+            completion_tokens=_int_or_none(combined_usage.get("completion_tokens")),
+            total_tokens=_int_or_none(combined_usage.get("total_tokens")),
+            cost_usd=_float_or_none(combined_usage.get("cost")),
+        )
+    retry_validation = _response_validation_error(retry_content, cfg)
+    if retry_validation:
+        merged_output = _format_retry_transcript(
+            original_output=original_content,
+            retry_output=retry_content,
+            recovered=False,
+        )
+        return ParticipantResult(
+            name=name,
+            ok=False,
+            output=merged_output,
+            error=(
+                "InvalidParticipantResponse: missing required RECOMMENDATION label "
+                "after one repair retry"
+            ),
+            elapsed_seconds=time.monotonic() - start,
+            model=model_id,
+            prompt_tokens=_int_or_none(combined_usage.get("prompt_tokens")),
+            completion_tokens=_int_or_none(combined_usage.get("completion_tokens")),
+            total_tokens=_int_or_none(combined_usage.get("total_tokens")),
+            cost_usd=_float_or_none(combined_usage.get("cost")),
+        )
+    merged_output = _format_retry_transcript(
+        original_output=original_content,
+        retry_output=retry_content,
+        recovered=True,
+    )
+    return ParticipantResult(
+        name=name,
+        ok=True,
+        output=merged_output,
+        error="",
+        elapsed_seconds=time.monotonic() - start,
+        model=model_id,
+        prompt_tokens=_int_or_none(combined_usage.get("prompt_tokens")),
+        completion_tokens=_int_or_none(combined_usage.get("completion_tokens")),
+        total_tokens=_int_or_none(combined_usage.get("total_tokens")),
+        cost_usd=_float_or_none(combined_usage.get("cost")),
+    )
+
+
+def _combine_openrouter_usage(
+    a: dict[str, Any], b: dict[str, Any]
+) -> dict[str, Any]:
+    combined: dict[str, Any] = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        first = _int_or_none(a.get(key))
+        second = _int_or_none(b.get(key))
+        if first is None and second is None:
+            continue
+        combined[key] = (first or 0) + (second or 0)
+    cost_a = _float_or_none(a.get("cost"))
+    cost_b = _float_or_none(b.get("cost"))
+    if cost_a is not None or cost_b is not None:
+        combined["cost"] = (cost_a or 0.0) + (cost_b or 0.0)
+    return combined
+
+
 async def run_ollama_participant(
     name: str,
     cfg: dict[str, Any],
@@ -327,7 +578,8 @@ async def run_ollama_participant(
         "stream": False,
     }
     try:
-        async with httpx.AsyncClient(timeout=float(cfg.get("timeout") or 180)) as client:
+        ollama_timeout = float(cfg.get("timeout") or 180)
+        async with httpx.AsyncClient(timeout=ollama_timeout) as client:
             response = await _request_with_retries(
                 client,
                 "POST",
@@ -337,12 +589,111 @@ async def run_ollama_participant(
             )
             data = response.json()
         content = data.get("message", {}).get("content", "")
+        finish_reason = data.get("done_reason")
         validation_error = _response_validation_error(content, cfg)
+        if validation_error:
+            should_retry = (
+                _retry_enabled(cfg)
+                and finish_reason != "length"
+                and _is_label_only_failure(content, cfg)
+            )
+            if should_retry:
+                retry_messages = list(payload["messages"]) + [
+                    {"role": "assistant", "content": content},
+                    {"role": "user", "content": REPAIR_RETRY_INSTRUCTION},
+                ]
+                retry_serialized = "\n".join(
+                    str(m.get("content") or "") for m in retry_messages
+                )
+                max_prompt_chars = cfg.get("max_prompt_chars")
+                if (
+                    max_prompt_chars is None
+                    or len(retry_serialized) <= int(max_prompt_chars)
+                ):
+                    retry_payload = dict(payload)
+                    retry_payload["messages"] = retry_messages
+                    try:
+                        async with httpx.AsyncClient(timeout=ollama_timeout) as retry_client:
+                            retry_response = await _request_with_retries(
+                                retry_client,
+                                "POST",
+                                f"{base_url}/api/chat",
+                                retries=_coerce_retries(cfg.get("retries"), default=1),
+                                json=retry_payload,
+                            )
+                            retry_data = retry_response.json()
+                    except Exception:
+                        retry_data = None
+                    if retry_data is not None:
+                        retry_content = (
+                            retry_data.get("message", {}).get("content", "") or ""
+                        )
+                        retry_done_reason = retry_data.get("done_reason")
+                        if retry_content.strip():
+                            if retry_done_reason == "length":
+                                merged = _format_retry_transcript(
+                                    original_output=content,
+                                    retry_output=retry_content,
+                                    recovered=False,
+                                )
+                                return ParticipantResult(
+                                    name=name,
+                                    ok=False,
+                                    output=merged,
+                                    error=(
+                                        "InvalidParticipantResponse: retry response "
+                                        "was truncated (done_reason=length); cannot "
+                                        "trust label"
+                                    ),
+                                    elapsed_seconds=time.monotonic() - start,
+                                    model=model,
+                                )
+                            retry_validation = _response_validation_error(
+                                retry_content, cfg
+                            )
+                            if retry_validation:
+                                merged = _format_retry_transcript(
+                                    original_output=content,
+                                    retry_output=retry_content,
+                                    recovered=False,
+                                )
+                                return ParticipantResult(
+                                    name=name,
+                                    ok=False,
+                                    output=merged,
+                                    error=(
+                                        "InvalidParticipantResponse: missing required "
+                                        "RECOMMENDATION label after one repair retry"
+                                    ),
+                                    elapsed_seconds=time.monotonic() - start,
+                                    model=model,
+                                )
+                            merged = _format_retry_transcript(
+                                original_output=content,
+                                retry_output=retry_content,
+                                recovered=True,
+                            )
+                            return ParticipantResult(
+                                name=name,
+                                ok=True,
+                                output=merged,
+                                error="",
+                                elapsed_seconds=time.monotonic() - start,
+                                model=model,
+                            )
+            return ParticipantResult(
+                name=name,
+                ok=False,
+                output=content.strip(),
+                error=validation_error,
+                elapsed_seconds=time.monotonic() - start,
+                model=model,
+            )
         return ParticipantResult(
             name=name,
-            ok=not validation_error,
+            ok=True,
             output=content.strip(),
-            error=validation_error,
+            error="",
             elapsed_seconds=time.monotonic() - start,
             model=model,
         )
@@ -558,6 +909,37 @@ def _response_validation_error(output: str, cfg: dict[str, Any]) -> str:
             f"First output: {excerpt}"
         )
     return "InvalidParticipantResponse: empty response"
+
+
+def _retry_enabled(cfg: dict[str, Any]) -> bool:
+    return cfg.get("retry_on_missing_label", True) is not False
+
+
+def _is_label_only_failure(output: str, cfg: dict[str, Any]) -> bool:
+    if not output or not output.strip():
+        return False
+    error = _response_validation_error(output, cfg)
+    return error.startswith("InvalidParticipantResponse: missing required")
+
+
+def _format_retry_transcript(
+    *, original_output: str, retry_output: str, recovered: bool
+) -> str:
+    header = (
+        "[recovered after retry] "
+        "First attempt was missing the required RECOMMENDATION label; "
+        "second attempt is shown below."
+        if recovered
+        else "[retry exhausted] "
+        "Both attempts were missing the required RECOMMENDATION label."
+    )
+    return (
+        f"{header}\n\n"
+        "--- Repaired response ---\n"
+        f"{retry_output.strip()}\n\n"
+        "--- Original response (first attempt) ---\n"
+        f"{original_output.strip()}"
+    )
 
 
 def _has_recommendation_label(output: str) -> bool:

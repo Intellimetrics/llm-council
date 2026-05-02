@@ -432,6 +432,7 @@ def test_cli_participant_rejects_successful_non_answer(monkeypatch, tmp_path: Pa
                 "command": "claude",
                 "args": ["-p"],
                 "stdin_prompt": True,
+                "retry_on_missing_label": False,
             },
             "prompt",
             tmp_path,
@@ -499,6 +500,602 @@ def test_cli_participant_ignores_success_stderr_banner(monkeypatch, tmp_path: Pa
 
     assert result.ok is True
     assert result.error == ""
+
+
+def test_cli_participant_retries_missing_label_and_recovers(
+    monkeypatch, tmp_path: Path
+):
+    calls: list[bytes | None] = []
+    responses = [
+        b"I have an opinion but I forgot the label.",
+        b"RECOMMENDATION: yes - looks good.\n\nDetails: same reasoning, label added.",
+    ]
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        async def communicate(self, input=None):
+            calls.append(input)
+            return self._payload, b""
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        index = len(calls)
+        return FakeProcess(responses[index])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+            },
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert len(calls) == 2
+    second_stdin = calls[1].decode()
+    assert "I have an opinion but I forgot the label." in second_stdin
+    assert "RECOMMENDATION:" in second_stdin
+    assert "Do not change your reasoning" in second_stdin
+    assert result.ok is True
+    assert "[recovered after retry]" in result.output
+    assert "RECOMMENDATION: yes - looks good." in result.output
+    assert "I have an opinion but I forgot the label." in result.output
+
+
+def test_cli_participant_retry_failure_preserves_original(
+    monkeypatch, tmp_path: Path
+):
+    calls: list[bytes | None] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, input=None):
+            calls.append(input)
+            return b"Still no label here.", b""
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+            },
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert len(calls) == 2
+    assert result.ok is False
+    assert result.error.startswith("InvalidParticipantResponse")
+    assert "after one repair retry" in result.error
+    assert "[retry exhausted]" in result.output
+    assert result.output.count("Still no label here.") == 2
+
+
+def test_cli_participant_retry_does_not_fire_on_empty_response(
+    monkeypatch, tmp_path: Path
+):
+    calls: list[bytes | None] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, input=None):
+            calls.append(input)
+            return b"", b""
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+            },
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert len(calls) == 1
+    assert result.ok is False
+    assert result.error == "InvalidParticipantResponse: empty response"
+
+
+def test_cli_participant_retry_does_not_fire_on_nonzero_exit(
+    monkeypatch, tmp_path: Path
+):
+    calls: list[bytes | None] = []
+
+    class FakeProcess:
+        returncode = 2
+
+        async def communicate(self, input=None):
+            calls.append(input)
+            return b"some partial output", b"oops"
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+            },
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert len(calls) == 1
+    assert result.ok is False
+    assert result.error == "oops"
+
+
+def test_cli_participant_retry_respects_max_prompt_chars(
+    monkeypatch, tmp_path: Path
+):
+    calls: list[bytes | None] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, input=None):
+            calls.append(input)
+            return b"x" * 200, b""
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+                "max_prompt_chars": 220,
+            },
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert len(calls) == 1
+    assert result.ok is False
+    assert result.error.startswith("InvalidParticipantResponse")
+    assert "after one repair retry" not in result.error
+
+
+def test_cli_participant_retry_disabled_via_config(monkeypatch, tmp_path: Path):
+    calls: list[bytes | None] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, input=None):
+            calls.append(input)
+            return b"no label whatsoever", b""
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+                "retry_on_missing_label": False,
+            },
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert len(calls) == 1
+    assert result.ok is False
+
+
+def test_openrouter_retries_missing_label_and_recovers(monkeypatch):
+    calls: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, body: dict):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    bodies = [
+        {
+            "model": "z-ai/glm-test",
+            "choices": [
+                {
+                    "message": {"content": "I forgot the label entirely."},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        },
+        {
+            "model": "z-ai/glm-test",
+            "choices": [
+                {
+                    "message": {
+                        "content": "RECOMMENDATION: tradeoff - depends.\n\nLong reasoning."
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
+        },
+    ]
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return FakeResponse(bodies[len(calls) - 1])
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openrouter_participant(
+            "glm",
+            {"type": "openrouter", "model": "z-ai/glm-test"},
+            "prompt",
+        )
+    )
+
+    assert len(calls) == 2
+    retry_messages = calls[1]["messages"]
+    assert retry_messages[-2] == {
+        "role": "assistant",
+        "content": "I forgot the label entirely.",
+    }
+    assert retry_messages[-1]["role"] == "user"
+    assert "RECOMMENDATION:" in retry_messages[-1]["content"]
+    assert result.ok is True
+    assert "[recovered after retry]" in result.output
+    assert "RECOMMENDATION: tradeoff" in result.output
+    assert "I forgot the label entirely." in result.output
+    assert result.total_tokens == 33
+    assert result.prompt_tokens == 22
+
+
+def test_openrouter_retry_failure_preserves_failure(monkeypatch):
+    calls: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, body: dict):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    bodies = [
+        {
+            "model": "z-ai/glm-test",
+            "choices": [
+                {
+                    "message": {"content": "first attempt missing label"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+        },
+        {
+            "model": "z-ai/glm-test",
+            "choices": [
+                {
+                    "message": {"content": "second attempt also missing"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 6, "completion_tokens": 4, "total_tokens": 10},
+        },
+    ]
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return FakeResponse(bodies[len(calls) - 1])
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openrouter_participant(
+            "glm",
+            {"type": "openrouter", "model": "z-ai/glm-test"},
+            "prompt",
+        )
+    )
+
+    assert len(calls) == 2
+    assert result.ok is False
+    assert "after one repair retry" in result.error
+    assert "[retry exhausted]" in result.output
+    assert "first attempt missing label" in result.output
+    assert "second attempt also missing" in result.output
+
+
+def test_openrouter_retry_rejects_truncated_retry_response(monkeypatch):
+    calls: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, body: dict):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    bodies = [
+        {
+            "model": "z-ai/glm-test",
+            "choices": [
+                {
+                    "message": {"content": "first attempt missing label"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+        },
+        {
+            "model": "z-ai/glm-test",
+            "choices": [
+                {
+                    "message": {
+                        "content": "RECOMMENDATION: yes - looks good but cut off"
+                    },
+                    "finish_reason": "length",
+                }
+            ],
+            "usage": {"prompt_tokens": 6, "completion_tokens": 4, "total_tokens": 10},
+        },
+    ]
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return FakeResponse(bodies[len(calls) - 1])
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openrouter_participant(
+            "glm",
+            {"type": "openrouter", "model": "z-ai/glm-test"},
+            "prompt",
+        )
+    )
+
+    assert len(calls) == 2
+    assert result.ok is False
+    assert "truncated" in result.error
+    assert "first attempt missing label" in result.output
+    assert "RECOMMENDATION: yes - looks good but cut off" in result.output
+
+
+def test_openrouter_retry_does_not_fire_on_finish_reason_length(monkeypatch):
+    calls: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, body: dict):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    body = {
+        "model": "z-ai/glm-test",
+        "choices": [
+            {
+                "message": {"content": "truncated body without label"},
+                "finish_reason": "length",
+            }
+        ],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+    }
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return FakeResponse(body)
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openrouter_participant(
+            "glm",
+            {"type": "openrouter", "model": "z-ai/glm-test"},
+            "prompt",
+        )
+    )
+
+    assert len(calls) == 1
+    assert result.ok is False
+    assert result.error.startswith("InvalidParticipantResponse")
+    assert "after one repair retry" not in result.error
+
+
+def test_openrouter_retry_does_not_fire_on_empty_content(monkeypatch):
+    calls: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, body: dict):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    body = {
+        "model": "z-ai/glm-test",
+        "choices": [
+            {
+                "message": {"content": ""},
+                "finish_reason": "content_filter",
+            }
+        ],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5},
+    }
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return FakeResponse(body)
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openrouter_participant(
+            "glm",
+            {"type": "openrouter", "model": "z-ai/glm-test"},
+            "prompt",
+        )
+    )
+
+    assert len(calls) == 1
+    assert result.ok is False
+    assert result.error.startswith("OpenRouterEmptyResponse")
+
+
+def test_openrouter_retry_does_not_fire_on_api_error(monkeypatch):
+    calls: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, body: dict):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    body = {
+        "model": "z-ai/glm-test",
+        "error": {"message": "rate limit", "code": 429},
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return FakeResponse(body)
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openrouter_participant(
+            "glm",
+            {"type": "openrouter", "model": "z-ai/glm-test"},
+            "prompt",
+        )
+    )
+
+    assert len(calls) == 1
+    assert result.ok is False
+    assert result.error.startswith("OpenRouterError")
+
+
+def test_openrouter_retry_disabled_via_config(monkeypatch):
+    calls: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, body: dict):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    body = {
+        "model": "z-ai/glm-test",
+        "choices": [
+            {
+                "message": {"content": "no label here"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+    }
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return FakeResponse(body)
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openrouter_participant(
+            "glm",
+            {
+                "type": "openrouter",
+                "model": "z-ai/glm-test",
+                "retry_on_missing_label": False,
+            },
+            "prompt",
+        )
+    )
+
+    assert len(calls) == 1
+    assert result.ok is False
+    assert result.error.startswith("InvalidParticipantResponse")
+
+
+def test_config_validates_retry_on_missing_label_type(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "participants": {
+                    "claude": {
+                        "type": "cli",
+                        "command": "claude",
+                        "retry_on_missing_label": "yes",
+                    }
+                },
+                "modes": {"quick": {"participants": ["claude"]}},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="retry_on_missing_label must be a boolean"):
+        load_config(path)
 
 
 def test_openrouter_empty_content_is_graceful(monkeypatch):
