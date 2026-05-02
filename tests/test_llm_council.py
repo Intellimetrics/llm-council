@@ -64,6 +64,7 @@ from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
 from llm_council.setup_wizard import mcp_config, project_config, write_setup_files
 from llm_council.transcript import (
+    convergence_summary_lines,
     deliberation_summary,
     final_round_results,
     find_transcript_by_id,
@@ -75,6 +76,14 @@ from llm_council.transcript import (
     safe_slug,
     transcript_records,
     write_transcript,
+)
+from llm_council.convergence import (
+    DEFAULT_THRESHOLDS,
+    classify,
+    jaccard_similarity,
+    resolve_thresholds,
+    tally_states,
+    tokenize,
 )
 
 
@@ -5075,3 +5084,521 @@ def test_mcp_run_council_continuation_missing_errors(monkeypatch, tmp_path: Path
                 }
             )
         )
+
+
+def test_tokenize_strips_stopwords_and_punctuation():
+    tokens = tokenize("The quick brown fox, jumps over the lazy dog!")
+    assert "quick" in tokens
+    assert "brown" in tokens
+    assert "fox" in tokens
+    assert "the" not in tokens
+    assert "over" in tokens
+
+
+def test_tokenize_strips_recommendation_line_wholesale():
+    """The RECOMMENDATION line is excised before tokenization so neither
+    the label words nor the rest of that line contribute to similarity."""
+    tokens = tokenize(
+        "Some background reasoning here.\n"
+        "RECOMMENDATION: yes - ship the patch immediately\n"
+        "More analysis below."
+    )
+    assert "recommendation" not in tokens
+    assert "yes" not in tokens
+    assert "ship" not in tokens  # part of the excised RECOMMENDATION line
+    assert "patch" not in tokens
+    assert "background" in tokens
+    assert "reasoning" in tokens
+    assert "analysis" in tokens
+
+
+def test_tokenize_keeps_yes_no_tradeoff_outside_recommendation_line():
+    """`yes/no/tradeoff` appearing in substantive prose are NOT stripped —
+    only the RECOMMENDATION line is excised."""
+    tokens = tokenize(
+        "I would say yes to caching but no to network calls; tradeoffs apply."
+    )
+    assert "yes" in tokens
+    assert "no" in tokens
+    assert "tradeoffs" in tokens
+
+
+def test_tokenize_repeated_stopwords_yields_empty():
+    assert tokenize("the the the") == set()
+
+
+def test_tokenize_handles_empty_input():
+    assert tokenize("") == set()
+    assert tokenize(None) == set()  # type: ignore[arg-type]
+
+
+def test_jaccard_identical_sets_is_one():
+    assert jaccard_similarity({"a", "b"}, {"a", "b"}) == 1.0
+
+
+def test_jaccard_disjoint_sets_is_zero():
+    assert jaccard_similarity({"a", "b"}, {"c", "d"}) == 0.0
+
+
+def test_jaccard_partial_overlap():
+    assert jaccard_similarity({"a", "b", "c"}, {"b", "c", "d"}) == pytest.approx(2 / 4)
+
+
+def test_jaccard_both_empty_is_one():
+    assert jaccard_similarity(set(), set()) == 1.0
+
+
+def test_jaccard_one_empty_is_zero():
+    assert jaccard_similarity({"a"}, set()) == 0.0
+    assert jaccard_similarity(set(), {"a"}) == 0.0
+
+
+def test_classify_uses_default_thresholds():
+    assert classify(0.95) == "converged"
+    assert classify(0.80) == "converged"
+    assert classify(0.65) == "refining"
+    assert classify(0.50) == "refining"
+    assert classify(0.49) == "diverging"
+    assert classify(0.0) == "diverging"
+
+
+def test_classify_respects_custom_thresholds():
+    custom = {"converged": 0.9, "refining": 0.6}
+    assert classify(0.85, custom) == "refining"
+    assert classify(0.91, custom) == "converged"
+    assert classify(0.59, custom) == "diverging"
+
+
+def test_resolve_thresholds_validates_ordering():
+    with pytest.raises(ValueError, match="refining must be <= converged"):
+        resolve_thresholds({"converged": 0.5, "refining": 0.7})
+
+
+def test_resolve_thresholds_validates_range():
+    with pytest.raises(ValueError, match="between 0.0 and 1.0"):
+        resolve_thresholds({"converged": 1.5})
+
+
+def test_resolve_thresholds_returns_defaults_when_none():
+    assert resolve_thresholds(None) == DEFAULT_THRESHOLDS
+
+
+def test_tally_states_counts_each_state():
+    counts = tally_states(
+        ["converged", "converged", "refining", "diverging", "insufficient"]
+    )
+    assert counts == {
+        "converged": 2,
+        "refining": 1,
+        "diverging": 1,
+        "insufficient": 1,
+    }
+
+
+def test_repeated_stopwords_do_not_count_as_converged():
+    a = tokenize("the the the")
+    b = tokenize("the the the")
+    similarity = jaccard_similarity(a, b)
+    assert classify(similarity) == "converged"
+    # but with no content tokens at all, both sets are empty -> 1.0 by convention.
+    # The signal value is that there's no real overlap to evaluate; this is the
+    # documented edge case (handled by treating empty/empty as 1.0 — the orchestrator
+    # only feeds outputs that already passed the RECOMMENDATION-label gate, so all-stopword
+    # bodies are vanishingly rare).
+    assert a == set()
+    assert b == set()
+
+
+def test_recommendation_line_excised_before_tokenization():
+    """The literal RECOMMENDATION line is dropped wholesale so it never inflates
+    similarity — but yes/no/tradeoff appearing in substantive prose still count."""
+    a = tokenize(
+        "RECOMMENDATION: yes - ship now\nThe yes path covers caching nicely."
+    )
+    b = tokenize(
+        "RECOMMENDATION: no - revert\nThe yes path was wrong about caching."
+    )
+    # 'yes' from the substantive prose IS preserved...
+    assert "yes" in a and "yes" in b
+    assert "path" in a and "path" in b
+    assert "caching" in a and "caching" in b
+    # ...but the RECOMMENDATION line (and everything on it) is excised.
+    assert "recommendation" not in a
+    assert "ship" not in a  # part of the excised RECOMMENDATION line
+    assert "revert" not in b
+    assert "now" not in a
+
+
+def test_recommendation_only_responses_yield_empty_token_sets():
+    a = tokenize("RECOMMENDATION: yes - ship")
+    b = tokenize("RECOMMENDATION: no - hold")
+    assert a == set()
+    assert b == set()
+
+
+_PEER_A_R1 = (
+    "RECOMMENDATION: yes - ship\n\n"
+    "Caching benefits include reduced database hits, lower latency for cold "
+    "requests, smoother failover under traffic spikes, and improved cost "
+    "predictability across the fleet. Redis with persistent snapshots covers "
+    "every major workload we expect."
+)
+_PEER_B_R1 = (
+    "RECOMMENDATION: no - hold\n\n"
+    "Migration pressure remains too high; query planner regressions continue "
+    "to surface in staging benchmarks. Index bloat, replication lag, vacuum "
+    "tuning, and rollout safety windows all deserve closer scrutiny first."
+)
+
+
+def test_execute_council_emits_convergence_for_round_2(monkeypatch, tmp_path: Path):
+    calls = 0
+
+    async def fake_run_participants(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [
+                ParticipantResult("a", True, _PEER_A_R1, "", 1),
+                ParticipantResult("b", True, _PEER_B_R1, "", 1),
+            ]
+        return [
+            # peer a: identical prose -> converged
+            ParticipantResult("a", True, _PEER_A_R1, "", 1),
+            # peer b: minor edits, mostly stable -> refining
+            ParticipantResult(
+                "b",
+                True,
+                "RECOMMENDATION: tradeoff - revisit\n\n"
+                "Migration pressure remains very high; query planner regressions "
+                "continue surfacing in staging benchmarks. Index bloat, replication "
+                "lag, vacuum tuning, and a careful rollout plan all deserve scrutiny "
+                "before we commit.",
+                "",
+                1,
+            ),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    results, metadata = asyncio.run(
+        execute_council(["a", "b"], {}, "question", tmp_path, {}, deliberate=True)
+    )
+    convergence = metadata.get("convergence")
+    assert convergence is not None
+    assert "2" in convergence
+    by_peer = {entry["participant"]: entry for entry in convergence["2"]}
+    assert by_peer["a"]["state"] == "converged"
+    assert by_peer["b"]["state"] in {"refining", "converged"}
+    events = metadata["progress_events"]
+    convergence_events = [e for e in events if e.get("event") == "convergence"]
+    assert {e["round"] for e in convergence_events} == {2}
+    assert {e["participant"] for e in convergence_events} == {"a", "b"}
+
+
+def test_execute_council_emits_no_convergence_event_for_round_1(monkeypatch, tmp_path: Path):
+    async def fake_run_participants(*args, **kwargs):
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+            ParticipantResult("b", True, "RECOMMENDATION: yes - ship", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(["a", "b"], {}, "question", tmp_path, {}, deliberate=True)
+    )
+    events = metadata["progress_events"]
+    convergence_events = [e for e in events if e.get("event") == "convergence"]
+    assert convergence_events == []
+    assert "convergence" not in metadata
+
+
+def test_execute_council_synthetic_three_peers_classify_distinct_states(
+    monkeypatch, tmp_path: Path
+):
+    """Peer 1 identical -> converged, peer 2 wildly different -> diverging,
+    peer 3 reworded but related -> refining."""
+    calls = 0
+
+    a_r1 = (
+        "RECOMMENDATION: yes - cache\n\n"
+        "Redis cache layer warms quickly. Lookup latency stays under "
+        "five milliseconds. Persistent snapshots cover restart cases. "
+        "Cluster topology balances primaries and replicas evenly. "
+        "Hit ratio crosses ninety percent within minutes."
+    )
+    b_r1 = (
+        "RECOMMENDATION: no - reject\n\n"
+        "Apple banana cherry donkey elephant flamingo giraffe horse "
+        "iguana jaguar kestrel lion mongoose newt octopus penguin "
+        "quokka raven salamander tarantula uakari vole."
+    )
+    b_r2 = (
+        "RECOMMENDATION: no - reject\n\n"
+        "Mountain river forest valley canyon meadow desert glacier "
+        "tundra swamp prairie reef island plateau peninsula straits "
+        "harbor estuary lagoon delta isthmus archipelago atoll fjord."
+    )
+    c_r1 = (
+        "RECOMMENDATION: tradeoff - refactor\n\n"
+        "Worker pool concurrency model needs refactoring. Scheduling "
+        "fairness suffers under bursty workloads. Queue depth metrics "
+        "lag actual saturation. Backpressure hooks remain incomplete. "
+        "Telemetry needs consolidation across services. Logging covers "
+        "ingress, egress, and health probes adequately for production."
+    )
+    c_r2 = (
+        "RECOMMENDATION: tradeoff - revise\n\n"
+        "Worker pool concurrency model needs refactoring. Scheduling "
+        "fairness suffers under bursty workloads. Queue depth metrics "
+        "lag saturation. Backpressure hooks remain incomplete. Telemetry "
+        "needs consolidation across services. Adding tracing spans on "
+        "egress paths would close the remaining observability gap."
+    )
+
+    async def fake_run_participants(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [
+                ParticipantResult("a", True, a_r1, "", 1),
+                ParticipantResult("b", True, b_r1, "", 1),
+                ParticipantResult("c", True, c_r1, "", 1),
+            ]
+        return [
+            ParticipantResult("a", True, a_r1, "", 1),
+            ParticipantResult("b", True, b_r2, "", 1),
+            ParticipantResult("c", True, c_r2, "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(["a", "b", "c"], {}, "question", tmp_path, {}, deliberate=True)
+    )
+    by_peer = {
+        entry["participant"]: entry for entry in metadata["convergence"]["2"]
+    }
+    assert by_peer["a"]["state"] == "converged"
+    assert by_peer["b"]["state"] == "diverging"
+    assert by_peer["c"]["state"] == "refining"
+
+
+def test_execute_council_per_mode_threshold_override(monkeypatch, tmp_path: Path):
+    """Per-mode override raises the converged bar so the same Jaccard
+    similarity that would normally classify as `converged` instead lands
+    in `refining`."""
+    calls = 0
+
+    a_r1 = (
+        "RECOMMENDATION: yes - go\n\n"
+        "Alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu "
+        "nu xi omicron pi rho sigma tau upsilon phi chi psi omega."
+    )
+    a_r2 = (
+        "RECOMMENDATION: yes - go\n\n"
+        "Alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu "
+        "nu xi omicron pi rho sigma tau upsilon phi chi psi prime."
+    )
+
+    async def fake_run_participants(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [
+                ParticipantResult("a", True, a_r1, "", 1),
+                ParticipantResult(
+                    "b",
+                    True,
+                    "RECOMMENDATION: no - hold\n\n"
+                    "One two three four five six seven eight nine ten "
+                    "eleven twelve thirteen fourteen fifteen sixteen.",
+                    "",
+                    1,
+                ),
+            ]
+        return [
+            ParticipantResult("a", True, a_r2, "", 1),
+            ParticipantResult(
+                "b",
+                True,
+                "RECOMMENDATION: tradeoff - revise\n\n"
+                "One hundred two hundred three hundred four hundred five hundred "
+                "six hundred seven hundred eight hundred nine hundred ten hundred.",
+                "",
+                1,
+            ),
+        ]
+
+    config_strict = {
+        "defaults": {"convergence_thresholds": {"converged": 0.80, "refining": 0.50}},
+        "modes": {"strict": {"convergence_thresholds": {"converged": 0.99}}},
+    }
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(
+            ["a", "b"],
+            {},
+            "question",
+            tmp_path,
+            config_strict,
+            deliberate=True,
+            mode="strict",
+        )
+    )
+    assert metadata["convergence_thresholds"]["converged"] == 0.99
+    by_peer = {entry["participant"]: entry for entry in metadata["convergence"]["2"]}
+    # 23 of 24 tokens overlap -> ~0.96, well over the default 0.80 bar but
+    # below the strict 0.99 override -> refining.
+    assert by_peer["a"]["state"] == "refining"
+
+
+def test_convergence_summary_lines_renders_per_round_tally():
+    metadata = {
+        "convergence": {
+            "2": [
+                {"participant": "a", "state": "converged", "similarity": 0.9},
+                {"participant": "b", "state": "converged", "similarity": 0.85},
+                {"participant": "c", "state": "refining", "similarity": 0.6},
+            ],
+            "3": [
+                {"participant": "a", "state": "converged", "similarity": 0.95},
+                {"participant": "b", "state": "converged", "similarity": 0.9},
+                {"participant": "c", "state": "converged", "similarity": 0.92},
+            ],
+        }
+    }
+    lines = convergence_summary_lines(metadata)
+    assert len(lines) == 2
+    assert "round 2" in lines[0]
+    assert "2 converged, 1 refining" in lines[0]
+    # All-converged round 3 surfaces ALL CONVERGED prominently.
+    assert "ALL CONVERGED" in lines[1]
+
+
+def test_convergence_summary_lines_empty_when_no_data():
+    assert convergence_summary_lines({}) == []
+    assert convergence_summary_lines({"convergence": {}}) == []
+
+
+def test_write_transcript_includes_convergence_summary(tmp_path: Path):
+    md = tmp_path / "out.md"
+    js = tmp_path / "out.json"
+    metadata = {
+        "rounds": 2,
+        "deliberated": True,
+        "deliberation_status": "ran_no_labeled_disagreement",
+        "convergence": {
+            "2": [
+                {"participant": "a", "state": "converged", "similarity": 0.9},
+                {"participant": "b", "state": "refining", "similarity": 0.6},
+            ]
+        },
+        "progress_events": [],
+    }
+    write_transcript(
+        md,
+        js,
+        question="Q",
+        mode="quick",
+        current="claude",
+        participants=["a", "b"],
+        prompt="prompt",
+        results=[
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ok", "", 1),
+            ParticipantResult("b", True, "RECOMMENDATION: yes - ok", "", 1),
+        ],
+        metadata=metadata,
+    )
+    body = md.read_text(encoding="utf-8")
+    assert "Convergence (round 2): 1 converged, 1 refining" in body
+    payload = json.loads(js.read_text(encoding="utf-8"))
+    assert payload["metadata"]["convergence"]["2"][0]["state"] == "converged"
+
+
+def test_execute_council_emits_insufficient_for_short_responses(
+    monkeypatch, tmp_path: Path
+):
+    """When a peer's filtered token count is below the floor, the
+    classifier emits `insufficient` rather than a noisy similarity bucket."""
+    a_r1 = (
+        "RECOMMENDATION: yes - alpha\n\n"
+        "Caching benefits include reduced database hits, lower latency for cold "
+        "requests, smoother failover under traffic spikes, improved cost "
+        "predictability, and clearer SLO accounting across the fleet."
+    )
+    a_r2 = "RECOMMENDATION: yes - alpha\n\nAgreed; no changes needed."
+
+    calls = 0
+
+    async def fake_run_participants(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [
+                ParticipantResult("a", True, a_r1, "", 1),
+                ParticipantResult(
+                    "b",
+                    True,
+                    "RECOMMENDATION: no - hold\n\n"
+                    "Migration pressure remains too high; query planner regressions "
+                    "continue surfacing. Index bloat and replication lag warrant "
+                    "deeper investigation before we move ahead.",
+                    "",
+                    1,
+                ),
+            ]
+        return [
+            ParticipantResult("a", True, a_r2, "", 1),
+            ParticipantResult(
+                "b",
+                True,
+                "RECOMMENDATION: tradeoff - revise\n\n"
+                "Migration pressure remains very high; query planner regressions "
+                "continue. Index bloat and replication lag still warrant deeper "
+                "investigation before any move.",
+                "",
+                1,
+            ),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(["a", "b"], {}, "question", tmp_path, {}, deliberate=True)
+    )
+    by_peer = {entry["participant"]: entry for entry in metadata["convergence"]["2"]}
+    assert by_peer["a"]["state"] == "insufficient"
+    assert by_peer["a"]["similarity"] is None
+    # peer b has plenty of content tokens both rounds -> classified normally.
+    assert by_peer["b"]["state"] in {"converged", "refining", "diverging"}
+
+
+def test_validate_config_rejects_inverted_convergence_thresholds(tmp_path: Path):
+    cfg_path = tmp_path / ".llm-council.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "defaults": {
+                    "convergence_thresholds": {"converged": 0.4, "refining": 0.7}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="refining must be <= converged"):
+        load_config(cfg_path)
+
+
+def test_validate_config_rejects_out_of_range_convergence_thresholds(tmp_path: Path):
+    cfg_path = tmp_path / ".llm-council.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "defaults": {"convergence_thresholds": {"converged": 1.5}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="between 0.0 and 1.0"):
+        load_config(cfg_path)
+

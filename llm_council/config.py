@@ -230,6 +230,10 @@ def validate_config(config: dict[str, Any]) -> None:
     _validate_positive_int(defaults, "max_prompt_chars", "defaults")
     _validate_positive_int(defaults, "mcp_max_prompt_chars", "defaults")
     _validate_positive_number(defaults, "mcp_max_estimated_cost_usd", "defaults")
+    _validate_convergence_thresholds(defaults, "defaults")
+    for mode_name, mode in modes.items():
+        if isinstance(mode, dict):
+            _validate_convergence_thresholds(mode, f"mode '{mode_name}'")
 
 
 def _validate_openai_compatible_participant(name: str, participant: dict[str, Any]) -> None:
@@ -446,6 +450,36 @@ def _validate_regex_list(mapping: dict[str, Any], key: str, label: str) -> None:
             raise ValueError(
                 f"{label} {key} contains invalid regex {pattern!r}: {exc}"
             ) from exc
+
+
+def _validate_convergence_thresholds(mapping: dict[str, Any], label: str) -> None:
+    value = mapping.get("convergence_thresholds")
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError(f"{label}.convergence_thresholds must be a mapping")
+    allowed = {"converged", "refining"}
+    for key, raw in value.items():
+        if key not in allowed:
+            raise ValueError(
+                f"{label}.convergence_thresholds has unknown key '{key}'; "
+                f"expected any of {sorted(allowed)}"
+            )
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError(
+                f"{label}.convergence_thresholds.{key} must be a number "
+                "between 0.0 and 1.0"
+            )
+        if raw < 0.0 or raw > 1.0:
+            raise ValueError(
+                f"{label}.convergence_thresholds.{key} must be between 0.0 and 1.0"
+            )
+    converged = value.get("converged")
+    refining = value.get("refining")
+    if converged is not None and refining is not None and refining > converged:
+        raise ValueError(
+            f"{label}.convergence_thresholds.refining must be <= converged"
+        )
 
 
 def _validate_positive_number(mapping: dict[str, Any], key: str, label: str) -> None:

@@ -13,6 +13,7 @@ from llm_council.adapters import (
     command_for_display,
     is_timeout_error,
 )
+from llm_council.convergence import tally_states
 from llm_council.deliberation import (
     default_min_quorum,
     labeled_quorum_count,
@@ -314,6 +315,38 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
     return payload
 
 
+def convergence_summary_lines(metadata: dict[str, Any]) -> list[str]:
+    """Render per-round convergence tallies as bullet lines for the markdown header.
+
+    Returns an empty list when no convergence data is recorded (i.e. fewer than
+    two rounds ran or the orchestrator did not stamp metadata).
+    """
+    convergence = metadata.get("convergence")
+    if not isinstance(convergence, dict) or not convergence:
+        return []
+    lines: list[str] = []
+    for round_key in sorted(convergence.keys(), key=lambda k: int(k)):
+        records = convergence.get(round_key) or []
+        if not isinstance(records, list) or not records:
+            continue
+        states = [r.get("state") for r in records if isinstance(r, dict)]
+        counts = tally_states(states)
+        insufficient = sum(1 for s in states if s == "insufficient")
+        classified_total = counts["converged"] + counts["refining"] + counts["diverging"]
+        parts = []
+        for state in ("converged", "refining", "diverging"):
+            if counts[state]:
+                parts.append(f"{counts[state]} {state}")
+        if insufficient:
+            parts.append(f"{insufficient} insufficient")
+        summary = ", ".join(parts) if parts else "no signal"
+        prefix = ""
+        if classified_total > 0 and counts["converged"] == classified_total:
+            prefix = "**ALL CONVERGED** — "
+        lines.append(f"- Convergence (round {round_key}): {prefix}{summary}")
+    return lines
+
+
 def deliberation_summary(metadata: dict[str, Any]) -> str:
     status = metadata.get("deliberation_status")
     if status == "ran_no_labeled_disagreement":
@@ -505,6 +538,7 @@ def write_transcript(
         f"- Cost reported: `${cost_total:.6f}`",
         f"- Rounds: `{metadata.get('rounds', 1)}`",
         f"- Deliberation: {deliberation_summary(metadata)}",
+        *convergence_summary_lines(metadata),
         *(
             [f"- Parent run: `{parent_run_id}`"]
             if parent_run_id

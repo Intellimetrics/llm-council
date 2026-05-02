@@ -11,12 +11,86 @@ from llm_council.adapters import (
     is_timeout_error,
     run_participants,
 )
+from llm_council.convergence import (
+    MIN_TOKENS_FOR_CLASSIFICATION,
+    classify,
+    jaccard_similarity,
+    resolve_thresholds,
+    tokenize,
+)
 from llm_council.deliberation import (
     build_deliberation_prompt,
     default_min_quorum,
     has_disagreement,
     labeled_quorum_count,
 )
+
+
+def _resolve_convergence_thresholds(
+    config: dict[str, Any], mode: str | None
+) -> dict[str, float]:
+    defaults = config.get("defaults", {}) or {}
+    base = defaults.get("convergence_thresholds") if isinstance(defaults, dict) else None
+    override: dict[str, float] | None = None
+    if mode:
+        modes = config.get("modes", {}) or {}
+        mode_cfg = modes.get(mode) or {}
+        if isinstance(mode_cfg, dict):
+            override = mode_cfg.get("convergence_thresholds")
+    merged: dict[str, float] = {}
+    if isinstance(base, dict):
+        merged.update(base)
+    if isinstance(override, dict):
+        merged.update(override)
+    return resolve_thresholds(merged or None)
+
+
+def _base_name(name: str) -> str:
+    return name.split(":round")[0]
+
+
+def _index_by_base_name(
+    results: list[ParticipantResult],
+) -> dict[str, ParticipantResult]:
+    return {_base_name(result.name): result for result in results}
+
+
+def _compute_round_convergence(
+    prior: list[ParticipantResult],
+    current: list[ParticipantResult],
+    thresholds: dict[str, float],
+) -> list[dict[str, Any]]:
+    prior_index = _index_by_base_name(prior)
+    records: list[dict[str, Any]] = []
+    for result in current:
+        base = _base_name(result.name)
+        prior_result = prior_index.get(base)
+        if prior_result is None or not prior_result.ok or not result.ok:
+            continue
+        prior_tokens = tokenize(prior_result.output or "")
+        current_tokens = tokenize(result.output or "")
+        token_floor = min(len(prior_tokens), len(current_tokens))
+        if token_floor < MIN_TOKENS_FOR_CLASSIFICATION:
+            records.append(
+                {
+                    "participant": base,
+                    "similarity": None,
+                    "state": "insufficient",
+                    "prior_tokens": len(prior_tokens),
+                    "current_tokens": len(current_tokens),
+                }
+            )
+            continue
+        similarity = jaccard_similarity(prior_tokens, current_tokens)
+        state = classify(similarity, thresholds)
+        records.append(
+            {
+                "participant": base,
+                "similarity": round(similarity, 4),
+                "state": state,
+            }
+        )
+    return records
 
 
 def _failed_for_deliberation(results: list[ParticipantResult]) -> set[str]:
@@ -41,8 +115,10 @@ async def execute_council(
     progress: Callable[[dict[str, Any]], None] | None = None,
     image_manifest: list[dict[str, Any]] | None = None,
     min_quorum: int | None = None,
+    mode: str | None = None,
 ) -> tuple[list[ParticipantResult], dict[str, Any]]:
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
+    convergence_thresholds = _resolve_convergence_thresholds(config, mode)
 
     progress_events: list[dict[str, Any]] = []
 
@@ -119,6 +195,7 @@ async def execute_council(
 
     cumulative_excluded: set[str] = set()
     aborted_all_excluded = False
+    convergence_by_round: dict[int, list[dict[str, Any]]] = {}
     while deliberate and max_rounds > round_number and has_disagreement(round_results):
         cumulative_excluded.update(_failed_for_deliberation(round_results))
         deliberation_participants = [
@@ -164,6 +241,7 @@ async def execute_council(
             round_number=round_number + 1,
             image_manifest=image_manifest,
         )
+        prior_round_results = list(round_results)
         round_number += 1
         round_results = [
             replace(result, name=f"{result.name}:round{round_number}")
@@ -172,6 +250,22 @@ async def execute_council(
         results.extend(round_results)
         metadata["rounds"] = round_number
         metadata["deliberated"] = True
+
+        round_convergence = _compute_round_convergence(
+            prior_round_results, round_results, convergence_thresholds
+        )
+        if round_convergence:
+            convergence_by_round[round_number] = round_convergence
+            for record in round_convergence:
+                emit(
+                    {
+                        "event": "convergence",
+                        "round": round_number,
+                        "participant": record["participant"],
+                        "state": record["state"],
+                        "similarity": record["similarity"],
+                    }
+                )
 
     if metadata["deliberated"] and not aborted_all_excluded:
         final_disagreement = has_disagreement(round_results)
@@ -196,6 +290,12 @@ async def execute_council(
                 "status": metadata["deliberation_status"],
             }
         )
+
+    if convergence_by_round:
+        metadata["convergence"] = {
+            str(round_no): records for round_no, records in sorted(convergence_by_round.items())
+        }
+        metadata["convergence_thresholds"] = convergence_thresholds
 
     effective_min_quorum = (
         int(min_quorum) if min_quorum is not None else default_min_quorum(len(participants))

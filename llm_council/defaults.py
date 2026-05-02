@@ -62,6 +62,7 @@ DEFAULT_CONFIG: dict = {
         "max_concurrency": 4,
         "transparent": False,
         "max_deliberation_rounds": 2,
+        "convergence_thresholds": {"converged": 0.80, "refining": 0.50},
     },
     "participants": {
         "claude": {
