@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +122,11 @@ def validate_config(config: dict[str, Any]) -> None:
             _validate_string_list(participant, "args", f"CLI participant '{name}'")
             _validate_string_list(
                 participant, "env_passthrough", f"CLI participant '{name}'"
+            )
+            _validate_regex_list(
+                participant,
+                "cli_retry_stderr_patterns",
+                f"CLI participant '{name}'",
             )
         if ptype in {"openrouter", "ollama"} and not participant.get("model"):
             raise ValueError(f"Participant '{name}' must define model")
@@ -264,6 +270,21 @@ def _validate_string_list(mapping: dict[str, Any], key: str, label: str) -> None
     value = mapping.get(key, [])
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"{label} {key} must be a string list")
+
+
+def _validate_regex_list(mapping: dict[str, Any], key: str, label: str) -> None:
+    if key not in mapping or mapping[key] is None:
+        return
+    value = mapping[key]
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{label} {key} must be a list of regex strings")
+    for pattern in value:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(
+                f"{label} {key} contains invalid regex {pattern!r}: {exc}"
+            ) from exc
 
 
 def _validate_positive_number(mapping: dict[str, Any], key: str, label: str) -> None:

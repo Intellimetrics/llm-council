@@ -81,7 +81,7 @@ def transcript_records(base_dir: Path) -> list[dict[str, Any]]:
 
 
 def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "name": result.name,
         "ok": result.ok,
         "model": result.model,
@@ -94,6 +94,9 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
         "total_tokens": result.total_tokens,
         "cost_usd": result.cost_usd,
     }
+    if result.recovered_after_launch_retry:
+        payload["recovered_after_launch_retry"] = True
+    return payload
 
 
 def deliberation_summary(metadata: dict[str, Any]) -> str:

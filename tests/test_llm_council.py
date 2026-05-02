@@ -1036,6 +1036,342 @@ def test_cli_participant_retry_disabled_via_config(monkeypatch, tmp_path: Path):
     assert result.ok is False
 
 
+def test_cli_launch_retry_recovers_on_matching_short_stderr(
+    monkeypatch, tmp_path: Path
+):
+    calls: list[bytes | None] = []
+    sleeps: list[float] = []
+
+    class FailingProcess:
+        returncode = 1
+
+        async def communicate(self, input=None):
+            calls.append(input)
+            return b"", b"ECONNRESET: broken pipe to subprocess"
+
+    class GoodProcess:
+        returncode = 0
+
+        async def communicate(self, input=None):
+            calls.append(input)
+            return b"RECOMMENDATION: yes - fine", b""
+
+    procs = [FailingProcess(), GoodProcess()]
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return procs[len(calls)]
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(adapters_module.asyncio, "sleep", fake_sleep)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+                "cli_retry_stderr_patterns": [r"ECONNRESET", r"broken pipe"],
+            },
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert len(calls) == 2
+    assert sleeps == [2.0]
+    assert result.ok is True
+    assert result.recovered_after_launch_retry is True
+    assert "RECOMMENDATION: yes" in result.output
+
+
+def test_cli_launch_retry_skipped_when_stderr_too_long(
+    monkeypatch, tmp_path: Path
+):
+    calls: list[bytes | None] = []
+    long_stderr = ("ECONNRESET " * 500).encode()
+    assert len(long_stderr) > 4096
+
+    class FailingProcess:
+        returncode = 1
+
+        async def communicate(self, input=None):
+            calls.append(input)
+            return b"", long_stderr
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return FailingProcess()
+
+    async def fake_sleep(seconds):
+        pass
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(adapters_module.asyncio, "sleep", fake_sleep)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+                "cli_retry_stderr_patterns": [r"ECONNRESET"],
+            },
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert len(calls) == 1
+    assert result.ok is False
+    assert result.recovered_after_launch_retry is False
+
+
+def test_cli_launch_retry_skipped_when_no_pattern_matches(
+    monkeypatch, tmp_path: Path
+):
+    calls: list[bytes | None] = []
+
+    class FailingProcess:
+        returncode = 1
+
+        async def communicate(self, input=None):
+            calls.append(input)
+            return b"", b"sandbox refused: this is a substantive policy decline"
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return FailingProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+                "cli_retry_stderr_patterns": [r"ECONNRESET", r"network unreachable"],
+            },
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert len(calls) == 1
+    assert result.ok is False
+    assert "sandbox refused" in result.error
+    assert result.recovered_after_launch_retry is False
+
+
+def test_cli_launch_retry_default_empty_patterns_preserves_behavior(
+    monkeypatch, tmp_path: Path
+):
+    calls: list[bytes | None] = []
+
+    class FailingProcess:
+        returncode = 1
+
+        async def communicate(self, input=None):
+            calls.append(input)
+            return b"", b"ECONNRESET: would have matched if patterns were set"
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return FailingProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+            },
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert len(calls) == 1
+    assert result.ok is False
+    assert result.recovered_after_launch_retry is False
+
+
+def test_cli_launch_retry_composes_with_repair_retry(
+    monkeypatch, tmp_path: Path
+):
+    calls: list[bytes | None] = []
+    sleeps: list[float] = []
+
+    launch_fail = (b"", b"ECONNRESET: transient")
+    label_missing = (b"I have an opinion but forgot the label.", b"")
+    label_present = (b"RECOMMENDATION: yes - now with label", b"")
+    sequence = [
+        (1, launch_fail),
+        (0, label_missing),
+        (0, label_present),
+    ]
+
+    class FakeProcess:
+        def __init__(self, idx: int):
+            self.returncode, self._payload = sequence[idx]
+
+        async def communicate(self, input=None):
+            calls.append(input)
+            return self._payload
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        idx = len(calls)
+        return FakeProcess(idx)
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(adapters_module.asyncio, "sleep", fake_sleep)
+
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+                "cli_retry_stderr_patterns": [r"ECONNRESET"],
+            },
+            "prompt",
+            tmp_path,
+        )
+    )
+
+    assert len(calls) == 3
+    assert sleeps == [2.0]
+    assert result.ok is True
+    assert result.recovered_after_launch_retry is True
+    assert "[recovered after retry]" in result.output
+    assert "RECOMMENDATION: yes - now with label" in result.output
+
+
+def test_config_rejects_invalid_cli_retry_stderr_patterns_regex(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "participants": {
+                    "claude": {
+                        "type": "cli",
+                        "command": "claude",
+                        "cli_retry_stderr_patterns": ["[unterminated"],
+                    }
+                },
+                "modes": {"quick": {"participants": ["claude"]}},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="invalid regex"):
+        load_config(path)
+
+
+def test_config_rejects_non_list_cli_retry_stderr_patterns(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "participants": {
+                    "claude": {
+                        "type": "cli",
+                        "command": "claude",
+                        "cli_retry_stderr_patterns": "ECONNRESET",
+                    }
+                },
+                "modes": {"quick": {"participants": ["claude"]}},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="cli_retry_stderr_patterns"):
+        load_config(path)
+
+
+def test_http_retries_cover_httpx_connect_error(monkeypatch):
+    import httpx as _httpx
+
+    attempts: list[int] = []
+
+    class FakeResponse:
+        status_code = 200
+        request = None
+
+        def json(self):
+            return {"ok": True}
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        async def request(self, method, url, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise _httpx.ConnectError("connection refused")
+            return FakeResponse()
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(adapters_module.asyncio, "sleep", fake_sleep)
+
+    response = asyncio.run(
+        adapters_module._request_with_retries(
+            FakeClient(),
+            "POST",
+            "https://example.invalid",
+            retries=2,
+        )
+    )
+
+    assert response.status_code == 200
+    assert len(attempts) == 2
+    assert sleeps and sleeps[0] == 0.75
+
+
+def test_http_retries_exhaust_propagates_connect_error(monkeypatch):
+    import httpx as _httpx
+
+    attempts: list[int] = []
+
+    class FakeClient:
+        async def request(self, method, url, **kwargs):
+            attempts.append(1)
+            raise _httpx.ConnectError("nope")
+
+    async def fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(adapters_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_httpx.ConnectError):
+        asyncio.run(
+            adapters_module._request_with_retries(
+                FakeClient(),
+                "POST",
+                "https://example.invalid",
+                retries=2,
+            )
+        )
+    assert len(attempts) == 3
+
+
 def test_openrouter_retries_missing_label_and_recovers(monkeypatch):
     calls: list[dict] = []
 

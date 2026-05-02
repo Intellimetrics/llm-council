@@ -41,6 +41,8 @@ REPAIR_RETRY_INSTRUCTION = (
     "reasoning. Do not change your reasoning, only add the missing label."
 )
 
+CLI_LAUNCH_RETRY_STDERR_LIMIT = 4096
+
 
 @dataclass
 class ParticipantResult:
@@ -55,6 +57,7 @@ class ParticipantResult:
     completion_tokens: int | None = None
     total_tokens: int | None = None
     cost_usd: float | None = None
+    recovered_after_launch_retry: bool = False
 
 
 def _format_arg(value: str, *, prompt: str, cwd: Path) -> str:
@@ -88,7 +91,15 @@ async def run_cli_participant(
     name: str, cfg: dict[str, Any], prompt: str, cwd: Path
 ) -> ParticipantResult:
     start = time.monotonic()
-    result = await _run_cli_once(name, cfg, prompt, cwd, start=start)
+    result, meta = await _run_cli_once(name, cfg, prompt, cwd, start=start)
+    if _should_launch_retry(meta, cfg):
+        await asyncio.sleep(_launch_retry_backoff(0))
+        retry_result, retry_meta = await _run_cli_once(
+            name, cfg, prompt, cwd, start=start
+        )
+        if retry_meta.get("exited") and not retry_meta.get("nonzero_exit"):
+            retry_result.recovered_after_launch_retry = True
+        result, meta = retry_result, retry_meta
     if (
         not result.ok
         and _retry_enabled(cfg)
@@ -99,8 +110,13 @@ async def run_cli_participant(
         max_prompt_chars = cfg.get("max_prompt_chars")
         if max_prompt_chars is not None and len(retry_prompt) > int(max_prompt_chars):
             return result
-        retry_result = await _run_cli_once(name, cfg, retry_prompt, cwd, start=start)
-        return _merge_cli_retry(result, retry_result)
+        retry_result, _retry_meta = await _run_cli_once(
+            name, cfg, retry_prompt, cwd, start=start
+        )
+        merged = _merge_cli_retry(result, retry_result)
+        if result.recovered_after_launch_retry:
+            merged.recovered_after_launch_retry = True
+        return merged
     return result
 
 
@@ -111,22 +127,25 @@ async def _run_cli_once(
     cwd: Path,
     *,
     start: float,
-) -> ParticipantResult:
+) -> tuple[ParticipantResult, dict[str, Any]]:
     timeout = int(cfg.get("timeout") or 240)
     command = _build_cli_command(name, cfg, prompt, cwd)
     max_prompt_chars = cfg.get("max_prompt_chars")
     if max_prompt_chars is not None and len(prompt) > int(max_prompt_chars):
-        return ParticipantResult(
-            name=name,
-            ok=False,
-            output="",
-            error=(
-                "PromptTooLarge: participant skipped before launch; "
-                f"prompt has {len(prompt)} chars, limit is {int(max_prompt_chars)}"
+        return (
+            ParticipantResult(
+                name=name,
+                ok=False,
+                output="",
+                error=(
+                    "PromptTooLarge: participant skipped before launch; "
+                    f"prompt has {len(prompt)} chars, limit is {int(max_prompt_chars)}"
+                ),
+                elapsed_seconds=time.monotonic() - start,
+                command=redact_prompt_args(command, prompt),
+                model=cfg.get("model"),
             ),
-            elapsed_seconds=time.monotonic() - start,
-            command=redact_prompt_args(command, prompt),
-            model=cfg.get("model"),
+            {"nonzero_exit": False, "stderr": "", "exited": False},
         )
     stdin_prompt = bool(cfg.get("stdin_prompt"))
     stdin_data = prompt if stdin_prompt else None
@@ -154,37 +173,68 @@ async def _run_cli_once(
         err = stderr.decode(errors="replace").strip()
         ok = proc.returncode == 0
         validation_error = _response_validation_error(out, cfg) if ok else ""
-        return ParticipantResult(
-            name=name,
-            ok=ok and not validation_error,
-            output=out,
-            error=validation_error or (err if not ok else ""),
-            elapsed_seconds=elapsed,
-            command=redact_prompt_args(command, prompt),
-            model=cfg.get("model"),
+        return (
+            ParticipantResult(
+                name=name,
+                ok=ok and not validation_error,
+                output=out,
+                error=validation_error or (err if not ok else ""),
+                elapsed_seconds=elapsed,
+                command=redact_prompt_args(command, prompt),
+                model=cfg.get("model"),
+            ),
+            {"nonzero_exit": not ok, "stderr": err, "exited": True},
         )
     except TimeoutError:
         elapsed = time.monotonic() - start
-        return ParticipantResult(
-            name=name,
-            ok=False,
-            output="",
-            error=_format_timeout_error(name, timeout, len(prompt)),
-            elapsed_seconds=elapsed,
-            command=redact_prompt_args(command, prompt),
-            model=cfg.get("model"),
+        return (
+            ParticipantResult(
+                name=name,
+                ok=False,
+                output="",
+                error=_format_timeout_error(name, timeout, len(prompt)),
+                elapsed_seconds=elapsed,
+                command=redact_prompt_args(command, prompt),
+                model=cfg.get("model"),
+            ),
+            {"nonzero_exit": False, "stderr": "", "exited": False},
         )
     except Exception as exc:
         elapsed = time.monotonic() - start
-        return ParticipantResult(
-            name=name,
-            ok=False,
-            output="",
-            error=f"{type(exc).__name__}: {exc}",
-            elapsed_seconds=elapsed,
-            command=redact_prompt_args(command, prompt),
-            model=cfg.get("model"),
+        return (
+            ParticipantResult(
+                name=name,
+                ok=False,
+                output="",
+                error=f"{type(exc).__name__}: {exc}",
+                elapsed_seconds=elapsed,
+                command=redact_prompt_args(command, prompt),
+                model=cfg.get("model"),
+            ),
+            {"nonzero_exit": False, "stderr": "", "exited": False},
         )
+
+
+def _should_launch_retry(meta: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    if not meta.get("nonzero_exit"):
+        return False
+    stderr = meta.get("stderr") or ""
+    if len(stderr) > CLI_LAUNCH_RETRY_STDERR_LIMIT:
+        return False
+    patterns = cfg.get("cli_retry_stderr_patterns") or []
+    if not patterns:
+        return False
+    for pattern in patterns:
+        try:
+            if re.search(pattern, stderr):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _launch_retry_backoff(attempt: int) -> float:
+    return float(min(2 * (1 + attempt), 8))
 
 
 def _build_cli_retry_prompt(original_prompt: str, prior_response: str) -> str:
