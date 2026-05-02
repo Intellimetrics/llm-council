@@ -2512,6 +2512,162 @@ def test_write_transcript_uses_final_round_for_recommendations(tmp_path: Path):
     assert "Model Comparison" not in content
 
 
+def test_write_transcript_omits_remaining_disagreement_when_resolved(tmp_path: Path):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "resolved.md"
+    json_path = out_dir / "resolved.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="resolved",
+        mode="quick",
+        current="codex",
+        participants=["a", "b"],
+        prompt="prompt",
+        results=[
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship it", "", 1.0),
+            ParticipantResult("b", True, "RECOMMENDATION: yes - ship it", "", 1.0),
+        ],
+        metadata={
+            "rounds": 1,
+            "deliberation_status": "skipped_no_labeled_disagreement",
+            "final_disagreement_detected": False,
+        },
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "## Remaining disagreement" not in md
+    assert "Deliberation: skipped, no labeled disagreement detected" in md
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert "remaining_disagreement" not in payload
+
+
+def test_write_transcript_emits_remaining_disagreement_section(tmp_path: Path):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "split.md"
+    json_path = out_dir / "split.json"
+    results = [
+        ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1.0),
+        ParticipantResult(
+            "a:round2", True, "RECOMMENDATION: yes - still ship", "", 1.0
+        ),
+        ParticipantResult(
+            "b:round2", True, "RECOMMENDATION: no - still wait", "", 1.0
+        ),
+    ]
+    write_transcript(
+        md_path,
+        json_path,
+        question="split",
+        mode="deliberate",
+        current="codex",
+        participants=["a", "b"],
+        prompt="prompt",
+        results=results,
+        metadata={
+            "rounds": 2,
+            "deliberation_status": "ran_max_rounds_unresolved",
+            "final_disagreement_detected": True,
+        },
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "## Remaining disagreement" in md
+    assert "Recommendations (final round): 1 yes / 1 no / 0 tradeoff / 0 unknown" in md
+    # Label should not be duplicated - the "RECOMMENDATION: yes -" prefix is stripped.
+    assert "- a:round2: yes — still ship" in md
+    assert "- b:round2: no — still wait" in md
+    assert "RECOMMENDATION: yes - still ship" not in md.split(
+        "## Remaining disagreement"
+    )[1].split("## Prompt Sent")[0]
+    assert "maximum configured rounds (2)" in md
+    # Header bullet that callers scan for must still be present (regression).
+    assert "- Deliberation: ran; max rounds reached with labeled disagreement" in md
+    assert (
+        "- Recommendations (final round): "
+        "`1 yes / 1 no / 0 tradeoff / 0 unknown`" in md
+    )
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    remaining = payload["remaining_disagreement"]
+    assert remaining["status"] == "ran_max_rounds_unresolved"
+    assert remaining["ran_max_rounds_unresolved"] is True
+    assert remaining["counts"] == {"yes": 1, "no": 1, "tradeoff": 0, "unknown": 0}
+    names = [entry["name"] for entry in remaining["participants"]]
+    assert names == ["a:round2", "b:round2"]
+    labels = {entry["name"]: entry["label"] for entry in remaining["participants"]}
+    assert labels == {"a:round2": "yes", "b:round2": "no"}
+    summaries = {entry["name"]: entry["summary"] for entry in remaining["participants"]}
+    assert summaries == {"a:round2": "still ship", "b:round2": "still wait"}
+    assert all(entry["ok"] is True for entry in remaining["participants"])
+
+
+def test_write_transcript_remaining_disagreement_handles_failed_and_whitespace_errors(
+    tmp_path: Path,
+):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "mixed.md"
+    json_path = out_dir / "mixed.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="mixed",
+        mode="quick",
+        current="codex",
+        participants=["a", "b", "c"],
+        prompt="prompt",
+        results=[
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1.0),
+            ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1.0),
+            # Whitespace-only error must not crash _first_nonempty_line.
+            ParticipantResult("c", False, "", "   \n  \n", 1.0),
+        ],
+        metadata={
+            "rounds": 1,
+            "deliberation_status": "skipped_max_rounds",
+            "final_disagreement_detected": True,
+        },
+    )
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    entries = {e["name"]: e for e in payload["remaining_disagreement"]["participants"]}
+    assert entries["c"]["ok"] is False
+    assert entries["c"]["label"] is None
+    assert entries["c"]["summary"] == ""
+    md = md_path.read_text(encoding="utf-8")
+    assert "- c: — — —" in md
+
+
+def test_write_transcript_remaining_disagreement_without_max_rounds_note(
+    tmp_path: Path,
+):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "skipped.md"
+    json_path = out_dir / "skipped.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="skipped",
+        mode="quick",
+        current="codex",
+        participants=["a", "b"],
+        prompt="prompt",
+        results=[
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1.0),
+            ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1.0),
+        ],
+        metadata={
+            "rounds": 1,
+            "deliberation_status": "skipped_max_rounds",
+            "final_disagreement_detected": True,
+        },
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "## Remaining disagreement" in md
+    assert "maximum configured rounds" not in md
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["remaining_disagreement"]["ran_max_rounds_unresolved"] is False
+    assert payload["remaining_disagreement"]["status"] == "skipped_max_rounds"
+
+
 def test_write_transcript_keeps_invalid_participant_output(tmp_path: Path):
     out_dir = tmp_path / ".llm-council" / "runs"
     md_path = out_dir / "invalid.md"

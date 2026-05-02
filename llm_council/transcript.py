@@ -13,7 +13,12 @@ from llm_council.adapters import (
     command_for_display,
     is_timeout_error,
 )
-from llm_council.deliberation import model_comparison, recommendation_counts
+from llm_council.deliberation import (
+    model_comparison,
+    recommendation_counts,
+    recommendation_label,
+    recommendation_line,
+)
 
 ROUND_SUFFIX_RE = re.compile(r":round(\d+)$")
 
@@ -122,6 +127,51 @@ def final_round_results(results: list[ParticipantResult]) -> list[ParticipantRes
     return [result for result in results if result_round(result.name) == final_round]
 
 
+_RECOMMENDATION_PREFIX_RE = re.compile(
+    r"^RECOMMENDATION:\s*(?:yes|no|tradeoff)\s*[-–—:]?\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_recommendation_prefix(line: str) -> str:
+    return _RECOMMENDATION_PREFIX_RE.sub("", line, count=1).strip()
+
+
+def _first_nonempty_line(text: str) -> str:
+    for line in text.splitlines():
+        cleaned = line.strip()
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _participant_disagreement_entry(result: ParticipantResult) -> dict[str, Any]:
+    if result.ok:
+        label = recommendation_label(result.output)
+        summary = _strip_recommendation_prefix(recommendation_line(result.output))
+    else:
+        label = None
+        summary = _first_nonempty_line(result.error or "")
+    return {"name": result.name, "ok": result.ok, "label": label, "summary": summary}
+
+
+def remaining_disagreement_payload(
+    final_results: list[ParticipantResult], metadata: dict[str, Any]
+) -> dict[str, Any] | None:
+    if not metadata.get("final_disagreement_detected"):
+        return None
+    if not final_results:
+        return None
+    counts = recommendation_counts(final_results)
+    return {
+        "status": metadata.get("deliberation_status"),
+        "ran_max_rounds_unresolved": metadata.get("deliberation_status")
+        == "ran_max_rounds_unresolved",
+        "counts": counts,
+        "participants": [_participant_disagreement_entry(r) for r in final_results],
+    }
+
+
 def write_transcript(
     markdown_path: Path,
     json_path: Path,
@@ -216,24 +266,51 @@ def write_transcript(
             if result.output.strip():
                 lines.extend(["Captured output:", "", result.output.strip(), ""])
 
+    remaining = remaining_disagreement_payload(final_results, metadata)
+    if remaining is not None:
+        counts = remaining["counts"]
+        lines.extend(["## Remaining disagreement", ""])
+        lines.append(
+            "Recommendations (final round): "
+            f"{counts['yes']} yes / {counts['no']} no / "
+            f"{counts['tradeoff']} tradeoff / {counts['unknown']} unknown"
+        )
+        lines.append("")
+        for entry in remaining["participants"]:
+            label = entry["label"] or "—"
+            summary = entry["summary"] or "—"
+            lines.append(f"- {entry['name']}: {label} — {summary}")
+        if remaining["ran_max_rounds_unresolved"]:
+            rounds_run = metadata.get("rounds")
+            rounds_phrase = (
+                f" ({rounds_run})" if isinstance(rounds_run, int) else ""
+            )
+            lines.extend(
+                [
+                    "",
+                    f"Deliberation reached the maximum configured rounds{rounds_phrase} "
+                    "without the council converging on a single recommendation.",
+                ]
+            )
+        lines.append("")
+
     fence = markdown_fence(prompt)
     lines.extend(["## Prompt Sent", "", f"{fence}text", prompt, fence, ""])
     markdown_path.write_text("\n".join(lines), encoding="utf-8")
 
+    json_payload: dict[str, Any] = {
+        "question": question,
+        "mode": mode,
+        "current": current,
+        "participants": participants,
+        "prompt": prompt,
+        "metadata": metadata,
+        "results": [result_to_dict(result) for result in results],
+    }
+    if remaining is not None:
+        json_payload["remaining_disagreement"] = remaining
     json_path.write_text(
-        json.dumps(
-            {
-                "question": question,
-                "mode": mode,
-                "current": current,
-                "participants": participants,
-                "prompt": prompt,
-                "metadata": metadata,
-                "results": [result_to_dict(result) for result in results],
-            },
-            indent=2,
-        )
-        + "\n",
+        json.dumps(json_payload, indent=2) + "\n",
         encoding="utf-8",
     )
 
