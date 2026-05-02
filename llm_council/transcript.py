@@ -313,6 +313,8 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
     }
     if result.recovered_after_launch_retry:
         payload["recovered_after_launch_retry"] = True
+    if result.from_cache:
+        payload["from_cache"] = True
     return payload
 
 
@@ -626,9 +628,10 @@ def write_transcript(
             status = "excluded"
         else:
             status = "error"
+        cache_tag = " [cached]" if result.from_cache else ""
         lines.extend(
             [
-                f"### {result.name} ({status})",
+                f"### {result.name} ({status}){cache_tag}",
                 "",
                 f"- Model: `{result.model or 'cli default'}`",
                 f"- Elapsed: `{result.elapsed_seconds:.1f}s`",

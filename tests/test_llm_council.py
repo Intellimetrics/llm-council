@@ -6448,3 +6448,484 @@ def test_write_transcript_overflow_bullet_omitted_when_no_overflow(
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert "context_overflow_excluded" not in payload
 
+
+
+# ------------------------------------------------------------------
+# Per-participant result cache (.llm-council/cache/)
+# ------------------------------------------------------------------
+
+import time as _time
+
+from llm_council import cache as cache_module
+from llm_council.adapters import CacheContext
+
+
+def _make_cli_cfg() -> dict:
+    return {
+        "type": "cli",
+        "command": "echo",
+        "args": ["RECOMMENDATION: yes - ok"],
+        "stdin_prompt": False,
+        "retry_on_missing_label": False,
+    }
+
+
+def _fake_cli_subprocess(monkeypatch, *, output: bytes, returncode: int = 0):
+    calls = {"count": 0}
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = returncode
+
+        async def communicate(self, input=None):
+            calls["count"] += 1
+            return (output, b"")
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    return calls
+
+
+def test_cache_compute_key_is_stable_and_distinguishes_participants():
+    cfg = {"type": "cli", "model": "x"}
+    k1 = cache_module.compute_key("alice", cfg, "prompt one")
+    k2 = cache_module.compute_key("alice", cfg, "prompt one")
+    k3 = cache_module.compute_key("bob", cfg, "prompt one")
+    k4 = cache_module.compute_key("alice", cfg, "prompt two")
+    assert k1 == k2
+    assert k1 != k3
+    assert k1 != k4
+
+
+def test_cache_compute_key_changes_when_config_changes():
+    base = {"type": "cli", "model": "claude-opus-4-7"}
+    swapped = {"type": "cli", "model": "claude-opus-4-6"}
+    assert cache_module.compute_key("claude", base, "p") != cache_module.compute_key(
+        "claude", swapped, "p"
+    )
+
+
+def test_cache_read_returns_none_on_miss(tmp_path: Path):
+    path = cache_module.cache_path(tmp_path, "claude", "abc")
+    assert cache_module.read_cache(path) is None
+
+
+def test_cache_write_then_read_round_trip(tmp_path: Path):
+    path = cache_module.cache_path(tmp_path, "claude", "deadbeef")
+    payload = cache_module.build_payload(
+        participant_name="claude",
+        prompt="hello world",
+        key="deadbeef",
+        output="RECOMMENDATION: yes - ok",
+        recommendation_label="yes",
+        elapsed_seconds=0.5,
+        prompt_tokens=10,
+        completion_tokens=5,
+        total_tokens=15,
+        cost_usd=0.0,
+        model="claude-x",
+        command=["claude", "-p"],
+    )
+    cache_module.write_cache(path, payload, ttl_seconds=3600)
+    loaded = cache_module.read_cache(path)
+    assert loaded is not None
+    assert loaded["participant_name"] == "claude"
+    assert loaded["output"] == "RECOMMENDATION: yes - ok"
+    assert loaded["recommendation_label"] == "yes"
+    assert loaded["prompt_preview"].startswith("hello world")
+    assert "cached_at_unix" in loaded
+
+
+def test_cache_read_treats_expired_entry_as_miss_and_deletes(tmp_path: Path):
+    path = cache_module.cache_path(tmp_path, "claude", "abc")
+    payload = cache_module.build_payload(
+        participant_name="claude",
+        prompt="p",
+        key="abc",
+        output="RECOMMENDATION: yes - ok",
+        recommendation_label="yes",
+        elapsed_seconds=0.0,
+        prompt_tokens=None,
+        completion_tokens=None,
+        total_tokens=None,
+        cost_usd=None,
+        model=None,
+        command=None,
+    )
+    cache_module.write_cache(path, payload, ttl_seconds=1)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["cached_at_unix"] = _time.time() - 10_000
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    assert cache_module.read_cache(path) is None
+    assert not path.exists()
+
+
+def test_is_caching_disabled_for_consensus_mode():
+    assert cache_module.is_caching_disabled_for_mode("consensus") is True
+    assert cache_module.is_caching_disabled_for_mode("quick") is False
+    assert cache_module.is_caching_disabled_for_mode(None) is False
+
+
+def test_resolve_ttl_seconds_per_mode_overrides_default():
+    config = {
+        "defaults": {"cache_ttl_hours": 12},
+        "modes": {"plan": {"cache_ttl_hours": 1}},
+    }
+    assert cache_module.resolve_ttl_seconds(config, "plan") == 3600
+    assert cache_module.resolve_ttl_seconds(config, "review") == 12 * 3600
+    assert cache_module.resolve_ttl_seconds({}, None) == 86400
+
+
+def test_cli_adapter_cache_hit_skips_subprocess(monkeypatch, tmp_path: Path):
+    cfg = _make_cli_cfg()
+    calls = _fake_cli_subprocess(monkeypatch, output=b"RECOMMENDATION: yes - first run")
+    ctx = CacheContext(cwd=tmp_path, cache_mode="on", ttl_seconds=3600)
+
+    first = asyncio.run(
+        adapters_module.run_cli_participant(
+            "alice", cfg, "the prompt", tmp_path, cache_ctx=ctx
+        )
+    )
+    assert first.ok is True
+    assert first.from_cache is False
+    assert calls["count"] == 1
+
+    second = asyncio.run(
+        adapters_module.run_cli_participant(
+            "alice", cfg, "the prompt", tmp_path, cache_ctx=ctx
+        )
+    )
+    assert second.ok is True
+    assert second.from_cache is True
+    assert calls["count"] == 1
+    assert second.output == first.output
+
+
+def test_cli_adapter_cache_off_skips_reads_and_writes(monkeypatch, tmp_path: Path):
+    cfg = _make_cli_cfg()
+    calls = _fake_cli_subprocess(monkeypatch, output=b"RECOMMENDATION: yes - x")
+    ctx = CacheContext(cwd=tmp_path, cache_mode="off", ttl_seconds=3600)
+
+    asyncio.run(
+        adapters_module.run_cli_participant(
+            "alice", cfg, "p", tmp_path, cache_ctx=ctx
+        )
+    )
+    asyncio.run(
+        adapters_module.run_cli_participant(
+            "alice", cfg, "p", tmp_path, cache_ctx=ctx
+        )
+    )
+    assert calls["count"] == 2
+    cache_dir = tmp_path / ".llm-council" / "cache"
+    assert not cache_dir.exists() or not list(cache_dir.glob("*.json"))
+
+
+def test_cli_adapter_cache_refresh_skips_read_but_writes(monkeypatch, tmp_path: Path):
+    cfg = _make_cli_cfg()
+    calls = _fake_cli_subprocess(monkeypatch, output=b"RECOMMENDATION: yes - r")
+    ctx_refresh = CacheContext(cwd=tmp_path, cache_mode="refresh", ttl_seconds=3600)
+
+    asyncio.run(
+        adapters_module.run_cli_participant(
+            "alice", cfg, "p", tmp_path, cache_ctx=ctx_refresh
+        )
+    )
+    asyncio.run(
+        adapters_module.run_cli_participant(
+            "alice", cfg, "p", tmp_path, cache_ctx=ctx_refresh
+        )
+    )
+    assert calls["count"] == 2
+    cache_files = list((tmp_path / ".llm-council" / "cache").glob("*.json"))
+    assert len(cache_files) == 1
+
+    ctx_on = CacheContext(cwd=tmp_path, cache_mode="on", ttl_seconds=3600)
+    third = asyncio.run(
+        adapters_module.run_cli_participant(
+            "alice", cfg, "p", tmp_path, cache_ctx=ctx_on
+        )
+    )
+    assert third.from_cache is True
+    assert calls["count"] == 2
+
+
+def test_cli_adapter_does_not_cache_failed_run(monkeypatch, tmp_path: Path):
+    cfg = _make_cli_cfg()
+    cfg["retry_on_missing_label"] = False
+    calls = _fake_cli_subprocess(monkeypatch, output=b"no label here", returncode=0)
+    ctx = CacheContext(cwd=tmp_path, cache_mode="on", ttl_seconds=3600)
+    first = asyncio.run(
+        adapters_module.run_cli_participant(
+            "alice", cfg, "p", tmp_path, cache_ctx=ctx
+        )
+    )
+    assert first.ok is False
+    assert first.from_cache is False
+    cache_dir = tmp_path / ".llm-council" / "cache"
+    assert not cache_dir.exists() or not list(cache_dir.glob("*.json"))
+
+
+def test_cli_adapter_different_prompt_yields_different_cache_key(
+    monkeypatch, tmp_path: Path
+):
+    cfg = _make_cli_cfg()
+    calls = _fake_cli_subprocess(monkeypatch, output=b"RECOMMENDATION: yes - ok")
+    ctx = CacheContext(cwd=tmp_path, cache_mode="on", ttl_seconds=3600)
+    asyncio.run(
+        adapters_module.run_cli_participant(
+            "alice", cfg, "prompt one", tmp_path, cache_ctx=ctx
+        )
+    )
+    asyncio.run(
+        adapters_module.run_cli_participant(
+            "alice", cfg, "prompt two", tmp_path, cache_ctx=ctx
+        )
+    )
+    assert calls["count"] == 2
+
+
+def test_cli_adapter_different_model_yields_different_cache_key(
+    monkeypatch, tmp_path: Path
+):
+    cfg_a = _make_cli_cfg()
+    cfg_a["model"] = "old-model"
+    cfg_b = _make_cli_cfg()
+    cfg_b["model"] = "new-model"
+    calls = _fake_cli_subprocess(monkeypatch, output=b"RECOMMENDATION: yes - ok")
+    ctx = CacheContext(cwd=tmp_path, cache_mode="on", ttl_seconds=3600)
+    asyncio.run(
+        adapters_module.run_cli_participant(
+            "alice", cfg_a, "p", tmp_path, cache_ctx=ctx
+        )
+    )
+    second = asyncio.run(
+        adapters_module.run_cli_participant(
+            "alice", cfg_b, "p", tmp_path, cache_ctx=ctx
+        )
+    )
+    assert calls["count"] == 2
+    assert second.from_cache is False
+
+
+def test_orchestrator_consensus_mode_skips_cache_even_with_cache_on(
+    monkeypatch, tmp_path: Path
+):
+    call_count = {"n": 0}
+
+    async def fake_run_participants(*args, **kwargs):
+        call_count["n"] += 1
+        cache_ctx = kwargs.get("cache_ctx")
+        assert cache_ctx is None or cache_ctx.cache_disabled is True
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    asyncio.run(
+        execute_council(
+            ["a"],
+            {"a": {"type": "cli"}},
+            "q",
+            tmp_path,
+            {},
+            mode="consensus",
+            cache_mode="on",
+        )
+    )
+    assert call_count["n"] == 1
+
+
+def test_orchestrator_deliberation_round_2_cache_disabled(
+    monkeypatch, tmp_path: Path
+):
+    captured: list[bool | None] = []
+    rounds = {"n": 0}
+
+    async def fake_run_participants(*args, **kwargs):
+        rounds["n"] += 1
+        ctx = kwargs.get("cache_ctx")
+        captured.append(None if ctx is None else ctx.cache_disabled)
+        return [
+            ParticipantResult(
+                "a", True, "RECOMMENDATION: yes - ship", "", 1.0
+            ),
+            ParticipantResult(
+                "b", True, "RECOMMENDATION: no - wait", "", 1.0
+            ),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    asyncio.run(
+        execute_council(
+            ["a", "b"],
+            {"a": {"type": "cli"}, "b": {"type": "cli"}},
+            "q",
+            tmp_path,
+            {},
+            deliberate=True,
+            max_rounds=2,
+            cache_mode="on",
+        )
+    )
+    assert rounds["n"] == 2
+    assert captured[0] is False
+    assert captured[1] is True
+
+
+def test_orchestrator_default_quick_mode_cache_enabled(monkeypatch, tmp_path: Path):
+    captured: list[bool | None] = []
+
+    async def fake_run_participants(*args, **kwargs):
+        ctx = kwargs.get("cache_ctx")
+        captured.append(None if ctx is None else ctx.cache_disabled)
+        return [ParticipantResult("a", True, "RECOMMENDATION: yes - ok", "", 1.0)]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    asyncio.run(
+        execute_council(
+            ["a"],
+            {"a": {"type": "cli"}},
+            "q",
+            tmp_path,
+            {},
+            mode="quick",
+            cache_mode="on",
+        )
+    )
+    assert captured == [False]
+
+
+def test_transcript_marks_cached_participant(tmp_path: Path):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "cached.md"
+    json_path = out_dir / "cached.json"
+    cached_result = ParticipantResult(
+        "alice", True, "RECOMMENDATION: yes - ok", "", 0.0
+    )
+    cached_result.from_cache = True
+    write_transcript(
+        md_path,
+        json_path,
+        question="q",
+        mode="quick",
+        current="claude",
+        participants=["alice"],
+        prompt="prompt",
+        results=[cached_result],
+        metadata={"rounds": 1, "labeled_quorum": 1, "min_quorum": 1, "degraded": False},
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "[cached]" in md
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["results"][0]["from_cache"] is True
+
+
+def test_transcript_omits_cached_tag_for_fresh_results(tmp_path: Path):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "fresh.md"
+    json_path = out_dir / "fresh.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="q",
+        mode="quick",
+        current="claude",
+        participants=["alice"],
+        prompt="prompt",
+        results=[
+            ParticipantResult("alice", True, "RECOMMENDATION: yes - ok", "", 1.0)
+        ],
+        metadata={"rounds": 1, "labeled_quorum": 1, "min_quorum": 1, "degraded": False},
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "[cached]" not in md
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert "from_cache" not in payload["results"][0]
+
+
+def test_concurrent_writes_do_not_corrupt_cache(tmp_path: Path):
+    path = cache_module.cache_path(tmp_path, "alice", "key1")
+
+    async def _write_one(value: str) -> None:
+        await asyncio.to_thread(
+            cache_module.write_cache,
+            path,
+            cache_module.build_payload(
+                participant_name="alice",
+                prompt=value,
+                key="key1",
+                output=f"RECOMMENDATION: yes - {value}",
+                recommendation_label="yes",
+                elapsed_seconds=0.0,
+                prompt_tokens=None,
+                completion_tokens=None,
+                total_tokens=None,
+                cost_usd=None,
+                model=None,
+                command=None,
+            ),
+            3600,
+        )
+
+    async def _drive():
+        await asyncio.gather(*[_write_one(f"v{i}") for i in range(10)])
+
+    asyncio.run(_drive())
+    loaded = cache_module.read_cache(path)
+    assert loaded is not None
+    assert loaded["recommendation_label"] == "yes"
+    assert loaded["output"].startswith("RECOMMENDATION: yes - ")
+
+
+def test_cli_flag_cache_choices_present():
+    parser = build_parser()
+    args = parser.parse_args(["run", "hello", "--cache", "off"])
+    assert args.cache_mode == "off"
+    args = parser.parse_args(["run", "hello", "--cache", "refresh"])
+    assert args.cache_mode == "refresh"
+    args = parser.parse_args(["run", "hello"])
+    assert args.cache_mode == "on"
+
+
+def test_cache_key_includes_image_manifest_digest():
+    cfg = {"type": "openrouter", "model": "x", "vision": True}
+    img_a = [{"sha256": "aaaa", "mime": "image/png", "size": 1, "relative_path": "a.png"}]
+    img_b = [{"sha256": "bbbb", "mime": "image/png", "size": 1, "relative_path": "b.png"}]
+    k_no_image = cache_module.compute_key("alice", cfg, "p")
+    k_a = cache_module.compute_key("alice", cfg, "p", image_manifest=img_a)
+    k_b = cache_module.compute_key("alice", cfg, "p", image_manifest=img_b)
+    assert k_no_image != k_a
+    assert k_a != k_b
+
+
+def test_read_cache_evicts_when_payload_key_does_not_match(tmp_path: Path):
+    path = cache_module.cache_path(tmp_path, "alice", "expected")
+    payload = cache_module.build_payload(
+        participant_name="alice",
+        prompt="p",
+        key="something_else",
+        output="RECOMMENDATION: yes - ok",
+        recommendation_label="yes",
+        elapsed_seconds=0.0,
+        prompt_tokens=None,
+        completion_tokens=None,
+        total_tokens=None,
+        cost_usd=None,
+        model=None,
+        command=None,
+    )
+    cache_module.write_cache(path, payload, ttl_seconds=3600)
+    assert cache_module.read_cache(path, expected_key="expected") is None
+    assert not path.exists()
+
+
+def test_resolve_ttl_seconds_treats_non_positive_as_default():
+    assert cache_module.resolve_ttl_seconds(
+        {"defaults": {"cache_ttl_hours": 0}}, None
+    ) == cache_module.DEFAULT_TTL_SECONDS
+    assert cache_module.resolve_ttl_seconds(
+        {"defaults": {"cache_ttl_hours": -5}}, None
+    ) == cache_module.DEFAULT_TTL_SECONDS

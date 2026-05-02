@@ -15,6 +15,14 @@ from urllib.parse import urlparse
 
 import httpx
 
+from llm_council.cache import (
+    build_payload as cache_build_payload,
+    cache_path as cache_path_for,
+    compute_key as cache_compute_key,
+    is_caching_disabled_for_mode,
+    read_cache as cache_read,
+    write_cache as cache_write,
+)
 from llm_council.context import IMAGE_MIME_ALLOWLIST
 
 
@@ -68,6 +76,120 @@ class ParticipantResult:
     total_tokens: int | None = None
     cost_usd: float | None = None
     recovered_after_launch_retry: bool = False
+    from_cache: bool = False
+
+
+@dataclass
+class CacheContext:
+    """Per-run cache settings threaded through the adapter dispatchers.
+
+    `mode` is one of "on", "off", "refresh". `cache_disabled` is a
+    pre-computed kill-switch the orchestrator flips for things like
+    consensus mode or deliberation rounds beyond the first.
+    """
+
+    cwd: Path
+    cache_mode: str = "on"
+    ttl_seconds: int = 86400
+    cache_disabled: bool = False
+
+    def can_read(self) -> bool:
+        return (
+            not self.cache_disabled
+            and self.cache_mode == "on"
+        )
+
+    def can_write(self) -> bool:
+        return (
+            not self.cache_disabled
+            and self.cache_mode in ("on", "refresh")
+        )
+
+
+def _participant_recommendation_label(output: str) -> str | None:
+    for line in (output or "").splitlines():
+        match = RECOMMENDATION_RE.match(line)
+        if match:
+            return match.group(1).lower()
+    return None
+
+
+def _result_from_cache_payload(
+    name: str, payload: dict[str, Any]
+) -> ParticipantResult:
+    return ParticipantResult(
+        name=name,
+        ok=True,
+        output=str(payload.get("output") or ""),
+        error="",
+        elapsed_seconds=float(payload.get("elapsed_seconds") or 0.0),
+        command=list(payload.get("command")) if payload.get("command") else None,
+        model=payload.get("model"),
+        prompt_tokens=payload.get("prompt_tokens"),
+        completion_tokens=payload.get("completion_tokens"),
+        total_tokens=payload.get("total_tokens"),
+        cost_usd=payload.get("cost_usd"),
+        from_cache=True,
+    )
+
+
+def _cache_lookup(
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    cache_ctx: CacheContext | None,
+    *,
+    image_manifest: list[dict[str, Any]] | None = None,
+) -> tuple[str | None, ParticipantResult | None]:
+    if cache_ctx is None or cache_ctx.cache_disabled:
+        return None, None
+    key = cache_compute_key(name, cfg, prompt, image_manifest=image_manifest)
+    if not cache_ctx.can_read():
+        return key, None
+    path = cache_path_for(cache_ctx.cwd, name, key)
+    payload = cache_read(path, expected_key=key)
+    if payload is None:
+        return key, None
+    return key, _result_from_cache_payload(name, payload)
+
+
+def _maybe_persist_cache(
+    name: str,
+    prompt: str,
+    key: str | None,
+    result: ParticipantResult,
+    cache_ctx: CacheContext | None,
+) -> None:
+    if cache_ctx is None or key is None:
+        return
+    if not cache_ctx.can_write():
+        return
+    if not result.ok:
+        return
+    if result.from_cache:
+        return
+    payload = cache_build_payload(
+        participant_name=name,
+        prompt=prompt,
+        key=key,
+        output=result.output,
+        recommendation_label=_participant_recommendation_label(result.output),
+        elapsed_seconds=result.elapsed_seconds,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        total_tokens=result.total_tokens,
+        cost_usd=result.cost_usd,
+        model=result.model,
+        command=result.command,
+    )
+    try:
+        cache_write(
+            cache_path_for(cache_ctx.cwd, name, key),
+            payload,
+            cache_ctx.ttl_seconds,
+        )
+    except OSError:
+        pass
 
 
 def _context_overflow_result(
@@ -134,11 +256,19 @@ def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -
 
 
 async def run_cli_participant(
-    name: str, cfg: dict[str, Any], prompt: str, cwd: Path
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    cwd: Path,
+    *,
+    cache_ctx: CacheContext | None = None,
 ) -> ParticipantResult:
     overflow = _context_overflow_result(name, cfg, prompt)
     if overflow is not None:
         return overflow
+    cache_key, cached = _cache_lookup(name, cfg, prompt, cache_ctx)
+    if cached is not None:
+        return cached
     start = time.monotonic()
     result, meta = await _run_cli_once(name, cfg, prompt, cwd, start=start)
     if _should_launch_retry(meta, cfg):
@@ -158,6 +288,7 @@ async def run_cli_participant(
         retry_prompt = _build_cli_retry_prompt(prompt, result.output)
         max_prompt_chars = cfg.get("max_prompt_chars")
         if max_prompt_chars is not None and len(retry_prompt) > int(max_prompt_chars):
+            _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
             return result
         retry_result, _retry_meta = await _run_cli_once(
             name, cfg, retry_prompt, cwd, start=start
@@ -165,7 +296,9 @@ async def run_cli_participant(
         merged = _merge_cli_retry(result, retry_result)
         if result.recovered_after_launch_retry:
             merged.recovered_after_launch_retry = True
+        _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
         return merged
+    _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
     return result
 
 
@@ -367,12 +500,32 @@ async def run_openai_compatible_participant(
     prompt: str,
     *,
     image_manifest: list[dict[str, Any]] | None = None,
+    cache_ctx: CacheContext | None = None,
 ) -> ParticipantResult:
     overflow = _context_overflow_result(
         name, cfg, prompt, image_manifest=image_manifest
     )
     if overflow is not None:
         return overflow
+    cache_key, cached = _cache_lookup(
+        name, cfg, prompt, cache_ctx, image_manifest=image_manifest
+    )
+    if cached is not None:
+        return cached
+    result = await _run_openai_compatible_inner(
+        name, cfg, prompt, image_manifest=image_manifest
+    )
+    _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
+    return result
+
+
+async def _run_openai_compatible_inner(
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    *,
+    image_manifest: list[dict[str, Any]] | None = None,
+) -> ParticipantResult:
     start = time.monotonic()
     key_env = cfg.get("api_key_env", "OPENROUTER_API_KEY")
     api_key = os.environ.get(key_env)
@@ -537,9 +690,10 @@ async def run_openrouter_participant(
     prompt: str,
     *,
     image_manifest: list[dict[str, Any]] | None = None,
+    cache_ctx: CacheContext | None = None,
 ) -> ParticipantResult:
     return await run_openai_compatible_participant(
-        name, cfg, prompt, image_manifest=image_manifest
+        name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx
     )
 
 
@@ -713,12 +867,30 @@ async def run_ollama_participant(
     prompt: str,
     *,
     image_manifest: list[dict[str, Any]] | None = None,
+    cache_ctx: CacheContext | None = None,
 ) -> ParticipantResult:
     overflow = _context_overflow_result(
         name, cfg, prompt, image_manifest=image_manifest
     )
     if overflow is not None:
         return overflow
+    cache_key, cached = _cache_lookup(
+        name, cfg, prompt, cache_ctx, image_manifest=image_manifest
+    )
+    if cached is not None:
+        return cached
+    result = await _run_ollama_inner(name, cfg, prompt, image_manifest=image_manifest)
+    _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
+    return result
+
+
+async def _run_ollama_inner(
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    *,
+    image_manifest: list[dict[str, Any]] | None = None,
+) -> ParticipantResult:
     start = time.monotonic()
     model = cfg.get("model")
     base_url = str(cfg.get("base_url") or "http://localhost:11434").rstrip("/")
@@ -871,6 +1043,7 @@ async def run_participant(
     cwd: Path,
     *,
     image_manifest: list[dict[str, Any]] | None = None,
+    cache_ctx: CacheContext | None = None,
 ) -> ParticipantResult:
     ptype = cfg.get("type")
     if ptype == "cli":
@@ -880,14 +1053,14 @@ async def run_participant(
         # ## Images prompt section. Adding `vision: true` to a CLI cfg
         # therefore has no effect — the orchestrator's images_skipped check
         # treats CLI as always image-aware (orchestrator.py).
-        return await run_cli_participant(name, cfg, prompt, cwd)
+        return await run_cli_participant(name, cfg, prompt, cwd, cache_ctx=cache_ctx)
     if ptype in ("openrouter", "openai_compatible"):
         return await run_openai_compatible_participant(
-            name, cfg, prompt, image_manifest=image_manifest
+            name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx
         )
     if ptype == "ollama":
         return await run_ollama_participant(
-            name, cfg, prompt, image_manifest=image_manifest
+            name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx
         )
     return ParticipantResult(
         name=name,
@@ -944,6 +1117,7 @@ async def run_participants(
     progress: Callable[[dict[str, Any]], None] | None = None,
     round_number: int = 1,
     image_manifest: list[dict[str, Any]] | None = None,
+    cache_ctx: CacheContext | None = None,
 ) -> list[ParticipantResult]:
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
@@ -984,6 +1158,7 @@ async def run_participants(
                     prompt,
                     cwd,
                     image_manifest=image_manifest,
+                    cache_ctx=cache_ctx,
                 )
             finally:
                 if slow_task is not None and not slow_task.done():
@@ -1024,6 +1199,7 @@ async def run_participants(
                         "model": result.model,
                         "total_tokens": result.total_tokens,
                         "cost_usd": result.cost_usd,
+                        "from_cache": result.from_cache,
                     }
                 )
             return result

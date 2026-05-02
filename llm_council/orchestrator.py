@@ -7,9 +7,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from llm_council.adapters import (
+    CacheContext,
     ParticipantResult,
     is_timeout_error,
     run_participants,
+)
+from llm_council.cache import (
+    is_caching_disabled_for_mode,
+    resolve_ttl_seconds,
 )
 from llm_council.convergence import (
     MIN_TOKENS_FOR_CLASSIFICATION,
@@ -116,9 +121,24 @@ async def execute_council(
     image_manifest: list[dict[str, Any]] | None = None,
     min_quorum: int | None = None,
     mode: str | None = None,
+    cache_mode: str = "on",
 ) -> tuple[list[ParticipantResult], dict[str, Any]]:
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
     convergence_thresholds = _resolve_convergence_thresholds(config, mode)
+
+    cache_disabled_for_mode = is_caching_disabled_for_mode(mode)
+    cache_ctx_round1 = CacheContext(
+        cwd=cwd,
+        cache_mode=cache_mode,
+        ttl_seconds=resolve_ttl_seconds(config, mode),
+        cache_disabled=cache_disabled_for_mode,
+    )
+    cache_ctx_deliberation = CacheContext(
+        cwd=cwd,
+        cache_mode=cache_mode,
+        ttl_seconds=resolve_ttl_seconds(config, mode),
+        cache_disabled=True,
+    )
 
     progress_events: list[dict[str, Any]] = []
 
@@ -162,6 +182,7 @@ async def execute_council(
         progress=emit,
         round_number=1,
         image_manifest=image_manifest,
+        cache_ctx=cache_ctx_round1,
     )
     round_results = results
     round_number = 1
@@ -240,6 +261,7 @@ async def execute_council(
             progress=emit,
             round_number=round_number + 1,
             image_manifest=image_manifest,
+            cache_ctx=cache_ctx_deliberation,
         )
         prior_round_results = list(round_results)
         round_number += 1

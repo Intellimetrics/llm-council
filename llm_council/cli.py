@@ -111,6 +111,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--cache",
+        dest="cache_mode",
+        choices=["on", "off", "refresh"],
+        default="on",
+        help=(
+            "Per-participant on-disk result cache keyed on prompt+config. "
+            "`on` reads and writes (default). `off` skips both. `refresh` "
+            "ignores the read but still writes."
+        ),
+    )
+    run.add_argument(
         "--chunk-strategy",
         dest="chunk_strategy",
         choices=["fail", "head", "tail", "hash-aware"],
@@ -954,6 +965,8 @@ def _print_progress_event(event: dict) -> None:
             details.append(f"{event['total_tokens']} tokens")
         if event.get("cost_usd") is not None:
             details.append(f"${float(event['cost_usd']):.6f}")
+        if event.get("from_cache"):
+            details.append("cached")
         print(f"- {participant}: {status} {round_label} ({'; '.join(details)})", flush=True)
         if event.get("error"):
             print(f"  {event['error']}", flush=True)
@@ -1166,6 +1179,8 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         progress=None if args.json else _print_progress_event,
         image_manifest=image_manifest or None,
         min_quorum=min_quorum_value,
+        mode=mode,
+        cache_mode=getattr(args, "cache_mode", "on"),
     )
     if image_manifest:
         metadata["images"] = [
