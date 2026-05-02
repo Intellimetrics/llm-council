@@ -29,18 +29,17 @@ configSchema:
         OpenRouter-routed peers via `type: openrouter` or
         `type: openai_compatible` with an OpenRouter-hosted base_url.
         Native CLI peers (Claude Code, Codex CLI, Gemini CLI) and
-        local Ollama do not need this.
-    OLLAMA_HOST:
+        local Ollama do not need this. The `api_key_env` field on a
+        participant config controls which env var the adapter reads —
+        OPENROUTER_API_KEY is the default but can be overridden per
+        peer.
+    LLM_COUNCIL_MCP_ROOT:
       type: string
       description: >-
-        Override Ollama server URL. Defaults to http://localhost:11434
-        when an Ollama participant is configured.
-    LLM_COUNCIL_CWD:
-      type: string
-      description: >-
-        Optional override for the project working directory the MCP
-        server resolves config and transcripts against. Defaults to
-        the host-supplied cwd.
+        Optional override for the project root the MCP server resolves
+        config and transcripts against. Defaults to the host-supplied
+        cwd. Useful when the host launches the server from one
+        directory but you want council operations rooted in another.
 
 # Project metadata surfaced in the Smithery listing.
 metadata:

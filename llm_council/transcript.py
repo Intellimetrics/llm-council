@@ -97,6 +97,14 @@ def count_continuation_depth(base_dir: Path, run_id: str, *, max_depth: int = 32
     Depth 1 means "this run has one parent" (i.e., it would be the second
     link in the chain when resumed). The traversal is bounded by
     ``max_depth`` so a corrupt cycle can't hang the caller.
+
+    Callers that want to enforce a configured cap should pass
+    ``max_depth=cap + 1`` so the walker can return a value strictly
+    greater than the cap when the chain exceeds it. A cycle in the
+    transcripts is always treated as corruption and surfaced via
+    ``ValueError`` rather than silently truncating, since under-counting
+    in that case would mistakenly approve a chain that should be
+    rejected.
     """
 
     visited: set[str] = set()
@@ -105,7 +113,11 @@ def count_continuation_depth(base_dir: Path, run_id: str, *, max_depth: int = 32
     while current and depth < max_depth:
         normalized = normalize_run_id(current)
         if normalized in visited:
-            break
+            raise ValueError(
+                f"Continuation chain contains a cycle: '{normalized}' "
+                "appears more than once. Inspect the affected transcript "
+                "JSON files' parent_run_id fields and remove the loop."
+            )
         visited.add(normalized)
         try:
             transcript = find_transcript_by_id(base_dir, normalized)

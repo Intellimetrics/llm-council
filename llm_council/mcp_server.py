@@ -430,7 +430,9 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
                 "max_continuation_depth", DEFAULT_MAX_CONTINUATION_DEPTH
             )
         )
-        depth = count_continuation_depth(transcripts_root, continuation_id)
+        depth = count_continuation_depth(
+            transcripts_root, continuation_id, max_depth=max_depth + 1
+        )
         if depth >= max_depth:
             raise ValueError(
                 f"Continuation chain depth ({depth} parents) reaches the "
@@ -571,6 +573,19 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
             + int(row.get("estimated_output_tokens") or 0)
             for row in token_rows
         )
+        unpriced_paid = [
+            row.get("name")
+            for row in token_rows
+            if row.get("type") in {"openrouter", "openai_compatible"}
+            and row.get("estimated_total_cost_usd") is None
+        ]
+        if max_cost_usd is not None and unpriced_paid:
+            raise ValueError(
+                "Pre-flight estimate cannot enforce max_cost_usd: hosted "
+                f"peer(s) without a catalog price: {', '.join(unpriced_paid)}. "
+                "Confirm the model id against `council_models` or drop these "
+                "peers before relying on the cost cap."
+            )
         if max_cost_usd is not None and cost_total > float(max_cost_usd):
             raise ValueError(
                 f"Pre-flight estimate ${cost_total:.6f} exceeds max_cost_usd "

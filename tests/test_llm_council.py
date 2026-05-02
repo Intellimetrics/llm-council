@@ -7354,9 +7354,11 @@ def test_count_continuation_depth_walks_parent_chain(tmp_path: Path):
     assert count_continuation_depth(out_dir, "20260103_000000_grandchild") == 2
 
 
-def test_count_continuation_depth_breaks_on_cycle(tmp_path: Path):
-    """A pathological cycle (corrupt transcripts referencing each other) must
-    not hang the walker."""
+def test_count_continuation_depth_raises_on_cycle(tmp_path: Path):
+    """A pathological cycle (corrupt transcripts referencing each other)
+    must surface as a ValueError instead of being silently truncated —
+    silent truncation could under-count and mistakenly approve a chain
+    that should be rejected."""
     from llm_council.transcript import count_continuation_depth
 
     out_dir = tmp_path / "runs"
@@ -7377,8 +7379,40 @@ def test_count_continuation_depth_breaks_on_cycle(tmp_path: Path):
         }
         (out_dir / f"{stem}.json").write_text(json.dumps(payload), encoding="utf-8")
         (out_dir / f"{stem}.md").write_text("# x", encoding="utf-8")
-    depth = count_continuation_depth(out_dir, "20260101_000000_a", max_depth=10)
-    assert depth < 10  # cycle short-circuited via visited set
+    with pytest.raises(ValueError, match="cycle"):
+        count_continuation_depth(out_dir, "20260101_000000_a", max_depth=10)
+
+
+def test_count_continuation_depth_respects_caller_max_depth(tmp_path: Path):
+    """V1 dogfood: CLI/MCP must pass max_depth through, otherwise the
+    walker's internal ceiling (default 32) silently masks any
+    user-configured cap higher than 32."""
+    from llm_council.transcript import count_continuation_depth
+
+    out_dir = tmp_path / "runs"
+    out_dir.mkdir()
+    # Build a deep chain of 7 nodes.
+    for i in range(7):
+        stem = f"20260101_00000{i}_node"
+        payload = {
+            "question": "q",
+            "mode": "quick",
+            "current": None,
+            "participants": ["a"],
+            "prompt": "p",
+            "metadata": {},
+            "results": [],
+        }
+        if i > 0:
+            payload["parent_run_id"] = f"20260101_00000{i - 1}_node"
+        (out_dir / f"{stem}.json").write_text(json.dumps(payload), encoding="utf-8")
+        (out_dir / f"{stem}.md").write_text("# x", encoding="utf-8")
+
+    leaf = "20260101_000006_node"
+    # With a small max_depth, walker stops early.
+    assert count_continuation_depth(out_dir, leaf, max_depth=3) == 3
+    # With a larger max_depth, walker counts the full chain (6 parents).
+    assert count_continuation_depth(out_dir, leaf, max_depth=10) == 6
 
 
 def test_transcripts_prune_dry_run(tmp_path: Path, capsys):
@@ -7470,6 +7504,263 @@ def test_council_run_schema_includes_stances_and_budget_args():
     ]
     assert "max_cost_usd" in props
     assert "max_tokens" in props
+
+
+def test_classify_error_recognizes_cli_nonzero_exit():
+    """V3 dogfood fix: silent CLI failure now lands with `CliExitNonZero:`
+    prefix and gets a stable `cli_nonzero_exit` kind, instead of leaking
+    past the taxonomy as None."""
+    from llm_council.adapters import (
+        ERROR_KIND_CLI_NONZERO,
+        classify_error,
+    )
+
+    assert (
+        classify_error("CliExitNonZero: `claude` exited with status 1 and no stderr output")
+        == ERROR_KIND_CLI_NONZERO
+    )
+
+
+def test_parse_keep_since_arg_iso_date_snaps_to_midnight():
+    """V3 dogfood fix: prune used to drift by current wall-clock time-of-day
+    on ISO dates. Now ISO dates snap to midnight UTC of that date."""
+    from datetime import date, datetime, timezone
+
+    from llm_council.cli import _parse_keep_since_arg
+
+    cutoff = _parse_keep_since_arg("2026-04-01")
+    expected = datetime(2026, 4, 1, tzinfo=timezone.utc).timestamp()
+    assert cutoff == expected
+    # Integer days back uses precise current-time math.
+    integer_cutoff = _parse_keep_since_arg("0")
+    now = datetime.now(timezone.utc).timestamp()
+    assert abs(integer_cutoff - now) < 5  # within 5s of "now"
+
+
+def test_parse_keep_since_arg_rejects_future_date():
+    from llm_council.cli import _parse_keep_since_arg
+
+    with pytest.raises(argparse.ArgumentTypeError, match="future"):
+        _parse_keep_since_arg("2099-01-01")
+
+
+def test_parse_keep_since_arg_rejects_garbage():
+    from llm_council.cli import _parse_keep_since_arg
+
+    with pytest.raises(argparse.ArgumentTypeError, match="ISO date"):
+        _parse_keep_since_arg("not-a-date")
+
+
+def test_dry_run_with_json_emits_structured_output(monkeypatch, tmp_path: Path, capsys):
+    """V3 dogfood fix: `run --dry-run --json` used to silently print plain
+    text. Now it emits a structured JSON record."""
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_prompt", lambda *_a, **_k: "PROMPT")
+
+    config = {
+        "version": 1,
+        "transcripts_dir": str(tmp_path / "runs"),
+        "defaults": {"mode": "quick"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {"quick": {"participants": ["claude"]}},
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "--dry-run",
+            "--json",
+            "test",
+        ]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    parsed = json.loads(out)
+    assert parsed["dry_run"] is True
+    assert parsed["mode"] == "quick"
+    assert parsed["participants"] == ["claude"]
+    assert parsed["prompt_chars"] > 0
+
+
+def test_cmd_run_max_cost_gate_runs_under_dry_run(monkeypatch, tmp_path: Path):
+    """V2 dogfood: budget gates used to skip under --dry-run because the
+    early-return at the top of the post-build_prompt block ran first.
+    Now the gate fires before --dry-run so users can validate the cap."""
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_prompt", lambda *_a, **_k: "PROMPT")
+    monkeypatch.setattr(
+        cli_module,
+        "estimate_council",
+        lambda **_k: {
+            "known_total_usd": 10.0,
+            "rows": [
+                {
+                    "name": "expensive",
+                    "type": "openrouter",
+                    "estimated_input_tokens": 100,
+                    "estimated_output_tokens": 50,
+                    "estimated_total_cost_usd": 10.0,
+                }
+            ],
+        },
+    )
+    config = {
+        "version": 1,
+        "transcripts_dir": str(tmp_path / "runs"),
+        "defaults": {"mode": "quick"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {"quick": {"participants": ["claude"]}},
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "--max-cost-usd",
+            "1.0",
+            "--dry-run",
+            "test",
+        ]
+    )
+    with pytest.raises(SystemExit, match="exceeds --max-cost-usd"):
+        cli_module.cmd_run(args)
+
+
+def test_cmd_run_refuses_when_hosted_peer_has_unknown_cost(
+    monkeypatch, tmp_path: Path
+):
+    """V2 dogfood: a hosted (openrouter / openai_compatible) peer whose
+    catalog lookup misses used to slip past --max-cost-usd because its row
+    cost was None and was excluded from `known_total_usd`. With the cap set
+    as a safety belt, refusing is the right default."""
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_prompt", lambda *_a, **_k: "PROMPT")
+    monkeypatch.setattr(
+        cli_module,
+        "estimate_council",
+        lambda **_k: {
+            "known_total_usd": 0.0,
+            "rows": [
+                {
+                    "name": "unknown_hosted",
+                    "type": "openrouter",
+                    "estimated_input_tokens": 100,
+                    "estimated_output_tokens": 50,
+                    "estimated_total_cost_usd": None,
+                },
+                {
+                    "name": "claude",
+                    "type": "cli",
+                    "estimated_input_tokens": 100,
+                    "estimated_output_tokens": 50,
+                    "estimated_total_cost_usd": None,
+                },
+            ],
+        },
+    )
+    config = {
+        "version": 1,
+        "transcripts_dir": str(tmp_path / "runs"),
+        "defaults": {"mode": "quick"},
+        "participants": {
+            "claude": {"type": "cli", "command": "claude"},
+            "unknown_hosted": {
+                "type": "openrouter",
+                "model": "made-up/unknown",
+            },
+        },
+        "modes": {"quick": {"participants": ["claude", "unknown_hosted"]}},
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "--max-cost-usd",
+            "5.0",
+            "--dry-run",
+            "test",
+        ]
+    )
+    with pytest.raises(SystemExit, match="hosted peer.*without a catalog price"):
+        cli_module.cmd_run(args)
+
+
+def test_cmd_run_max_cost_allows_only_cli_peers_without_catalog(
+    monkeypatch, tmp_path: Path
+):
+    """The unknown-cost gate must NOT refuse a pure-CLI council just because
+    CLI participants legitimately have no API price."""
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_prompt", lambda *_a, **_k: "PROMPT")
+    monkeypatch.setattr(
+        cli_module,
+        "estimate_council",
+        lambda **_k: {
+            "known_total_usd": 0.0,
+            "rows": [
+                {
+                    "name": "claude",
+                    "type": "cli",
+                    "estimated_input_tokens": 100,
+                    "estimated_output_tokens": 50,
+                    "estimated_total_cost_usd": None,
+                }
+            ],
+        },
+    )
+
+    async def fake_execute_council(*_a, **_k):
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    config = {
+        "version": 1,
+        "transcripts_dir": str(tmp_path / "runs"),
+        "defaults": {"mode": "quick"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {"quick": {"participants": ["claude"]}},
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "--max-cost-usd",
+            "0.01",
+            "--json",
+            "test",
+        ]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0  # CLI peers under the cap proceed normally
 
 
 def test_cmd_run_refuses_when_max_cost_exceeded(monkeypatch, tmp_path: Path):

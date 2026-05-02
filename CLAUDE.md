@@ -69,9 +69,10 @@ Key modules:
 
 - `defaults.py` — built-in `DEFAULT_CONFIG`. Project YAML is deep-merged on top
   via `config.deep_merge`. The set of legal participant types (`cli`,
-  `openrouter`, `ollama`) and built-in modes (`quick`, `peer-only`, `plan`,
-  `review`, `review-cheap`, `diverse`, `private-local`, `us-only`,
-  `deliberate`, plus the temporary `opus-versions`) live here.
+  `openrouter`, `openai_compatible`, `ollama`) and built-in modes (`quick`,
+  `peer-only`, `plan`, `review`, `review-cheap`, `diverse`, `private-local`,
+  `us-only`, `deliberate`, `consensus`, plus the temporary `opus-versions`)
+  live here.
 - `config.py` — config discovery (`find_config` walks up from cwd looking for
   `.llm-council.yaml` etc.), validation, the `other_cli_peers` strategy used by
   most modes, `detect_current_agent` (parent-process walk on `/proc`), and
@@ -138,6 +139,7 @@ failure path; do not let strings drift.
 | `prompt_too_large`   | Prompt skipped before launch (per-participant `max_prompt_chars`)                    |
 | `invalid_response`   | CLI/HTTP succeeded but lacked `RECOMMENDATION:` label after one repair retry         |
 | `downstream_error`   | httpx / hosted-API failures (HTTPStatusError, ConnectError, ReadTimeout, etc.)       |
+| `cli_nonzero_exit`   | CLI participant exited with a nonzero status and empty stderr. Prefix: `CliExitNonZero:` |
 | `unknown`            | Non-empty error that did not match any known prefix — file a dogfood note            |
 
 ## Custom CLI participant: minimal template
@@ -157,15 +159,21 @@ participants:
     model: my-model        # optional model identifier
     timeout: 240           # seconds before the participant is killed
     max_prompt_chars: 120000  # per-peer prompt cap (chunking targets this)
-    read_only: true        # required: enforces the read-only invariant
+    read_only: true        # advisory marker; the read-only invariant is
+                           # actually enforced by the per-CLI args baked
+                           # into defaults.py (e.g. --permission-mode default
+                           # for Claude, --sandbox read-only for Codex), so
+                           # custom CLIs need to pass equivalent flags via
+                           # `args` for the invariant to hold
     stdin_prompt: true     # whether the prompt is delivered via stdin (default)
                            # vs. {prompt} arg substitution
 ```
 
 Forget `family` and the participant works but config validation may flag it
 as orphaned. Forget `stdin_prompt: true` and an unsubstituted-`{prompt}`
-arg gets shipped as literal text. Forget `read_only` and the read-only
-invariant is silently bypassed.
+arg gets shipped as literal text. The read-only invariant lives in the
+host CLI's own permission flags (passed via `args`), not in the
+`read_only:` key — that key is documentation-only today.
 
 ## Continuation chain depth
 

@@ -8,7 +8,7 @@ import json
 import os
 import shutil
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -342,11 +342,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     transcripts_prune.add_argument(
         "--keep-since",
-        type=_parse_since_arg,
+        type=_parse_keep_since_arg,
         default=None,
         help=(
             "Keep only transcripts newer than the cutoff (integer days back "
-            "or ISO date YYYY-MM-DD); older are pruned"
+            "or ISO date YYYY-MM-DD; ISO dates snap to midnight UTC); older "
+            "are pruned"
         ),
     )
     transcripts_prune.add_argument(
@@ -451,6 +452,49 @@ def _parse_since_arg(raw: str) -> int:
         ) from exc
     today = datetime.now(timezone.utc).date()
     return (today - cutoff).days
+
+
+def _parse_keep_since_arg(raw: str) -> float:
+    """Same surface as `_parse_since_arg` but returns a precise epoch cutoff.
+
+    For prune the ``rolling now - N*86400`` semantics that ``stats --since``
+    uses would silently discard files mtime'd earlier in the day on the
+    cutoff date. Snap the ISO-date case to midnight UTC of that date so the
+    cutoff means "at the start of the day you named", and keep the integer
+    case as a precise N-day rolling window.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        raise argparse.ArgumentTypeError("--keep-since cannot be empty")
+    now = datetime.now(timezone.utc)
+    try:
+        days = int(raw)
+    except ValueError:
+        days = None
+    if days is not None:
+        if days < 0:
+            raise argparse.ArgumentTypeError(
+                "--keep-since must be a non-negative integer (days back)"
+            )
+        return (now - timedelta(days=days)).timestamp()
+    try:
+        cutoff_date = date.fromisoformat(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--keep-since must be an integer (days back) or ISO date "
+            f"(YYYY-MM-DD): got '{raw}' ({exc})"
+        ) from exc
+    cutoff_dt = datetime(
+        cutoff_date.year,
+        cutoff_date.month,
+        cutoff_date.day,
+        tzinfo=timezone.utc,
+    )
+    if cutoff_dt > now:
+        raise argparse.ArgumentTypeError(
+            f"--keep-since date {raw} is in the future"
+        )
+    return cutoff_dt.timestamp()
 
 
 def _question_from_args(parts: list[str], flag_value: str | None = None) -> str:
@@ -1083,8 +1127,7 @@ def _cmd_transcripts_prune(args: argparse.Namespace, out_dir: Path) -> int:
         )
     if args.keep_last is not None and args.keep_last < 0:
         raise SystemExit("--keep-last must be non-negative")
-    if args.keep_since is not None and args.keep_since < 0:
-        raise SystemExit("--keep-since must be a positive integer or past ISO date")
+    # args.keep_since is now a precise epoch cutoff (float) when supplied.
 
     if not out_dir.exists():
         message = f"No transcripts directory at {out_dir}"
@@ -1103,9 +1146,7 @@ def _cmd_transcripts_prune(args: argparse.Namespace, out_dir: Path) -> int:
         for path, _mtime in indexed[: args.keep_last]:
             keep_set.add(path)
     if args.keep_since is not None:
-        import time as _time
-
-        cutoff = _time.time() - args.keep_since * 86400
+        cutoff = float(args.keep_since)
         for path, mtime in indexed:
             if mtime >= cutoff:
                 keep_set.add(path)
@@ -1306,7 +1347,13 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                     "max_continuation_depth", DEFAULT_MAX_CONTINUATION_DEPTH
                 )
             )
-            depth = count_continuation_depth(out_dir, continue_id)
+            # Pass the user-configured cap + 1 so the walker can count past
+            # the cap and report it accurately. Without this, the walker's
+            # internal default ceiling (32) would silently mask any
+            # user-configured cap higher than 32.
+            depth = count_continuation_depth(
+                out_dir, continue_id, max_depth=max_depth + 1
+            )
             if depth >= max_depth:
                 raise SystemExit(
                     f"Continuation chain depth ({depth} parents) reaches the "
@@ -1407,13 +1454,6 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 
-    if args.dry_run:
-        print(f"mode: {mode}")
-        print(f"current: {current or 'unknown'}")
-        print("participants: " + ", ".join(participants))
-        print(f"prompt_chars: {len(prompt)}")
-        return 0
-
     mode_cfg = config.get("modes", {}).get(mode, {})
     transparent = bool(args.transparent or config.get("defaults", {}).get("transparent"))
     deliberate = bool(args.deliberate or mode_cfg.get("deliberate"))
@@ -1432,6 +1472,8 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         min_quorum_value = None
     participant_cfg = config.get("participants", {})
 
+    # Budget gates run BEFORE the dry-run early-return so users can validate
+    # their cap is configured correctly without spending real-call dollars.
     max_cost_usd = getattr(args, "max_cost_usd", None)
     max_tokens = getattr(args, "max_tokens", None)
     if max_cost_usd is not None or max_tokens is not None:
@@ -1463,6 +1505,25 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             + int(row.get("estimated_output_tokens") or 0)
             for row in token_rows
         )
+        # Refuse when a hosted (paid-API) peer has unknown cost. CLI / Ollama
+        # rows legitimately report `estimated_total_cost_usd: None` because
+        # they're not API-priced here — those don't compromise a $-cap.
+        # OpenRouter / openai_compatible rows that come back as None mean
+        # the catalog lookup missed, which would silently let a paid peer
+        # slip past the safety cap if we trusted `known_total_usd` alone.
+        unpriced_paid = [
+            row.get("name")
+            for row in token_rows
+            if row.get("type") in {"openrouter", "openai_compatible"}
+            and row.get("estimated_total_cost_usd") is None
+        ]
+        if max_cost_usd is not None and unpriced_paid:
+            raise SystemExit(
+                "Pre-flight estimate cannot enforce --max-cost-usd: hosted "
+                f"peer(s) without a catalog price: {', '.join(unpriced_paid)}. "
+                "Run `llm-council models openrouter` to confirm the model id, "
+                "or drop these peers, before relying on the cost cap."
+            )
         if max_cost_usd is not None and cost_total > float(max_cost_usd):
             raise SystemExit(
                 f"Pre-flight estimate ${cost_total:.6f} exceeds --max-cost-usd "
@@ -1476,6 +1537,27 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                 f"{int(max_tokens)}. Drop --diff/--context, narrow the question, "
                 "or raise the cap."
             )
+
+    if args.dry_run:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "dry_run": True,
+                        "mode": mode,
+                        "current": current,
+                        "participants": participants,
+                        "prompt_chars": len(prompt),
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"mode: {mode}")
+            print(f"current: {current or 'unknown'}")
+            print("participants: " + ", ".join(participants))
+            print(f"prompt_chars: {len(prompt)}")
+        return 0
     if not args.json:
         print(
             f"Council starting: mode={mode}, current={current or 'unknown'}, "

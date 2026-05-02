@@ -357,6 +357,15 @@ async def _run_cli_once(
         err = stderr.decode(errors="replace").strip()
         ok = proc.returncode == 0
         validation_error = _response_validation_error(out, cfg) if ok else ""
+        # Silent CLI failures (nonzero exit but empty stderr) used to land
+        # with `error=""`, which made `classify_error` return None — a
+        # taxonomy hole. Always synthesize a stable error string when ok is
+        # false so downstream callers can branch on `error_kind`.
+        if not ok and not validation_error and not err:
+            err = (
+                f"CliExitNonZero: `{name}` exited with status "
+                f"{proc.returncode} and no stderr output"
+            )
         return (
             ParticipantResult(
                 name=name,
@@ -1350,6 +1359,7 @@ ERROR_KIND_CONTEXT_OVERFLOW = "context_overflow"
 ERROR_KIND_PROMPT_TOO_LARGE = "prompt_too_large"
 ERROR_KIND_INVALID_RESPONSE = "invalid_response"
 ERROR_KIND_DOWNSTREAM = "downstream_error"
+ERROR_KIND_CLI_NONZERO = "cli_nonzero_exit"
 ERROR_KIND_UNKNOWN = "unknown"
 
 KNOWN_ERROR_KINDS = frozenset(
@@ -1359,6 +1369,7 @@ KNOWN_ERROR_KINDS = frozenset(
         ERROR_KIND_PROMPT_TOO_LARGE,
         ERROR_KIND_INVALID_RESPONSE,
         ERROR_KIND_DOWNSTREAM,
+        ERROR_KIND_CLI_NONZERO,
         ERROR_KIND_UNKNOWN,
     }
 )
@@ -1383,6 +1394,8 @@ def classify_error(error: str) -> str | None:
         return ERROR_KIND_PROMPT_TOO_LARGE
     if error.startswith("InvalidParticipantResponse:"):
         return ERROR_KIND_INVALID_RESPONSE
+    if error.startswith("CliExitNonZero:"):
+        return ERROR_KIND_CLI_NONZERO
     # httpx + downstream-API errors funnel through f"{type(exc).__name__}: ..."
     # in the openrouter / ollama paths; we don't try to introspect those
     # further here, just classify them as `downstream_error` so callers can
