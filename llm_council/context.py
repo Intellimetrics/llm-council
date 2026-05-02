@@ -29,8 +29,8 @@ def ensure_inside_cwd(path: Path, cwd: Path) -> None:
         path.resolve().relative_to(cwd.resolve())
     except ValueError as exc:
         raise ValueError(
-            f"Context file is outside working directory: {path}. "
-            "Use --allow-outside-cwd only when this is intentional."
+            f"Context file is outside working directory: {path}.\n"
+            "  Pass --allow-outside-cwd if this is intentional."
         ) from exc
 
 

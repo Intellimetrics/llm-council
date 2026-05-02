@@ -1,0 +1,56 @@
+# Smithery deployment manifest for the llm-council MCP server.
+# Docs: https://smithery.ai/docs/build/project-config/smithery-yaml
+#
+# llm-council is a stdio MCP server. It exposes nine tools (council_run,
+# council_estimate, council_recommend, council_doctor, council_list_modes,
+# council_last_transcript, council_models, council_stats, council_run with
+# typed outputSchema). The server is read-only by default — configured
+# council participants are explicitly forbidden from editing files.
+
+runtime: python
+
+startCommand:
+  type: stdio
+  command: llm-council
+  args:
+    - mcp-server
+
+# Optional environment-variable knobs. None are strictly required for the
+# native CLI triad (claude / codex / gemini) — install those separately on
+# the host. OPENROUTER_API_KEY is only needed if the user wires up the
+# `openrouter` / `openai_compatible` participant types.
+configSchema:
+  type: object
+  properties:
+    OPENROUTER_API_KEY:
+      type: string
+      description: >-
+        OpenRouter API key. Only required when the user enables
+        OpenRouter-routed peers via `type: openrouter` or
+        `type: openai_compatible` with an OpenRouter-hosted base_url.
+        Native CLI peers (Claude Code, Codex CLI, Gemini CLI) and
+        local Ollama do not need this.
+    OLLAMA_HOST:
+      type: string
+      description: >-
+        Override Ollama server URL. Defaults to http://localhost:11434
+        when an Ollama participant is configured.
+    LLM_COUNCIL_CWD:
+      type: string
+      description: >-
+        Optional override for the project working directory the MCP
+        server resolves config and transcripts against. Defaults to
+        the host-supplied cwd.
+
+# Project metadata surfaced in the Smithery listing.
+metadata:
+  name: llm-council
+  description: >-
+    Read-only multi-agent council MCP server. Lets one coding agent ask a
+    council of other LLMs (Claude Code, Codex CLI, Gemini CLI, OpenRouter
+    hosted models, local Ollama) for second opinions before acting. Ships
+    consensus / deliberate / quick modes, conversation threading,
+    convergence detection, per-peer budgets, and pre-flight cost caps.
+  license: MIT
+  homepage: https://github.com/Intellimetrics/llm-council
+  repository: https://github.com/Intellimetrics/llm-council

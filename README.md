@@ -87,8 +87,45 @@ using `uvx`, copying placeholder paths into `.mcp.json`, overwriting existing
 project instructions, silently accepting the wrong preset, skipping the
 instruction-file append step, or declaring success before `doctor` passes.
 
+### Try Without Installing
+
+If you only want to kick the tires before deciding whether to install
+project-wide, you can run a one-shot via `uvx` without committing anything to
+disk:
+
+```bash
+uvx --from git+https://github.com/Intellimetrics/llm-council.git llm-council \
+    run --mode quick "explain why this codebase chose option X over option Y"
+```
+
+Caveats: `uvx` re-resolves and re-installs the package on every invocation, no
+project config (`.llm-council.yaml` / `.mcp.json`) is written, and your
+coding agent will not get MCP-level access to the council. This is for
+exploration, not durable use — the [primary install path](#install-the-way-users-actually-will)
+is the right choice for any real project.
+
+### Install via Smithery
+
+For Smithery-aware MCP hosts, the repo ships a [`smithery.yaml`](smithery.yaml)
+that registers `llm-council mcp-server` as a stdio MCP server. Install it from
+the Smithery marketplace UI in your host of choice; the manifest's
+`configSchema` exposes optional `OPENROUTER_API_KEY`, `OLLAMA_HOST`, and
+`LLM_COUNCIL_CWD` overrides. Native CLI peers (Claude Code, Codex CLI,
+Gemini CLI) still need to be installed on the host separately.
+
 ## What's New
 
+- **v0.4.0** ships ~17 commits of work in deliberation, observability, and
+  scale: stance-assigned `consensus` mode with ethical-override clause,
+  `--continue <run_id>` conversation threading (with depth-cap safety),
+  `--diff` chunking strategies (`head` / `tail` / `hash-aware`), per-peer
+  context-window budgets with graceful exclusion, on-disk per-participant
+  result cache, convergence detection, run-level token / dollar budget caps
+  (`--max-cost-usd` / `--max-tokens`), structured `council_run` output
+  schema, failure taxonomy on every result, `transcripts prune` subcommand,
+  and `llm-council stats`. See [CHANGELOG.md](CHANGELOG.md) for the full
+  list, including the six v0.4.0 ship-blocker fixes the council itself
+  caught during a self-review pass.
 - **Image passthrough.** Council can review UI screenshots, browser captures,
   and other image artifacts. Stage them under `.llm-council/inputs/<slug>/`
   and pass `image_paths` to `council_run` (or `--image` on the CLI). Native

@@ -7515,6 +7515,32 @@ def test_cmd_run_refuses_when_max_cost_exceeded(monkeypatch, tmp_path: Path):
         cli_module.cmd_run(args)
 
 
+def test_setup_writes_per_host_skill_files(tmp_path: Path):
+    """Track C #5: setup must emit host-installable skill files for Claude
+    Code, Codex CLI, and Gemini CLI under .llm-council/skills/, not just
+    project-level instructions under .llm-council/instructions/."""
+    write_setup_files(
+        tmp_path,
+        include_native=True,
+        include_openrouter=False,
+        include_local=False,
+        write_mcp=False,
+        write_instructions=True,
+    )
+    skills = tmp_path / ".llm-council" / "skills"
+    assert (skills / "README.md").exists()
+    claude_skill = (skills / "claude-code" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert claude_skill.startswith("---\n")
+    assert "name: llm-council" in claude_skill
+    assert "current` as `claude`" in claude_skill
+    codex_md = (skills / "codex-cli" / "AGENTS.md").read_text(encoding="utf-8")
+    assert "current` as `codex`" in codex_md
+    gemini_md = (skills / "gemini-cli" / "GEMINI.md").read_text(encoding="utf-8")
+    assert "current` as `gemini`" in gemini_md
+
+
 def test_cli_stance_flag_overrides_mode_stance(monkeypatch, tmp_path: Path):
     """--stance peer=for overrides whatever the mode declared, and forwards
     the merged map into both build_prompt and execute_council."""

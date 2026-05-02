@@ -294,6 +294,15 @@ def write_setup_files(
                 )
                 written.append(path)
 
+        skills_dir = root / ".llm-council" / "skills"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        skill_files = _generate_host_skill_files(skills_dir)
+        for path, content in skill_files:
+            if force or not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+                written.append(path)
+
     runtime_gitignore = root / ".llm-council" / ".gitignore"
     runtime_gitignore.parent.mkdir(parents=True, exist_ok=True)
     desired_gitignore = "runs/\ninputs/\n*.log\n"
@@ -353,3 +362,139 @@ def _read_json_mapping(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a JSON object. Fix it or rerun setup with --force.")
     return data
+
+
+def _generate_host_skill_files(skills_dir: Path) -> list[tuple[Path, str]]:
+    """Build host-specific agent-skill files for Claude Code, Codex, Gemini.
+
+    These are generated under `.llm-council/skills/<host>/` so the user can
+    install them into their host's *global* skill location (vs. the
+    per-project `.llm-council/instructions/` that the README install flow
+    appends to project files). Each host has its own format.
+    """
+
+    files: list[tuple[Path, str]] = []
+    files.append((skills_dir / "README.md", _SKILLS_README))
+    files.append(
+        (skills_dir / "claude-code" / "SKILL.md", _CLAUDE_CODE_SKILL_MD)
+    )
+    files.append(
+        (skills_dir / "codex-cli" / "AGENTS.md", _CODEX_CLI_AGENTS_MD)
+    )
+    files.append(
+        (skills_dir / "gemini-cli" / "GEMINI.md", _GEMINI_CLI_GEMINI_MD)
+    )
+    return files
+
+
+_SKILLS_README = """# Host-installable agent skills for llm-council
+
+This directory holds host-specific skill / instruction files you can install
+into your coding agent's *global* config so every project picks up the
+council routing rules — not just this project. They are independent of the
+per-project files in `.llm-council/instructions/` (which the README install
+flow appends to your project's `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`).
+
+Pick the host(s) you use:
+
+## Claude Code
+
+```bash
+mkdir -p ~/.claude/skills/llm-council
+cp .llm-council/skills/claude-code/SKILL.md ~/.claude/skills/llm-council/SKILL.md
+```
+
+Restart Claude Code. The skill becomes discoverable; it has YAML frontmatter
+naming it `llm-council` so the host can surface it where it surfaces other
+skills.
+
+## Codex CLI
+
+```bash
+mkdir -p ~/.codex
+cat .llm-council/skills/codex-cli/AGENTS.md >> ~/.codex/AGENTS.md
+```
+
+Codex CLI reads `~/.codex/AGENTS.md` as global agent instructions. Append
+(don't overwrite) so existing entries are preserved.
+
+## Gemini CLI
+
+```bash
+mkdir -p ~/.gemini
+cat .llm-council/skills/gemini-cli/GEMINI.md >> ~/.gemini/GEMINI.md
+```
+
+Gemini CLI reads `~/.gemini/GEMINI.md` as global instructions.
+
+After installing on any host, the prerequisite is that `llm-council` is on
+PATH (via `uv tool install` or `pipx install`) and that an MCP transport is
+wired up in the host's MCP config. See the project README's primary install
+path for that.
+"""
+
+
+_HOST_SKILL_BODY = """When the user asks for a "council" review — natural triggers include
+"use council", "go to council", "ask council", "take this to council",
+or "get a second opinion" — call the `llm-council` MCP tool `council_run`.
+
+Routing rules:
+- Pass `current` as `{current}` so transcripts record which host will
+  synthesize and act on the council output.
+- Default `mode` is `quick`. Use `consensus` when the user explicitly
+  wants assigned-stance debate (for/against/neutral). Use `peer-only`
+  when the user wants to exclude this host from the council. Use
+  `private-local` for offline/Ollama-only review.
+- Treat "on the diff" / "current diff" / "review my changes" as
+  `include_diff: true`.
+- Treat "with budget" or "max $X" as setting `max_cost_usd` to that
+  value — the council will refuse to run if the pre-flight estimate
+  exceeds the cap.
+- Treat "continue from <run_id>" as setting `continuation_id` to that
+  prior run; the new transcript will record `parent_run_id`.
+
+Council output shape (when the host supports MCP outputSchema):
+- `recommendation`: yes / no / tradeoff / unknown — the majority label
+- `agreement_count`: peers matching the majority
+- `degraded`: true when fewer than `min_quorum` peers labeled
+- `transcript`: filesystem path to the markdown transcript
+
+Before acting on council feedback, summarize agreements, surface real
+disagreements, and ask the user before making large or risky edits.
+
+Council is read-only by default. Council participants must not edit
+files; this host agent remains responsible for deciding what to do next.
+
+Do not send classified, regulated, secret, credential, or customer data
+to council unless the user has explicitly confirmed the configured
+participants are approved for that data.
+"""
+
+
+_CLAUDE_CODE_SKILL_MD = (
+    "---\n"
+    "name: llm-council\n"
+    "description: >-\n"
+    "  Read-only multi-agent council for second opinions before risky\n"
+    "  edits. Routes to the local CLI triad (Claude / Codex / Gemini) plus\n"
+    "  optional OpenRouter / Ollama peers via the llm-council MCP server.\n"
+    "---\n"
+    "\n"
+    "# LLM Council\n"
+    "\n"
+    + _HOST_SKILL_BODY.format(current="claude")
+)
+
+
+_CODEX_CLI_AGENTS_MD = (
+    "# LLM Council (global agent instructions)\n"
+    "\n"
+    + _HOST_SKILL_BODY.format(current="codex")
+)
+
+
+_GEMINI_CLI_GEMINI_MD = (
+    "# LLM Council (global Gemini CLI instructions)\n"
+    "\n"
+    + _HOST_SKILL_BODY.format(current="gemini")
+)
