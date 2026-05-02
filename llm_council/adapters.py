@@ -229,7 +229,7 @@ async def run_openrouter_participant(
                 client,
                 "POST",
                 "https://openrouter.ai/api/v1/chat/completions",
-                retries=int(cfg.get("retries") or 2),
+                retries=_coerce_retries(cfg.get("retries"), default=2),
                 headers=headers,
                 json=payload,
             )
@@ -332,7 +332,7 @@ async def run_ollama_participant(
                 client,
                 "POST",
                 f"{base_url}/api/chat",
-                retries=int(cfg.get("retries") or 1),
+                retries=_coerce_retries(cfg.get("retries"), default=1),
                 json=payload,
             )
             data = response.json()
@@ -508,6 +508,12 @@ async def run_participants(
             return result
 
     return await asyncio.gather(*[run_one(name) for name in selected])
+
+
+def _coerce_retries(value: Any, *, default: int) -> int:
+    if value is None:
+        return default
+    return int(value)
 
 
 def _int_or_none(value: Any) -> int | None:
