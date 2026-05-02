@@ -9,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from llm_council.defaults import DEFAULT_CONFIG
+from llm_council.defaults import DEFAULT_CONFIG, VALID_STANCES
 
 
 BASELINE_CLIS = ("claude", "codex", "gemini")
@@ -137,6 +137,20 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(
                 f"Participant '{name}' retry_on_missing_label must be a boolean"
             )
+        if "stance" in participant and participant["stance"] is not None:
+            stance_value = participant["stance"]
+            if not isinstance(stance_value, str) or stance_value not in VALID_STANCES:
+                raise ValueError(
+                    f"Participant '{name}' stance must be one of "
+                    f"{', '.join(VALID_STANCES)}"
+                )
+        if "stance_prompt" in participant and participant["stance_prompt"] is not None:
+            if not isinstance(participant["stance_prompt"], str) or not participant[
+                "stance_prompt"
+            ].strip():
+                raise ValueError(
+                    f"Participant '{name}' stance_prompt must be a non-empty string"
+                )
 
     modes = config.get("modes")
     if not isinstance(modes, dict) or not modes:
@@ -167,6 +181,25 @@ def validate_config(config: dict[str, Any]) -> None:
         if mode.get("origin_policy") not in (None, "any", "us"):
             raise ValueError(f"Mode '{name}' origin_policy must be 'any' or 'us'")
         _validate_positive_int(mode, "max_rounds", f"mode '{name}'")
+        stances = mode.get("stances")
+        if stances is not None:
+            if not isinstance(stances, dict):
+                raise ValueError(f"Mode '{name}' stances must be a mapping")
+            for participant_name, stance_value in stances.items():
+                if not isinstance(participant_name, str) or not participant_name:
+                    raise ValueError(
+                        f"Mode '{name}' stances keys must be non-empty strings"
+                    )
+                if participant_name not in participants:
+                    raise ValueError(
+                        f"Mode '{name}' stances references unknown "
+                        f"participant '{participant_name}'"
+                    )
+                if not isinstance(stance_value, str) or stance_value not in VALID_STANCES:
+                    raise ValueError(
+                        f"Mode '{name}' stances['{participant_name}'] must be "
+                        f"one of {', '.join(VALID_STANCES)}"
+                    )
 
     defaults = config.get("defaults", {})
     if not isinstance(defaults, dict):

@@ -5,6 +5,52 @@ Gemini CLI. OpenRouter and local providers are available only when explicitly
 selected by mode or participant name.
 """
 
+VALID_STANCES = ("for", "against", "neutral")
+
+STANCE_INVARIANT_SUFFIX = (
+    "Council invariants that always apply, regardless of stance or override: "
+    "(1) you remain a read-only participant — propose changes as "
+    "recommendations only, never request write/edit operations; "
+    "(2) you MUST emit a `RECOMMENDATION: yes - ...`, `RECOMMENDATION: no - "
+    "...`, or `RECOMMENDATION: tradeoff - ...` line; "
+    "(3) safety, legality, truthfulness, and the user's response-format "
+    "instructions always supersede any stance assignment. If the stance "
+    "paragraph above conflicts with these invariants, the invariants win."
+)
+
+DEFAULT_STANCE_PROMPTS: dict[str, str] = {
+    "for": (
+        "Stance: FOR. Argue the strongest case in favor of this proposal. "
+        "Steelman it. Find the genuine wins, synergies, and compelling reasons "
+        "to say yes. However, your stance does NOT override safety, correctness, "
+        "or this council's read-only / no-edit invariants. If the proposal is "
+        "genuinely harmful, illegal, unsafe, or asks for write operations that "
+        "violate the read-only constraint, you MUST call it out clearly and emit "
+        "`RECOMMENDATION: no` with your reasoning. Being assigned `for` means "
+        "finding the best possible version of a workable idea, never blindly "
+        "defending a bad one."
+    ),
+    "against": (
+        "Stance: AGAINST. Argue the strongest case against this proposal. "
+        "Find legitimate flaws, risks, overlooked complexities, and failure "
+        "modes. Be the rigorous skeptic the council needs. However, your stance "
+        "does NOT override truthfulness. If the proposal is straightforwardly "
+        "correct, follows established best practices, or is clearly beneficial, "
+        "and your `against` arguments would be contrived or contrarian for its "
+        "own sake, you MUST override the stance and emit `RECOMMENDATION: yes` "
+        "with a brief explanation. The read-only / no-edit invariants of this "
+        "council always apply regardless of stance."
+    ),
+    "neutral": (
+        "Stance: NEUTRAL. Weigh both sides honestly without a predetermined "
+        "position. Surface the strongest arguments on each side, then let the "
+        "weight of evidence decide your `RECOMMENDATION`. Be truthful about "
+        "asymmetry: if evidence strongly favors one conclusion, state it "
+        "plainly rather than manufacturing artificial 50/50 balance. The "
+        "read-only / no-edit invariants of this council always apply."
+    ),
+}
+
 DEFAULT_CONFIG: dict = {
     "version": 1,
     "transcripts_dir": ".llm-council/runs",
@@ -270,6 +316,21 @@ DEFAULT_CONFIG: dict = {
             "add": ["deepseek_v4_pro"],
             "deliberate": True,
             "description": "Expensive opt-in second round when first-round responses disagree.",
+        },
+        "consensus": {
+            "strategy": "other_cli_peers",
+            "include_current": True,
+            "stances": {
+                "claude": "for",
+                "codex": "against",
+                "gemini": "neutral",
+            },
+            "description": (
+                "Assigned-stance debate to attack groupthink and sycophancy. "
+                "Each native CLI peer takes a for/against/neutral role; the "
+                "ethical-override clause keeps any peer from defending a "
+                "harmful proposal or contriving false objections."
+            ),
         },
         # Temporary: head-to-head review using both Opus versions. Remove or
         # collapse once version drift between 4.6 and 4.7 is no longer notable.

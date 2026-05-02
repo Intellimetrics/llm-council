@@ -8,6 +8,12 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from llm_council.defaults import (
+    DEFAULT_STANCE_PROMPTS,
+    STANCE_INVARIANT_SUFFIX,
+    VALID_STANCES,
+)
+
 
 MAX_CONTEXT_FILE_CHARS = 120_000
 MAX_PROMPT_CHARS = 200_000
@@ -187,6 +193,116 @@ def _git_diff_unavailable(reason: str) -> str:
     return f"## Git Diff\n\n```text\n[git diff unavailable: {reason}]\n```"
 
 
+def _resolve_stance_inputs(
+    *,
+    mode: str,
+    cwd: Path,
+    stances: dict[str, str] | None,
+    participants: dict[str, dict[str, Any]] | None,
+) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    """Resolve per-participant stances, optionally loading from project config.
+
+    Explicit kwargs win. When `stances` is None we attempt a best-effort lookup
+    in the project config under cwd; failures fall through silently so the
+    existing prompt structure is preserved.
+    """
+
+    if stances is not None:
+        return dict(stances), dict(participants or {})
+    try:
+        from llm_council.config import find_config, load_config
+
+        config_path = find_config(cwd)
+        if not config_path:
+            return {}, {}
+        loaded = load_config(config_path)
+    except (OSError, ValueError):
+        return {}, {}
+    mode_cfg = loaded.get("modes", {}).get(mode, {}) if isinstance(loaded, dict) else {}
+    if not isinstance(mode_cfg, dict):
+        return {}, {}
+    raw_stances = mode_cfg.get("stances")
+    if not isinstance(raw_stances, dict) or not raw_stances:
+        return {}, {}
+    raw_participants = loaded.get("participants", {})
+    if not isinstance(raw_participants, dict):
+        raw_participants = {}
+    return dict(raw_stances), dict(raw_participants)
+
+
+def resolve_stance_prompt(
+    stance: str, *, override: str | None = None
+) -> str:
+    """Return the stance paragraph, preferring an explicit override."""
+
+    if override is not None:
+        text = override.strip()
+        if text:
+            return text
+    if stance in DEFAULT_STANCE_PROMPTS:
+        return DEFAULT_STANCE_PROMPTS[stance]
+    raise ValueError(
+        f"Unknown stance '{stance}'. Expected one of: "
+        f"{', '.join(VALID_STANCES)}"
+    )
+
+
+def _sanitize_identifier(value: str, *, max_chars: int = 64) -> str:
+    forbidden = {"`", "\n", "\r", "\t", "#", "*", "_", "[", "]"}
+    cleaned = "".join(
+        ch for ch in str(value) if ch.isprintable() and ch not in forbidden
+    ).strip()
+    if not cleaned:
+        return "unknown"
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars]
+    return cleaned
+
+
+def render_stance_section(
+    stances: dict[str, str],
+    *,
+    participants: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    """Render the per-participant Stance Assignments block."""
+
+    if not stances:
+        return ""
+    participants = participants or {}
+    lines = [
+        "## Stance Assignments",
+        "",
+        (
+            "This is a consensus-mode council where each participant has been "
+            "assigned a stance to attack groupthink and sycophancy. Find the "
+            "row matching your CLI / model identity below and adopt that "
+            "stance for this response. If you cannot identify which row "
+            "applies to you, default to the `neutral` stance."
+        ),
+        "",
+    ]
+    for name, stance in stances.items():
+        if stance not in VALID_STANCES:
+            raise ValueError(
+                f"Stance for '{name}' must be one of {', '.join(VALID_STANCES)}"
+            )
+        cfg = participants.get(name) or {}
+        family = cfg.get("family") or name
+        override = cfg.get("stance_prompt")
+        paragraph = resolve_stance_prompt(stance, override=override)
+        safe_name = _sanitize_identifier(name)
+        safe_family = _sanitize_identifier(family)
+        lines.append(
+            f"### Participant `{safe_name}` (family: {safe_family}) — Stance: {stance}"
+        )
+        lines.append("")
+        lines.append(paragraph)
+        lines.append("")
+        lines.append(STANCE_INVARIANT_SUFFIX)
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 def build_prompt(
     question: str,
     *,
@@ -199,8 +315,17 @@ def build_prompt(
     max_prompt_chars: int | None = MAX_PROMPT_CHARS,
     image_paths: list[str] | None = None,
     image_manifest: list[dict[str, Any]] | None = None,
+    stances: dict[str, str] | None = None,
+    participants: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """Build the read-only prompt sent to each participant."""
+
+    resolved_stances, resolved_participants = _resolve_stance_inputs(
+        mode=mode,
+        cwd=cwd,
+        stances=stances,
+        participants=participants,
+    )
 
     sections = [
         "You are a read-only participant in an LLM council for a coding project.",
@@ -239,6 +364,13 @@ def build_prompt(
 
     if context_sections:
         sections.extend(["", "Context:", *context_sections])
+
+    if resolved_stances:
+        stance_block = render_stance_section(
+            resolved_stances, participants=resolved_participants
+        )
+        if stance_block:
+            sections.extend(["", stance_block])
 
     prompt = "\n".join(sections)
     if max_prompt_chars is not None and len(prompt) > max_prompt_chars:
