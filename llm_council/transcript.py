@@ -11,6 +11,7 @@ from typing import Any
 from llm_council.adapters import (
     ParticipantResult,
     command_for_display,
+    is_context_overflow_error,
     is_timeout_error,
 )
 from llm_council.convergence import tally_states
@@ -430,7 +431,42 @@ def _missing_label_reason(result: ParticipantResult) -> str:
         return "labeled"
     if is_timeout_error(result.error):
         return "timeout"
+    if is_context_overflow_error(result.error):
+        return "context overflow"
     return "failed"
+
+
+def context_overflow_excluded_names(
+    results: list[ParticipantResult],
+) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for result in results:
+        if result.ok or not is_context_overflow_error(result.error):
+            continue
+        base = ROUND_SUFFIX_RE.sub("", result.name)
+        if base in seen:
+            continue
+        seen.add(base)
+        names.append(base)
+    return names
+
+
+def context_overflow_records(
+    results: list[ParticipantResult],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for result in results:
+        if result.ok or not is_context_overflow_error(result.error):
+            continue
+        records.append(
+            {
+                "name": result.name,
+                "estimated_tokens": result.prompt_tokens,
+                "error": result.error,
+            }
+        )
+    return records
 
 
 def _participant_quorum_entry(result: ParticipantResult) -> dict[str, Any]:
@@ -525,6 +561,12 @@ def write_transcript(
     )
     if quorum["degraded"]:
         quorum_bullet += " — **DEGRADED**"
+    overflow_names = context_overflow_excluded_names(final_results)
+    overflow_bullet = (
+        [f"- Excluded for context overflow: {', '.join(overflow_names)}"]
+        if overflow_names
+        else []
+    )
     lines = [
         "# LLM Council Transcript",
         "",
@@ -548,6 +590,7 @@ def write_transcript(
         f"`{recommendations['yes']} yes / {recommendations['no']} no / "
         f"{recommendations['tradeoff']} tradeoff / {recommendations['unknown']} unknown`",
         quorum_bullet,
+        *overflow_bullet,
         "",
         "## Question",
         "",
@@ -579,6 +622,8 @@ def write_transcript(
             status = "ok"
         elif is_timeout_error(result.error):
             status = "timeout"
+        elif is_context_overflow_error(result.error):
+            status = "excluded"
         else:
             status = "error"
         lines.extend(
@@ -681,6 +726,9 @@ def write_transcript(
         json_payload["remaining_disagreement"] = remaining
     if degraded is not None:
         json_payload["degraded_consensus"] = degraded
+    overflow_records = context_overflow_records(results)
+    if overflow_records:
+        json_payload["context_overflow_excluded"] = overflow_records
     json_path.write_text(
         json.dumps(json_payload, indent=2) + "\n",
         encoding="utf-8",

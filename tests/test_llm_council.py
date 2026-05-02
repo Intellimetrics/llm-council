@@ -5926,3 +5926,525 @@ def test_chunk_diff_hash_aware_falls_back_when_no_hunk_fits():
     # Marker from the head fallback should still appear.
     assert "diff truncated" in result.text
 
+
+def test_estimate_tokens_basic():
+    from llm_council.estimate import estimate_tokens
+
+    assert estimate_tokens("") == 0
+    # 4 chars / 4 chars per token = 1
+    assert estimate_tokens("abcd") == 1
+    # 5 chars / 4 = 1.25 -> ceil 2
+    assert estimate_tokens("abcde") == 2
+    # 400 chars / 4 = 100
+    assert estimate_tokens("x" * 400) == 100
+
+
+def test_estimate_tokens_rounds_up_partial_token():
+    from llm_council.estimate import estimate_tokens
+
+    assert estimate_tokens("a") == 1
+    assert estimate_tokens("ab") == 1
+    assert estimate_tokens("abc") == 1
+    assert estimate_tokens("abcd") == 1
+    assert estimate_tokens("abcde") == 2
+
+
+def test_cli_participant_excluded_when_prompt_exceeds_max_context_tokens(
+    monkeypatch, tmp_path: Path
+):
+    launched = {"called": False}
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        launched["called"] = True
+        raise AssertionError("subprocess should not be launched on overflow")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    long_prompt = "x" * 500  # ~125 tokens
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+                "max_context_tokens": 100,
+            },
+            long_prompt,
+            tmp_path,
+        )
+    )
+    assert launched["called"] is False
+    assert result.ok is False
+    assert result.error.startswith("ContextOverflowExcluded:")
+    assert "125" in result.error
+    assert "100" in result.error
+    assert "approximate" in result.error
+    assert result.prompt_tokens == 125
+
+
+def test_participant_without_max_context_tokens_runs_long_prompts(
+    monkeypatch, tmp_path: Path
+):
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, input=None):
+            return b"RECOMMENDATION: yes - ok", b""
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    long_prompt = "x" * 50_000
+    result = asyncio.run(
+        adapters_module.run_cli_participant(
+            "claude",
+            {
+                "type": "cli",
+                "command": "claude",
+                "args": ["-p"],
+                "stdin_prompt": True,
+            },
+            long_prompt,
+            tmp_path,
+        )
+    )
+    assert result.ok is True
+    assert "ContextOverflow" not in result.error
+
+
+def test_run_participants_emits_context_overflow_excluded_event(
+    monkeypatch, tmp_path: Path
+):
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        raise AssertionError("subprocess should not be launched")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    events: list[dict] = []
+
+    long_prompt = "x" * 500
+    cfg = {
+        "small": {
+            "type": "cli",
+            "command": "claude",
+            "args": ["-p"],
+            "stdin_prompt": True,
+            "max_context_tokens": 100,
+        }
+    }
+    results = asyncio.run(
+        run_participants(
+            ["small"],
+            cfg,
+            long_prompt,
+            tmp_path,
+            progress=events.append,
+        )
+    )
+    assert len(results) == 1
+    overflow_events = [
+        e for e in events if e.get("event") == "context_overflow_excluded"
+    ]
+    assert len(overflow_events) == 1
+    evt = overflow_events[0]
+    assert evt["participant"] == "small"
+    assert evt["estimated_tokens"] == 125
+    assert evt["max_context_tokens"] == 100
+    finish = next(e for e in events if e.get("event") == "participant_finish")
+    assert finish["status"] == "excluded"
+
+
+def test_execute_council_excludes_overflow_then_degraded_when_all_excluded(
+    monkeypatch, tmp_path: Path
+):
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        raise AssertionError("subprocess should not be launched")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    long_prompt = "y" * 500
+    participant_cfg = {
+        "a": {
+            "type": "cli",
+            "command": "claude",
+            "args": ["-p"],
+            "stdin_prompt": True,
+            "max_context_tokens": 100,
+        },
+        "b": {
+            "type": "cli",
+            "command": "claude",
+            "args": ["-p"],
+            "stdin_prompt": True,
+            "max_context_tokens": 100,
+        },
+        "c": {
+            "type": "cli",
+            "command": "claude",
+            "args": ["-p"],
+            "stdin_prompt": True,
+            "max_context_tokens": 100,
+        },
+    }
+    results, metadata = asyncio.run(
+        execute_council(
+            ["a", "b", "c"],
+            participant_cfg,
+            long_prompt,
+            tmp_path,
+            {},
+            deliberate=False,
+        )
+    )
+    assert metadata["labeled_quorum"] == 0
+    assert metadata["min_quorum"] == 2
+    assert metadata["degraded"] is True
+    assert all(r.error.startswith("ContextOverflowExcluded:") for r in results)
+    overflow_events = [
+        e
+        for e in metadata["progress_events"]
+        if e.get("event") == "context_overflow_excluded"
+    ]
+    assert {e["participant"] for e in overflow_events} == {"a", "b", "c"}
+
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "ovr.md"
+    json_path = out_dir / "ovr.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="overflow test",
+        mode="quick",
+        current="codex",
+        participants=["a", "b", "c"],
+        prompt=long_prompt,
+        results=results,
+        metadata=metadata,
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "- Excluded for context overflow: a, b, c" in md
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    overflow_records = payload["context_overflow_excluded"]
+    assert {entry["name"] for entry in overflow_records} == {"a", "b", "c"}
+    for entry in overflow_records:
+        assert entry["estimated_tokens"] == 125
+        assert entry["error"].startswith("ContextOverflowExcluded:")
+    assert payload["degraded_consensus"]["labeled_quorum"] == 0
+    missing_reasons = {
+        entry["name"]: entry["reason"]
+        for entry in payload["degraded_consensus"]["missing"]
+    }
+    assert missing_reasons == {"a": "context overflow", "b": "context overflow", "c": "context overflow"}
+
+
+def test_execute_council_mixed_overflow_lets_remaining_peer_label(
+    monkeypatch, tmp_path: Path
+):
+    call_log: list[tuple[str, ...]] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, input=None):
+            return b"RECOMMENDATION: yes - ship", b""
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        call_log.append(tuple(command))
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    long_prompt = "z" * 500  # 125 tokens
+    participant_cfg = {
+        "tight_a": {
+            "type": "cli",
+            "command": "claude",
+            "args": ["-p"],
+            "stdin_prompt": True,
+            "max_context_tokens": 50,
+        },
+        "tight_b": {
+            "type": "cli",
+            "command": "claude",
+            "args": ["-p"],
+            "stdin_prompt": True,
+            "max_context_tokens": 50,
+        },
+        "roomy": {
+            "type": "cli",
+            "command": "claude",
+            "args": ["-p"],
+            "stdin_prompt": True,
+            "max_context_tokens": 10_000,
+        },
+    }
+    results, metadata = asyncio.run(
+        execute_council(
+            ["tight_a", "tight_b", "roomy"],
+            participant_cfg,
+            long_prompt,
+            tmp_path,
+            {},
+            deliberate=False,
+        )
+    )
+    by_name = {r.name: r for r in results}
+    assert by_name["tight_a"].error.startswith("ContextOverflowExcluded:")
+    assert by_name["tight_b"].error.startswith("ContextOverflowExcluded:")
+    assert by_name["roomy"].ok is True
+    # Only the surviving peer launched a subprocess.
+    assert len(call_log) == 1
+    assert metadata["labeled_quorum"] == 1
+    assert metadata["min_quorum"] == 2
+    assert metadata["degraded"] is True
+
+
+def test_max_context_tokens_validated_as_positive_int(tmp_path: Path):
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "participants": {
+                    "claude": {
+                        **DEFAULT_CONFIG["participants"]["claude"],
+                        "max_context_tokens": 0,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="max_context_tokens"):
+        load_config(config_path, search=False)
+
+
+def test_openai_compatible_participant_excluded_on_overflow(monkeypatch):
+    requests = {"called": False}
+
+    async def fake_request(client, method, url, **kwargs):
+        requests["called"] = True
+        raise AssertionError("HTTP request should not be made on overflow")
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    long_prompt = "q" * 500
+    result = asyncio.run(
+        adapters_module.run_openai_compatible_participant(
+            "router",
+            {
+                "type": "openai_compatible",
+                "model": "z-ai/glm-test",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+                "max_context_tokens": 100,
+            },
+            long_prompt,
+        )
+    )
+    assert requests["called"] is False
+    assert result.error.startswith("ContextOverflowExcluded:")
+    assert result.prompt_tokens == 125
+
+
+def test_ollama_participant_excluded_on_overflow(monkeypatch):
+    requests = {"called": False}
+
+    async def fake_request(client, method, url, **kwargs):
+        requests["called"] = True
+        raise AssertionError("HTTP request should not be made on overflow")
+
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    long_prompt = "q" * 500
+    result = asyncio.run(
+        adapters_module.run_ollama_participant(
+            "local",
+            {
+                "type": "ollama",
+                "model": "qwen3:q4",
+                "base_url": "http://localhost:11434",
+                "max_context_tokens": 100,
+            },
+            long_prompt,
+        )
+    )
+    assert requests["called"] is False
+    assert result.error.startswith("ContextOverflowExcluded:")
+
+
+def test_overflow_check_includes_image_tokens_for_vision_peer(monkeypatch):
+    requests = {"called": False}
+
+    async def fake_request(client, method, url, **kwargs):
+        requests["called"] = True
+        raise AssertionError("HTTP request should not be made on overflow")
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    short_prompt = "x" * 40  # ~10 tokens
+    image_manifest = [
+        {"path": "/tmp/img1.png", "mime": "image/png", "size": 1},
+        {"path": "/tmp/img2.png", "mime": "image/png", "size": 1},
+    ]
+    # IMAGE_TOKEN_HEURISTIC = 1500 each -> 3000 image tokens + 10 text = 3010
+    result = asyncio.run(
+        adapters_module.run_openai_compatible_participant(
+            "router",
+            {
+                "type": "openai_compatible",
+                "model": "z-ai/glm-test",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+                "max_context_tokens": 1000,
+                "vision": True,
+            },
+            short_prompt,
+            image_manifest=image_manifest,
+        )
+    )
+    assert requests["called"] is False
+    assert result.error.startswith("ContextOverflowExcluded:")
+    assert result.prompt_tokens == 10 + 2 * 1500
+
+
+def test_overflow_check_ignores_images_for_non_vision_peer(monkeypatch):
+    captured: dict = {}
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "model": "x/y",
+                "choices": [
+                    {
+                        "message": {"content": "RECOMMENDATION: yes - ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+
+    async def fake_request(client, method, url, **kwargs):
+        captured["called"] = True
+        return FakeResponse()
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    short_prompt = "x" * 40  # 10 tokens, well under any limit
+    # vision=False (default): images are referenced as text only and don't add to budget.
+    image_manifest = [
+        {"path": "/tmp/img.png", "mime": "image/png", "size": 1}
+    ] * 5
+    result = asyncio.run(
+        adapters_module.run_openai_compatible_participant(
+            "router",
+            {
+                "type": "openai_compatible",
+                "model": "z-ai/glm-test",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+                "max_context_tokens": 100,
+            },
+            short_prompt,
+            image_manifest=image_manifest,
+        )
+    )
+    assert captured.get("called") is True
+    assert result.ok is True
+
+
+def test_deliberation_re_evaluates_overflow_per_round(monkeypatch, tmp_path: Path):
+    """Peer that overflowed round 1 should get a fresh check round 2.
+
+    Round-2 deliberation prompts drop the bulky Context: section and are
+    materially shorter, so a peer near the limit may fit on the second pass.
+    """
+    round_calls: list[int] = []
+
+    async def fake_run_participants(
+        selected, participant_cfg, prompt, cwd, *, round_number, **kwargs
+    ):
+        round_calls.append(round_number)
+        if round_number == 1:
+            return [
+                ParticipantResult(
+                    "tight",
+                    False,
+                    "",
+                    "ContextOverflowExcluded: estimated 200 prompt tokens (approximate; chars/4) exceed max_context_tokens=100",
+                    0.0,
+                    prompt_tokens=200,
+                ),
+                ParticipantResult(
+                    "roomy", True, "RECOMMENDATION: yes - ship", "", 1.0
+                ),
+            ]
+        return [
+            ParticipantResult(
+                "tight", True, "RECOMMENDATION: no - reconsider", "", 1.0
+            ),
+            ParticipantResult(
+                "roomy", True, "RECOMMENDATION: yes - ship", "", 1.0
+            ),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    monkeypatch.setattr(orchestrator_module, "has_disagreement", lambda results: True)
+
+    _, metadata = asyncio.run(
+        execute_council(
+            ["tight", "roomy"],
+            {},
+            "q",
+            tmp_path,
+            {},
+            deliberate=True,
+            max_rounds=2,
+        )
+    )
+    # Both rounds ran; the overflowed peer was NOT permanently excluded.
+    assert round_calls == [1, 2]
+    skip_events = [
+        e
+        for e in metadata["progress_events"]
+        if e.get("event") == "deliberation_skip_participants"
+    ]
+    assert skip_events == []
+
+
+def test_write_transcript_overflow_bullet_omitted_when_no_overflow(
+    tmp_path: Path,
+):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "no-overflow.md"
+    json_path = out_dir / "no-overflow.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="ordinary run",
+        mode="quick",
+        current="codex",
+        participants=["a", "b", "c"],
+        prompt="prompt",
+        results=[
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1.0),
+            ParticipantResult("b", True, "RECOMMENDATION: yes - ship", "", 1.0),
+            ParticipantResult("c", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        ],
+        metadata={"rounds": 1, "labeled_quorum": 3, "min_quorum": 2, "degraded": False},
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "Excluded for context overflow" not in md
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert "context_overflow_excluded" not in payload
+

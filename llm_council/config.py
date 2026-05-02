@@ -142,6 +142,9 @@ def validate_config(config: dict[str, Any]) -> None:
             _validate_openai_compatible_participant(name, participant)
         _validate_positive_int(participant, "timeout", f"participant '{name}'")
         _validate_positive_int(participant, "max_prompt_chars", f"participant '{name}'")
+        _validate_positive_int(
+            participant, "max_context_tokens", f"participant '{name}'"
+        )
         _validate_positive_number(
             participant, "slow_warn_after_seconds", f"participant '{name}'"
         )

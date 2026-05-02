@@ -22,6 +22,19 @@ from llm_council.model_catalog import fetch_openrouter_models
 IMAGE_TOKEN_HEURISTIC = 1500
 
 
+def estimate_tokens(text: str) -> int:
+    """Approximate token count for a prompt string.
+
+    Uses ``len(text) / 4`` rounded up, matching ``ESTIMATED_CHARS_PER_TOKEN``
+    elsewhere. This is a coarse lower-bound suitable for budget guards; real
+    tokenizers vary per model and may produce higher counts (especially for
+    code, CJK, and long identifiers). Empty input returns 0.
+    """
+    if not text:
+        return 0
+    return math.ceil(len(text) / ESTIMATED_CHARS_PER_TOKEN)
+
+
 def estimate_council(
     *,
     config: dict[str, Any],

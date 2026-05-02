@@ -51,6 +51,8 @@ REPAIR_RETRY_INSTRUCTION = (
 
 CLI_LAUNCH_RETRY_STDERR_LIMIT = 4096
 
+CONTEXT_OVERFLOW_ERROR_PREFIX = "ContextOverflowExcluded:"
+
 
 @dataclass
 class ParticipantResult:
@@ -66,6 +68,42 @@ class ParticipantResult:
     total_tokens: int | None = None
     cost_usd: float | None = None
     recovered_after_launch_retry: bool = False
+
+
+def _context_overflow_result(
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    *,
+    image_manifest: list[dict[str, Any]] | None = None,
+) -> ParticipantResult | None:
+    raw_limit = cfg.get("max_context_tokens")
+    if raw_limit is None:
+        return None
+    limit = int(raw_limit)
+    from llm_council.estimate import IMAGE_TOKEN_HEURISTIC, estimate_tokens
+
+    estimated = estimate_tokens(prompt)
+    if image_manifest and cfg.get("vision"):
+        estimated += len(image_manifest) * IMAGE_TOKEN_HEURISTIC
+    if estimated <= limit:
+        return None
+    return ParticipantResult(
+        name=name,
+        ok=False,
+        output="",
+        error=(
+            f"{CONTEXT_OVERFLOW_ERROR_PREFIX} estimated {estimated} prompt tokens "
+            f"(approximate; chars/4) exceed max_context_tokens={limit}"
+        ),
+        elapsed_seconds=0.0,
+        model=cfg.get("model"),
+        prompt_tokens=estimated,
+    )
+
+
+def is_context_overflow_error(error: str) -> bool:
+    return error.startswith(CONTEXT_OVERFLOW_ERROR_PREFIX)
 
 
 def _format_arg(value: str, *, prompt: str, cwd: Path) -> str:
@@ -98,6 +136,9 @@ def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -
 async def run_cli_participant(
     name: str, cfg: dict[str, Any], prompt: str, cwd: Path
 ) -> ParticipantResult:
+    overflow = _context_overflow_result(name, cfg, prompt)
+    if overflow is not None:
+        return overflow
     start = time.monotonic()
     result, meta = await _run_cli_once(name, cfg, prompt, cwd, start=start)
     if _should_launch_retry(meta, cfg):
@@ -327,6 +368,11 @@ async def run_openai_compatible_participant(
     *,
     image_manifest: list[dict[str, Any]] | None = None,
 ) -> ParticipantResult:
+    overflow = _context_overflow_result(
+        name, cfg, prompt, image_manifest=image_manifest
+    )
+    if overflow is not None:
+        return overflow
     start = time.monotonic()
     key_env = cfg.get("api_key_env", "OPENROUTER_API_KEY")
     api_key = os.environ.get(key_env)
@@ -668,6 +714,11 @@ async def run_ollama_participant(
     *,
     image_manifest: list[dict[str, Any]] | None = None,
 ) -> ParticipantResult:
+    overflow = _context_overflow_result(
+        name, cfg, prompt, image_manifest=image_manifest
+    )
+    if overflow is not None:
+        return overflow
     start = time.monotonic()
     model = cfg.get("model")
     base_url = str(cfg.get("base_url") or "http://localhost:11434").rstrip("/")
@@ -944,6 +995,20 @@ async def run_participants(
             status = "ok" if result.ok else "error"
             if result.error.startswith("PromptTooLarge:"):
                 status = "skipped"
+            elif is_context_overflow_error(result.error):
+                status = "excluded"
+                if progress:
+                    progress(
+                        {
+                            "event": "context_overflow_excluded",
+                            "participant": name,
+                            "round": round_number,
+                            "estimated_tokens": result.prompt_tokens,
+                            "max_context_tokens": int(cfg.get("max_context_tokens"))
+                            if cfg.get("max_context_tokens") is not None
+                            else None,
+                        }
+                    )
             elif is_timeout_error(result.error):
                 status = "timeout"
             if progress:
