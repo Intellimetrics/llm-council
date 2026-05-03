@@ -741,10 +741,11 @@ async def test_mcp_council_run_dry_run_lists_inline_images(tmp_path: Path, monke
             "dry_run": True,
         }
     )
-    assert len(result["images"]) == 1
-    assert result["images"][0]["mime"] == "image/png"
+    images = result["metadata"]["images"]
+    assert len(images) == 1
+    assert images[0]["mime"] == "image/png"
     # Confirm staged file exists on disk after dry_run staging.
-    rel = result["images"][0]["path"]
+    rel = images[0]["path"]
     staged = tmp_path / rel
     assert staged.exists()
     assert staged.read_bytes() == sample.read_bytes()

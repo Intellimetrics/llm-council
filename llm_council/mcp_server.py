@@ -580,15 +580,39 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
     )
 
     if arguments.get("dry_run"):
+        # Strict MCP clients reject any council_run response that doesn't
+        # satisfy the advertised outputSchema. Build a schema-valid envelope
+        # with sentinel values for the fields a real run would populate, and
+        # park the dry-run preview details in `metadata`. `recommendation:
+        # "unknown"` is a legal enum value precisely for "no peer labeled" —
+        # which is exactly what dry-run is.
+        participant_models = {
+            name: (config.get("participants", {}).get(name, {}) or {}).get("model")
+            for name in participants
+        }
         return {
+            "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
+            "recommendation": "unknown",
+            "agreement_count": 0,
+            "total_labeled": 0,
+            "degraded": True,
+            "rounds": 0,
+            "deliberated": False,
             "mode": mode,
             "current": current,
             "participants": participants,
-            "prompt_chars": len(prompt),
-            "deliberate": deliberate,
-            "max_rounds": max_rounds,
-            "budget": budget,
-            "images": [_public_image_entry(entry, cwd) for entry in image_manifest],
+            "results": [],
+            "metadata": {
+                "dry_run": True,
+                "prompt_chars": len(prompt),
+                "deliberate": deliberate,
+                "max_rounds": max_rounds,
+                "budget": budget,
+                "participant_models": participant_models,
+                "images": [
+                    _public_image_entry(entry, cwd) for entry in image_manifest
+                ],
+            },
         }
 
     enforce_mcp_budget(budget)

@@ -203,9 +203,10 @@ participants:
         }
     )
 
-    assert result["budget"]["cost_estimate_available"] is True
-    assert result["budget"]["within_budget"] is False
-    assert result["budget"]["violations"][0]["limit"] == "max_estimated_cost_usd"
+    budget = result["metadata"]["budget"]
+    assert budget["cost_estimate_available"] is True
+    assert budget["within_budget"] is False
+    assert budget["violations"][0]["limit"] == "max_estimated_cost_usd"
 
 
 @pytest.mark.asyncio
@@ -250,7 +251,7 @@ async def test_mcp_image_paths_present_does_not_break_budget_check(
             "dry_run": True,
         }
     )
-    assert result["prompt_chars"] > 0
+    assert result["metadata"]["prompt_chars"] > 0
 
 
 @pytest.mark.asyncio

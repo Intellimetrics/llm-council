@@ -8103,6 +8103,63 @@ def test_transcripts_prune_requires_retention_policy(tmp_path: Path):
         cli_module._cmd_transcripts_prune(args, out_dir)
 
 
+@pytest.mark.asyncio
+async def test_mcp_council_run_dry_run_satisfies_output_schema(
+    tmp_path: Path, monkeypatch
+):
+    """council_run dry_run=true must return all outputSchema-required fields.
+    Strict MCP clients reject the call entirely if `schema_version`,
+    `recommendation`, `agreement_count`, etc. are missing — exactly the bug
+    the v0.4.0 outputSchema work was supposed to prevent."""
+    from llm_council.mcp_server import (
+        COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
+        council_run_output_schema,
+        run_council,
+    )
+
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    (tmp_path / ".llm-council.yaml").write_text(
+        """
+defaults:
+  mode: review-cheap
+participants:
+  cheap:
+    type: openrouter
+    model: openai/gpt-4o-mini
+    api_key_env: X
+modes:
+  review-cheap:
+    participants: [cheap]
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("X", "secret")
+
+    result = await run_council(
+        {
+            "question": "ping",
+            "working_directory": str(tmp_path),
+            "dry_run": True,
+        }
+    )
+
+    schema = council_run_output_schema()
+    for required_field in schema["required"]:
+        assert required_field in result, (
+            f"dry_run response missing required outputSchema field "
+            f"{required_field!r}; strict MCP clients will reject this"
+        )
+    assert result["schema_version"] == COUNCIL_RUN_OUTPUT_SCHEMA_VERSION
+    assert result["recommendation"] == "unknown"
+    assert result["agreement_count"] == 0
+    assert result["total_labeled"] == 0
+    assert result["degraded"] is True
+    assert result["rounds"] == 0
+    assert result["results"] == []
+    assert result["metadata"]["dry_run"] is True
+    assert result["metadata"]["participant_models"] == {"cheap": "openai/gpt-4o-mini"}
+
+
 def test_council_run_output_schema_advertises_typed_fields():
     from llm_council.mcp_server import council_run_output_schema
 
