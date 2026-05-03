@@ -187,6 +187,35 @@ def maybe_print_update_nag(
     return False
 
 
+def hydrate_nag_cache_from_status(
+    status: UpdateStatus,
+    *,
+    cache_path: Path | None = None,
+    now: float | None = None,
+) -> None:
+    """Write the nag cache from an explicit UpdateStatus.
+
+    Lets `llm-council check-update` count as the daily check — without this,
+    a user who runs check-update sees "no update" but the next `run` still
+    fires the nag because the cache wasn't refreshed.
+    """
+    if status.error or not status.latest_version:
+        # Failed checks shouldn't stamp a "fresh" cache; leave the file alone
+        # so the next nag attempt re-checks.
+        return
+    cache_file = cache_path if cache_path is not None else _default_nag_cache_path()
+    timestamp = now if now is not None else time.time()
+    _write_nag_cache(
+        cache_file,
+        {
+            "checked_at": timestamp,
+            "current_version": status.current_version,
+            "latest_version": status.latest_version,
+            "install_command": status.install_command,
+        },
+    )
+
+
 def _print_nag(
     stream: IO[str], current: str, latest: str, install_command: str | None
 ) -> None:

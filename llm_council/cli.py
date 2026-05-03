@@ -48,7 +48,11 @@ from llm_council.transcript import (
     transcript_records,
     write_transcript,
 )
-from llm_council.update_check import check_for_update, maybe_print_update_nag
+from llm_council.update_check import (
+    check_for_update,
+    hydrate_nag_cache_from_status,
+    maybe_print_update_nag,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -325,6 +329,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Extra OpenRouter model ID to price without editing config",
     )
     estimate.add_argument("--no-cache", action="store_true", help="Bypass model cache")
+    estimate.add_argument(
+        "--tier",
+        default=None,
+        help=(
+            "Swap participant models per `defaults.tiers.<name>` in "
+            ".llm-council.yaml before estimating, so the per-peer cost "
+            "reflects the tier you'd actually run."
+        ),
+    )
     estimate.add_argument("--json", action="store_true", help="Print JSON")
 
     last = sub.add_parser("last", help="Print the latest council transcript path/content")
@@ -923,6 +936,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_check_update(args: argparse.Namespace) -> int:
     status = check_for_update(__version__)
+    # An explicit check is at least as authoritative as the passive 24h
+    # nag refresh, so it should hydrate the same cache. Without this, a
+    # user who manually runs `check-update` would still see the old nag
+    # message on next `run` until the cache organically expires.
+    hydrate_nag_cache_from_status(status)
     if args.json:
         print(json.dumps(status.to_dict(), indent=2))
     else:
@@ -970,6 +988,12 @@ def cmd_estimate(args: argparse.Namespace) -> int:
         config = load_config(args.config or find_config(cwd), search=False)
     except (OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
+    tier = getattr(args, "tier", None)
+    if tier:
+        try:
+            apply_tier_override(config, tier)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     mode = args.mode or config.get("defaults", {}).get("mode", "quick")
     current = args.current or detect_current_agent()
     stdin_text = sys.stdin.read() if args.stdin else None
@@ -1609,6 +1633,13 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             )
 
     if args.dry_run:
+        # Surface the resolved per-peer model so callers can verify a tier
+        # override (or any participant-level model: setting) actually landed
+        # without having to run the council for real.
+        participant_models = {
+            name: (participant_cfg.get(name, {}) or {}).get("model")
+            for name in participants
+        }
         if args.json:
             print(
                 json.dumps(
@@ -1617,6 +1648,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                         "mode": mode,
                         "current": current,
                         "participants": participants,
+                        "participant_models": participant_models,
                         "prompt_chars": len(prompt),
                     },
                     indent=2,
@@ -1626,6 +1658,11 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             print(f"mode: {mode}")
             print(f"current: {current or 'unknown'}")
             print("participants: " + ", ".join(participants))
+            models_line = ", ".join(
+                f"{name}={participant_models[name] or 'default'}"
+                for name in participants
+            )
+            print(f"models: {models_line}")
             print(f"prompt_chars: {len(prompt)}")
         return 0
     if not args.json:

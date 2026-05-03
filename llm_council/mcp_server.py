@@ -389,6 +389,14 @@ def estimate_schema() -> dict[str, Any]:
                 "description": "Set to 'us' to allow only US-origin participants.",
             },
             "no_cache": {"type": "boolean", "default": False},
+            "tier": {
+                "type": "string",
+                "description": (
+                    "Swap participant models per `defaults.tiers.<name>` in "
+                    ".llm-council.yaml before estimating, so the per-peer "
+                    "cost reflects the tier you'd actually run."
+                ),
+            },
         },
         "required": ["question"],
         "additionalProperties": False,
@@ -776,6 +784,9 @@ def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
         cwd = _resolve_working_directory(arguments)
         load_project_env(cwd)
         config = load_config(find_config(cwd), search=False)
+        tier = arguments.get("tier")
+        if tier:
+            apply_tier_override(config, str(tier))
         mode = arguments.get("mode") or config.get("defaults", {}).get("mode", "quick")
         current = arguments.get("current") or detect_current_agent()
         completion_tokens = (

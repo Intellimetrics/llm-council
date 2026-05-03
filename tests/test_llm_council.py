@@ -3108,6 +3108,238 @@ def test_doctor_skips_catalog_check_when_no_openrouter_peer(monkeypatch):
     assert all(c.name != "catalog:openrouter" for c in checks)
 
 
+def test_doctor_catalog_age_uses_adaptive_units(monkeypatch, tmp_path):
+    """Sub-day thresholds shouldn't display as `0.0 days old > 0-day`."""
+    import llm_council.doctor as doctor_module
+
+    cache = tmp_path / "openrouter-models.json"
+    cache.write_text("[]")
+    monkeypatch.setattr(doctor_module, "openrouter_cache_path", lambda: cache)
+    monkeypatch.setattr(
+        doctor_module, "openrouter_cache_age_seconds", lambda: 120.0
+    )
+
+    config = {
+        "defaults": {"catalog_stale_seconds": 60},
+        "participants": {
+            "remote": {
+                "type": "openrouter",
+                "model": "anthropic/claude-sonnet-4-6",
+                "api_key_env": "X",
+            }
+        },
+        "modes": {"remote": {"participants": ["remote"]}},
+    }
+    monkeypatch.setenv("X", "secret")
+
+    checks = check_environment(config)
+    catalog_check = next(c for c in checks if c.name == "catalog:openrouter")
+    assert catalog_check.ok is False
+    # 120s old vs. 60s threshold should both render in seconds/minutes,
+    # not "0.0 days".
+    assert "0-day" not in catalog_check.detail
+    assert "days" not in catalog_check.detail
+    assert "2m" in catalog_check.detail or "120s" in catalog_check.detail
+
+
+def test_format_duration_picks_smallest_unit():
+    from llm_council.doctor import _format_duration
+
+    assert _format_duration(45) == "45s"
+    assert _format_duration(120) == "2m"
+    assert _format_duration(3700) == "1.0h"
+    assert _format_duration(90000) == "1.0d"
+    assert _format_duration(14 * 86400) == "14.0d"
+
+
+def test_estimate_subcommand_accepts_tier(monkeypatch, tmp_path, capsys):
+    """--tier should swap participant models in the estimate path too."""
+    project = tmp_path / "p"
+    project.mkdir()
+    config = {
+        "defaults": {
+            "mode": "triad",
+            "tiers": {"deep": {"gpt": "openai/o1-pro"}},
+        },
+        "participants": {
+            "gpt": {
+                "type": "openrouter",
+                "model": "openai/gpt-4o-mini",
+                "api_key_env": "X",
+                "input_per_million": 3.0,
+                "output_per_million": 15.0,
+            }
+        },
+        "modes": {"triad": {"participants": ["gpt"]}},
+        "transcripts_dir": str(project / "runs"),
+    }
+    config_path = project / ".llm-council.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    monkeypatch.setenv("X", "secret")
+
+    captured: dict[str, object] = {}
+    real_estimate = estimate_module.estimate_council
+
+    def spy(**kwargs):
+        captured["model"] = kwargs["config"]["participants"]["gpt"]["model"]
+        return real_estimate(**kwargs)
+
+    monkeypatch.setattr(estimate_module, "estimate_council", spy)
+    monkeypatch.setattr(cli_module, "estimate_council", spy)
+
+    rc = main(
+        [
+            "estimate",
+            "--config",
+            str(config_path),
+            "--cwd",
+            str(project),
+            "--tier",
+            "deep",
+            "--json",
+            "ping",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["model"] == "openai/o1-pro"
+
+
+def test_dry_run_json_includes_participant_models(monkeypatch, tmp_path):
+    """Dry-run JSON must expose resolved per-peer model after tier override."""
+    project = tmp_path / "p"
+    project.mkdir()
+    config = {
+        "defaults": {
+            "mode": "triad",
+            "tiers": {"fast": {"gpt": "openai/gpt-4o-mini"}},
+        },
+        "participants": {
+            "gpt": {
+                "type": "openrouter",
+                "model": "openai/gpt-4o",
+                "api_key_env": "X",
+            }
+        },
+        "modes": {"triad": {"participants": ["gpt"]}},
+        "transcripts_dir": str(project / "runs"),
+    }
+    config_path = project / ".llm-council.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    monkeypatch.setenv("X", "secret")
+
+    rc = main(
+        [
+            "run",
+            "--config",
+            str(config_path),
+            "--cwd",
+            str(project),
+            "--tier",
+            "fast",
+            "--dry-run",
+            "--json",
+            "ping",
+        ]
+    )
+    assert rc == 0
+
+
+def test_dry_run_json_participant_models_payload(monkeypatch, tmp_path, capsys):
+    """Verify the JSON payload itself, not just the exit code."""
+    project = tmp_path / "p"
+    project.mkdir()
+    config = {
+        "defaults": {
+            "mode": "triad",
+            "tiers": {"fast": {"gpt": "openai/gpt-4o-mini"}},
+        },
+        "participants": {
+            "gpt": {
+                "type": "openrouter",
+                "model": "openai/gpt-4o",
+                "api_key_env": "X",
+            }
+        },
+        "modes": {"triad": {"participants": ["gpt"]}},
+        "transcripts_dir": str(project / "runs"),
+    }
+    config_path = project / ".llm-council.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    monkeypatch.setenv("X", "secret")
+
+    rc = main(
+        [
+            "run",
+            "--config",
+            str(config_path),
+            "--cwd",
+            str(project),
+            "--tier",
+            "fast",
+            "--dry-run",
+            "--json",
+            "ping",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert rc == 0
+    assert payload["dry_run"] is True
+    assert payload["participant_models"] == {"gpt": "openai/gpt-4o-mini"}
+
+
+def test_check_update_hydrates_nag_cache(monkeypatch, tmp_path):
+    """`check-update` must write to the same cache the passive nag uses."""
+    cache = tmp_path / "update-check.json"
+    monkeypatch.setattr(
+        update_check_module,
+        "_default_nag_cache_path",
+        lambda: cache,
+    )
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [{"name": "v9.9.9"}]
+
+    monkeypatch.setattr(
+        update_check_module.httpx, "get", lambda *_args, **_kwargs: FakeResponse()
+    )
+
+    rc = main(["check-update"])
+
+    assert rc == 0
+    assert cache.exists()
+    cached = json.loads(cache.read_text())
+    assert cached["latest_version"] == "9.9.9"
+    assert "checked_at" in cached
+
+
+def test_check_update_does_not_hydrate_cache_on_error(monkeypatch, tmp_path):
+    """A failed check-update must not stamp a fresh cache or it would mask
+    a real upgrade window with stale negative info."""
+    cache = tmp_path / "update-check.json"
+    monkeypatch.setattr(
+        update_check_module,
+        "_default_nag_cache_path",
+        lambda: cache,
+    )
+
+    def boom(*_args, **_kwargs):
+        raise httpx.ConnectError("simulated")
+
+    monkeypatch.setattr(update_check_module.httpx, "get", boom)
+
+    rc = main(["check-update"])
+
+    assert rc == 1
+    assert not cache.exists()
+
+
 def test_recommendation_policy_for_architecture():
     use, mode, reason = should_use_council("architecture decision for auth")
     assert use is True

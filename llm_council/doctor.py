@@ -132,22 +132,37 @@ def _check_openrouter_catalog_age(config: dict[str, Any]) -> Check:
                 "run `llm-council models refresh`"
             ),
         )
-    days = age / 86400.0
     if age > threshold:
         return Check(
             name="catalog:openrouter",
             ok=False,
             detail=(
-                f"stale ({days:.1f} days old > "
-                f"{threshold / 86400.0:.0f}-day threshold) — "
+                f"stale ({_format_duration(age)} old > "
+                f"{_format_duration(threshold)} threshold) — "
                 "run `llm-council models refresh`"
             ),
         )
     return Check(
         name="catalog:openrouter",
         ok=True,
-        detail=f"fresh ({days:.1f} days old)",
+        detail=f"fresh ({_format_duration(age)} old)",
     )
+
+
+def _format_duration(seconds: float) -> str:
+    """Render a duration in the smallest sensible unit.
+
+    Avoids the `0.0 days old > 0-day threshold` confusion when a user
+    configures sub-day thresholds — picks whichever unit produces a
+    readable, non-zero number.
+    """
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
 
 
 def _probe_openrouter(
