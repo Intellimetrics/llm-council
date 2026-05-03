@@ -166,17 +166,39 @@ def council_run_schema() -> dict[str, Any]:
     }
 
 
+COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 1
+COUNCIL_RUN_VALID_STANCES = ("for", "against", "neutral")
+COUNCIL_RUN_VALID_ERROR_KINDS = (
+    "timeout",
+    "context_overflow",
+    "prompt_too_large",
+    "invalid_response",
+    "downstream_error",
+    "cli_nonzero_exit",
+    "unknown",
+)
+
+
 def council_run_output_schema() -> dict[str, Any]:
     """JSON schema describing council_run's structured response.
 
     Advertised so callers can branch on typed fields rather than parsing the
     text content. The shape mirrors what `run_council` returns and is kept
-    in sync by the regression tests.
+    in sync by the regression tests. Bump COUNCIL_RUN_OUTPUT_SCHEMA_VERSION
+    on any breaking shape change.
     """
 
     return {
         "type": "object",
         "properties": {
+            "schema_version": {
+                "type": "integer",
+                "const": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
+                "description": (
+                    "Output-schema version. Bump when the shape changes in "
+                    "a way that downstream consumers must adapt to."
+                ),
+            },
             "recommendation": {
                 "type": "string",
                 "enum": ["yes", "no", "tradeoff", "unknown"],
@@ -224,10 +246,16 @@ def council_run_output_schema() -> dict[str, Any]:
                             "type": ["string", "null"],
                             "enum": ["yes", "no", "tradeoff", "unknown", None],
                         },
-                        "stance": {"type": ["string", "null"]},
+                        "stance": {
+                            "type": ["string", "null"],
+                            "enum": [*COUNCIL_RUN_VALID_STANCES, None],
+                        },
                         "elapsed_seconds": {"type": "number"},
                         "error": {"type": "string"},
-                        "error_kind": {"type": ["string", "null"]},
+                        "error_kind": {
+                            "type": ["string", "null"],
+                            "enum": [*COUNCIL_RUN_VALID_ERROR_KINDS, None],
+                        },
                         "model": {"type": ["string", "null"]},
                         "total_tokens": {"type": ["integer", "null"]},
                         "cost_usd": {"type": ["number", "null"]},
@@ -241,6 +269,7 @@ def council_run_output_schema() -> dict[str, Any]:
             "metadata": {"type": "object"},
         },
         "required": [
+            "schema_version",
             "recommendation",
             "agreement_count",
             "total_labeled",
@@ -562,11 +591,16 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
                 deliberate=deliberate,
                 max_rounds=max_rounds,
                 use_cache=True,
+                allow_network=False,
                 image_paths=image_path_inputs or None,
             )
         except (OSError, ValueError) as exc:
             raise ValueError(f"failed to compute pre-flight estimate: {exc}") from exc
-        cost_total = float(preflight.get("known_total_usd") or 0.0)
+        cost_total = float(
+            preflight.get("known_total_with_retry_safety_usd")
+            if preflight.get("known_total_with_retry_safety_usd") is not None
+            else (preflight.get("known_total_usd") or 0.0)
+        )
         token_rows = preflight.get("rows") or []
         token_total = sum(
             int(row.get("estimated_input_tokens") or 0)
@@ -588,7 +622,8 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
             )
         if max_cost_usd is not None and cost_total > float(max_cost_usd):
             raise ValueError(
-                f"Pre-flight estimate ${cost_total:.6f} exceeds max_cost_usd "
+                f"Pre-flight estimate ${cost_total:.6f} (with worst-case "
+                f"repair-retry headroom) exceeds max_cost_usd "
                 f"${float(max_cost_usd):.6f}; refused before any participant "
                 "was invoked."
             )
@@ -674,6 +709,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
             }
         )
     return {
+        "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
         "recommendation": recommendation,
         "agreement_count": agreement,
         "total_labeled": labeled_total,

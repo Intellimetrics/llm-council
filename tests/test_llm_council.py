@@ -7506,6 +7506,109 @@ def test_council_run_schema_includes_stances_and_budget_args():
     assert "max_tokens" in props
 
 
+def test_council_run_output_schema_advertises_schema_version_and_enums():
+    """v0.4.1 polish: schema_version field is required + advertised; stance
+    and error_kind have closed enums so consumers can branch safely."""
+    from llm_council.mcp_server import (
+        COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
+        council_run_output_schema,
+    )
+
+    schema = council_run_output_schema()
+    assert "schema_version" in schema["properties"]
+    assert (
+        schema["properties"]["schema_version"]["const"]
+        == COUNCIL_RUN_OUTPUT_SCHEMA_VERSION
+    )
+    assert "schema_version" in schema["required"]
+    item_props = schema["properties"]["results"]["items"]["properties"]
+    assert set(item_props["stance"]["enum"]) >= {"for", "against", "neutral", None}
+    assert set(item_props["error_kind"]["enum"]) >= {
+        "timeout",
+        "context_overflow",
+        "prompt_too_large",
+        "invalid_response",
+        "downstream_error",
+        "cli_nonzero_exit",
+        "unknown",
+        None,
+    }
+
+
+def test_estimate_council_includes_repair_retry_safety_total(tmp_path: Path):
+    """v0.4.1 polish: pre-flight estimate must include a retry-safety total
+    so the budget cap accounts for the worst-case repair retry HTTP call
+    that the runtime adapter will make if the first response is missing
+    the RECOMMENDATION label."""
+    from llm_council.estimate import estimate_council
+
+    config = {
+        "version": 1,
+        "defaults": {"mode": "quick"},
+        "participants": {
+            "claude": {"type": "cli", "command": "claude"},
+        },
+        "modes": {"quick": {"participants": ["claude"]}},
+    }
+    estimate = estimate_council(
+        config=config,
+        cwd=tmp_path,
+        question="test",
+        mode="quick",
+        current=None,
+        deliberate=False,
+        allow_network=False,
+    )
+    assert "known_total_with_retry_safety_usd" in estimate
+    # CLI peers have no priced cost, so both totals are 0; the field
+    # must still be present as a number for downstream callers.
+    assert isinstance(estimate["known_total_with_retry_safety_usd"], (int, float))
+
+
+def test_estimate_council_skips_network_when_allow_network_false(monkeypatch, tmp_path: Path):
+    """v0.4.1 polish: budget-gate preflight must not stall on httpx.get
+    when the catalog cache is missing. Returning empty rows for hosted
+    peers triggers the unpriced-paid refusal path instead of waiting on
+    a network call that's about to be irrelevant."""
+    from llm_council import estimate as estimate_mod
+
+    fetch_calls: list[bool] = []
+
+    def fake_fetch(use_cache=True, allow_network=True):
+        fetch_calls.append(allow_network)
+        # Simulate cache-miss + no-network: return empty.
+        if not allow_network:
+            return []
+        raise AssertionError("network fetch must be skipped when allow_network=False")
+
+    monkeypatch.setattr(estimate_mod, "fetch_openrouter_models", fake_fetch)
+    config = {
+        "version": 1,
+        "defaults": {"mode": "quick"},
+        "participants": {
+            "hosted": {
+                "type": "openrouter",
+                "model": "anthropic/claude-3.5-sonnet",
+                "api_key_env": "OPENROUTER_API_KEY",
+            },
+        },
+        "modes": {"quick": {"participants": ["hosted"]}},
+    }
+    estimate = estimate_mod.estimate_council(
+        config=config,
+        cwd=tmp_path,
+        question="test",
+        mode="quick",
+        current=None,
+        deliberate=False,
+        allow_network=False,
+    )
+    assert fetch_calls == [False]
+    # The hosted row's cost lookup missed → None, so it's an unknown-cost
+    # row. The budget gate's unpriced_paid check would refuse on this.
+    assert estimate["unknown_cost_rows"] == ["hosted"]
+
+
 def test_classify_error_recognizes_cli_nonzero_exit():
     """V3 dogfood fix: silent CLI failure now lands with `CliExitNonZero:`
     prefix and gets a stable `cli_nonzero_exit` kind, instead of leaking

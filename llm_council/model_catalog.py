@@ -63,13 +63,23 @@ def openrouter_cache_path() -> Path:
 
 
 def fetch_openrouter_models(
-    timeout: float = 30, *, use_cache: bool = True
+    timeout: float = 30, *, use_cache: bool = True, allow_network: bool = True
 ) -> list[dict[str, Any]]:
+    """Fetch the OpenRouter model catalog.
+
+    `use_cache=True` reads from the disk cache when fresh. `allow_network=False`
+    additionally refuses to fall through to a live HTTP fetch on cache miss
+    or stale cache, so callers that need a fast no-network path (e.g. the
+    pre-flight budget gate) can fail cleanly instead of stalling on the
+    network. Returns an empty list when both paths are denied.
+    """
     cache_path = openrouter_cache_path()
     if use_cache:
         cached = _read_cache(cache_path)
         if cached is not None:
             return cached
+    if not allow_network:
+        return []
     response = httpx.get(OPENROUTER_MODELS_URL, timeout=timeout)
     response.raise_for_status()
     data = response.json()

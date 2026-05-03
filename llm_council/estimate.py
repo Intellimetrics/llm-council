@@ -54,9 +54,19 @@ def estimate_council(
     completion_tokens: int = 1500,
     openrouter_models: list[str] | None = None,
     use_cache: bool = True,
+    allow_network: bool = True,
     image_paths: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Return a best-effort preflight estimate for a council run."""
+    """Return a best-effort preflight estimate for a council run.
+
+    `allow_network=False` prevents the OpenRouter catalog fetch from falling
+    back to live HTTP if the disk cache is missing or stale; the result is
+    a fast-fail estimate suitable for the pre-flight budget gate (which
+    needs to refuse before any network call so a too-low cap doesn't cost
+    a multi-second wait). Hosted peers without a cached price come back
+    with `estimated_total_cost_usd: None`, which the budget gate already
+    treats as a refusal condition.
+    """
     participants = select_participants(
         config,
         mode,
@@ -120,7 +130,9 @@ def estimate_council(
         try:
             catalog_by_id = {
                 model["id"]: model
-                for model in fetch_openrouter_models(use_cache=use_cache)
+                for model in fetch_openrouter_models(
+                    use_cache=use_cache, allow_network=allow_network
+                )
                 if model.get("id")
             }
         except Exception as exc:  # pragma: no cover - depends on network state
@@ -156,6 +168,26 @@ def estimate_council(
         for row in rows
         if row["estimated_total_cost_usd"] is not None
     )
+    # Repair-retry safety margin: the adapter issues one extra HTTP call per
+    # peer when the first response is missing the RECOMMENDATION label, and
+    # that call wasn't covered by the round-budget cost. For peers where
+    # retry_on_missing_label is enabled (the default), worst case is
+    # roughly one additional round of input+output tokens per peer.
+    safety_total = known_total
+    for row in rows:
+        if row["estimated_total_cost_usd"] is None:
+            continue
+        peer_cfg = participant_cfg.get(row["name"], {}) if isinstance(
+            participant_cfg, dict
+        ) else {}
+        if peer_cfg.get("retry_on_missing_label", True) is False:
+            continue
+        per_round = (
+            row["estimated_total_cost_usd"] / budgeted_rounds
+            if budgeted_rounds > 0
+            else row["estimated_total_cost_usd"]
+        )
+        safety_total += per_round
     unknown_cost_rows = [
         row["name"] for row in rows if row["estimated_total_cost_usd"] is None
     ]
@@ -178,6 +210,7 @@ def estimate_council(
         "completion_tokens_assumed_each": completion_tokens,
         "image_paths": list(image_paths or []),
         "known_total_usd": round(known_total, 6),
+        "known_total_with_retry_safety_usd": round(safety_total, 6),
         "unknown_cost_rows": unknown_cost_rows,
         "catalog_error": catalog_error,
         "rows": rows,

@@ -1494,11 +1494,18 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                 deliberate=deliberate,
                 max_rounds=max_rounds,
                 use_cache=True,
+                allow_network=False,
                 image_paths=args.image,
             )
         except (OSError, ValueError) as exc:
             raise SystemExit(f"failed to compute pre-flight estimate: {exc}") from exc
-        cost_total = float(preflight.get("known_total_usd") or 0.0)
+        # Use the retry-safety total so a worst-case repair retry can't
+        # silently push spend past the cap after preflight clears.
+        cost_total = float(
+            preflight.get("known_total_with_retry_safety_usd")
+            if preflight.get("known_total_with_retry_safety_usd") is not None
+            else (preflight.get("known_total_usd") or 0.0)
+        )
         token_rows = preflight.get("rows") or []
         token_total = sum(
             int(row.get("estimated_input_tokens") or 0)
@@ -1526,10 +1533,13 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             )
         if max_cost_usd is not None and cost_total > float(max_cost_usd):
             raise SystemExit(
-                f"Pre-flight estimate ${cost_total:.6f} exceeds --max-cost-usd "
+                f"Pre-flight estimate ${cost_total:.6f} (with worst-case "
+                f"repair-retry headroom) exceeds --max-cost-usd "
                 f"${float(max_cost_usd):.6f}. Free/local peers count as $0; "
                 "drop expensive peers, raise the cap, or run `llm-council "
-                "estimate ...` for a per-peer breakdown."
+                "estimate ...` for a per-peer breakdown. To exclude the "
+                "repair-retry margin, set retry_on_missing_label: false on "
+                "individual participants."
             )
         if max_tokens is not None and token_total > int(max_tokens):
             raise SystemExit(
