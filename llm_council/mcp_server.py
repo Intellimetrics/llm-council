@@ -936,7 +936,7 @@ async def _serve() -> None:
         ]
 
     @app.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    async def call_tool(name: str, arguments: dict):
         if name == "council_run":
             result = await run_council(arguments)
         elif name == "council_recommend":
@@ -961,7 +961,14 @@ async def _serve() -> None:
             result = run_stats(arguments)
         else:
             raise ValueError(f"Unknown tool: {name}")
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        text_blocks = [TextContent(type="text", text=json.dumps(result, indent=2))]
+        # Tools that advertise an outputSchema MUST return structuredContent
+        # alongside the text payload — strict MCP clients refuse the call
+        # otherwise. Right now only `council_run` is typed; if more tools
+        # gain outputSchema, extend this set.
+        if name == "council_run":
+            return text_blocks, result
+        return text_blocks
 
     async with stdio_server() as (read_stream, write_stream):
         await app.run(
