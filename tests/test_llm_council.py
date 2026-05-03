@@ -2640,6 +2640,16 @@ def test_load_project_env_does_not_override_existing(tmp_path: Path, monkeypatch
     assert __import__("os").environ["OPENROUTER_API_KEY"] == "from-env"
 
 
+def test_load_project_env_llm_council_env_overrides_shell(tmp_path: Path, monkeypatch):
+    """Project-specific `.llm-council.env` is authoritative over the parent
+    shell, so a stale OPENROUTER_API_KEY in the MCP host's environment can't
+    silently shadow the value the user just put in the project file."""
+    (tmp_path / ".llm-council.env").write_text("OPENROUTER_API_KEY=from-council-file\n")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "stale-shell-value")
+    load_project_env(tmp_path)
+    assert __import__("os").environ["OPENROUTER_API_KEY"] == "from-council-file"
+
+
 def test_load_project_env_precedence(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     (tmp_path / ".env").write_text("OPENROUTER_API_KEY=from-env-file\n")

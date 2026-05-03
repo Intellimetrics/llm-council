@@ -18,6 +18,7 @@ htmlcov/
 
 .mcp.json
 .llm-council.yaml
+.llm-council.env
 .llm-council/
 
 .DS_Store
