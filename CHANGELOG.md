@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Visual identity
+
+- CLI progress and final-result lines now render through a right-aligned
+  12-character bold-cyan gutter (verbs `Convening` / `Round` /
+  `Deliberating` / `Concluded` for orchestrator events; peer name as the
+  gutter token for per-participant lines). Status words inside the
+  content are colored separately (`ok` green, `timeout`/`slow` yellow,
+  `failed`/`error`/`degraded` red). The layout — not the color — is the
+  signature, so it survives `NO_COLOR=1` and non-TTY contexts unchanged.
+- Final-result block now ends with a `─` × 12 rule (ASCII `-` × 12
+  fallback when `sys.stdout.encoding` is not UTF) above the transcript
+  path so the reader's eye lands on the path last.
+- New `summary_markdown` field on the MCP `council_run` outputSchema:
+  `**Council** · mode=X · N/M succeeded · time · recommendation=Y` +
+  per-peer markdown table + blockquoted transcript path. Designed to
+  survive host-agent rendering (markdown blockquotes/tables/bold
+  headings are reliably preserved when agents quote tool output, even
+  if they paraphrase surrounding prose). Also emitted on dry-run.
+- **Deprecation note:** the literal substrings `Council starting:` and
+  `Council complete:` are preserved inside the gutter content for one
+  minor version so existing greppers / CI scripts continue to match.
+  They will move to the gutter token only in 0.6.0; update any matchers
+  to look for the gutter verbs (`Convening`, `Concluded`) before then.
+
 ## 0.4.0 - 2026-05-02
 
 This release pairs structural fixes for the consensus-stance feature with ergonomics, observability, and budget improvements surfaced during end-to-end testing of the v0.4.0 surface.

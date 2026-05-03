@@ -24,6 +24,7 @@ from llm_council.config import (
 )
 from llm_council.adapters import classify_error
 from llm_council.budget import image_attachment_violations
+from llm_council import display
 from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_prompt
 from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env
@@ -1282,15 +1283,27 @@ def _print_progress_event(event: dict) -> None:
     kind = event.get("event")
     participant = event.get("participant")
     round_label = f"round {event.get('round')}" if event.get("round") else "round ?"
+    color = display.wants_color(sys.stderr)
     if kind == "participant_start":
-        print(f"- {participant}: starting {round_label}", flush=True)
+        print(
+            display.format_gutter(
+                participant or "peer",
+                f"start {round_label}",
+                color=color,
+            ),
+            flush=True,
+        )
         return
     if kind == "participant_slow":
         elapsed = float(event.get("elapsed_seconds") or 0)
         timeout = float(event.get("timeout_seconds") or 0)
+        slow = display.colorize_status("slow", color=color)
         print(
-            f"- {participant}: still running after {elapsed:.1f}s "
-            f"(hard timeout at {timeout:.0f}s)",
+            display.format_gutter(
+                participant or "peer",
+                f"{slow} after {elapsed:.1f}s (hard timeout at {timeout:.0f}s)",
+                color=color,
+            ),
             flush=True,
         )
         return
@@ -1303,42 +1316,96 @@ def _print_progress_event(event: dict) -> None:
             details.append(f"${float(event['cost_usd']):.6f}")
         if event.get("from_cache"):
             details.append("cached")
-        print(f"- {participant}: {status} {round_label} ({'; '.join(details)})", flush=True)
+        colored_status = display.colorize_status(status, color=color)
+        print(
+            display.format_gutter(
+                participant or "peer",
+                f"{colored_status} {round_label} ({'; '.join(details)})",
+                color=color,
+            ),
+            flush=True,
+        )
         if event.get("error"):
-            print(f"  {event['error']}", flush=True)
+            print(
+                display.format_gutter("", event["error"], color=color),
+                flush=True,
+            )
         return
     if kind == "deliberation_skip_participants":
         skipped = ", ".join(event.get("skipped") or [])
         print(
-            f"Deliberation: skipping {skipped} from round {event.get('round')} "
-            f"({event.get('reason')})",
+            display.format_gutter(
+                display.VERB_DELIBERATING,
+                f"skipping {skipped} from round {event.get('round')} "
+                f"({event.get('reason')})",
+                color=color,
+            ),
             flush=True,
         )
         return
     if kind == "deliberation_pending":
-        print(f"Deliberation: disagreement detected; starting round {event.get('round')}", flush=True)
+        print(
+            display.format_gutter(
+                display.VERB_DELIBERATING,
+                f"disagreement detected; starting round {event.get('round')}",
+                color=color,
+            ),
+            flush=True,
+        )
         return
     if kind == "deliberation_round_start":
-        print(f"Deliberation: running round {event.get('round')}", flush=True)
+        print(
+            display.format_gutter(
+                display.VERB_ROUND,
+                f"{event.get('round')} (deliberation)",
+                color=color,
+            ),
+            flush=True,
+        )
         return
     if kind == "deliberation_skip":
-        print(f"Deliberation: skipped ({event.get('reason')})", flush=True)
+        print(
+            display.format_gutter(
+                display.VERB_DELIBERATING,
+                f"skipped ({event.get('reason')})",
+                color=color,
+            ),
+            flush=True,
+        )
         return
     if kind == "deliberation_finish":
-        print(f"Deliberation: {event.get('status')} after {event.get('rounds')} rounds", flush=True)
+        status = event.get("status") or "done"
+        colored_status = display.colorize_status(status, color=color)
+        print(
+            display.format_gutter(
+                display.VERB_DELIBERATING,
+                f"{colored_status} after {event.get('rounds')} rounds",
+                color=color,
+            ),
+            flush=True,
+        )
         return
     if kind == "degraded_consensus":
         labeled = event.get("labeled_quorum")
         threshold = event.get("min_quorum")
+        degraded = display.colorize_status("DEGRADED", color=color)
         print(
-            f"Quorum: {labeled} of {threshold} required peers labeled — DEGRADED",
+            display.format_gutter(
+                "Quorum",
+                f"{labeled} of {threshold} required peers labeled — {degraded}",
+                color=color,
+            ),
             flush=True,
         )
         return
     if kind == "images_skipped":
         print(
-            f"- {participant}: image attachments skipped ({event.get('reason')}; "
-            f"{event.get('image_count')} image(s) referenced as text only)",
+            display.format_gutter(
+                participant or "peer",
+                f"image attachments skipped ({event.get('reason')}; "
+                f"{event.get('image_count')} image(s) referenced as text only)",
+                color=color,
+            ),
             flush=True,
         )
 
@@ -1686,13 +1753,28 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             print(f"prompt_chars: {len(prompt)}")
         return 0
     if not args.json:
+        color = display.wants_color(sys.stderr)
+        # Keep the literal "Council starting:" substring in the content half
+        # so existing greppers / CI scripts continue to match for one minor
+        # version (deprecation note in CHANGELOG).
         print(
-            f"Council starting: mode={mode}, current={current or 'unknown'}, "
-            f"participants={', '.join(participants)}, prompt_chars={len(prompt)}",
+            display.format_gutter(
+                display.VERB_CONVENING,
+                f"Council starting: mode={mode}, current={current or 'unknown'}, "
+                f"participants={', '.join(participants)}, prompt_chars={len(prompt)}",
+                color=color,
+            ),
             flush=True,
         )
         if deliberate:
-            print(f"Deliberation enabled: max_rounds={max_rounds}", flush=True)
+            print(
+                display.format_gutter(
+                    display.VERB_DELIBERATING,
+                    f"enabled: max_rounds={max_rounds}",
+                    color=color,
+                ),
+                flush=True,
+            )
     results, metadata = await execute_council(
         participants,
         participant_cfg,
@@ -1780,9 +1862,26 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
 
         ok = sum(1 for result in results if result.ok)
         timed_out = [result for result in results if is_timeout_error(result.error)]
-        print(f"Council complete: {ok}/{len(results)} participants succeeded")
+        color = display.wants_color(sys.stdout)
+        unicode_safe = display.wants_unicode_rule(sys.stdout)
+        # Same "Council complete:" substring is preserved in the content so
+        # existing greppers don't break.
+        complete_word = display.colorize_status("complete", color=color)
+        print(
+            display.format_gutter(
+                display.VERB_CONCLUDED,
+                f"Council {complete_word}: {ok}/{len(results)} participants succeeded",
+                color=color,
+            )
+        )
         if metadata.get("deliberated"):
-            print("Deliberation: second round ran after disagreement detection")
+            print(
+                display.format_gutter(
+                    display.VERB_DELIBERATING,
+                    "second round ran after disagreement detection",
+                    color=color,
+                )
+            )
         for result in results:
             if result.ok:
                 status = "ok"
@@ -1790,7 +1889,14 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                 status = "timeout"
             else:
                 status = "error"
-            print(f"- {result.name}: {status} ({result.elapsed_seconds:.1f}s)")
+            colored_status = display.colorize_status(status, color=color)
+            print(
+                display.format_gutter(
+                    result.name,
+                    f"{colored_status} ({result.elapsed_seconds:.1f}s)",
+                    color=color,
+                )
+            )
             if transparent:
                 details = []
                 if result.total_tokens is not None:
@@ -1798,18 +1904,39 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                 if result.cost_usd is not None:
                     details.append(f"${result.cost_usd:.6f}")
                 if details:
-                    print(f"  {'; '.join(details)}")
+                    print(
+                        display.format_gutter(
+                            "", "; ".join(details), color=color
+                        )
+                    )
             if not result.ok:
-                print(f"  {result.error}")
+                print(display.format_gutter("", result.error, color=color))
         if timed_out:
             names = ", ".join(
                 sorted({r.name.split(":round")[0] for r in timed_out})
             )
             print(
-                f"Note: {names} timed out. Increase `participants.<name>.timeout` "
-                "in `.llm-council.yaml` for slower models, or shorten the prompt."
+                display.format_gutter(
+                    "Note",
+                    f"{names} timed out. Increase "
+                    f"`participants.<name>.timeout` in `.llm-council.yaml` "
+                    "for slower models, or shorten the prompt.",
+                    color=color,
+                )
             )
-        print(f"Transcript: {md_path}")
+        # Horizontal rule → transcript path. The rule's gutter token is
+        # blank; the rule itself is the content. Above the path so the
+        # reader's eye lands on the path last (council-recommended).
+        print(
+            display.format_gutter(
+                "",
+                display.horizontal_rule(
+                    unicode_safe=unicode_safe, color=color
+                ),
+                color=color,
+            )
+        )
+        print(display.format_gutter("Transcript", str(md_path), color=color))
     return 0
 
 

@@ -14,20 +14,29 @@
 > parallel, all logged to a local transcript.
 
 ```text
-Council starting: mode=consensus, current=codex, participants=claude, codex, gemini
-- claude: starting round 1   (stance: for)
-- codex:  starting round 1   (stance: against)
-- gemini: starting round 1   (stance: neutral)
-- claude: ok    round 1     1432 tokens   $0.00867
-- codex:  ok    round 1     1581 tokens   $0.00951
-- gemini: ok    round 1     1290 tokens   $0.00774
-Convergence: diverging   -> deliberation round 2 scheduled
-- gemini: ok    round 2     1104 tokens   $0.00662
-- codex:  ok    round 2     1221 tokens   $0.00734
-- claude: ok    round 2      996 tokens   $0.00598
-Council complete: 3/3 participants succeeded   total: $0.04586
-Transcript: .llm-council/runs/20260503_142701_review_consensus.md
+   Convening Council starting: mode=consensus, current=codex, participants=claude, codex, gemini
+      claude start round 1
+       codex start round 1
+      gemini start round 1
+      claude ok round 1 (1432 tokens; $0.00867)
+       codex ok round 1 (1581 tokens; $0.00951)
+      gemini ok round 1 (1290 tokens; $0.00774)
+Deliberating disagreement detected; starting round 2
+       Round 2 (deliberation)
+      gemini ok round 2 (1104 tokens; $0.00662)
+       codex ok round 2 (1221 tokens; $0.00734)
+      claude ok round 2 (996 tokens; $0.00598)
+   Concluded Council complete: 3/3 participants succeeded
+             ────────────
+  Transcript .llm-council/runs/20260503_142701_review_consensus.md
 ```
+
+A right-aligned bold-cyan gutter (verb on orchestrator lines, peer name
+on per-participant lines) gives council its visual identity. The
+*layout* is the signature, not the color — `NO_COLOR=1` and piped
+contexts strip the ANSI but keep the right-alignment, so council output
+stays scannable in CI logs too. Status words inside the content are
+colored separately: `ok` green, `timeout` yellow, `failed` / `error` red.
 
 ---
 

@@ -2343,9 +2343,10 @@ def test_cli_run_summary_dedupes_round_suffixed_timeout_names(tmp_path, capsys, 
     rc = main(["run", "--cwd", str(tmp_path), "--current", "claude", "x"])
     assert rc == 0
     out = capsys.readouterr().out
-    # Summary line uses base name only, not 'b:round2'.
-    assert "Note: b timed out." in out
-    assert "b:round2" not in out.split("Note:")[1]
+    # Summary line uses base name only, not 'b:round2'. The gutter
+    # right-aligns "Note" so we look for the bare `b timed out.` content.
+    assert "b timed out." in out
+    assert "b:round2" not in out.split("timed out")[1]
 
 
 def test_validate_config_rejects_negative_slow_warn_after_seconds():
@@ -3473,6 +3474,249 @@ def test_cache_hit_seconds_none_for_uncached_runs():
     )
     assert fresh.from_cache is False
     assert fresh.cache_hit_seconds is None
+
+
+def test_display_format_gutter_right_aligns_to_12_chars():
+    from llm_council.display import format_gutter
+
+    line = format_gutter("claude", "ok round 1 (12.3s)", color=False)
+    # Right-aligned: 6 spaces + "claude" = 12, then space, then content.
+    assert line == "      claude ok round 1 (12.3s)"
+
+
+def test_display_format_gutter_truncates_oversize_token():
+    from llm_council.display import format_gutter
+
+    line = format_gutter("very_long_peer_name_indeed", "ok", color=False)
+    # Truncated to 12 chars; gutter width preserved.
+    assert line == "very_long_pe ok"
+
+
+def test_display_format_gutter_color_wraps_with_ansi_when_enabled():
+    from llm_council.display import ANSI_GUTTER, ANSI_RESET, format_gutter
+
+    line = format_gutter("Convening", "Council starting: ...", color=True)
+    assert ANSI_GUTTER in line
+    assert ANSI_RESET in line
+    # The right-aligned token is inside the ANSI wrappers; content is plain.
+    assert "Council starting: ..." in line
+
+
+def test_display_colorize_status_maps_known_words():
+    from llm_council.display import (
+        ANSI_FAIL,
+        ANSI_OK,
+        ANSI_WARN,
+        colorize_status,
+    )
+
+    assert ANSI_OK in colorize_status("ok", color=True)
+    assert ANSI_FAIL in colorize_status("error", color=True)
+    assert ANSI_FAIL in colorize_status("failed", color=True)
+    assert ANSI_WARN in colorize_status("timeout", color=True)
+    assert ANSI_WARN in colorize_status("slow", color=True)
+    # Unknown status word: returned unchanged.
+    assert colorize_status("mystery", color=True) == "mystery"
+    # Color disabled: never wraps.
+    assert colorize_status("ok", color=False) == "ok"
+
+
+def test_display_wants_color_respects_no_color(monkeypatch):
+    from llm_council.display import wants_color
+
+    class FakeTty:
+        def isatty(self):
+            return True
+
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert wants_color(FakeTty()) is False
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    assert wants_color(FakeTty()) is True
+
+
+def test_display_wants_color_false_for_non_tty():
+    from llm_council.display import wants_color
+
+    class FakeNonTty:
+        def isatty(self):
+            return False
+
+    assert wants_color(FakeNonTty()) is False
+
+
+def test_display_wants_unicode_rule_sniffs_encoding():
+    from llm_council.display import wants_unicode_rule
+
+    class FakeStream:
+        def __init__(self, encoding):
+            self.encoding = encoding
+
+    assert wants_unicode_rule(FakeStream("utf-8")) is True
+    assert wants_unicode_rule(FakeStream("UTF-16")) is True
+    # CP437 / legacy windows console — fallback to ASCII rule.
+    assert wants_unicode_rule(FakeStream("cp437")) is False
+    assert wants_unicode_rule(FakeStream(None)) is False
+
+
+def test_display_horizontal_rule_falls_back_to_ascii():
+    from llm_council.display import horizontal_rule
+
+    assert "─" in horizontal_rule(unicode_safe=True, color=False)
+    assert horizontal_rule(unicode_safe=False, color=False) == "-" * 12
+
+
+def test_render_summary_markdown_has_council_header_and_table():
+    from llm_council.display import render_summary_markdown
+
+    markdown = render_summary_markdown(
+        mode="quick",
+        ok_count=3,
+        total=3,
+        elapsed_seconds=18.4,
+        recommendation="tradeoff",
+        per_peer_rows=[
+            {"name": "claude", "label": "yes", "stance": None, "elapsed_seconds": 12.3},
+            {"name": "codex", "label": "no", "stance": None, "elapsed_seconds": 8.7},
+            {"name": "gemini", "label": "tradeoff", "stance": None, "elapsed_seconds": 14.1},
+        ],
+        transcript_path=".llm-council/runs/example.md",
+    )
+    # Council header with mid-dot separators.
+    assert markdown.startswith("**Council** ·")
+    assert "mode=quick" in markdown
+    assert "3/3 succeeded" in markdown
+    assert "recommendation=tradeoff" in markdown
+    # Markdown table per peer.
+    assert "| peer | label | time |" in markdown
+    assert "| claude | yes |" in markdown
+    # Blockquoted transcript path.
+    assert "> Transcript: `.llm-council/runs/example.md`" in markdown
+
+
+def test_render_summary_markdown_includes_stance_column_when_present():
+    from llm_council.display import render_summary_markdown
+
+    markdown = render_summary_markdown(
+        mode="consensus",
+        ok_count=3,
+        total=3,
+        elapsed_seconds=20.0,
+        recommendation="yes",
+        per_peer_rows=[
+            {"name": "claude", "label": "yes", "stance": "for", "elapsed_seconds": 10.0},
+            {"name": "codex", "label": "no", "stance": "against", "elapsed_seconds": 8.0},
+        ],
+        transcript_path=None,
+        deliberated=True,
+        rounds=2,
+    )
+    assert "stance" in markdown
+    assert "| claude | yes | for |" in markdown
+    assert "2 rounds" in markdown
+
+
+def test_council_run_emits_summary_markdown(monkeypatch, tmp_path):
+    """council_run must include summary_markdown so host agents can quote it."""
+    import asyncio
+
+    from llm_council.adapters import ParticipantResult
+    from llm_council.mcp_server import run_council
+
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    (tmp_path / ".llm-council.yaml").write_text(
+        """
+defaults:
+  mode: review-cheap
+participants:
+  cheap:
+    type: openrouter
+    model: openai/gpt-4o-mini
+    api_key_env: X
+modes:
+  review-cheap:
+    participants: [cheap]
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("X", "secret")
+
+    async def fake_execute_council(*args, **kwargs):
+        return (
+            [
+                ParticipantResult(
+                    name="cheap",
+                    ok=True,
+                    output="RECOMMENDATION: yes - looks fine",
+                    error="",
+                    elapsed_seconds=2.5,
+                    model="openai/gpt-4o-mini",
+                )
+            ],
+            {
+                "rounds": 1,
+                "deliberated": False,
+                "min_quorum": 1,
+                "labeled_quorum": 1,
+                "degraded": False,
+            },
+        )
+
+    import llm_council.mcp_server as mcp_module
+
+    monkeypatch.setattr(mcp_module, "execute_council", fake_execute_council)
+
+    result = asyncio.run(
+        run_council(
+            {"question": "ping", "working_directory": str(tmp_path)}
+        )
+    )
+
+    assert "summary_markdown" in result
+    payload = result["summary_markdown"]
+    assert payload.startswith("**Council** ·")
+    assert "mode=review-cheap" in payload
+    assert "1/1 succeeded" in payload
+    assert "recommendation=yes" in payload
+    assert "| cheap | yes |" in payload
+
+
+def test_council_run_dry_run_summary_markdown_marks_dry_run(monkeypatch, tmp_path):
+    """Dry-run path must also emit a summary_markdown so the typed field
+    isn't sometimes-present, sometimes-absent."""
+    import asyncio
+    from llm_council.mcp_server import run_council
+
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    (tmp_path / ".llm-council.yaml").write_text(
+        """
+defaults:
+  mode: review-cheap
+participants:
+  cheap:
+    type: openrouter
+    model: openai/gpt-4o-mini
+    api_key_env: X
+modes:
+  review-cheap:
+    participants: [cheap]
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("X", "secret")
+
+    result = asyncio.run(
+        run_council(
+            {
+                "question": "ping",
+                "working_directory": str(tmp_path),
+                "dry_run": True,
+            }
+        )
+    )
+
+    assert "summary_markdown" in result
+    assert "(dry-run)" in result["summary_markdown"]
+    assert "0/1 succeeded" in result["summary_markdown"]
 
 
 def test_recommendation_policy_for_architecture():

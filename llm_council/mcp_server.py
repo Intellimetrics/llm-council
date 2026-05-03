@@ -287,6 +287,16 @@ def council_run_output_schema() -> dict[str, Any]:
                 },
             },
             "metadata": {"type": "object"},
+            "summary_markdown": {
+                "type": "string",
+                "description": (
+                    "Markdown payload designed to survive host-agent rendering: "
+                    "`**Council**` heading + per-peer table + blockquoted "
+                    "transcript path. Agents that quote from tool output "
+                    "preserve markdown blockquotes/tables verbatim, giving "
+                    "users a visual anchor for council-sourced content."
+                ),
+            },
         },
         "required": [
             "schema_version",
@@ -600,6 +610,27 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
             name: (config.get("participants", {}).get(name, {}) or {}).get("model")
             for name in participants
         }
+        from llm_council.display import render_summary_markdown
+
+        dry_summary = render_summary_markdown(
+            mode=mode,
+            ok_count=0,
+            total=len(participants),
+            elapsed_seconds=0.0,
+            recommendation="unknown",
+            per_peer_rows=[
+                {
+                    "name": name,
+                    "label": "(dry-run)",
+                    "stance": None,
+                    "elapsed_seconds": 0.0,
+                }
+                for name in participants
+            ],
+            transcript_path=None,
+            deliberated=False,
+            rounds=0,
+        )
         return {
             "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
             "recommendation": "unknown",
@@ -623,6 +654,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
                     _public_image_entry(entry, cwd) for entry in image_manifest
                 ],
             },
+            "summary_markdown": dry_summary,
         }
 
     enforce_mcp_budget(budget)
@@ -764,6 +796,34 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
                 "repair_retry_recovered": bool(result.repair_retry_recovered),
             }
         )
+    from llm_council.display import render_summary_markdown
+
+    # Surface a markdown payload host agents tend to preserve verbatim
+    # when quoting tool output. Use only the final-round results so the
+    # per-peer table reflects each peer's last position rather than
+    # listing every round separately. The blockquoted transcript path
+    # gives the user a copy-pasteable pointer to the full record.
+    final_peer_rows = [
+        {
+            "name": row["name"],
+            "label": row.get("label"),
+            "stance": row.get("stance"),
+            "elapsed_seconds": row.get("elapsed_seconds") or 0,
+        }
+        for row in structured_results
+        if ":round" not in row["name"]
+    ]
+    summary_markdown = render_summary_markdown(
+        mode=mode,
+        ok_count=sum(1 for r in results if r.ok),
+        total=len(results),
+        elapsed_seconds=sum(r.elapsed_seconds for r in results),
+        recommendation=recommendation,
+        per_peer_rows=final_peer_rows,
+        transcript_path=str(md_path),
+        deliberated=bool(metadata.get("deliberated")),
+        rounds=int(metadata.get("rounds") or 1),
+    )
     return {
         "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
         "recommendation": recommendation,
@@ -779,6 +839,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         "transcript": str(md_path),
         "json": str(json_path),
         "results": structured_results,
+        "summary_markdown": summary_markdown,
     }
 
 
