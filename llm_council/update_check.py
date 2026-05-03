@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import sys
+import time
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable, IO
 
 import httpx
 
 
 TAGS_URL = "https://api.github.com/repos/Intellimetrics/llm-council/tags?per_page=50"
 INSTALL_COMMAND = "uv tool install --force git+https://github.com/Intellimetrics/llm-council.git"
+
+NAG_CACHE_TTL_SECONDS = 24 * 60 * 60
+NAG_OPT_OUT_ENV = "LLM_COUNCIL_NO_UPDATE_CHECK"
+NAG_NETWORK_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass
@@ -114,3 +123,101 @@ def _version_parts(version: str) -> list[int]:
         match = re.match(r"(\d+)", part)
         parts.append(int(match.group(1)) if match else 0)
     return parts
+
+
+def _default_nag_cache_path() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "llm-council" / "update-check.json"
+
+
+def maybe_print_update_nag(
+    current_version: str,
+    *,
+    stream: IO[str] | None = None,
+    cache_path: Path | None = None,
+    now: float | None = None,
+    checker: Callable[[str], UpdateStatus] | None = None,
+) -> bool:
+    """Print one stderr line if a newer version exists; cached for 24h.
+
+    Returns True if a nag was printed (an update is available); False
+    otherwise. Designed for hot paths: every error swallowed, opt-out via
+    env var, network timeout kept tight, cache prevents per-run latency.
+    The nag fires from CLI entry points only — never from `mcp-server`,
+    which speaks structured stdio that a stray stderr nag would not break
+    but is still etiquette to leave clean.
+    """
+    if os.environ.get(NAG_OPT_OUT_ENV, "").strip():
+        return False
+    out = stream if stream is not None else sys.stderr
+    cache_file = cache_path if cache_path is not None else _default_nag_cache_path()
+    timestamp = now if now is not None else time.time()
+    cached = _read_nag_cache(cache_file)
+    if cached and (timestamp - cached.get("checked_at", 0)) < NAG_CACHE_TTL_SECONDS:
+        latest = cached.get("latest_version")
+        if (
+            isinstance(latest, str)
+            and latest
+            and _compare_versions(current_version, latest) < 0
+        ):
+            _print_nag(out, current_version, latest, cached.get("install_command"))
+            return True
+        return False
+    do_check = checker if checker is not None else (
+        lambda version: check_for_update(version, timeout=NAG_NETWORK_TIMEOUT_SECONDS)
+    )
+    try:
+        status = do_check(current_version)
+    except Exception:
+        return False
+    _write_nag_cache(
+        cache_file,
+        {
+            "checked_at": timestamp,
+            "current_version": current_version,
+            "latest_version": status.latest_version,
+            "install_command": status.install_command,
+        },
+    )
+    if status.update_available and status.latest_version:
+        _print_nag(
+            out, current_version, status.latest_version, status.install_command
+        )
+        return True
+    return False
+
+
+def _print_nag(
+    stream: IO[str], current: str, latest: str, install_command: str | None
+) -> None:
+    install = install_command or INSTALL_COMMAND
+    try:
+        print(
+            f"note: llm-council {latest} is available (you have {current}); "
+            f"upgrade with `{install}`",
+            file=stream,
+            flush=True,
+        )
+    except Exception:
+        # Never let a broken stderr take down the run.
+        pass
+
+
+def _read_nag_cache(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_nag_cache(path: Path, payload: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+    except OSError:
+        # A read-only home or full disk shouldn't block the run; the
+        # next invocation will just re-check (and probably also fail).
+        pass

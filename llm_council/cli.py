@@ -42,7 +42,7 @@ from llm_council.transcript import (
     transcript_records,
     write_transcript,
 )
-from llm_council.update_check import check_for_update
+from llm_council.update_check import check_for_update, maybe_print_update_nag
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1313,6 +1313,10 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         args.question, flag_value=getattr(args, "question_flag", None)
     )
     load_project_env(cwd)
+    # Cached daily nag — skips network on cache hit, opt-out via
+    # LLM_COUNCIL_NO_UPDATE_CHECK=1, never raises. mcp_server.py does
+    # not call this so the stdio transport stays clean.
+    maybe_print_update_nag(__version__)
     try:
         config = load_config(args.config or find_config(cwd), search=False)
     except (OSError, ValueError) as exc:

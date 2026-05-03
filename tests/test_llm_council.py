@@ -2725,6 +2725,167 @@ def test_check_update_json_reports_current(monkeypatch, capsys):
     assert data["update_available"] is False
 
 
+def _build_nag_status(latest: str | None, *, available: bool | None):
+    return update_check_module.UpdateStatus(
+        current_version="0.4.0",
+        latest_version=latest,
+        update_available=available,
+        source=update_check_module.TAGS_URL,
+        install_command=update_check_module.INSTALL_COMMAND,
+    )
+
+
+def test_maybe_print_update_nag_prints_when_update_available(tmp_path, capsys):
+    cache = tmp_path / "update-check.json"
+
+    def fake_check(_version: str):
+        return _build_nag_status("9.9.9", available=True)
+
+    nagged = update_check_module.maybe_print_update_nag(
+        "0.4.0",
+        cache_path=cache,
+        now=1000.0,
+        checker=fake_check,
+    )
+
+    captured = capsys.readouterr()
+    assert nagged is True
+    assert "llm-council 9.9.9 is available" in captured.err
+    assert "you have 0.4.0" in captured.err
+    cached = json.loads(cache.read_text())
+    assert cached["latest_version"] == "9.9.9"
+    assert cached["checked_at"] == 1000.0
+
+
+def test_maybe_print_update_nag_silent_when_up_to_date(tmp_path, capsys):
+    cache = tmp_path / "update-check.json"
+
+    def fake_check(_version: str):
+        return _build_nag_status("0.4.0", available=False)
+
+    nagged = update_check_module.maybe_print_update_nag(
+        "0.4.0",
+        cache_path=cache,
+        now=2000.0,
+        checker=fake_check,
+    )
+
+    captured = capsys.readouterr()
+    assert nagged is False
+    assert captured.err == ""
+    assert json.loads(cache.read_text())["latest_version"] == "0.4.0"
+
+
+def test_maybe_print_update_nag_skips_network_within_24h(tmp_path, capsys):
+    cache = tmp_path / "update-check.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "checked_at": 1000.0,
+                "current_version": "0.4.0",
+                "latest_version": "9.9.9",
+                "install_command": "uv tool install --foo",
+            }
+        )
+    )
+
+    calls: list[str] = []
+
+    def fake_check(version: str):
+        calls.append(version)
+        return _build_nag_status("9.9.9", available=True)
+
+    nagged = update_check_module.maybe_print_update_nag(
+        "0.4.0",
+        cache_path=cache,
+        now=1000.0 + 60 * 60,  # one hour later
+        checker=fake_check,
+    )
+
+    captured = capsys.readouterr()
+    assert nagged is True
+    assert calls == [], "should not hit network when cache is fresh"
+    assert "llm-council 9.9.9 is available" in captured.err
+    assert "uv tool install --foo" in captured.err
+
+
+def test_maybe_print_update_nag_refreshes_when_cache_is_stale(tmp_path, capsys):
+    cache = tmp_path / "update-check.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "checked_at": 1000.0,
+                "current_version": "0.4.0",
+                "latest_version": "0.4.0",
+                "install_command": update_check_module.INSTALL_COMMAND,
+            }
+        )
+    )
+
+    calls: list[str] = []
+
+    def fake_check(version: str):
+        calls.append(version)
+        return _build_nag_status("9.9.9", available=True)
+
+    later = 1000.0 + update_check_module.NAG_CACHE_TTL_SECONDS + 1
+    nagged = update_check_module.maybe_print_update_nag(
+        "0.4.0",
+        cache_path=cache,
+        now=later,
+        checker=fake_check,
+    )
+
+    captured = capsys.readouterr()
+    assert nagged is True
+    assert calls == ["0.4.0"], "stale cache must trigger a re-check"
+    assert "9.9.9" in captured.err
+    assert json.loads(cache.read_text())["latest_version"] == "9.9.9"
+
+
+def test_maybe_print_update_nag_respects_opt_out(tmp_path, monkeypatch, capsys):
+    cache = tmp_path / "update-check.json"
+    monkeypatch.setenv(update_check_module.NAG_OPT_OUT_ENV, "1")
+
+    calls: list[str] = []
+
+    def fake_check(version: str):
+        calls.append(version)
+        return _build_nag_status("9.9.9", available=True)
+
+    nagged = update_check_module.maybe_print_update_nag(
+        "0.4.0",
+        cache_path=cache,
+        now=3000.0,
+        checker=fake_check,
+    )
+
+    captured = capsys.readouterr()
+    assert nagged is False
+    assert calls == [], "opt-out must skip the network entirely"
+    assert captured.err == ""
+    assert not cache.exists(), "opt-out must not write a cache entry"
+
+
+def test_maybe_print_update_nag_swallows_network_error(tmp_path, capsys):
+    cache = tmp_path / "update-check.json"
+
+    def fake_check(_version: str):
+        raise RuntimeError("simulated DNS failure")
+
+    nagged = update_check_module.maybe_print_update_nag(
+        "0.4.0",
+        cache_path=cache,
+        now=4000.0,
+        checker=fake_check,
+    )
+
+    captured = capsys.readouterr()
+    assert nagged is False
+    assert captured.err == "", "network errors must not surface to the user"
+    assert not cache.exists(), "failed checks must not write a cache entry"
+
+
 def test_recommendation_policy_for_architecture():
     use, mode, reason = should_use_council("architecture decision for auth")
     assert use is True
