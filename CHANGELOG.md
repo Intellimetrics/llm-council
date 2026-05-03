@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.1 - 2026-05-03
+
 ### Visual identity
 
 - CLI progress and final-result lines now render through a right-aligned
