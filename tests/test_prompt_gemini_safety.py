@@ -2,12 +2,14 @@ import asyncio
 from copy import deepcopy
 from pathlib import Path
 
+import pytest
+
 from llm_council.adapters import run_cli_participant
 from llm_council.context import build_prompt
 from llm_council.defaults import DEFAULT_CONFIG
 
 
-def test_long_context_keeps_response_format_and_read_only_instructions(
+def test_long_context_overflow_fails_fast_instead_of_truncating(
     tmp_path: Path,
 ) -> None:
     first = tmp_path / "first.txt"
@@ -15,21 +17,19 @@ def test_long_context_keeps_response_format_and_read_only_instructions(
     first.write_text("a" * 120_000)
     second.write_text("b" * 120_000)
 
-    prompt = build_prompt(
-        "Should we make this change?",
-        mode="review",
-        cwd=tmp_path,
-        context_paths=[str(first), str(second)],
-        include_diff=False,
-        stdin_text=None,
-    )
+    with pytest.raises(ValueError) as excinfo:
+        build_prompt(
+            "Should we make this change?",
+            mode="review",
+            cwd=tmp_path,
+            context_paths=[str(first), str(second)],
+            include_diff=False,
+            stdin_text=None,
+        )
 
-    assert "Do not edit files" in prompt
-    assert "Response format:" in prompt
-    assert "RECOMMENDATION: yes" in prompt
-    assert "Keep implementation suggestions read-only" in prompt
-    assert prompt.index("Response format:") < prompt.index("Context:")
-    assert "[llm-council prompt truncated" in prompt
+    message = str(excinfo.value)
+    assert "max_prompt_chars" in message
+    assert "chunk-strategy" in message
 
 
 def test_build_prompt_honors_configured_prompt_limit(tmp_path: Path) -> None:
