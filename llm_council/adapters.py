@@ -78,6 +78,11 @@ class ParticipantResult:
     recovered_after_launch_retry: bool = False
     repair_retry_recovered: bool = False
     from_cache: bool = False
+    # Wall-clock seconds the cache lookup itself took. None for non-cached
+    # runs. `elapsed_seconds` always reports the original run's timing
+    # (preserved across cache hits) so callers can see "true cost"; this
+    # field documents how fast the cache hit actually returned.
+    cache_hit_seconds: float | None = None
     stance: str | None = None
 
 
@@ -145,6 +150,7 @@ def _cache_lookup(
 ) -> tuple[str | None, ParticipantResult | None]:
     if cache_ctx is None or cache_ctx.cache_disabled:
         return None, None
+    lookup_start = time.monotonic()
     key = cache_compute_key(name, cfg, prompt, image_manifest=image_manifest)
     if not cache_ctx.can_read():
         return key, None
@@ -152,7 +158,9 @@ def _cache_lookup(
     payload = cache_read(path, expected_key=key)
     if payload is None:
         return key, None
-    return key, _result_from_cache_payload(name, payload)
+    result = _result_from_cache_payload(name, payload)
+    result.cache_hit_seconds = round(time.monotonic() - lookup_start, 6)
+    return key, result
 
 
 def _maybe_persist_cache(
@@ -1214,6 +1222,7 @@ async def run_participants(
                         "total_tokens": result.total_tokens,
                         "cost_usd": result.cost_usd,
                         "from_cache": result.from_cache,
+                        "cache_hit_seconds": result.cache_hit_seconds,
                         "recovered_after_launch_retry": result.recovered_after_launch_retry,
                         "repair_retry_recovered": result.repair_retry_recovered,
                     }

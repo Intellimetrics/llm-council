@@ -360,6 +360,8 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
         payload["repair_retry_recovered"] = True
     if result.from_cache:
         payload["from_cache"] = True
+        if result.cache_hit_seconds is not None:
+            payload["cache_hit_seconds"] = result.cache_hit_seconds
     if result.stance is not None:
         payload["stance"] = result.stance
     from llm_council.adapters import classify_error

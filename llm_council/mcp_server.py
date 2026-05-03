@@ -270,6 +270,16 @@ def council_run_output_schema() -> dict[str, Any]:
                         "total_tokens": {"type": ["integer", "null"]},
                         "cost_usd": {"type": ["number", "null"]},
                         "from_cache": {"type": "boolean"},
+                        "cache_hit_seconds": {
+                            "type": ["number", "null"],
+                            "description": (
+                                "Wall-clock seconds the cache lookup took on a "
+                                "hit. `null` for non-cached runs. `elapsed_seconds` "
+                                "always preserves the original run's timing so "
+                                "callers can see true cost; this field documents "
+                                "actual cache-hit latency for speedup analysis."
+                            ),
+                        },
                         "recovered_after_launch_retry": {"type": "boolean"},
                         "repair_retry_recovered": {"type": "boolean"},
                     },
@@ -747,6 +757,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
                 "total_tokens": result.total_tokens,
                 "cost_usd": result.cost_usd,
                 "from_cache": bool(result.from_cache),
+                "cache_hit_seconds": result.cache_hit_seconds,
                 "recovered_after_launch_retry": bool(
                     result.recovered_after_launch_retry
                 ),

@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -359,6 +360,15 @@ def build_parser() -> argparse.ArgumentParser:
         "summary", help="Summarize transcript totals"
     )
     transcripts_summary.add_argument("--cwd", default=".", help="Working directory")
+    transcripts_summary.add_argument(
+        "--since",
+        type=_parse_since_arg,
+        default=None,
+        help=(
+            "Only summarize transcripts within the last N days (e.g. `7`) "
+            "or since an absolute ISO date (e.g. `2026-04-01`)"
+        ),
+    )
     transcripts_prune = transcripts_sub.add_parser(
         "prune",
         help="Delete old transcripts (paired md+json) by count or age",
@@ -1149,12 +1159,22 @@ def cmd_transcripts(args: argparse.Namespace) -> int:
 
     if args.transcripts_command == "summary":
         records = transcript_records(out_dir)
+        since_days = getattr(args, "since", None)
+        if since_days is not None:
+            if since_days <= 0:
+                raise SystemExit(
+                    "--since must be a positive integer or ISO date in the past"
+                )
+            cutoff = time.time() - since_days * 86400
+            records = [r for r in records if r.get("mtime", 0) >= cutoff]
         runs = len(records)
         tokens = sum(record["tokens"] for record in records)
         cost = sum(record["cost_usd"] for record in records)
         successes = sum(record["ok"] for record in records)
         participants = sum(record["total"] for record in records)
         print(f"runs: {runs}")
+        if since_days is not None:
+            print(f"since: last {since_days}d")
         print(f"participant_successes: {successes}/{participants}")
         print(f"tokens: {tokens}")
         print(f"cost_usd: ${cost:.6f}")
@@ -1744,6 +1764,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                             "total_tokens": result.total_tokens,
                             "cost_usd": result.cost_usd,
                             "from_cache": result.from_cache,
+                            "cache_hit_seconds": result.cache_hit_seconds,
                             "recovered_after_launch_retry": result.recovered_after_launch_retry,
                             "repair_retry_recovered": result.repair_retry_recovered,
                             "stance": result.stance,

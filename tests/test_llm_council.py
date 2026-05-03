@@ -3340,6 +3340,141 @@ def test_check_update_does_not_hydrate_cache_on_error(monkeypatch, tmp_path):
     assert not cache.exists()
 
 
+def test_transcripts_summary_accepts_since_filter(tmp_path, capsys):
+    """Mirrors `stats --since`: same parser, same time-window semantics.
+    Without --since, the summary aggregates everything; with --since N,
+    only transcripts mtime'd within the window are counted."""
+    runs = tmp_path / "runs"
+    runs.mkdir()
+
+    def _stamp(name: str, mtime: float, ok: int, total: int):
+        md_path = runs / f"{name}.md"
+        json_path = runs / f"{name}.json"
+        md_path.write_text("# stub")
+        payload = {
+            "metadata": {},
+            "results": [
+                {
+                    "ok": idx < ok,
+                    "total_tokens": 100,
+                    "cost_usd": 0.001,
+                }
+                for idx in range(total)
+            ],
+        }
+        json_path.write_text(json.dumps(payload))
+        os.utime(md_path, (mtime, mtime))
+        os.utime(json_path, (mtime, mtime))
+
+    now = time.time()
+    _stamp("20260420_old_run", now - 13 * 86400, ok=3, total=3)
+    _stamp("20260501_recent", now - 2 * 86400, ok=2, total=3)
+    _stamp("20260503_today", now - 60, ok=1, total=1)
+
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(f"transcripts_dir: {runs}\n")
+
+    rc = main(
+        [
+            "transcripts",
+            "summary",
+            "--cwd",
+            str(tmp_path),
+            "--since",
+            "7",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    # Window is "last 7 days" — should include the 2-day-old + today, exclude
+    # the 13-day-old.
+    assert "runs: 2" in captured.out
+    assert "since: last 7d" in captured.out
+
+    # Without --since: full summary picks up all three.
+    rc = main(
+        [
+            "transcripts",
+            "summary",
+            "--cwd",
+            str(tmp_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "runs: 3" in captured.out
+    assert "since:" not in captured.out
+
+
+def test_cache_hit_seconds_distinct_from_elapsed_seconds(tmp_path):
+    """A cache hit must report cache_hit_seconds (lookup latency, fast),
+    leaving elapsed_seconds as the original-run timing — so callers can
+    distinguish "true cost" from "actual cache-hit speedup"."""
+    from llm_council import adapters as adapters_module
+    from llm_council import cache as cache_module
+
+    name = "claude_test"
+    cfg = {
+        "type": "cli",
+        "command": "/bin/echo",
+        "model": "test",
+        "args": [],
+        "stdin_prompt": True,
+    }
+    prompt = "ping for cache hit timing"
+    cache_ctx = adapters_module.CacheContext(cwd=tmp_path, cache_mode="on")
+
+    # Populate the cache with an artificial original-run time using the
+    # actual cache helpers so the file format matches what `read_cache`
+    # expects (prompt_sha256, cached_at_unix, ttl_seconds).
+    key = cache_module.compute_key(name, cfg, prompt)
+    payload = cache_module.build_payload(
+        participant_name=name,
+        prompt=prompt,
+        key=key,
+        output="RECOMMENDATION: yes - test",
+        recommendation_label="yes",
+        elapsed_seconds=9.974,
+        model="test",
+        command=None,
+        prompt_tokens=None,
+        completion_tokens=None,
+        total_tokens=None,
+        cost_usd=None,
+    )
+    path = cache_module.cache_path(tmp_path, name, key)
+    cache_module.write_cache(path, payload, ttl_seconds=86400)
+
+    _, cached = adapters_module._cache_lookup(name, cfg, prompt, cache_ctx)
+
+    assert cached is not None
+    assert cached.from_cache is True
+    # Original-run time preserved unchanged.
+    assert cached.elapsed_seconds == 9.974
+    # Cache-hit time reflects the actual lookup, which is fast (well under
+    # the original 9.974s).
+    assert cached.cache_hit_seconds is not None
+    assert cached.cache_hit_seconds < 1.0
+    assert cached.cache_hit_seconds >= 0.0
+
+
+def test_cache_hit_seconds_none_for_uncached_runs():
+    """Non-cached runs must NOT carry a cache_hit_seconds value, or
+    consumers can't tell the two cases apart."""
+    from llm_council.adapters import ParticipantResult
+
+    fresh = ParticipantResult(
+        name="x",
+        ok=True,
+        output="RECOMMENDATION: yes",
+        error="",
+        elapsed_seconds=2.5,
+    )
+    assert fresh.from_cache is False
+    assert fresh.cache_hit_seconds is None
+
+
 def test_recommendation_policy_for_architecture():
     use, mode, reason = should_use_council("architecture decision for auth")
     assert use is True
