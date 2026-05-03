@@ -24,3 +24,7 @@ htmlcov/
 .DS_Store
 *.log
 *.tmp
+
+# Per-CLI runtime artifacts (created by Gemini CLI in cwd)
+.gemini/
+GEMINI.md
