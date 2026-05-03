@@ -162,8 +162,6 @@ forward `mode_stances` from the merged config explicitly.
 - CLAUDE.md gains sections for the failure taxonomy, custom CLI
   participant minimal template, continuation-chain depth cap, and
   run-level budget caps.
-- `docs/dogfood-issues.md` tracks every friction encountered while using
-  llm-council on llm-council.
 
 ## 0.3.2 - 2026-04-29
 
