@@ -3495,11 +3495,11 @@ def test_display_format_gutter_truncates_oversize_token():
 def test_display_format_gutter_color_wraps_with_ansi_when_enabled():
     from llm_council.display import ANSI_GUTTER, ANSI_RESET, format_gutter
 
-    line = format_gutter("Convening", "Council starting: ...", color=True)
+    line = format_gutter("Convening", "llm-council starting: ...", color=True)
     assert ANSI_GUTTER in line
     assert ANSI_RESET in line
     # The right-aligned token is inside the ANSI wrappers; content is plain.
-    assert "Council starting: ..." in line
+    assert "llm-council starting: ..." in line
 
 
 def test_display_colorize_status_maps_known_words():
@@ -3582,7 +3582,7 @@ def test_render_summary_markdown_has_council_header_and_table():
         transcript_path=".llm-council/runs/example.md",
     )
     # Council header with mid-dot separators.
-    assert markdown.startswith("**Council** ·")
+    assert markdown.startswith("**LLM Council** ·")
     assert "mode=quick" in markdown
     assert "3/3 succeeded" in markdown
     assert "recommendation=tradeoff" in markdown
@@ -3673,7 +3673,7 @@ modes:
 
     assert "summary_markdown" in result
     payload = result["summary_markdown"]
-    assert payload.startswith("**Council** ·")
+    assert payload.startswith("**LLM Council** ·")
     assert "mode=review-cheap" in payload
     assert "1/1 succeeded" in payload
     assert "recommendation=yes" in payload

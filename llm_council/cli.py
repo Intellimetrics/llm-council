@@ -1754,13 +1754,10 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         return 0
     if not args.json:
         color = display.wants_color(sys.stderr)
-        # Keep the literal "Council starting:" substring in the content half
-        # so existing greppers / CI scripts continue to match for one minor
-        # version (deprecation note in CHANGELOG).
         print(
             display.format_gutter(
                 display.VERB_CONVENING,
-                f"Council starting: mode={mode}, current={current or 'unknown'}, "
+                f"llm-council starting: mode={mode}, current={current or 'unknown'}, "
                 f"participants={', '.join(participants)}, prompt_chars={len(prompt)}",
                 color=color,
             ),
@@ -1864,13 +1861,11 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         timed_out = [result for result in results if is_timeout_error(result.error)]
         color = display.wants_color(sys.stdout)
         unicode_safe = display.wants_unicode_rule(sys.stdout)
-        # Same "Council complete:" substring is preserved in the content so
-        # existing greppers don't break.
         complete_word = display.colorize_status("complete", color=color)
         print(
             display.format_gutter(
                 display.VERB_CONCLUDED,
-                f"Council {complete_word}: {ok}/{len(results)} participants succeeded",
+                f"llm-council {complete_word}: {ok}/{len(results)} participants succeeded",
                 color=color,
             )
         )

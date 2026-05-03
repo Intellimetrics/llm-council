@@ -153,7 +153,7 @@ def render_summary_markdown(
     """
     deliberation_note = f" · {rounds} rounds" if deliberated else ""
     header = (
-        f"**Council** · mode={mode} · {ok_count}/{total} succeeded · "
+        f"**LLM Council** · mode={mode} · {ok_count}/{total} succeeded · "
         f"{elapsed_seconds:.1f}s · recommendation={recommendation}{deliberation_note}"
     )
     lines = [header, ""]

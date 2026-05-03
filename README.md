@@ -14,7 +14,7 @@
 > parallel, all logged to a local transcript.
 
 ```text
-   Convening Council starting: mode=consensus, current=codex, participants=claude, codex, gemini
+   Convening llm-council starting: mode=consensus, current=codex, participants=claude, codex, gemini
       claude start round 1
        codex start round 1
       gemini start round 1
@@ -26,7 +26,7 @@ Deliberating disagreement detected; starting round 2
       gemini ok round 2 (1104 tokens; $0.00662)
        codex ok round 2 (1221 tokens; $0.00734)
       claude ok round 2 (996 tokens; $0.00598)
-   Concluded Council complete: 3/3 participants succeeded
+   Concluded llm-council complete: 3/3 participants succeeded
              ────────────
   Transcript .llm-council/runs/20260503_142701_review_consensus.md
 ```
