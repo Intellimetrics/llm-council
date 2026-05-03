@@ -1,11 +1,14 @@
 # LLM Council Operator Reference
 
-The README is the agent-first user guide. This file is the deeper reference for
-people and coding agents that need exact setup behavior, config fields, MCP
-tool names, cost controls, and custom participant routing.
+The [README](../README.md) is the agent-first user guide. This file is the
+deeper reference for people and coding agents that need exact setup behavior,
+config fields, MCP tool names, cost controls, and custom participant routing.
 
-In normal use, a person does not run council by hand. They ask their coding
-agent to install it, then ask that same agent to use council during real work:
+> [!NOTE]
+> In normal use, a person does not run council by hand. They ask their coding
+> agent to install it, then ask that same agent to use council during real
+> work — the terminal command is for setup, diagnostics, direct runs, and
+> transcript inspection.
 
 ```text
 Install LLM Council from https://github.com/Intellimetrics/llm-council in this project.
@@ -15,10 +18,25 @@ Install LLM Council from https://github.com/Intellimetrics/llm-council in this p
 Use council to review this migration before editing files.
 ```
 
-The terminal command remains available for setup, diagnostics, direct runs, and
-transcript inspection.
+## Table of contents
 
-## Agent-First Setup
+- [Agent-first setup](#agent-first-setup)
+- [Presets](#presets)
+- [Coding-agent install path](#coding-agent-install-path)
+- [Manual MCP install](#manual-mcp-install)
+- [Versioning and updates](#versioning-and-updates)
+- [Config model](#config-model)
+- [Participants](#participants)
+- [Model and cost selection](#model-and-cost-selection)
+- [Modes](#modes)
+- [Images](#images)
+- [Timeouts and slow warnings](#timeouts-and-slow-warnings)
+- [MCP](#mcp)
+- [User-facing output](#user-facing-output)
+- [Transcripts](#transcripts)
+- [Safety notes](#safety-notes)
+
+## Agent-first setup
 
 Recommended user prompt:
 
@@ -62,9 +80,11 @@ llm-council setup --yes --preset <chosen-preset>
 llm-council doctor
 ```
 
-Do not use `uvx` for project installation. `uvx` is useful for one-off smoke
-tests, but `setup` writes the command used by the MCP client. Prefer a stable
-installed `llm-council` executable, then run setup from the target project.
+> [!WARNING]
+> Do not use `uvx` for project installation. `uvx` is useful for one-off
+> smoke tests, but `setup` writes the command used by the MCP client. Prefer
+> a stable installed `llm-council` executable, then run setup from the
+> target project.
 
 ## Presets
 
@@ -114,7 +134,7 @@ If `.mcp.json` was already committed, remove it from the index with
 `git rm --cached .mcp.json` after confirming your team does not intentionally
 share local MCP config.
 
-## Coding-Agent Install Path
+## Coding-agent install path
 
 When a user asks a coding agent to install LLM Council, the agent should do the
 same thing a careful human would do:
@@ -154,7 +174,7 @@ llm-council doctor passes or gives an actionable missing requirement.
 llm-council --version prints a version.
 ```
 
-## Manual MCP Install
+## Manual MCP install
 
 Manual MCP install without `setup`:
 
@@ -194,7 +214,7 @@ llm-council setup --yes --preset <chosen-preset>
 llm-council doctor
 ```
 
-## Versioning And Updates
+## Versioning and updates
 
 Releases are versioned in `pyproject.toml`, exposed by the package, recorded in
 `CHANGELOG.md`, and tagged as `vX.Y.Z` in git. The installed package version is
@@ -223,7 +243,7 @@ llm-council estimate --mode review-cheap "Review this change"
 llm-council estimate --mode review-cheap --completion-tokens 2500 "Review this diff"
 ```
 
-## Config Model
+## Config model
 
 Project config merges over built-in defaults unless `replace_defaults: true` is
 set. Generated setup configs use `replace_defaults: true` so presets remain
@@ -288,7 +308,7 @@ participants:
 Hosted paid MCP calls fail closed when pricing is unknown. Add
 `input_per_million` and `output_per_million` for custom paid hosted models.
 
-## Model And Cost Selection
+## Model and cost selection
 
 Native CLI participants use the user's installed Claude Code, Codex CLI, or
 Gemini CLI account. That cost is external to `llm-council`; it may be a
@@ -488,7 +508,7 @@ finish, skip, error, and deliberation events. With the stdio MCP server these
 events are returned when the tool call completes, not streamed incrementally.
 MCP context files are always restricted to the selected working directory.
 
-## User-Facing Output
+## User-facing output
 
 CLI runs print:
 
@@ -519,19 +539,21 @@ llm-council transcripts list
 llm-council transcripts summary
 ```
 
-## Safety Notes
+## Safety notes
 
 The built-in Claude, Codex, and Gemini participants are configured for
 read-only or plan modes, and prompts are sent over stdin where the CLI supports
 it. Subprocess environments are sanitized; only configured `env_passthrough`
 variables are forwarded.
 
-Do not include secrets in diffs or context files. OpenRouter participants send
-the prompt to OpenRouter and the selected upstream model. Ollama participants
-send the prompt to the configured Ollama server.
+> [!WARNING]
+> Do not include secrets in diffs or context files. OpenRouter participants
+> send the prompt to OpenRouter and the selected upstream model. Ollama
+> participants send the prompt to the configured Ollama server.
 
-Do not use council for classified, CUI, regulated, customer, production,
-credential, or `DEPLOY_MODE=secret` content unless every configured participant
-is explicitly approved for that data. US-origin participants identify
-model/company origin only; they do not imply GovCloud, FedRAMP, or enterprise
-data-handling approval.
+> [!CAUTION]
+> Do not use council for classified, CUI, regulated, customer, production,
+> credential, or `DEPLOY_MODE=secret` content unless every configured
+> participant is explicitly approved for that data. US-origin participants
+> identify model/company origin only; they do not imply GovCloud, FedRAMP,
+> or enterprise data-handling approval.
