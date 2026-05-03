@@ -89,6 +89,35 @@ def fetch_openrouter_models(
     return models
 
 
+def refresh_openrouter_cache(timeout: float = 30) -> dict[str, Any]:
+    """Force-fetch the catalog and overwrite the disk cache.
+
+    Returns a small summary so the CLI can print model count + cache age.
+    Raises on network failure — callers (the explicit `models refresh`
+    subcommand) want a clear error, not silent silence.
+    """
+    response = httpx.get(OPENROUTER_MODELS_URL, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    models = [normalize_openrouter_model(model) for model in data.get("data", [])]
+    cache_path = openrouter_cache_path()
+    _write_cache(cache_path, models)
+    return {
+        "model_count": len(models),
+        "cache_path": str(cache_path),
+        "fetched_at": time.time(),
+    }
+
+
+def openrouter_cache_age_seconds() -> float | None:
+    """Seconds since the catalog cache was last written, or None if missing."""
+    path = openrouter_cache_path()
+    try:
+        return time.time() - path.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _read_cache(path: Path) -> list[dict[str, Any]] | None:
     try:
         if not path.exists():

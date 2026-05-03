@@ -532,6 +532,53 @@ def parse_csv(value: str | None) -> list[str] | None:
     return items or None
 
 
+def apply_tier_override(config: dict[str, Any], tier_name: str) -> list[str]:
+    """Swap participant model ids for the named tier; returns swapped peers.
+
+    `defaults.tiers.<tier_name>: {<peer>: <model_id>}` pins the per-peer
+    model. Mutates `config` in place. Missing tier name raises ValueError so
+    a typo doesn't silently fall through to the default models. Peers absent
+    from the tier map are left untouched, so a tier can swap a subset of
+    peers without redeclaring the rest.
+    """
+    defaults = config.get("defaults") or {}
+    tiers = defaults.get("tiers") or {}
+    if not isinstance(tiers, dict) or tier_name not in tiers:
+        available = sorted(k for k in tiers.keys() if isinstance(k, str))
+        if available:
+            available_msg = f"available tiers: {', '.join(available)}"
+        else:
+            available_msg = (
+                "no tiers configured — add `defaults.tiers.<name>: "
+                "{<peer>: <model_id>}` to .llm-council.yaml"
+            )
+        raise ValueError(
+            f"unknown tier '{tier_name}'; {available_msg}"
+        )
+    tier_map = tiers[tier_name]
+    if not isinstance(tier_map, dict) or not tier_map:
+        raise ValueError(
+            f"tier '{tier_name}' is empty; expected mapping of peer -> model id"
+        )
+    participants = config.get("participants")
+    if not isinstance(participants, dict):
+        raise ValueError(
+            f"tier '{tier_name}' configured but no participants in config"
+        )
+    swapped: list[str] = []
+    for peer, model_id in tier_map.items():
+        if peer not in participants or not isinstance(participants[peer], dict):
+            continue
+        if not isinstance(model_id, str) or not model_id:
+            raise ValueError(
+                f"tier '{tier_name}' entry for peer '{peer}' must be a "
+                f"non-empty model id"
+            )
+        participants[peer]["model"] = model_id
+        swapped.append(peer)
+    return swapped
+
+
 def select_participants(
     config: dict[str, Any],
     mode: str,

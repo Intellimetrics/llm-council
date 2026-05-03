@@ -23,6 +23,7 @@ from llm_council.budget import (
 from llm_council.context import IMAGE_MIME_ALLOWLIST
 from llm_council.defaults import DEFAULT_CONFIG
 from llm_council.config import (
+    apply_tier_override,
     detect_current_agent,
     find_config,
     load_config,
@@ -158,6 +159,15 @@ def council_run_schema() -> dict[str, Any]:
                 "description": (
                     "Hard ceiling on estimated prompt+completion tokens "
                     "across all participants and budgeted rounds."
+                ),
+            },
+            "tier": {
+                "type": "string",
+                "description": (
+                    "Swap participant models per `defaults.tiers.<name>` "
+                    "in .llm-council.yaml (e.g. `deep` for top thinking "
+                    "models, `fast` for budget). Missing peers in the "
+                    "tier map keep their default model."
                 ),
             },
         },
@@ -434,6 +444,9 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
     config = load_config(find_config(cwd), search=False)
+    tier = arguments.get("tier")
+    if tier:
+        apply_tier_override(config, str(tier))
     question = arguments["question"]
     mode = arguments.get("mode") or config.get("defaults", {}).get("mode", "quick")
     current = arguments.get("current") or detect_current_agent()

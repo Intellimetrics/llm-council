@@ -1,10 +1,13 @@
 import asyncio
 import argparse
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
+import httpx
 import pytest
 import yaml
 
@@ -26,6 +29,7 @@ from llm_council.cli import build_parser, cmd_doctor, cmd_setup, cmd_transcripts
 from llm_council.config import (
     OLD_CLAUDE_PLAN_ARGS,
     OLD_CODEX_APPROVAL_ARGS,
+    apply_tier_override,
     load_config,
     select_participants,
 )
@@ -2884,6 +2888,224 @@ def test_maybe_print_update_nag_swallows_network_error(tmp_path, capsys):
     assert nagged is False
     assert captured.err == "", "network errors must not surface to the user"
     assert not cache.exists(), "failed checks must not write a cache entry"
+
+
+def test_apply_tier_override_swaps_named_peers(tmp_path):
+    config = {
+        "defaults": {
+            "tiers": {
+                "deep": {
+                    "claude": "anthropic/claude-opus-4",
+                    "codex": "openai/o1-pro",
+                },
+                "fast": {"claude": "anthropic/claude-haiku-4-5"},
+            }
+        },
+        "participants": {
+            "claude": {"type": "cli", "model": "anthropic/claude-sonnet-4-6"},
+            "codex": {"type": "cli", "model": "openai/gpt-5"},
+            "gemini": {"type": "cli", "model": "google/gemini-2.5-pro"},
+        },
+    }
+
+    swapped = apply_tier_override(config, "deep")
+
+    assert sorted(swapped) == ["claude", "codex"]
+    assert config["participants"]["claude"]["model"] == "anthropic/claude-opus-4"
+    assert config["participants"]["codex"]["model"] == "openai/o1-pro"
+    # gemini absent from deep map -> untouched
+    assert config["participants"]["gemini"]["model"] == "google/gemini-2.5-pro"
+
+
+def test_apply_tier_override_unknown_tier_lists_available():
+    config = {
+        "defaults": {"tiers": {"deep": {"claude": "x"}, "fast": {"claude": "y"}}},
+        "participants": {"claude": {"type": "cli", "model": "z"}},
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        apply_tier_override(config, "ultra")
+
+    message = str(excinfo.value)
+    assert "ultra" in message
+    assert "deep" in message and "fast" in message
+
+
+def test_apply_tier_override_no_tiers_configured_explains():
+    config = {
+        "defaults": {},
+        "participants": {"claude": {"type": "cli", "model": "z"}},
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        apply_tier_override(config, "deep")
+
+    assert "no tiers configured" in str(excinfo.value)
+
+
+def test_apply_tier_override_skips_peers_not_in_config():
+    config = {
+        "defaults": {"tiers": {"deep": {"claude": "x", "ghost": "y"}}},
+        "participants": {"claude": {"type": "cli", "model": "z"}},
+    }
+
+    swapped = apply_tier_override(config, "deep")
+
+    assert swapped == ["claude"]
+    assert "ghost" not in config["participants"]
+
+
+def test_apply_tier_override_rejects_empty_model_id():
+    config = {
+        "defaults": {"tiers": {"deep": {"claude": ""}}},
+        "participants": {"claude": {"type": "cli", "model": "z"}},
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        apply_tier_override(config, "deep")
+
+    assert "non-empty model id" in str(excinfo.value)
+
+
+def test_models_refresh_writes_cache_and_prints_summary(monkeypatch, tmp_path, capsys):
+    import llm_council.model_catalog as catalog_module
+
+    cache = tmp_path / "openrouter-models.json"
+    monkeypatch.setattr(
+        catalog_module, "openrouter_cache_path", lambda: cache
+    )
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": [
+                    {
+                        "id": "anthropic/claude-opus-4",
+                        "name": "Claude Opus 4",
+                        "context_length": 200000,
+                        "pricing": {"prompt": "0.000003", "completion": "0.000015"},
+                    },
+                    {
+                        "id": "openai/o1-pro",
+                        "name": "o1 Pro",
+                        "context_length": 128000,
+                        "pricing": {"prompt": "0.00015", "completion": "0.0006"},
+                    },
+                ]
+            }
+
+    monkeypatch.setattr(
+        catalog_module.httpx, "get", lambda *_args, **_kwargs: FakeResponse()
+    )
+
+    assert main(["models", "refresh"]) == 0
+
+    captured = capsys.readouterr()
+    assert "refreshed openrouter catalog: 2 models" in captured.out
+    assert cache.exists()
+    written = json.loads(cache.read_text())
+    assert {entry["id"] for entry in written} == {
+        "anthropic/claude-opus-4",
+        "openai/o1-pro",
+    }
+
+
+def test_models_refresh_network_error_exits_1(monkeypatch, tmp_path, capsys):
+    import llm_council.model_catalog as catalog_module
+
+    monkeypatch.setattr(
+        catalog_module, "openrouter_cache_path", lambda: tmp_path / "cache.json"
+    )
+
+    def boom(*_args, **_kwargs):
+        raise httpx.ConnectError("simulated")
+
+    monkeypatch.setattr(catalog_module.httpx, "get", boom)
+
+    assert main(["models", "refresh"]) == 1
+    captured = capsys.readouterr()
+    assert "openrouter catalog refresh failed" in captured.err
+
+
+def test_doctor_warns_when_openrouter_catalog_is_stale(monkeypatch, tmp_path):
+    import llm_council.doctor as doctor_module
+
+    cache = tmp_path / "openrouter-models.json"
+    cache.write_text("[]")
+    very_old = time.time() - (60 * 24 * 60 * 60)
+    os.utime(cache, (very_old, very_old))
+    monkeypatch.setattr(doctor_module, "openrouter_cache_path", lambda: cache)
+    monkeypatch.setattr(
+        doctor_module,
+        "openrouter_cache_age_seconds",
+        lambda: time.time() - cache.stat().st_mtime,
+    )
+
+    config = {
+        "defaults": {},
+        "participants": {
+            "remote": {
+                "type": "openrouter",
+                "model": "anthropic/claude-sonnet-4-6",
+                "api_key_env": "X",
+            }
+        },
+        "modes": {"remote": {"participants": ["remote"]}},
+    }
+    monkeypatch.setenv("X", "secret")
+
+    checks = check_environment(config)
+    catalog_check = next(c for c in checks if c.name == "catalog:openrouter")
+    assert catalog_check.ok is False
+    assert "stale" in catalog_check.detail
+    assert "models refresh" in catalog_check.detail
+
+
+def test_doctor_catalog_check_ok_when_cache_is_fresh(monkeypatch, tmp_path):
+    import llm_council.doctor as doctor_module
+
+    cache = tmp_path / "openrouter-models.json"
+    cache.write_text("[]")
+    monkeypatch.setattr(doctor_module, "openrouter_cache_path", lambda: cache)
+    monkeypatch.setattr(
+        doctor_module,
+        "openrouter_cache_age_seconds",
+        lambda: 60.0,  # one minute old
+    )
+
+    config = {
+        "defaults": {},
+        "participants": {
+            "remote": {
+                "type": "openrouter",
+                "model": "anthropic/claude-sonnet-4-6",
+                "api_key_env": "X",
+            }
+        },
+        "modes": {"remote": {"participants": ["remote"]}},
+    }
+    monkeypatch.setenv("X", "secret")
+
+    checks = check_environment(config)
+    catalog_check = next(c for c in checks if c.name == "catalog:openrouter")
+    assert catalog_check.ok is True
+    assert "fresh" in catalog_check.detail
+
+
+def test_doctor_skips_catalog_check_when_no_openrouter_peer(monkeypatch):
+    config = {
+        "defaults": {},
+        "participants": {
+            "claude": {"type": "cli", "command": "claude", "model": "x"}
+        },
+        "modes": {"quick": {"participants": ["claude"]}},
+    }
+
+    checks = check_environment(config)
+    assert all(c.name != "catalog:openrouter" for c in checks)
 
 
 def test_recommendation_policy_for_architecture():

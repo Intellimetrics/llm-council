@@ -14,6 +14,7 @@ from typing import Any
 
 from llm_council import __version__
 from llm_council.config import (
+    apply_tier_override,
     detect_current_agent,
     find_config,
     load_config,
@@ -26,7 +27,12 @@ from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_pr
 from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env
 from llm_council.estimate import estimate_council
-from llm_council.model_catalog import fetch_openrouter_models
+from llm_council.model_catalog import (
+    fetch_openrouter_models,
+    openrouter_cache_age_seconds,
+    openrouter_cache_path,
+    refresh_openrouter_cache,
+)
 from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
 from llm_council.setup_wizard import write_setup_files
@@ -180,6 +186,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Default `fail` preserves fail-fast behavior. `head`/`tail` keep "
             "the first/last bytes that fit. `hash-aware` drops lower-relevance "
             "files (per-file `diff --git` blocks) until the prompt fits."
+        ),
+    )
+    run.add_argument(
+        "--tier",
+        default=None,
+        help=(
+            "Swap participant models per `defaults.tiers.<name>` in "
+            ".llm-council.yaml (e.g. `--tier deep` for top-end thinking "
+            "models, `--tier fast` for budget models). Pin the tier->model "
+            "map yourself; missing peers in the map keep their default "
+            "model so a tier can swap a subset."
         ),
     )
 
@@ -393,6 +410,12 @@ def build_parser() -> argparse.ArgumentParser:
     openrouter.add_argument("--limit", type=int, default=40)
     openrouter.add_argument("--no-cache", action="store_true", help="Bypass disk cache")
     openrouter.add_argument("--json", action="store_true", help="Print JSON")
+
+    refresh = models_sub.add_parser(
+        "refresh",
+        help="Force-fetch the OpenRouter catalog and overwrite the local cache",
+    )
+    refresh.add_argument("--json", action="store_true", help="Print JSON summary")
 
     return parser
 
@@ -1277,8 +1300,10 @@ def _print_progress_event(event: dict) -> None:
 
 
 def cmd_models(args: argparse.Namespace) -> int:
+    if args.models_command == "refresh":
+        return _cmd_models_refresh(args)
     if args.models_command != "openrouter":
-        raise SystemExit("models subcommand is required")
+        raise SystemExit("models subcommand is required (openrouter|refresh)")
     models = fetch_openrouter_models(use_cache=not args.no_cache)
     if args.filter:
         needle = args.filter.lower()
@@ -1307,6 +1332,26 @@ def cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_models_refresh(args: argparse.Namespace) -> int:
+    try:
+        summary = refresh_openrouter_cache()
+    except Exception as exc:
+        message = f"openrouter catalog refresh failed: {type(exc).__name__}: {exc}"
+        if args.json:
+            print(json.dumps({"ok": False, "error": message}, indent=2))
+        else:
+            print(message, file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps({"ok": True, **summary}, indent=2))
+    else:
+        print(
+            f"refreshed openrouter catalog: {summary['model_count']} models -> "
+            f"{summary['cache_path']}"
+        )
+    return 0
+
+
 async def cmd_run_async(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).resolve()
     question = _question_from_args(
@@ -1321,6 +1366,17 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         config = load_config(args.config or find_config(cwd), search=False)
     except (OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
+    tier = getattr(args, "tier", None)
+    if tier:
+        try:
+            swapped = apply_tier_override(config, tier)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if not args.json and swapped:
+            print(
+                f"Tier '{tier}' applied: swapped models for {', '.join(swapped)}",
+                flush=True,
+            )
     mode = args.mode or config.get("defaults", {}).get("mode", "quick")
     current = args.current or detect_current_agent()
     explicit = parse_csv(args.participants)

@@ -39,6 +39,7 @@ Transcript: .llm-council/runs/20260503_142701_review_consensus.md
 - [Use it from your agent](#use-it-from-your-agent)
 - [Pick your council](#pick-your-council)
 - [Modes](#modes)
+- [Tier selection](#tier-selection)
 - [Consensus mode at a glance](#consensus-mode-at-a-glance)
 - [Costs and data boundaries](#costs-and-data-boundaries)
 - [What setup creates](#what-setup-creates)
@@ -280,6 +281,43 @@ Add your own in `.llm-council.yaml` under `modes:`. See the
 
 ---
 
+## Tier selection
+
+Swap the model each peer uses without rewriting your config. Pin a `deep`
+(top-end thinking) and `fast` (budget) tier in `.llm-council.yaml`:
+
+```yaml
+defaults:
+  tiers:
+    deep:
+      claude: anthropic/claude-opus-4
+      codex:  openai/o1-pro
+      gemini: google/gemini-2.5-pro-thinking
+    fast:
+      claude: anthropic/claude-haiku-4-5
+      codex:  openai/gpt-4o-mini
+      gemini: google/gemini-2.5-flash
+```
+
+Then pick a tier per run:
+
+```bash
+llm-council run --tier deep --diff "Is this auth migration safe?"
+llm-council run --tier fast --mode quick "summarize what this module exports"
+```
+
+> [!NOTE]
+> Peers absent from the tier map keep their default model, so a tier can
+> swap a subset without redeclaring the whole council. A typo in the tier
+> name fails the run with the list of configured tiers — no silent
+> fall-through.
+
+`council_run` accepts the same `tier` argument over MCP, so your coding
+agent can ask "use council with the deep tier" and the swap happens
+transparently.
+
+---
+
 ## Consensus mode at a glance
 
 `consensus` is the high-leverage mode for release-gate review: peers are
@@ -398,7 +436,8 @@ uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
 cd /path/to/project
 llm-council setup --plan
 llm-council setup --yes --preset <chosen-preset>
-llm-council doctor
+llm-council doctor                    # also checks OpenRouter catalog age
+llm-council models refresh            # force-fetch the OpenRouter catalog
 llm-council check-update
 ```
 

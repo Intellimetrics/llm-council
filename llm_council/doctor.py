@@ -10,6 +10,14 @@ from urllib.parse import urlparse
 
 import httpx
 
+from llm_council.model_catalog import (
+    openrouter_cache_age_seconds,
+    openrouter_cache_path,
+)
+
+
+CATALOG_STALE_SECONDS_DEFAULT = 14 * 24 * 60 * 60
+
 
 @dataclass
 class Check:
@@ -72,6 +80,7 @@ def check_environment(
             )
         )
     if openrouter_envs:
+        checks.append(_check_openrouter_catalog_age(config))
         if probe_openrouter:
             key_env = openrouter_envs[0]
             checks.append(_probe_openrouter(os.environ.get(key_env), key_env=key_env))
@@ -105,6 +114,40 @@ def check_environment(
         )
 
     return checks
+
+
+def _check_openrouter_catalog_age(config: dict[str, Any]) -> Check:
+    threshold = int(
+        (config.get("defaults", {}) or {}).get(
+            "catalog_stale_seconds", CATALOG_STALE_SECONDS_DEFAULT
+        )
+    )
+    age = openrouter_cache_age_seconds()
+    if age is None:
+        return Check(
+            name="catalog:openrouter",
+            ok=False,
+            detail=(
+                f"missing ({openrouter_cache_path()}) — "
+                "run `llm-council models refresh`"
+            ),
+        )
+    days = age / 86400.0
+    if age > threshold:
+        return Check(
+            name="catalog:openrouter",
+            ok=False,
+            detail=(
+                f"stale ({days:.1f} days old > "
+                f"{threshold / 86400.0:.0f}-day threshold) — "
+                "run `llm-council models refresh`"
+            ),
+        )
+    return Check(
+        name="catalog:openrouter",
+        ok=True,
+        detail=f"fresh ({days:.1f} days old)",
+    )
 
 
 def _probe_openrouter(
