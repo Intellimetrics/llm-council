@@ -6,7 +6,7 @@
 [![Read-only](https://img.shields.io/badge/default-read--only-6b7280)](#read-only-means-read-only)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/Intellimetrics/llm-council?style=flat&color=yellow)](https://github.com/Intellimetrics/llm-council/stargazers)
-[![Version](https://img.shields.io/badge/version-0.4.1-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.2-111827)](CHANGELOG.md)
 
 Your coding agent is confident.
 

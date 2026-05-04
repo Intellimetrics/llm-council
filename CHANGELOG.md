@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.2 - 2026-05-04
+
 ### CLI
 
 - `llm-council estimate` now accepts `--max-cost-usd` and `--max-tokens`,
