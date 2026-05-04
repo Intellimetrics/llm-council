@@ -18,7 +18,7 @@ It is a Python 3.11+ MCP server and CLI. It works with the tools developers alre
 
 The console command is `llm-council`. The MCP server name is also `llm-council`.
 
-MIT licensed. Current version: `0.4.0`.
+MIT licensed. Current version: `0.4.2`.
 
 GitHub: <https://github.com/Intellimetrics/llm-council>
 
