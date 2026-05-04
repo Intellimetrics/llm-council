@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### CLI
+
+- `llm-council estimate` now accepts `--max-cost-usd` and `--max-tokens`,
+  mirroring the gates that already exist on `run`. The breakdown is still
+  printed; the command exits non-zero when the projected cost or token
+  total exceeds the cap. This lets wrappers and CI gate "would this run
+  exceed budget" with a single subprocess call (estimate-then-check)
+  instead of running an estimate, parsing JSON, and comparing manually.
+  Hosted (openrouter / openai_compatible) peers with no catalog price
+  refuse rather than slipping past the cap as $0, same as `run`.
+
 ## 0.4.1 - 2026-05-03
 
 ### Visual identity

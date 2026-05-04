@@ -8970,6 +8970,256 @@ def test_cmd_run_refuses_when_max_cost_exceeded(monkeypatch, tmp_path: Path):
         cli_module.cmd_run(args)
 
 
+def _estimate_cap_config(tmp_path: Path) -> dict:
+    return {
+        "version": 1,
+        "transcripts_dir": str(tmp_path / "runs"),
+        "defaults": {"mode": "quick"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {"quick": {"participants": ["claude"]}},
+    }
+
+
+def test_cmd_estimate_refuses_when_max_cost_exceeded(
+    monkeypatch, tmp_path: Path, capsys
+):
+    """`estimate --max-cost-usd` mirrors `run --max-cost-usd`: if the
+    estimate exceeds the cap, the command exits non-zero. The breakdown
+    is still printed first so the caller sees per-peer costs."""
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        cli_module,
+        "estimate_council",
+        lambda **_k: {
+            "known_total_usd": 10.0,
+            "rows": [
+                {
+                    "name": "expensive",
+                    "model": "deepseek/deepseek-v4-pro",
+                    "type": "openrouter",
+                    "estimated_input_tokens": 100,
+                    "estimated_output_tokens": 50,
+                    "input_per_million": 1.0,
+                    "output_per_million": 5.0,
+                    "estimated_input_cost_usd": 0.0001,
+                    "estimated_output_cost_usd": 0.00025,
+                    "estimated_total_cost_usd": 10.0,
+                }
+            ],
+            "mode": "quick",
+            "current": "claude",
+            "participants": ["expensive"],
+            "extra_openrouter_models": [],
+            "prompt_chars": 100,
+            "estimated_prompt_tokens": 25,
+            "budgeted_rounds": 1,
+            "completion_tokens_assumed_each": 1500,
+            "notes": [],
+        },
+    )
+    config = _estimate_cap_config(tmp_path)
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "estimate",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "--max-cost-usd",
+            "1.0",
+            "--json",
+            "test",
+        ]
+    )
+    with pytest.raises(SystemExit, match="exceeds --max-cost-usd"):
+        cli_module.cmd_estimate(args)
+    # Breakdown printed before the gate fires.
+    out = capsys.readouterr().out
+    assert "known_total_usd" in out
+
+
+def test_cmd_estimate_refuses_when_hosted_peer_has_unknown_cost(
+    monkeypatch, tmp_path: Path
+):
+    """A hosted peer with no catalog price would silently slip past the
+    cap if treated as $0. estimate must refuse, same as run."""
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        cli_module,
+        "estimate_council",
+        lambda **_k: {
+            "known_total_usd": 0.0,
+            "rows": [
+                {
+                    "name": "unknown_hosted",
+                    "model": "made-up/unknown",
+                    "type": "openrouter",
+                    "estimated_input_tokens": 100,
+                    "estimated_output_tokens": 50,
+                    "input_per_million": None,
+                    "output_per_million": None,
+                    "estimated_input_cost_usd": None,
+                    "estimated_output_cost_usd": None,
+                    "estimated_total_cost_usd": None,
+                }
+            ],
+            "mode": "quick",
+            "current": "claude",
+            "participants": ["unknown_hosted"],
+            "extra_openrouter_models": [],
+            "prompt_chars": 100,
+            "estimated_prompt_tokens": 25,
+            "budgeted_rounds": 1,
+            "completion_tokens_assumed_each": 1500,
+            "notes": [],
+        },
+    )
+    config = {
+        "version": 1,
+        "transcripts_dir": str(tmp_path / "runs"),
+        "defaults": {"mode": "quick"},
+        "participants": {
+            "unknown_hosted": {"type": "openrouter", "model": "made-up/unknown"},
+        },
+        "modes": {"quick": {"participants": ["unknown_hosted"]}},
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "estimate",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "--max-cost-usd",
+            "5.0",
+            "--json",
+            "test",
+        ]
+    )
+    with pytest.raises(SystemExit, match="hosted peer.*without a catalog price"):
+        cli_module.cmd_estimate(args)
+
+
+def test_cmd_estimate_max_cost_allows_only_cli_peers_without_catalog(
+    monkeypatch, tmp_path: Path
+):
+    """A pure-CLI council legitimately reports None costs (CLIs aren't
+    API-priced here). The cap must NOT refuse on that basis alone."""
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        cli_module,
+        "estimate_council",
+        lambda **_k: {
+            "known_total_usd": 0.0,
+            "rows": [
+                {
+                    "name": "claude",
+                    "model": "cli default",
+                    "type": "cli",
+                    "estimated_input_tokens": 100,
+                    "estimated_output_tokens": 50,
+                    "input_per_million": None,
+                    "output_per_million": None,
+                    "estimated_input_cost_usd": None,
+                    "estimated_output_cost_usd": None,
+                    "estimated_total_cost_usd": None,
+                }
+            ],
+            "mode": "quick",
+            "current": "claude",
+            "participants": ["claude"],
+            "extra_openrouter_models": [],
+            "prompt_chars": 100,
+            "estimated_prompt_tokens": 25,
+            "budgeted_rounds": 1,
+            "completion_tokens_assumed_each": 1500,
+            "notes": [],
+        },
+    )
+    config = _estimate_cap_config(tmp_path)
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "estimate",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "--max-cost-usd",
+            "0.01",
+            "--json",
+            "test",
+        ]
+    )
+    rc = cli_module.cmd_estimate(args)
+    assert rc == 0
+
+
+def test_cmd_estimate_refuses_when_max_tokens_exceeded(
+    monkeypatch, tmp_path: Path
+):
+    """--max-tokens on estimate fires when projected token total exceeds
+    the cap, same as run."""
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        cli_module,
+        "estimate_council",
+        lambda **_k: {
+            "known_total_usd": 0.0,
+            "rows": [
+                {
+                    "name": "claude",
+                    "model": "cli default",
+                    "type": "cli",
+                    "estimated_input_tokens": 800_000,
+                    "estimated_output_tokens": 200_000,
+                    "input_per_million": None,
+                    "output_per_million": None,
+                    "estimated_input_cost_usd": None,
+                    "estimated_output_cost_usd": None,
+                    "estimated_total_cost_usd": None,
+                }
+            ],
+            "mode": "quick",
+            "current": "claude",
+            "participants": ["claude"],
+            "extra_openrouter_models": [],
+            "prompt_chars": 100,
+            "estimated_prompt_tokens": 25,
+            "budgeted_rounds": 1,
+            "completion_tokens_assumed_each": 200_000,
+            "notes": [],
+        },
+    )
+    config = _estimate_cap_config(tmp_path)
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "estimate",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "--max-tokens",
+            "100000",
+            "--json",
+            "test",
+        ]
+    )
+    with pytest.raises(SystemExit, match="exceeds --max-tokens"):
+        cli_module.cmd_estimate(args)
+
+
 def test_setup_writes_per_host_skill_files(tmp_path: Path):
     """Track C #5: setup must emit host-installable skill files for Claude
     Code, Codex CLI, and Gemini CLI under .llm-council/skills/, not just

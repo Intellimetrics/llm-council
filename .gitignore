@@ -28,3 +28,10 @@ htmlcov/
 # Per-CLI runtime artifacts (created by Gemini CLI in cwd)
 .gemini/
 GEMINI.md
+
+# Local strategy / planning notes — kept in the working tree but not shipped.
+BUILD_MAP_STRATEGY.md
+
+# uv lockfile — released versions have not tracked it; flip this if you
+# decide to pin transitive dependency versions for reproducible installs.
+uv.lock

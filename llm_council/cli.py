@@ -340,6 +340,28 @@ def build_parser() -> argparse.ArgumentParser:
             "reflects the tier you'd actually run."
         ),
     )
+    estimate.add_argument(
+        "--max-cost-usd",
+        type=float,
+        default=None,
+        help=(
+            "Hard ceiling on the council's pre-flight estimated cost in USD. "
+            "The breakdown is still printed, but the command exits non-zero "
+            "if the estimate exceeds this. Free/local participants count as "
+            "$0; if the catalog is unavailable for a hosted peer, the cap is "
+            "informational only (unknown costs cannot be enforced and the "
+            "command refuses rather than waving them through)."
+        ),
+    )
+    estimate.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Hard ceiling on estimated prompt+completion tokens across all "
+            "participants and budgeted rounds. Exits non-zero if exceeded."
+        ),
+    )
     estimate.add_argument("--json", action="store_true", help="Print JSON")
 
     last = sub.add_parser("last", help="Print the latest council transcript path/content")
@@ -1036,6 +1058,53 @@ def cmd_estimate(args: argparse.Namespace) -> int:
         print(json.dumps(estimate, indent=2))
     else:
         _print_estimate(estimate)
+
+    # Budget gates mirror `cmd_run`'s logic so the same cap can be enforced
+    # pre-flight from a wrapper or CI without re-running the cost math.
+    # The breakdown is printed unconditionally above so the caller still
+    # sees per-peer costs along with the non-zero exit.
+    max_cost_usd = getattr(args, "max_cost_usd", None)
+    max_tokens = getattr(args, "max_tokens", None)
+    if max_cost_usd is not None or max_tokens is not None:
+        cost_total = float(
+            estimate.get("known_total_with_retry_safety_usd")
+            if estimate.get("known_total_with_retry_safety_usd") is not None
+            else (estimate.get("known_total_usd") or 0.0)
+        )
+        token_rows = estimate.get("rows") or []
+        token_total = sum(
+            int(row.get("estimated_input_tokens") or 0)
+            + int(row.get("estimated_output_tokens") or 0)
+            for row in token_rows
+        )
+        unpriced_paid = [
+            row.get("name")
+            for row in token_rows
+            if row.get("type") in {"openrouter", "openai_compatible"}
+            and row.get("estimated_total_cost_usd") is None
+        ]
+        if max_cost_usd is not None and unpriced_paid:
+            raise SystemExit(
+                "Pre-flight estimate cannot enforce --max-cost-usd: hosted "
+                f"peer(s) without a catalog price: {', '.join(unpriced_paid)}. "
+                "Run `llm-council models openrouter` to confirm the model id, "
+                "or drop these peers, before relying on the cost cap."
+            )
+        if max_cost_usd is not None and cost_total > float(max_cost_usd):
+            raise SystemExit(
+                f"Pre-flight estimate ${cost_total:.6f} (with worst-case "
+                f"repair-retry headroom) exceeds --max-cost-usd "
+                f"${float(max_cost_usd):.6f}. Free/local peers count as $0; "
+                "drop expensive peers, raise the cap, or see the per-peer "
+                "breakdown above. To exclude the repair-retry margin, set "
+                "retry_on_missing_label: false on individual participants."
+            )
+        if max_tokens is not None and token_total > int(max_tokens):
+            raise SystemExit(
+                f"Pre-flight estimate {token_total} tokens exceeds --max-tokens "
+                f"{int(max_tokens)}. Drop --diff/--context, narrow the question, "
+                "or raise the cap."
+            )
     return 0
 
 
