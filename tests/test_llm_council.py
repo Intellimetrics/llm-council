@@ -29,7 +29,9 @@ from llm_council.cli import build_parser, cmd_doctor, cmd_setup, cmd_transcripts
 from llm_council.config import (
     OLD_CLAUDE_PLAN_ARGS,
     OLD_CODEX_APPROVAL_ARGS,
+    _normalize_origin,
     apply_tier_override,
+    config_warnings,
     load_config,
     select_participants,
 )
@@ -407,6 +409,145 @@ modes:
     )
     with pytest.raises(ValueError, match="unsupported strategy"):
         load_config(config_path)
+
+
+# ---------------------------------------------------------------------------
+# config_warnings — origin typo detection
+# ---------------------------------------------------------------------------
+
+
+def test_config_warnings_clean_on_default_config():
+    """The shipped defaults must not trigger any warnings — every built-in
+    origin string must be exactly canonical."""
+    config = load_config(None)
+    assert config_warnings(config) == []
+
+
+def test_config_warnings_flags_lowercase_us_origin():
+    config = {
+        "participants": {
+            "off": {
+                "type": "openrouter",
+                "origin": "us/anthropic",
+                "model": "x",
+            },
+        },
+    }
+    [warning] = config_warnings(config)
+    assert "'off'" in warning
+    assert "'us/anthropic'" in warning
+    assert "'US / Anthropic'" in warning
+    assert "Did you mean" in warning
+
+
+def test_config_warnings_flags_missing_spaces_around_slash():
+    """The most likely typo class — slash with no surrounding spaces."""
+    config = {
+        "participants": {
+            "off": {
+                "type": "openrouter",
+                "origin": "US/Meta",
+                "model": "x",
+            },
+        },
+    }
+    [warning] = config_warnings(config)
+    assert "'US / Meta'" in warning
+
+
+def test_config_warnings_silent_on_canonical_origin():
+    config = {
+        "participants": {
+            "ok": {
+                "type": "openrouter",
+                "origin": "US / Anthropic",
+                "model": "x",
+            },
+        },
+    }
+    assert config_warnings(config) == []
+
+
+def test_config_warnings_silent_on_legitimate_custom_origin():
+    """Origins not in the registry are accepted without comment — free-text
+    is allowed; the warning is only for near-misses on canonical strings."""
+    config = {
+        "participants": {
+            "ok": {
+                "type": "openrouter",
+                "origin": "Canada / Ada Lovelace Labs",
+                "model": "x",
+            },
+        },
+    }
+    assert config_warnings(config) == []
+
+
+def test_config_warnings_silent_on_missing_or_empty_origin():
+    """Participants without an origin are not penalized — origin is optional
+    on `type: cli` participants and the warning is purely about typo
+    detection."""
+    config = {
+        "participants": {
+            "no_origin": {"type": "openrouter", "model": "x"},
+            "blank_origin": {"type": "openrouter", "origin": "", "model": "y"},
+            "whitespace": {"type": "openrouter", "origin": "   ", "model": "z"},
+        },
+    }
+    assert config_warnings(config) == []
+
+
+def test_config_warnings_does_not_fuzzy_match_real_typos():
+    """Edit-distance fuzzy matching is intentionally NOT done — `US / Anthrpic`
+    (missing 'o') doesn't normalize to `US / Anthropic`, so we don't catch
+    it. The warning class is strictly normalize-equality (case + spacing +
+    punctuation), not similarity."""
+    config = {
+        "participants": {
+            "missed_letter": {
+                "type": "openrouter",
+                "origin": "US / Anthrpic",
+                "model": "x",
+            },
+        },
+    }
+    assert config_warnings(config) == []
+
+
+def test_config_warnings_flags_each_offender_independently():
+    config = {
+        "participants": {
+            "first": {
+                "type": "openrouter",
+                "origin": "us/anthropic",
+                "model": "x",
+            },
+            "second": {
+                "type": "openrouter",
+                "origin": "China/DeepSeek",
+                "model": "y",
+            },
+            "ok": {
+                "type": "openrouter",
+                "origin": "US / Anthropic",
+                "model": "z",
+            },
+        },
+    }
+    warnings = config_warnings(config)
+    assert len(warnings) == 2
+    assert any("'first'" in w and "'US / Anthropic'" in w for w in warnings)
+    assert any("'second'" in w and "'China / DeepSeek'" in w for w in warnings)
+
+
+def test_normalize_origin_drops_case_whitespace_punctuation():
+    assert _normalize_origin("US / Anthropic") == "usanthropic"
+    assert _normalize_origin("us/anthropic") == "usanthropic"
+    assert _normalize_origin("US/Anthropic") == "usanthropic"
+    assert _normalize_origin("  us  /  anthropic  ") == "usanthropic"
+    assert _normalize_origin("China / Z.ai") == "chinazai"
+    assert _normalize_origin("China / z.ai") == "chinazai"
+    assert _normalize_origin("") == ""
 
 
 def test_is_local_base_url_classification():

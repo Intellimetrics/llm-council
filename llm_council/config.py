@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from llm_council.defaults import DEFAULT_CONFIG, VALID_STANCES
+from llm_council.defaults import DEFAULT_CONFIG, KNOWN_ORIGIN_STRINGS, VALID_STANCES
 
 
 BASELINE_CLIS = ("claude", "codex", "gemini")
@@ -653,6 +653,65 @@ def apply_tier_override(config: dict[str, Any], tier_name: str) -> list[str]:
         participants[peer]["model"] = model_id
         swapped.append(peer)
     return swapped
+
+
+def _normalize_origin(value: str) -> str:
+    """Strip case, whitespace, and punctuation from an origin string.
+
+    Used to detect near-miss typos in `origin` fields against
+    :data:`KNOWN_ORIGIN_STRINGS`. The intent is purely typo detection, not
+    fuzzy matching — `usanthropic` should match `US / Anthropic` but
+    `usanthrpic` (a missed letter) should NOT, because edit-distance fuzzy
+    matching is its own rabbit hole and the high-impact typo class is
+    case/spacing/punctuation drift.
+    """
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def config_warnings(config: dict[str, Any]) -> list[str]:
+    """Return non-fatal advisories for a loaded config.
+
+    Today this surfaces near-miss typos in participant `origin` strings —
+    a participant whose origin normalizes to a canonical value in
+    :data:`KNOWN_ORIGIN_STRINGS` but doesn't match it literally is almost
+    certainly a typo (e.g., ``us/anthropic`` for ``US / Anthropic``).
+    `origin_policy: us` does literal-prefix matching, so such participants
+    silently fail to filter as the user intended.
+
+    The returned strings are informational. Callers (CLI command handlers,
+    MCP server) print them to stderr or include them in metadata; nothing
+    here changes selection or exit codes.
+    """
+    warnings: list[str] = []
+    canonical_by_normalized: dict[str, str] = {
+        _normalize_origin(canonical): canonical
+        for canonical in KNOWN_ORIGIN_STRINGS
+    }
+    participants = config.get("participants", {})
+    if not isinstance(participants, dict):
+        return warnings
+    for name, cfg in participants.items():
+        if not isinstance(cfg, dict):
+            continue
+        origin = cfg.get("origin")
+        if not isinstance(origin, str) or not origin.strip():
+            continue
+        if origin in KNOWN_ORIGIN_STRINGS:
+            continue
+        normalized = _normalize_origin(origin)
+        if not normalized:
+            continue
+        suggestion = canonical_by_normalized.get(normalized)
+        if suggestion is None:
+            continue
+        warnings.append(
+            f"Participant {name!r} has origin {origin!r}, which normalizes "
+            f"to {suggestion!r} but does not match literally. "
+            f"`origin_policy: us` uses literal-prefix matching ('US / '), "
+            f"so this typo silently breaks US-only filtering. "
+            f"Did you mean {suggestion!r}?"
+        )
+    return warnings
 
 
 def select_participants(

@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## 0.4.5 - 2026-05-07
+
+### Validation
+
+- New `config_warnings(config)` surfaces non-fatal advisories at config-
+  load time. The first class shipped is **origin typo detection**:
+  participants whose `origin` string normalizes (lowercase + strip
+  whitespace + strip punctuation) to a canonical entry in the new
+  `KNOWN_ORIGIN_STRINGS` registry but doesn't match it literally trigger
+  a warning suggesting the canonical form. `origin_policy: us` uses
+  literal-prefix matching (`origin.startswith("US /")`), so spacing or
+  case typos (`us/anthropic`, `US/Meta`, `us / meta`) silently exclude a
+  participant from US-only runs — the warning catches that class before
+  it bites.
+- `KNOWN_ORIGIN_STRINGS` (in `defaults.py`) lists every origin used by
+  built-in participants plus the ones promised in
+  `docs/local-models.md`: `US / Anthropic`, `US / OpenAI`, `US / Google`,
+  `US / Meta`, `US / Mistral`, `France / Mistral`, `China / Alibaba Qwen`,
+  `China / DeepSeek`, `China / Z.ai`, `China / Moonshot AI`. Origins
+  outside the registry are accepted without comment (free-text custom
+  origins like `Canada / Ada Lovelace Labs` are not flagged).
+- The detection is intentionally normalize-equality only, not edit-
+  distance fuzzy match. `US / Anthrpic` (missing 'o') is not flagged —
+  the warning class targets the high-impact case/spacing/punctuation
+  drift that's almost always a typo, not similarity matching.
+- Warnings print to stderr (prefix `llm-council warning:`) at the start
+  of `list`, `doctor`, `estimate`, and `run`. Informational only —
+  exit codes and behavior are unchanged.
+
 ## 0.4.4 - 2026-05-07
 
 ### Modes

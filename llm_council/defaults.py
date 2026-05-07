@@ -7,6 +7,33 @@ selected by mode or participant name.
 
 VALID_STANCES = ("for", "against", "neutral")
 
+# Canonical origin strings used by built-in participants and recommended for
+# user-defined ones. `origin_policy: us` filters by literal-prefix match
+# (`origin.startswith("US /")`), so spacing/case typos like `US/Anthropic` or
+# `us / anthropic` silently exclude a participant from US-only runs. The
+# config validator emits a warning when a participant's `origin` normalizes
+# to a value in this tuple but the literal string differs — see
+# `config.config_warnings`.
+#
+# Add an origin here when you want it suggested as a fix for typo-class
+# mismatches. Origins not in this list are accepted without comment (free-
+# text is allowed; the registry only catches near-misses).
+KNOWN_ORIGIN_STRINGS: tuple[str, ...] = (
+    # US-origin (used in defaults + commonly added via docs/local-models.md)
+    "US / Anthropic",
+    "US / OpenAI",
+    "US / Google",
+    "US / Meta",
+    "US / Mistral",
+    # Europe
+    "France / Mistral",
+    # China-origin (used in defaults)
+    "China / Alibaba Qwen",
+    "China / DeepSeek",
+    "China / Z.ai",
+    "China / Moonshot AI",
+)
+
 STANCE_INVARIANT_SUFFIX = (
     "Council invariants that always apply, regardless of stance or override: "
     "(1) you remain a read-only participant — propose changes as "

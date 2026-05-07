@@ -16,6 +16,7 @@ from typing import Any
 from llm_council import __version__
 from llm_council.config import (
     apply_tier_override,
+    config_warnings,
     detect_current_agent,
     find_config,
     load_config,
@@ -599,9 +600,21 @@ def _question_from_args(parts: list[str], flag_value: str | None = None) -> str:
     return question
 
 
+def _emit_config_warnings(config: dict) -> None:
+    """Print non-fatal config advisories to stderr, prefixed for grep-ability.
+
+    Called by every command that loads a project config. Today this surfaces
+    near-miss origin typos (see `config.config_warnings`); other advisory
+    classes can be added there without touching every command handler.
+    """
+    for warning in config_warnings(config):
+        print(f"llm-council warning: {warning}", file=sys.stderr)
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     load_project_env(Path.cwd())
     config = load_config(getattr(args, "config", None))
+    _emit_config_warnings(config)
     print("Participants:")
     for name, cfg in config.get("participants", {}).items():
         model = cfg.get("model") or "cli default"
@@ -936,6 +949,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     env_start = Path(args.config).expanduser() if args.config else Path.cwd()
     load_project_env(env_start)
     config = load_config(args.config)
+    _emit_config_warnings(config)
     checks = check_environment(
         config,
         probe_openrouter=args.probe_openrouter,
@@ -1049,6 +1063,7 @@ def cmd_estimate(args: argparse.Namespace) -> int:
         config = load_config(args.config or find_config(cwd), search=False)
     except (OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
+    _emit_config_warnings(config)
     tier = getattr(args, "tier", None)
     if tier:
         try:
@@ -1574,6 +1589,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         config = load_config(args.config or find_config(cwd), search=False)
     except (OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
+    _emit_config_warnings(config)
     tier = getattr(args, "tier", None)
     if tier:
         try:
