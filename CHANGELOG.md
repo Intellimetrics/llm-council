@@ -2,6 +2,99 @@
 
 ## Unreleased
 
+## 0.4.9 - 2026-05-07
+
+Council code-review pass on v0.4.3..v0.4.8. Fixes 13 items the council
+flagged when reviewing the actual implementation against the design
+consensus from the prior two rounds.
+
+### Correctness fixes
+
+- **Local openai_compatible peers now count as $0 in the budget gate.**
+  The wizard scaffolds `type: openai_compatible` participants without
+  pricing fields; before this fix, `--max-cost-usd` and
+  `--max-tokens` would refuse to run a `local-only` mode entirely
+  because the budget gate flagged them as "unknown unpriced paid"
+  hosted peers. Now `_estimate_participant_row` detects `base_url`
+  resolves loopback or RFC1918 and forces the row to
+  `input_per_million=0.0`, `output_per_million=0.0`,
+  `pricing_source="local"`. Matches the promise in
+  `docs/local-models.md`. Direct contradiction fixed.
+- **`local-only` mode now refuses runtime `--include` of hosted
+  peers.** Previously, `--mode local-only --include claude` would
+  smuggle a hosted CLI into the run because `select_participants`
+  appended `include` after strategy selection. Now the selector
+  hard-fails with a clear error pointing at the offending peers,
+  matching the config-time strict-mode posture.
+- **MCP error-kind schema now lists `preflight_failed`.**
+  `classify_error` returns it, but `COUNCIL_RUN_VALID_ERROR_KINDS` in
+  `mcp_server.py` was missing the entry — schema-driven MCP callers
+  would reject otherwise-valid tool output.
+- **MCP responses now surface `config_warnings`.** `run_council`,
+  `run_doctor`, and `estimate_run` all propagate the warning list
+  (in `metadata.config_warnings` for `run_council`, top-level
+  `config_warnings` for the others). Origin typos that previously
+  went silent for MCP-driven runs (Claude Code / Codex / Gemini calling
+  council via MCP) now surface where users actually see them.
+
+### Pre-flight refinements
+
+- **Pre-flight defaults to loopback only.** v0.4.6 ran for any
+  `is_local_participant` (loopback + RFC1918), which false-failed
+  homelab/VPN endpoints with a 1-second timeout. Now `is_loopback_base_url`
+  (new helper) gates the default-on path; RFC1918 endpoints opt in via
+  explicit `pre_flight_check: true`. Existing loopback users see no
+  change. Documented in `docs/local-models.md`.
+- **Credentials redacted from preflight error messages.**
+  `allow_private: true` skips the embedded-credentials validator, so
+  `http://user:pass@127.0.0.1:8000/v1` is permitted. The preflight
+  error message now strips `user:pass@` to `***@` before formatting,
+  preventing creds from leaking into transcripts and progress events.
+- **Synthesized preflight result carries `model`.** Transcripts now
+  identify which model was targeted even though no call was made.
+
+### Architecture
+
+- **`_is_local_participant` and `_is_local_base_url` (config.py)
+  promoted to public** (`is_local_participant`, `is_local_base_url`).
+  Both are imported by `orchestrator.py`, `estimate.py`, and tests —
+  the cross-module dependency makes them part of the project's public
+  surface in practice. `_normalize_local_openai_base_url` (doctor.py)
+  similarly promoted.
+- **New `LocalOpenAIProbe` dataclass + `discover_local_openai()`.**
+  Replaces the wizard's parsing-of-`Check.detail`-strings approach
+  (fragile if the probe's detail format ever changed; lost models
+  past the first three due to truncation) with structured records
+  carrying `base_url`, full `models` tuple, `ok`, and `detail`.
+  `probe_local_openai` keeps its `list[Check]` return for `cmd_doctor`
+  but is now a thin wrapper around `discover_local_openai`.
+- **DNS resolution for `is_local_base_url` cached.** `getaddrinfo`
+  results memoized in a 64-entry process-lifetime LRU cache. Avoids
+  repeated syscalls when the same hostname is classified across
+  `select_participants` + preflight. Matches the OS resolver cache's
+  semantics — host-classification doesn't change mid-process.
+
+### Polish
+
+- `pre_flight_check: false` documented in `docs/local-models.md`
+  troubleshooting section, with a `pre_flight_check: true` recipe
+  for opting RFC1918 in to the loopback ping.
+- TODO comment on `_derive_default_family` naming the keyword list
+  for future maintainers when granite/command-r/nemotron/exaone
+  emerge as new prominent families.
+- Redundant `from llm_council.doctor import probe_local_openai`
+  inside `_probe_and_collect_local_participants` removed (already
+  imported at module top).
+
+### Tests
+
+- 10 new regression tests pinning the fixes: local participant cost
+  classification, --include rejection for local-only, --include
+  acceptance of local peers, is_loopback_base_url / RFC1918
+  separation, RFC1918 skipped by default, RFC1918 opt-in honored,
+  credential redaction, synthesized model field, MCP error-kind
+  schema, MCP doctor surfaces config_warnings.
+
 ## 0.4.8 - 2026-05-07
 
 ### Setup wizard

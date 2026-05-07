@@ -329,6 +329,27 @@ vLLM with very long context windows (≥131K) can take minutes to serve a
 single completion. If you're running into the default 180s timeout, bump
 `timeout: 360` (or higher) on the participant.
 
+### Pre-flight ping is failing my LAN endpoint (homelab/VPN)
+
+By default the orchestrator pre-flight pings only **loopback** endpoints
+(`127.0.0.1`, `localhost`, `[::1]`, `0.0.0.0`) with a 1-second timeout.
+RFC1918 endpoints (`10.x`, `172.16-31.x`, `192.168.x`) are skipped by
+default — homelab and VPN servers can take longer than a second to
+respond, and a false-positive failure is worse than no ping. To opt a
+LAN endpoint INTO the pre-flight check (e.g., to fail-fast when the
+homelab box is offline), set `pre_flight_check: true` on the
+participant. To opt a flaky loopback endpoint OUT of the check, set
+`pre_flight_check: false`.
+
+```yaml
+participants:
+  homelab_vllm:
+    type: openai_compatible
+    base_url: http://10.0.0.99:8000/v1
+    # ...
+    pre_flight_check: true   # opt RFC1918 in to the 1s loopback ping
+```
+
 ### `origin_policy: us` excludes my local Llama
 
 Check the exact `origin` string. The matching is case-sensitive. `US / Meta`

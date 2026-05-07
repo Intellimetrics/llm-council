@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import ipaddress
 import os
 import re
@@ -368,19 +369,37 @@ def _enforce_public_https_endpoint(name: str, parsed: Any) -> None:
             )
 
 
-def _resolve_host_addresses(host: str) -> tuple[list[str], str | None]:
+@functools.lru_cache(maxsize=64)
+def _resolve_host_addresses_cached(host: str) -> tuple[tuple[str, ...], str | None]:
+    """Cached form of `getaddrinfo` for use in hot paths.
+
+    `is_local_base_url` is called from `select_participants` (every run)
+    and from preflight (every run); resolving the same hostname N times
+    in close succession is wasteful. The OS resolver caches under the
+    hood, but a small in-process cache eliminates the syscall + GIL
+    round-trip too. The cache is intentionally small (64 entries) and
+    process-lifetime — no TTL — because re-running the council inside
+    the same process is the only path that hits this, and the host
+    classification (loopback vs RFC1918 vs public) doesn't change
+    mid-process for the same hostname.
+    """
     if _parse_ip_literal(host) is not None:
-        return [], None
+        return (), None
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError as exc:
-        return [], str(exc) or type(exc).__name__
+        return (), str(exc) or type(exc).__name__
     addresses: list[str] = []
     for info in infos:
         sockaddr = info[4]
         if sockaddr:
             addresses.append(str(sockaddr[0]))
-    return addresses, None
+    return tuple(addresses), None
+
+
+def _resolve_host_addresses(host: str) -> tuple[list[str], str | None]:
+    addresses, error = _resolve_host_addresses_cached(host)
+    return list(addresses), error
 
 
 def _parse_ip_literal(value: str) -> ipaddress._BaseAddress | None:
@@ -404,7 +423,37 @@ def _is_private_ip(ip: ipaddress._BaseAddress) -> bool:
     )
 
 
-def _is_local_base_url(base_url: str) -> bool:
+def is_loopback_base_url(base_url: str) -> bool:
+    """True iff `base_url` points at the loopback interface.
+
+    Stricter than :func:`is_local_base_url` — only matches `localhost`,
+    `127.0.0.1`, `[::1]`, `0.0.0.0`, etc. RFC1918 addresses (`10.x`,
+    `172.16-31.x`, `192.168.x`) return False. Used by the orchestrator
+    pre-flight ping where a 1s timeout is reasonable for loopback but
+    can false-fail homelab/VPN servers on a slower LAN link.
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
+        return False
+    try:
+        parsed = urlparse(base_url.strip())
+    except ValueError:
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    normalized = host.lower().rstrip(".")
+    if normalized in _LOOPBACK_HOSTNAMES:
+        return True
+    literal = _parse_ip_literal(host)
+    if literal is None:
+        return False
+    # is_loopback covers 127.0.0.0/8 and ::1; is_unspecified covers 0.0.0.0
+    # which servers commonly bind to. Exclude is_private (RFC1918) — that's
+    # what is_local_base_url handles.
+    return literal.is_loopback or literal.is_unspecified
+
+
+def is_local_base_url(base_url: str) -> bool:
     """True iff `base_url` points at a loopback or RFC1918-style address.
 
     Used by the `local_only_peers` mode strategy. Mirrors the host classification
@@ -442,7 +491,7 @@ def _is_local_base_url(base_url: str) -> bool:
     return False
 
 
-def _is_local_participant(cfg: dict[str, Any]) -> bool:
+def is_local_participant(cfg: dict[str, Any]) -> bool:
     """True iff a participant runs on the user's machine / private network.
 
     - `type: ollama` is always local (the adapter only talks to localhost-ish
@@ -456,7 +505,7 @@ def _is_local_participant(cfg: dict[str, Any]) -> bool:
     if ptype == "ollama":
         return True
     if ptype == "openai_compatible":
-        return _is_local_base_url(str(cfg.get("base_url") or ""))
+        return is_local_base_url(str(cfg.get("base_url") or ""))
     return False
 
 
@@ -761,7 +810,7 @@ def select_participants(
             selected = [
                 name
                 for name, cfg in participants.items()
-                if _is_local_participant(cfg)
+                if is_local_participant(cfg)
             ]
             if not selected:
                 raise ValueError(
@@ -775,6 +824,26 @@ def select_participants(
             raise ValueError(f"Mode '{mode}' has no participants or known strategy")
 
     if include:
+        # Strict-mode posture for local_only_peers: refuse runtime --include
+        # of hosted peers. Without this, `--mode local-only --include claude`
+        # would smuggle a hosted CLI into a "local-only" run despite the
+        # mode name and config-time strict checks. Matches the validator's
+        # rejection of `add` and `include_current` at config-load time.
+        if not explicit_requested and mode_cfg.get("strategy") == "local_only_peers":
+            offenders = [
+                name
+                for name in include
+                if name in participants
+                and not is_local_participant(participants[name])
+            ]
+            if offenders:
+                raise ValueError(
+                    f"Mode '{mode}' (strategy local_only_peers) refuses "
+                    f"--include of non-local participants: "
+                    f"{', '.join(offenders)}. The mode's purpose is to "
+                    "consult only on-prem inference. For a hybrid run, "
+                    "use a different mode or pass --participants explicitly."
+                )
         selected.extend(include)
 
     deduped: list[str] = []

@@ -24,6 +24,7 @@ from llm_council.context import IMAGE_MIME_ALLOWLIST
 from llm_council.defaults import DEFAULT_CONFIG
 from llm_council.config import (
     apply_tier_override,
+    config_warnings,
     detect_current_agent,
     find_config,
     load_config,
@@ -185,6 +186,7 @@ COUNCIL_RUN_VALID_ERROR_KINDS = (
     "invalid_response",
     "downstream_error",
     "cli_nonzero_exit",
+    "preflight_failed",
     "unknown",
 )
 
@@ -472,6 +474,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
     config = load_config(find_config(cwd), search=False)
+    warnings = config_warnings(config)
     tier = arguments.get("tier")
     if tier:
         apply_tier_override(config, str(tier))
@@ -653,6 +656,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
                 "images": [
                     _public_image_entry(entry, cwd) for entry in image_manifest
                 ],
+                "config_warnings": warnings,
             },
             "summary_markdown": dry_summary,
         }
@@ -720,6 +724,10 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
                 f"{int(max_tokens)}; refused before any participant was invoked."
             )
     cfg = config.get("participants", {})
+    # Stash warnings now so they survive into the post-run response. We
+    # populate the metadata field once execute_council has returned its
+    # own dict, but hold the list locally so it doesn't fall out of scope.
+    _pending_config_warnings = warnings
     results, metadata = await execute_council(
         participants,
         cfg,
@@ -737,6 +745,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         metadata["images"] = [
             _public_image_entry(entry, cwd) for entry in image_manifest
         ]
+    metadata["config_warnings"] = _pending_config_warnings
     write_transcript(
         md_path,
         json_path,
@@ -861,6 +870,7 @@ def run_doctor(arguments: dict[str, Any]) -> dict[str, Any]:
     load_project_env(cwd)
     config = load_config(find_config(cwd), search=False)
     result: dict[str, Any] = {
+        "config_warnings": config_warnings(config),
         "checks": checks_to_dict(
             check_environment(
                 config,
@@ -880,6 +890,7 @@ def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
         cwd = _resolve_working_directory(arguments)
         load_project_env(cwd)
         config = load_config(find_config(cwd), search=False)
+        warnings = config_warnings(config)
         tier = arguments.get("tier")
         if tier:
             apply_tier_override(config, str(tier))
@@ -922,7 +933,7 @@ def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
         )
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    return {"ok": True, **estimate}
+    return {"ok": True, "config_warnings": warnings, **estimate}
 
 
 def list_models(arguments: dict[str, Any]) -> dict[str, Any]:

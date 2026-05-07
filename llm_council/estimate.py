@@ -10,7 +10,7 @@ from llm_council.budget import (
     ESTIMATED_CHARS_PER_TOKEN,
     image_attachment_violations,
 )
-from llm_council.config import select_participants
+from llm_council.config import is_local_participant, select_participants
 from llm_council.context import (
     MAX_PROMPT_CHARS,
     build_image_manifest,
@@ -257,20 +257,48 @@ def _estimate_participant_row(
 ) -> dict[str, Any]:
     participant_type = cfg.get("type") or "unknown"
     model = cfg.get("model") or "cli default"
-    if participant_type not in ("openrouter", "openai_compatible"):
+    # Native CLI / Ollama / local openai_compatible all have no cash cost
+    # to llm-council (the user pays for their own GPU / subscription / API
+    # quota out-of-band). Treat them as $0 in the budget gate so the
+    # estimate gate doesn't refuse a local-only run for missing pricing.
+    is_local_endpoint = (
+        participant_type == "openai_compatible" and is_local_participant(cfg)
+    )
+    if participant_type not in ("openrouter", "openai_compatible") or is_local_endpoint:
         note = (
             "Native CLI subscription or local runtime cost is external to "
             "llm-council."
         )
+        # Force zero pricing for local endpoints so the budget gate's
+        # "unpriced paid" check (cli.py / mcp_server.py) doesn't refuse
+        # local-only runs as if they were unknown-cost hosted peers. The
+        # cash cost to llm-council really is $0; the GPU/subscription
+        # cost is the user's problem.
         if participant_type == "ollama":
             note = "Local Ollama runtime cost is external to llm-council."
+            input_per_million_value: float | None = 0.0
+            output_per_million_value: float | None = 0.0
+            pricing_source_value: str | None = "local"
+        elif is_local_endpoint:
+            note = (
+                "Local openai_compatible endpoint (base_url resolves "
+                "loopback/RFC1918); GPU / subscription cost is external "
+                "to llm-council."
+            )
+            input_per_million_value = 0.0
+            output_per_million_value = 0.0
+            pricing_source_value = "local"
+        else:
+            input_per_million_value = None
+            output_per_million_value = None
+            pricing_source_value = None
         return _row(
             name=name,
             participant_type=participant_type,
             model=str(model),
-            pricing_source=None,
-            input_per_million=None,
-            output_per_million=None,
+            pricing_source=pricing_source_value,
+            input_per_million=input_per_million_value,
+            output_per_million=output_per_million_value,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             rounds=rounds,

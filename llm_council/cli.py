@@ -699,7 +699,14 @@ def _derive_default_family(model_id: str) -> str:
     `deepseek-ai/DeepSeek-V4` → `deepseek`
 
     Best-effort substring match against well-known family keywords; falls
-    back to the model id's first segment when nothing matches.
+    back to the model id's first segment when nothing matches. The user
+    can always override the default at the wizard prompt.
+
+    TODO: when a new prominent family lands (granite, command-r,
+    nemotron, exaone, …) extend this list. The fallback path keeps the
+    wizard usable for unknown families — a missing keyword surfaces as
+    a default like `local_acme_some_model`, which the user can rename
+    inline.
     """
     lower = model_id.lower()
     for keyword in (
@@ -730,45 +737,18 @@ def _probe_and_collect_local_participants(
 
     Caller is responsible for ensuring this only runs in interactive mode.
     """
-    from llm_council.doctor import probe_local_openai
+    from llm_council.doctor import discover_local_openai
 
     print("\nProbing local OpenAI-compatible endpoints…")
-    checks = probe_local_openai(probe_url)
+    probes = discover_local_openai(probe_url)
     extras: dict[str, dict] = {}
-    for check in checks:
-        if not check.ok:
-            print(f"  - {check.name}: {check.detail}")
+    for probe in probes:
+        if not probe.ok:
+            print(f"  - {probe.label}: {probe.detail}")
             continue
-        # Extract base URL: the check name is `probe:local-openai:<label>`
-        # for default scan, or `probe:local-openai:<full url>` for explicit.
-        # In both cases, the detail names the served models. We need the URL
-        # to scaffold a participant; rebuild it from the well-known label or
-        # the explicit form.
-        from llm_council.doctor import (
-            WELL_KNOWN_LOCAL_OPENAI_PORTS,
-            _normalize_local_openai_base_url,
-        )
-        label_to_port = {
-            label: port for port, label in WELL_KNOWN_LOCAL_OPENAI_PORTS
-        }
-        suffix = check.name[len("probe:local-openai:"):]
-        if suffix in label_to_port:
-            base_url = f"http://127.0.0.1:{label_to_port[suffix]}/v1"
-        else:
-            base_url = _normalize_local_openai_base_url(suffix)
-        # Pull served model ids out of the detail string
-        # ("N model(s): id1, id2, ..."); we'll prompt the user to confirm.
-        detail = check.detail
-        try:
-            ids_part = detail.split(":", 1)[1].strip()
-        except IndexError:
-            ids_part = ""
-        served_models = [s.strip() for s in ids_part.split(",") if s.strip()]
-        # Drop any "(+N)" tail produced by the probe's truncation marker.
-        served_models = [s for s in served_models if not s.startswith("…")]
-
-        print(f"\n  Found: {check.detail}")
-        print(f"  Endpoint: {base_url}")
+        served_models = list(probe.models)
+        print(f"\n  Found: {probe.detail}")
+        print(f"  Endpoint: {probe.base_url}")
         if not _confirm("  Scaffold a council participant for this endpoint?", True):
             continue
         if served_models:
@@ -794,6 +774,7 @@ def _probe_and_collect_local_participants(
             if not model_id:
                 print("  Skipping (no model id).")
                 continue
+        base_url = probe.base_url
         default_name = _derive_default_participant_name(model_id)
         name_input = input(f"  Participant name [{default_name}]: ").strip()
         name = name_input or default_name

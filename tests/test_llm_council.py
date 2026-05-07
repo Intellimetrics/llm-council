@@ -49,7 +49,7 @@ from llm_council.deliberation import (
 )
 from llm_council import doctor as doctor_module
 from llm_council.doctor import (
-    _normalize_local_openai_base_url,
+    normalize_local_openai_base_url,
     _probe_ollama,
     _probe_openrouter,
     check_environment,
@@ -390,6 +390,270 @@ def test_write_setup_files_passes_extras_through(tmp_path: Path):
     assert select_participants(config, "local-only", current=None) == [
         "local_lmstudio_llama"
     ]
+
+
+def test_estimate_local_openai_compatible_counts_as_zero(tmp_path: Path):
+    """Regression for the v0.4.9 fix: local openai_compatible participants
+    must count as $0 in the budget gate, not "unknown unpriced paid". A
+    wizard-scaffolded local participant ships without input_per_million /
+    output_per_million; before the fix, --max-cost-usd would refuse the
+    run entirely. After: aggregate cost is $0 and unknown_cost_rows is
+    empty."""
+    from llm_council.estimate import estimate_council
+
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        """
+participants:
+  local_vllm:
+    type: openai_compatible
+    base_url: http://127.0.0.1:8000/v1
+    model: Qwen/Qwen3.6-27B
+    family: qwen
+    origin: "China / Alibaba Qwen"
+    api_key_env: LOCAL_OPENAI_API_KEY
+    allow_private: true
+    timeout: 360
+modes:
+  test-local:
+    strategy: local_only_peers
+    description: test
+""",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    estimate = estimate_council(
+        config=config,
+        cwd=tmp_path,
+        question="hello",
+        mode="test-local",
+        current=None,
+        explicit=None,
+        include=None,
+        origin_policy=None,
+        context_paths=[],
+        include_diff=False,
+        stdin_text=None,
+        allow_outside_cwd=False,
+        deliberate=False,
+        max_rounds=None,
+        completion_tokens=1500,
+        openrouter_models=[],
+        use_cache=False,
+        image_paths=None,
+    )
+    assert estimate["known_total_usd"] == 0.0
+    assert estimate["unknown_cost_rows"] == []
+    # Both participant rows must report cost=$0 with the local pricing tag.
+    by_name = {row["name"]: row for row in estimate["rows"]}
+    assert by_name["local_vllm"]["estimated_total_cost_usd"] == 0.0
+    assert by_name["local_vllm"]["pricing_source"] == "local"
+    assert by_name["local_qwen_coder"]["estimated_total_cost_usd"] == 0.0
+    assert by_name["local_qwen_coder"]["pricing_source"] == "local"
+
+
+def test_local_only_mode_rejects_runtime_include_of_hosted_peer(tmp_path: Path):
+    """Regression for the v0.4.9 fix: --mode local-only --include claude
+    used to silently smuggle a hosted CLI into a "local-only" run because
+    runtime include was appended after strategy selection. Now the
+    selector hard-fails with a clear error."""
+    config = load_config(None)
+    with pytest.raises(ValueError, match="local_only_peers"):
+        select_participants(
+            config,
+            "local-only",
+            current="claude",
+            include=["claude"],
+        )
+
+
+def test_local_only_mode_allows_runtime_include_of_local_peer(tmp_path: Path):
+    """Counterpart to the rejection test: --include of an additional
+    local participant is fine."""
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        """
+participants:
+  local_vllm:
+    type: openai_compatible
+    base_url: http://127.0.0.1:8000/v1
+    model: Qwen/Qwen3.6-27B
+    family: qwen
+    origin: "China / Alibaba Qwen"
+    api_key_env: LOCAL_OPENAI_API_KEY
+    allow_private: true
+""",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    selected = select_participants(
+        config,
+        "local-only",
+        current=None,
+        include=["local_vllm"],
+    )
+    assert "local_vllm" in selected
+
+
+def test_is_loopback_base_url_excludes_rfc1918():
+    from llm_council.config import is_loopback_base_url
+
+    # Loopback hostnames + literals match.
+    assert is_loopback_base_url("http://localhost:8000/v1") is True
+    assert is_loopback_base_url("http://127.0.0.1:8000/v1") is True
+    assert is_loopback_base_url("http://[::1]:8000/v1") is True
+    assert is_loopback_base_url("http://0.0.0.0:8000/v1") is True
+
+    # RFC1918 — emphatically not loopback.
+    assert is_loopback_base_url("http://10.0.0.5:8000/v1") is False
+    assert is_loopback_base_url("http://192.168.1.10:8000/v1") is False
+    assert is_loopback_base_url("http://172.16.0.1:8000/v1") is False
+
+    # Public + bad input.
+    assert is_loopback_base_url("https://api.openai.com/v1") is False
+    assert is_loopback_base_url("") is False
+
+
+def test_preflight_skips_rfc1918_by_default():
+    """v0.4.9: pre-flight is loopback-only by default to avoid false-fails
+    on homelab/VPN/private-LAN servers where 1s is too tight."""
+    from llm_council.orchestrator import preflight_local_participants
+
+    cfg = {
+        "lan_vllm": {
+            "type": "openai_compatible",
+            "base_url": "http://10.0.0.99/v1",  # RFC1918, not running
+            "model": "x",
+        },
+    }
+    failures = asyncio.run(preflight_local_participants(["lan_vllm"], cfg))
+    assert failures == {}, "RFC1918 should be skipped by default"
+
+
+def test_preflight_pings_rfc1918_when_explicitly_opted_in():
+    """Setting `pre_flight_check: true` overrides the loopback-only
+    default and pings RFC1918 endpoints too. Uses a genuine RFC1918
+    address (10.255.255.250) rather than 127.0.0.1 so the test
+    actually exercises the RFC1918 → opt-in path; with `True` the
+    address class doesn't matter for the queue decision."""
+    from llm_council.orchestrator import preflight_local_participants
+
+    cfg = {
+        "lan_vllm": {
+            "type": "openai_compatible",
+            "base_url": "http://10.255.255.250:8000/v1",  # RFC1918, ~unreachable
+            "model": "x",
+            "pre_flight_check": True,
+        },
+    }
+    failures = asyncio.run(preflight_local_participants(["lan_vllm"], cfg))
+    assert "lan_vllm" in failures
+    assert "PreflightFailed:" in failures["lan_vllm"]
+
+
+def test_preflight_redacts_credentials_in_base_url():
+    """v0.4.9: `allow_private: true` skips the embedded-cred check; the
+    preflight error message must not leak `user:pass@` to transcripts."""
+    from llm_council.orchestrator import _redact_base_url, preflight_local_participants
+
+    assert (
+        _redact_base_url("http://user:pass@127.0.0.1:8000/v1")
+        == "http://***@127.0.0.1:8000/v1"
+    )
+    assert (
+        _redact_base_url("http://user@127.0.0.1:8000/v1")
+        == "http://***@127.0.0.1:8000/v1"
+    )
+    # No creds → no change.
+    assert (
+        _redact_base_url("http://127.0.0.1:8000/v1")
+        == "http://127.0.0.1:8000/v1"
+    )
+
+    cfg = {
+        "leaky": {
+            "type": "openai_compatible",
+            "base_url": "http://user:secretpass@127.0.0.1:9/v1",
+            "model": "x",
+            "allow_private": True,
+        },
+    }
+    failures = asyncio.run(preflight_local_participants(["leaky"], cfg))
+    assert "leaky" in failures
+    assert "secretpass" not in failures["leaky"]
+    assert "user" not in failures["leaky"] or "user:" not in failures["leaky"]
+
+
+def test_redact_credentials_in_text_strips_embedded_userinfo():
+    """Defense-in-depth scrub for httpx exception strings that may quote
+    the URL they tried to reach."""
+    from llm_council.orchestrator import _redact_credentials_in_text
+
+    # Bare URL.
+    assert (
+        _redact_credentials_in_text("ConnectError: tried http://user:pass@host/v1")
+        == "ConnectError: tried http://***@host/v1"
+    )
+    # Multiple URLs in one string.
+    assert (
+        _redact_credentials_in_text(
+            "first http://a:b@x then https://c:d@y"
+        )
+        == "first http://***@x then https://***@y"
+    )
+    # No userinfo → unchanged.
+    assert (
+        _redact_credentials_in_text("ConnectError: http://example.com/path")
+        == "ConnectError: http://example.com/path"
+    )
+    # Non-URL strings → unchanged.
+    assert _redact_credentials_in_text("plain text") == "plain text"
+
+
+def test_preflight_synthesized_result_carries_model():
+    """v0.4.9: the synthesized ParticipantResult must carry `model` so
+    transcripts identify which model was targeted even though no call
+    was made."""
+    from llm_council.orchestrator import _synth_preflight_failure
+
+    result = _synth_preflight_failure(
+        "dead", "PreflightFailed: x", model="Qwen/Qwen3.6-27B"
+    )
+    assert result.model == "Qwen/Qwen3.6-27B"
+
+
+def test_mcp_error_kind_schema_includes_preflight_failed():
+    """v0.4.9: classify_error returns 'preflight_failed', so the MCP
+    schema must list it, otherwise schema-driven callers reject valid
+    output."""
+    from llm_council.mcp_server import COUNCIL_RUN_VALID_ERROR_KINDS
+
+    assert "preflight_failed" in COUNCIL_RUN_VALID_ERROR_KINDS
+
+
+def test_mcp_run_doctor_surfaces_config_warnings(tmp_path: Path, monkeypatch):
+    """v0.4.9: MCP doctor must echo config_warnings so MCP-driven users
+    see origin typos. Earlier slices wired CLI commands but missed the
+    primary user-facing surface (Claude Code/Codex/Gemini → MCP)."""
+    from llm_council.mcp_server import run_doctor
+
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        """
+participants:
+  typo:
+    type: openrouter
+    family: typo
+    origin: "us/anthropic"
+    model: x
+    api_key_env: OPENROUTER_API_KEY
+""",
+        encoding="utf-8",
+    )
+    result = run_doctor({"working_directory": str(tmp_path)})
+    assert "config_warnings" in result
+    assert any("us/anthropic" in w for w in result["config_warnings"])
 
 
 def test_env_strict_validation_rejects_non_bool(tmp_path: Path):
@@ -877,28 +1141,28 @@ def test_normalize_origin_drops_case_whitespace_punctuation():
     assert _normalize_origin("") == ""
 
 
-def test_is_local_base_url_classification():
-    from llm_council.config import _is_local_base_url
+def testis_local_base_url_classification():
+    from llm_council.config import is_local_base_url
 
     # Loopback hostnames + IP literals
-    assert _is_local_base_url("http://localhost:8000/v1") is True
-    assert _is_local_base_url("http://127.0.0.1:8000/v1") is True
-    assert _is_local_base_url("http://[::1]:8000/v1") is True
+    assert is_local_base_url("http://localhost:8000/v1") is True
+    assert is_local_base_url("http://127.0.0.1:8000/v1") is True
+    assert is_local_base_url("http://[::1]:8000/v1") is True
 
     # RFC1918
-    assert _is_local_base_url("http://10.0.0.5:8000/v1") is True
-    assert _is_local_base_url("http://192.168.1.10:8000/v1") is True
-    assert _is_local_base_url("http://172.16.0.1:8000/v1") is True
+    assert is_local_base_url("http://10.0.0.5:8000/v1") is True
+    assert is_local_base_url("http://192.168.1.10:8000/v1") is True
+    assert is_local_base_url("http://172.16.0.1:8000/v1") is True
 
     # Public
-    assert _is_local_base_url("https://api.openai.com/v1") is False
-    assert _is_local_base_url("https://openrouter.ai/api/v1") is False
-    assert _is_local_base_url("https://api.together.xyz/v1") is False
+    assert is_local_base_url("https://api.openai.com/v1") is False
+    assert is_local_base_url("https://openrouter.ai/api/v1") is False
+    assert is_local_base_url("https://api.together.xyz/v1") is False
 
     # Bad input
-    assert _is_local_base_url("") is False
-    assert _is_local_base_url("not a url") is False
-    assert _is_local_base_url(None) is False  # type: ignore[arg-type]
+    assert is_local_base_url("") is False
+    assert is_local_base_url("not a url") is False
+    assert is_local_base_url(None) is False  # type: ignore[arg-type]
 
 
 def test_explicit_participants_win():
@@ -4515,11 +4779,11 @@ def test_local_openai_probe_connect_error_is_clear():
 
 def test_local_openai_probe_url_canonicalization():
     # Accept all four common forms; canonical is `<base>/v1`.
-    assert _normalize_local_openai_base_url("http://h:8000") == "http://h:8000/v1"
-    assert _normalize_local_openai_base_url("http://h:8000/") == "http://h:8000/v1"
-    assert _normalize_local_openai_base_url("http://h:8000/v1") == "http://h:8000/v1"
-    assert _normalize_local_openai_base_url("http://h:8000/v1/") == "http://h:8000/v1"
-    assert _normalize_local_openai_base_url(" http://h:8000 ") == "http://h:8000/v1"
+    assert normalize_local_openai_base_url("http://h:8000") == "http://h:8000/v1"
+    assert normalize_local_openai_base_url("http://h:8000/") == "http://h:8000/v1"
+    assert normalize_local_openai_base_url("http://h:8000/v1") == "http://h:8000/v1"
+    assert normalize_local_openai_base_url("http://h:8000/v1/") == "http://h:8000/v1"
+    assert normalize_local_openai_base_url(" http://h:8000 ") == "http://h:8000/v1"
 
 
 def test_local_openai_port_scan_suppresses_silent_ports(monkeypatch):

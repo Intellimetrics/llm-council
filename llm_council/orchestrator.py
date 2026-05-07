@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import httpx
 
@@ -21,7 +23,7 @@ from llm_council.cache import (
     is_caching_disabled_for_mode,
     resolve_ttl_seconds,
 )
-from llm_council.config import _is_local_participant
+from llm_council.config import is_local_participant, is_loopback_base_url
 from llm_council.convergence import (
     MIN_TOKENS_FOR_CLASSIFICATION,
     classify,
@@ -38,6 +40,47 @@ from llm_council.deliberation import (
 
 
 PREFLIGHT_TIMEOUT_SECONDS = 1.0
+
+
+# Embedded-credential regex shared by `_redact_base_url` (for the rendered
+# base_url) and `_redact_credentials_in_text` (defense-in-depth pass over
+# arbitrary strings — e.g. an httpx exception that echoes the URL it tried
+# to reach). Matches `<scheme>://<userinfo>@<host>` and replaces userinfo
+# with `***`. Conservative: the scheme/host shapes stay intact.
+_EMBEDDED_CRED_RE = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]*://)[^/@\s]+@")
+
+
+def _redact_base_url(base_url: str) -> str:
+    """Strip embedded credentials (user:pass@host) from a URL before
+    rendering it into user-facing error messages or transcripts.
+
+    `allow_private: true` skips the embedded-credentials validator (so
+    that local participants with `http://user:pass@127.0.0.1` are
+    permitted), which means a careless config could otherwise leak the
+    creds into transcripts via the preflight error message.
+    """
+    try:
+        parsed = urlparse(base_url)
+    except ValueError:
+        return base_url
+    if not parsed.username and not parsed.password:
+        return base_url
+    netloc = parsed.hostname or ""
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    if parsed.username or parsed.password:
+        netloc = f"***@{netloc}"
+    return parsed._replace(netloc=netloc).geturl()
+
+
+def _redact_credentials_in_text(text: str) -> str:
+    """Defense-in-depth scrub of an arbitrary string for `scheme://user:pass@host`
+    patterns. Used on the raw exception text from httpx, which may echo
+    back the URL it tried to reach. `_redact_base_url` already handles
+    the rendered `base_url`; this pass catches anything else that might
+    quote the user-info portion.
+    """
+    return _EMBEDDED_CRED_RE.sub(lambda m: f"{m.group('scheme')}***@", text)
 
 
 async def _preflight_one(name: str, cfg: dict[str, Any]) -> str | None:
@@ -63,18 +106,22 @@ async def _preflight_one(name: str, cfg: dict[str, Any]) -> str | None:
             url = f"{base_url}/v1/models"
     else:
         return None
+    redacted = _redact_base_url(base_url)
     try:
         async with httpx.AsyncClient(timeout=PREFLIGHT_TIMEOUT_SECONDS) as client:
             response = await client.get(url)
     except Exception as exc:  # noqa: BLE001 — surface every failure mode legibly
+        # Defense-in-depth: httpx errors sometimes quote the URL they tried
+        # to reach, which would re-introduce embedded creds even after the
+        # base_url is redacted. Run the same scrub over the exception text.
+        exc_text = _redact_credentials_in_text(f"{type(exc).__name__}: {exc}")
         return (
             f"{PREFLIGHT_FAILED_PREFIX} local endpoint unreachable for "
-            f"{name!r} (base_url={base_url!r}): "
-            f"{type(exc).__name__}: {exc}"
+            f"{name!r} (base_url={redacted!r}): {exc_text}"
         )
     if response.status_code >= 500:
         return (
-            f"{PREFLIGHT_FAILED_PREFIX} local endpoint at {base_url!r} returned "
+            f"{PREFLIGHT_FAILED_PREFIX} local endpoint at {redacted!r} returned "
             f"HTTP {response.status_code} for {name!r}"
         )
     # 2xx, 3xx, 4xx: server is up enough for the run path to make progress
@@ -103,11 +150,31 @@ async def preflight_local_participants(
         (name, participant_cfg.get(name) or {})
         for name in participants
     ]
-    todo = [
-        (name, cfg)
-        for name, cfg in candidates
-        if _is_local_participant(cfg) and cfg.get("pre_flight_check", True)
-    ]
+    # Default-on for loopback (`127.0.0.1`, `localhost`, `[::1]`, `0.0.0.0`)
+    # where a 1s timeout is reasonable. Default-off for RFC1918 (`10.x`,
+    # `192.168.x`, `172.16-31.x`) where a homelab/VPN endpoint might
+    # legitimately take longer to respond. Users wanting to ping their LAN
+    # vLLM can opt in with `pre_flight_check: true`. Users wanting to skip
+    # an unreliable loopback endpoint can opt out with `pre_flight_check:
+    # false`.
+    todo = []
+    for name, cfg in candidates:
+        if not is_local_participant(cfg):
+            continue
+        opted_in = cfg.get("pre_flight_check")  # tri-state: True / False / None
+        is_loopback = is_loopback_base_url(str(cfg.get("base_url") or ""))
+        # Ollama's default base_url is loopback; treat type:ollama as loopback
+        # for preflight purposes when its base_url is omitted/local.
+        if cfg.get("type") == "ollama" and not cfg.get("base_url"):
+            is_loopback = True
+        if opted_in is False:
+            continue  # explicit opt-out always wins
+        if opted_in is True:
+            todo.append((name, cfg))
+            continue
+        # opted_in is None — use the default policy
+        if is_loopback:
+            todo.append((name, cfg))
     if not todo:
         return {}
     results = await asyncio.gather(
@@ -121,13 +188,17 @@ async def preflight_local_participants(
     }
 
 
-def _synth_preflight_failure(name: str, error: str) -> ParticipantResult:
+def _synth_preflight_failure(
+    name: str, error: str, *, model: str | None = None
+) -> ParticipantResult:
     """Construct a ParticipantResult that mirrors what a failed run looks like.
 
     Synthesizing this here (rather than letting the participant attempt to
     run and fail at the timeout) keeps the failure visible early and
     uses our explicit `preflight_failed` error_kind instead of the
-    catch-all `downstream_error`.
+    catch-all `downstream_error`. Carrying `model` through means
+    transcripts and the summary table still identify which model was
+    targeted, even though no call was made.
     """
     return ParticipantResult(
         name=name,
@@ -135,7 +206,7 @@ def _synth_preflight_failure(name: str, error: str) -> ParticipantResult:
         output="",
         error=error,
         elapsed_seconds=0.0,
-        model=None,
+        model=model,
     )
 
 
@@ -322,7 +393,10 @@ async def execute_council(
     # order so transcripts and the summary table stay deterministic.
     by_name: dict[str, ParticipantResult] = {result.name: result for result in run_results}
     for name, error in preflight_failures.items():
-        by_name[name] = _synth_preflight_failure(name, error)
+        cfg = participant_cfg.get(name) or {}
+        by_name[name] = _synth_preflight_failure(
+            name, error, model=cfg.get("model")
+        )
     results = [by_name[name] for name in participants if name in by_name]
     round_results = results
     round_number = 1

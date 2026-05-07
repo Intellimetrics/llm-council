@@ -229,7 +229,7 @@ def _probe_ollama(base_url: str) -> Check:
         )
 
 
-def _normalize_local_openai_base_url(url: str) -> str:
+def normalize_local_openai_base_url(url: str) -> str:
     """Canonicalize a user-provided base URL to point at `/v1`.
 
     Accepts `http://host:port`, `http://host:port/`, `http://host:port/v1`,
@@ -243,91 +243,136 @@ def _normalize_local_openai_base_url(url: str) -> str:
     return f"{cleaned}/v1"
 
 
+@dataclass
+class LocalOpenAIProbe:
+    """Structured result from probing a single local OpenAI-compatible endpoint.
+
+    Carries everything the wizard needs to scaffold a participant block
+    (canonical `base_url`, full list of served `models`) plus the
+    human-readable `Check` for the doctor command. Replaces the prior
+    pattern of having the wizard reverse-engineer model ids by parsing
+    `Check.detail` strings.
+    """
+
+    label: str          # well-known port label or full URL
+    base_url: str       # canonical http://host:port/v1 form
+    ok: bool
+    detail: str         # human-readable status (matches check.detail)
+    models: tuple[str, ...]  # full served model id list (NOT truncated)
+
+    def to_check(self) -> Check:
+        return Check(
+            name=f"probe:local-openai:{self.label}",
+            ok=self.ok,
+            detail=self.detail,
+        )
+
+
 def _probe_one_local_openai(
     base_url: str, *, timeout: float, label: str | None = None
-) -> Check:
+) -> LocalOpenAIProbe:
     """Probe a single OpenAI-compatible endpoint.
 
     Validates the JSON shape of `/v1/models`, not just that the port answers.
     `:8000` is a common dev-server port; without shape validation the probe
     would happily report a Django app as a "local model server."
     """
-    root = _normalize_local_openai_base_url(base_url)
-    name = (
-        f"probe:local-openai:{label}"
-        if label
-        else f"probe:local-openai:{root}"
-    )
+    root = normalize_local_openai_base_url(base_url)
+    effective_label = label or root
+
+    def fail(detail: str) -> LocalOpenAIProbe:
+        return LocalOpenAIProbe(
+            label=effective_label,
+            base_url=root,
+            ok=False,
+            detail=detail,
+            models=(),
+        )
+
     try:
         response = httpx.get(f"{root}/models", timeout=timeout)
     except Exception as exc:
-        return Check(
-            name=name,
-            ok=False,
-            detail=f"{type(exc).__name__}: {exc}",
-        )
+        return fail(f"{type(exc).__name__}: {exc}")
     if response.status_code == 404:
-        return Check(
-            name=name,
-            ok=False,
-            detail=(
-                "HTTP 404 — server reachable but `/v1/models` not implemented "
-                "(some llama.cpp builds; can still be usable via "
-                "`/v1/chat/completions` if the model id is known)"
-            ),
+        return fail(
+            "HTTP 404 — server reachable but `/v1/models` not implemented "
+            "(some llama.cpp builds; can still be usable via "
+            "`/v1/chat/completions` if the model id is known)"
         )
     if response.status_code != 200:
-        return Check(
-            name=name, ok=False, detail=f"HTTP {response.status_code}"
-        )
+        return fail(f"HTTP {response.status_code}")
     try:
         body = response.json()
     except Exception:
-        return Check(
-            name=name,
-            ok=False,
-            detail=(
-                "HTTP 200 but body is not JSON — almost certainly not an "
-                "OpenAI-compatible endpoint (probably a generic web server)"
-            ),
+        return fail(
+            "HTTP 200 but body is not JSON — almost certainly not an "
+            "OpenAI-compatible endpoint (probably a generic web server)"
         )
     # Canonical OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
     # Some servers omit `object` but the data shape is the load-bearing check.
     if not isinstance(body, dict):
-        return Check(
-            name=name,
-            ok=False,
-            detail="HTTP 200 JSON but not an object (not OpenAI-compatible)",
+        return fail(
+            "HTTP 200 JSON but not an object (not OpenAI-compatible)"
         )
     data = body.get("data")
     if not isinstance(data, list):
-        return Check(
-            name=name,
-            ok=False,
-            detail=(
-                "HTTP 200 JSON but missing OpenAI-compatible `data` array "
-                "(probably a different API on the same port)"
-            ),
+        return fail(
+            "HTTP 200 JSON but missing OpenAI-compatible `data` array "
+            "(probably a different API on the same port)"
         )
-    model_ids = [
+    model_ids: tuple[str, ...] = tuple(
         str(entry.get("id"))
         for entry in data
         if isinstance(entry, dict) and entry.get("id")
-    ]
+    )
     if not model_ids:
-        return Check(
-            name=name,
+        return LocalOpenAIProbe(
+            label=effective_label,
+            base_url=root,
             ok=True,
             detail="endpoint reachable but no models listed",
+            models=(),
         )
     preview = ", ".join(model_ids[:3])
     if len(model_ids) > 3:
         preview = f"{preview}, … (+{len(model_ids) - 3})"
-    return Check(
-        name=name,
+    return LocalOpenAIProbe(
+        label=effective_label,
+        base_url=root,
         ok=True,
         detail=f"{len(model_ids)} model(s): {preview}",
+        models=model_ids,
     )
+
+
+def discover_local_openai(base_url: str | None) -> list[LocalOpenAIProbe]:
+    """Probe local OpenAI-compatible inference servers, returning structured results.
+
+    Same scan-or-explicit semantics as :func:`probe_local_openai` (which is
+    a thin wrapper that adapts these records to `Check` objects), but
+    exposes the canonical `base_url` and the full served-models list.
+    Used by the setup wizard to scaffold participant blocks without
+    reverse-engineering anything from human-readable strings.
+    """
+    if base_url:
+        return [_probe_one_local_openai(base_url, timeout=5.0)]
+
+    probes: list[LocalOpenAIProbe] = []
+    for port, label in WELL_KNOWN_LOCAL_OPENAI_PORTS:
+        url = f"http://127.0.0.1:{port}"
+        probe = _probe_one_local_openai(url, timeout=0.5, label=label)
+        # Suppress noise from ports nothing is listening on. Connection
+        # failures show up as ConnectError / ConnectionRefusedError in the
+        # detail; everything else (timeouts, 404s, wrong-shape responses)
+        # is informative and worth surfacing.
+        if not probe.ok and (
+            "ConnectError" in probe.detail
+            or "ConnectionRefused" in probe.detail
+            or "Connect call failed" in probe.detail
+        ):
+            continue
+        probes.append(probe)
+    return probes
 
 
 def probe_local_openai(base_url: str | None) -> list[Check]:
@@ -341,28 +386,14 @@ def probe_local_openai(base_url: str | None) -> list[Check]:
 
     With an explicit `base_url`, probes that endpoint with a longer timeout
     and always emits one check.
+
+    Wraps :func:`discover_local_openai` for cmd_doctor; if you need
+    structured access to URL + served models (e.g. for scaffolding), use
+    `discover_local_openai` directly.
     """
-    if base_url:
-        return [_probe_one_local_openai(base_url, timeout=5.0)]
-
-    checks: list[Check] = []
-    for port, label in WELL_KNOWN_LOCAL_OPENAI_PORTS:
-        url = f"http://127.0.0.1:{port}"
-        check = _probe_one_local_openai(url, timeout=0.5, label=label)
-        # Suppress noise from ports nothing is listening on. Connection
-        # failures show up as ConnectError / ConnectionRefusedError in the
-        # detail; everything else (timeouts, 404s, wrong-shape responses)
-        # is informative and worth surfacing.
-        detail = check.detail or ""
-        if not check.ok and (
-            "ConnectError" in detail
-            or "ConnectionRefused" in detail
-            or "Connect call failed" in detail
-        ):
-            continue
-        checks.append(check)
-
-    if not checks:
+    probes = discover_local_openai(base_url)
+    checks = [probe.to_check() for probe in probes]
+    if not checks and base_url is None:
         ports_list = ", ".join(
             str(port) for port, _ in WELL_KNOWN_LOCAL_OPENAI_PORTS
         )
