@@ -71,8 +71,8 @@ Key modules:
   via `config.deep_merge`. The set of legal participant types (`cli`,
   `openrouter`, `openai_compatible`, `ollama`) and built-in modes (`quick`,
   `peer-only`, `plan`, `review`, `review-cheap`, `diverse`, `private-local`,
-  `us-only`, `deliberate`, `consensus`, plus the temporary `opus-versions`)
-  live here.
+  `local-only`, `us-only`, `deliberate`, `consensus`, plus the temporary
+  `opus-versions`) live here.
 - `config.py` — config discovery (`find_config` walks up from cwd looking for
   `.llm-council.yaml` etc.), validation, the `other_cli_peers` strategy used by
   most modes, `detect_current_agent` (parent-process walk on `/proc`), and

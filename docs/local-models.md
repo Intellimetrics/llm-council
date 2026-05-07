@@ -243,21 +243,37 @@ participants:
 
 ## Wiring local participants into modes
 
-Built-in modes don't include local participants by default. To add them:
+### Built-in `local-only` mode
+
+The `local-only` mode auto-discovers every local participant in your config —
+both `type: ollama` entries and any `type: openai_compatible` whose `base_url`
+resolves to loopback (`127.0.0.1`, `localhost`) or RFC1918. No further
+wiring needed:
+
+```bash
+llm-council run --mode local-only --diff "Review this change"
+```
+
+Hosted-inference CLI peers (claude/codex/gemini) and hosted API peers
+(openrouter) are excluded — `local-only` is for offline/private review.
+
+### Custom modes
+
+To mix local and hosted peers, define your own mode:
 
 ```yaml
 modes:
-  # Add a local pass alongside the native CLI peers
+  # Native triad plus a local pass
   plan-with-local:
     strategy: other_cli_peers
     include_current: true
     add: ["local_vllm"]
     description: "Native triad plus local Qwen on vLLM."
 
-  # Or run only your local model(s)
-  local-only:
+  # Pin a specific local participant
+  vllm-only:
     participants: ["local_vllm"]
-    description: "Local-only private review."
+    description: "Single-peer local review against vLLM."
 ```
 
 Or use `--include local_vllm` on a single run without modifying modes.

@@ -193,8 +193,28 @@ def validate_config(config: dict[str, Any]) -> None:
                 raise ValueError(
                     f"Mode '{name}' references unknown participant '{participant}'"
                 )
-        if has_strategy and mode.get("strategy") != "other_cli_peers":
+        if has_strategy and mode.get("strategy") not in (
+            "other_cli_peers",
+            "local_only_peers",
+        ):
             raise ValueError(f"Mode '{name}' has unsupported strategy '{mode.get('strategy')}'")
+        if mode.get("strategy") == "local_only_peers":
+            # `include_current` is meaningless for local_only — the host CLI is
+            # never a local participant in this sense (its inference is hosted).
+            # Also reject `add` to keep the mode honest: local-only with a
+            # hosted addition is contradictory; users wanting a hybrid should
+            # use an explicit `participants:` list instead.
+            if "include_current" in mode:
+                raise ValueError(
+                    f"Mode '{name}' (strategy local_only_peers) does not "
+                    "support include_current"
+                )
+            if "add" in mode:
+                raise ValueError(
+                    f"Mode '{name}' (strategy local_only_peers) does not "
+                    "support 'add' — use an explicit participants list for "
+                    "hybrid modes"
+                )
         if "include_current" in mode and not isinstance(mode["include_current"], bool):
             raise ValueError(f"Mode '{name}' include_current must be a boolean")
         if mode.get("origin_policy") not in (None, "any", "us"):
@@ -376,6 +396,62 @@ def _is_private_ip(ip: ipaddress._BaseAddress) -> bool:
         or ip.is_unspecified
         or ip.is_reserved
     )
+
+
+def _is_local_base_url(base_url: str) -> bool:
+    """True iff `base_url` points at a loopback or RFC1918-style address.
+
+    Used by the `local_only_peers` mode strategy. Mirrors the host classification
+    in :func:`_enforce_public_https_endpoint` but inverted — instead of erroring
+    on private hosts, it identifies them so the local-only mode can select them.
+
+    Hostnames that fail to resolve are treated as **not** local — better to
+    omit a participant from a local-only run than to silently include a peer
+    we cannot prove is on-prem.
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
+        return False
+    try:
+        parsed = urlparse(base_url.strip())
+    except ValueError:
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    normalized = host.lower().rstrip(".")
+    if not normalized:
+        return False
+    if normalized in _LOOPBACK_HOSTNAMES:
+        return True
+    literal = _parse_ip_literal(host)
+    if literal is not None:
+        return _is_private_ip(literal)
+    addresses, resolution_error = _resolve_host_addresses(normalized)
+    if resolution_error is not None:
+        return False
+    for address in addresses:
+        ip = _parse_ip_literal(address)
+        if ip is not None and _is_private_ip(ip):
+            return True
+    return False
+
+
+def _is_local_participant(cfg: dict[str, Any]) -> bool:
+    """True iff a participant runs on the user's machine / private network.
+
+    - `type: ollama` is always local (the adapter only talks to localhost-ish
+      servers and the type itself implies on-prem).
+    - `type: openai_compatible` is local when its `base_url` resolves loopback
+      or RFC1918.
+    - `type: cli` and `type: openrouter` are never local for this purpose:
+      the binary may run locally but the inference is hosted.
+    """
+    ptype = cfg.get("type")
+    if ptype == "ollama":
+        return True
+    if ptype == "openai_compatible":
+        return _is_local_base_url(str(cfg.get("base_url") or ""))
+    return False
 
 
 def migrate_known_cli_defaults(config: dict[str, Any]) -> None:
@@ -616,6 +692,20 @@ def select_participants(
                 if not current:
                     selected = list(BASELINE_CLIS)
             selected.extend(mode_cfg.get("add", []))
+        elif mode_cfg.get("strategy") == "local_only_peers":
+            selected = [
+                name
+                for name, cfg in participants.items()
+                if _is_local_participant(cfg)
+            ]
+            if not selected:
+                raise ValueError(
+                    f"Mode '{mode}' (strategy local_only_peers) has no "
+                    "matching participants. Add at least one `type: ollama` "
+                    "or `type: openai_compatible` participant whose "
+                    "base_url is loopback or private (see "
+                    "docs/local-models.md)."
+                )
         else:
             raise ValueError(f"Mode '{mode}' has no participants or known strategy")
 

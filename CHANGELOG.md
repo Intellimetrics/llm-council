@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## 0.4.4 - 2026-05-07
+
+### Modes
+
+- New built-in `local-only` mode and `local_only_peers` mode strategy.
+  Selects every `type: ollama` participant plus any `type:
+  openai_compatible` whose `base_url` resolves to loopback (`127.0.0.1`,
+  `localhost`, `[::1]`) or RFC1918 (`10.x`, `172.16-31.x`, `192.168.x`).
+  Excludes hosted-inference CLIs (claude/codex/gemini — local binary,
+  hosted inference) and hosted API peers (openrouter). Auto-extends as
+  users add local participants — no need to update mode wiring when a
+  new vLLM/sglang/LM Studio entry shows up in `.llm-council.yaml`.
+- `local-only` is distinct from `private-local`: `private-local` stays
+  hard-pinned to the built-in `local_qwen_coder` (Ollama) for backcompat,
+  while `local-only` picks up any local participant the user has wired
+  up. Existing `private-local` callers see no behavior change.
+- The `local_only_peers` strategy refuses `include_current` and `add` —
+  hybrid modes (local + hosted) must use an explicit `participants:`
+  list so the contradiction is visible at the call site rather than
+  silently producing a non-local result.
+- Setup wizard surfaces the `local-only` mode in generated configs only
+  when the project has at least one local participant, mirroring the
+  existing pattern that hides `private-local` from setups without
+  Ollama.
+
 ## 0.4.3 - 2026-05-07
 
 ### Diagnostics

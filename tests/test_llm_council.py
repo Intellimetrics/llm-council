@@ -225,6 +225,214 @@ def test_deliberate_mode_adds_deepseek_and_marks_expensive():
     assert config["modes"]["deliberate"]["deliberate"] is True
 
 
+# ---------------------------------------------------------------------------
+# local-only mode (strategy: local_only_peers)
+# ---------------------------------------------------------------------------
+
+
+def test_local_only_mode_picks_up_default_ollama_participant():
+    """The shipped `local-only` mode should resolve to the built-in
+    Ollama-backed participant on a clean default config — no extra wiring
+    needed."""
+    config = load_config(None)
+    assert "local-only" in config["modes"]
+    selected = select_participants(config, "local-only", current=None)
+    assert selected == ["local_qwen_coder"]
+
+
+def test_local_only_mode_excludes_native_clis_even_when_current(tmp_path: Path):
+    """The host CLI (claude/codex/gemini) is never local in this sense — its
+    inference is hosted. `local-only` must not reach for the current agent."""
+    config = load_config(None)
+    selected = select_participants(config, "local-only", current="claude")
+    assert "claude" not in selected
+    assert "codex" not in selected
+    assert "gemini" not in selected
+
+
+def test_local_only_mode_includes_local_openai_compatible(tmp_path: Path):
+    """A user-defined `type: openai_compatible` participant on loopback should
+    be selected. A hosted one (api.together.xyz) must be filtered out."""
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        """
+participants:
+  local_vllm:
+    type: openai_compatible
+    base_url: http://127.0.0.1:8000/v1
+    model: Qwen/Qwen3.6-27B
+    family: qwen
+    origin: "China / Alibaba Qwen"
+    api_key_env: LOCAL_OPENAI_API_KEY
+    allow_private: true
+    timeout: 360
+  hosted_together:
+    type: openai_compatible
+    base_url: https://api.together.xyz/v1
+    model: Qwen/Qwen2.5-72B-Instruct-Turbo
+    family: qwen
+    origin: "China / Alibaba Qwen"
+    api_key_env: TOGETHER_API_KEY
+""",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    selected = select_participants(config, "local-only", current=None)
+    assert "local_vllm" in selected
+    assert "local_qwen_coder" in selected  # default Ollama entry
+    assert "hosted_together" not in selected
+
+
+def test_local_only_mode_includes_localhost_hostname(tmp_path: Path):
+    """Hostname `localhost` must qualify just like the literal `127.0.0.1`."""
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        """
+participants:
+  local_lmstudio:
+    type: openai_compatible
+    base_url: http://localhost:1234/v1
+    model: lmstudio-loaded-model
+    family: llama
+    origin: "US / Meta"
+    api_key_env: LOCAL_OPENAI_API_KEY
+    allow_private: true
+""",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    selected = select_participants(config, "local-only", current=None)
+    assert "local_lmstudio" in selected
+
+
+def test_local_only_mode_includes_rfc1918_ip(tmp_path: Path):
+    """A private-network IP (e.g., `10.0.0.5`) should qualify — covers the
+    homelab/on-prem case where the inference server is on the LAN, not the
+    same machine."""
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        """
+participants:
+  homelab_vllm:
+    type: openai_compatible
+    base_url: http://10.0.0.5:8000/v1
+    model: Qwen/Qwen3.6-27B
+    family: qwen
+    origin: "China / Alibaba Qwen"
+    api_key_env: LOCAL_OPENAI_API_KEY
+    allow_private: true
+""",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    selected = select_participants(config, "local-only", current=None)
+    assert "homelab_vllm" in selected
+
+
+def test_local_only_mode_errors_when_no_local_participants():
+    """If a config has no local participants at all, `local-only` must
+    produce a clear error naming the strategy — not silently degrade to
+    empty."""
+    # Construct a minimal hosted-only config directly. `load_config` would
+    # always merge in the default `local_qwen_coder` (and YAML `null` does
+    # not delete merged keys), so this test bypasses the loader.
+    config = {
+        "version": 1,
+        "participants": {
+            "hosted_only": {
+                "type": "openrouter",
+                "family": "qwen",
+                "origin": "China / Alibaba Qwen",
+                "model": "qwen/qwen3-coder-flash",
+                "api_key_env": "OPENROUTER_API_KEY",
+            },
+        },
+        "modes": {
+            "local-only": {
+                "strategy": "local_only_peers",
+                "description": "test",
+            },
+        },
+    }
+    with pytest.raises(ValueError, match="local_only_peers"):
+        select_participants(config, "local-only", current=None)
+
+
+def test_local_only_strategy_rejects_include_current(tmp_path: Path):
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        """
+modes:
+  bad-local:
+    strategy: local_only_peers
+    include_current: true
+    description: should be rejected
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="include_current"):
+        load_config(config_path)
+
+
+def test_local_only_strategy_rejects_add(tmp_path: Path):
+    """`local_only_peers + add: [hosted_peer]` is contradictory — the
+    validator should reject it rather than silently producing a hybrid."""
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        """
+modes:
+  bad-mixed:
+    strategy: local_only_peers
+    add: ["qwen_coder_flash"]
+    description: should be rejected
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="add"):
+        load_config(config_path)
+
+
+def test_unknown_strategy_still_rejected(tmp_path: Path):
+    """Sanity check: adding `local_only_peers` to the validator's allowlist
+    must not have widened it to accept arbitrary strings."""
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        """
+modes:
+  weird:
+    strategy: every_peer_ever
+    description: should be rejected
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unsupported strategy"):
+        load_config(config_path)
+
+
+def test_is_local_base_url_classification():
+    from llm_council.config import _is_local_base_url
+
+    # Loopback hostnames + IP literals
+    assert _is_local_base_url("http://localhost:8000/v1") is True
+    assert _is_local_base_url("http://127.0.0.1:8000/v1") is True
+    assert _is_local_base_url("http://[::1]:8000/v1") is True
+
+    # RFC1918
+    assert _is_local_base_url("http://10.0.0.5:8000/v1") is True
+    assert _is_local_base_url("http://192.168.1.10:8000/v1") is True
+    assert _is_local_base_url("http://172.16.0.1:8000/v1") is True
+
+    # Public
+    assert _is_local_base_url("https://api.openai.com/v1") is False
+    assert _is_local_base_url("https://openrouter.ai/api/v1") is False
+    assert _is_local_base_url("https://api.together.xyz/v1") is False
+
+    # Bad input
+    assert _is_local_base_url("") is False
+    assert _is_local_base_url("not a url") is False
+    assert _is_local_base_url(None) is False  # type: ignore[arg-type]
+
+
 def test_explicit_participants_win():
     config = load_config(None)
     selected = select_participants(config, "quick", "codex", explicit=["glm_5_1"])

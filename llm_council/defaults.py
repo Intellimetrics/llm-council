@@ -305,6 +305,16 @@ DEFAULT_CONFIG: dict = {
             "participants": ["local_qwen_coder"],
             "description": "Local-only private pass. Requires the model/runtime to exist.",
         },
+        "local-only": {
+            "strategy": "local_only_peers",
+            "description": (
+                "All configured local participants — `type: ollama` and any "
+                "`type: openai_compatible` whose base_url is loopback or "
+                "RFC1918. Excludes hosted-inference CLIs (claude/codex/"
+                "gemini) and hosted API peers (openrouter). See "
+                "docs/local-models.md for adding local-server participants."
+            ),
+        },
         "us-only": {
             "strategy": "other_cli_peers",
             "include_current": True,

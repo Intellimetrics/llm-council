@@ -175,6 +175,14 @@ def _mode_available(
 ) -> bool:
     if mode.get("strategy") == "other_cli_peers" and not include_native:
         return False
+    if mode.get("strategy") == "local_only_peers":
+        # `local-only` is only useful when the project has at least one
+        # local participant. Today that means the default `local_qwen_coder`
+        # (Ollama) — pulled in only when `include_local=True`. Any
+        # user-defined local openai_compatible peers will satisfy this too,
+        # but the wizard adds those after this filter runs, so we gate on
+        # the same `include_local` signal that drives `local_qwen_coder`.
+        return "local_qwen_coder" in participant_names
     return _mode_participants(mode).issubset(participant_names)
 
 

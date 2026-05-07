@@ -397,11 +397,13 @@ for current costs.
 
 ## Modes
 
-A mode either lists exact participants or uses `strategy: other_cli_peers`.
-Built-in native modes set `include_current: true`, so `quick` asks Claude,
-Codex, and Gemini as explicit read-only participants even when one of them is
-the active host. Use `peer-only`, or set `include_current: false`, when you only
-want outside perspectives.
+A mode either lists exact participants or uses one of two strategies:
+`other_cli_peers` (the native triad — Claude/Codex/Gemini, optionally with
+extras via `add`) or `local_only_peers` (every configured participant whose
+inference runs on-prem). Built-in native modes set `include_current: true`,
+so `quick` asks Claude, Codex, and Gemini as explicit read-only participants
+even when one of them is the active host. Use `peer-only`, or set
+`include_current: false`, when you only want outside perspectives.
 
 ```yaml
 modes:
@@ -417,7 +419,16 @@ modes:
     add: ["qwen_coder_plus"]
   cheap:
     participants: ["deepseek_v4_flash", "qwen_coder_flash"]
+  local-only:
+    strategy: local_only_peers
 ```
+
+The built-in `local-only` mode auto-discovers every `type: ollama` participant
+plus any `type: openai_compatible` whose `base_url` is loopback or RFC1918.
+Hosted-inference CLIs and hosted API peers are excluded. See
+[`docs/local-models.md`](local-models.md) for adding local-server
+participants. `local_only_peers` does not support `include_current` or
+`add` — use an explicit `participants:` list for hybrid modes.
 
 `origin_policy: us` filters non-US participants. If the filter removes every
 participant, the run fails clearly.

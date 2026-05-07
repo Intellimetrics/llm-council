@@ -6,7 +6,7 @@
 [![Read-only](https://img.shields.io/badge/default-read--only-6b7280)](#read-only-means-read-only)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/Intellimetrics/llm-council?style=flat&color=yellow)](https://github.com/Intellimetrics/llm-council/stargazers)
-[![Version](https://img.shields.io/badge/version-0.4.3-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.4-111827)](CHANGELOG.md)
 
 Your coding agent is confident.
 
@@ -18,7 +18,7 @@ It is a Python 3.11+ MCP server and CLI. It works with the tools developers alre
 
 The console command is `llm-council`. The MCP server name is also `llm-council`.
 
-MIT licensed. Current version: `0.4.3`.
+MIT licensed. Current version: `0.4.4`.
 
 GitHub: <https://github.com/Intellimetrics/llm-council>
 
