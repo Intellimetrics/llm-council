@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+## 0.4.8 - 2026-05-07
+
+### Setup wizard
+
+- New `llm-council setup --probe-local` flag scaffolds local
+  OpenAI-compatible participants from running endpoints. Reuses the
+  doctor probe (`probe_local_openai`) to discover servers on the
+  well-known ports (vLLM, sglang, LM Studio, llama.cpp `--api`, MLX,
+  Ollama `/v1`), then for each found endpoint prompts the user to:
+  (1) confirm scaffolding, (2) pick a served model from the
+  `/v1/models` enumeration (or enter manually if the server doesn't
+  list any), (3) confirm participant name and family, and (4) pick an
+  origin from a numbered registry (`KNOWN_ORIGIN_STRINGS` + free-text
+  "Other"). The participant block is written to `.llm-council.yaml`
+  with sensible defaults: `allow_private: true`, `timeout: 360`,
+  `read_only: true`, `api_key_env: LOCAL_OPENAI_API_KEY`.
+- Auto-derives sensible defaults for the user-prompted fields:
+  `family` from a substring match against known model families
+  (qwen / llama / deepseek / mistral / gemma / phi / kimi / glm) with
+  a first-segment fallback, and `participant name` as
+  `local_<family>_<sluggified-model-id>` (e.g.,
+  `Qwen/Qwen3.6-27B` → `local_qwen_qwen3_6_27b`).
+- The flag is interactive-only; under `--yes` it warns and is treated
+  as a no-op (probing requires prompts for origin/family). Without the
+  flag, `setup` does no network probing — pure-config command behavior
+  is preserved by default, matching the council's "opt-in, not
+  surprise scan" recommendation.
+- `project_config()` and `write_setup_files()` accept a new
+  `extra_local_participants={name: cfg, …}` keyword. The wizard
+  uses this to merge probe-scaffolded participants into the
+  generated YAML alongside the preset's defaults.
+- `_mode_available()` for `local_only_peers` now checks a `has_local`
+  signal (true when either `include_local` is set or any
+  wizard-probed local participant is present), so the `local-only`
+  mode surfaces in the generated config whenever ANY local
+  participant is configured — not just when the built-in
+  `local_qwen_coder` is included.
+- After scaffolding, the wizard prints a one-line reminder to
+  `export LOCAL_OPENAI_API_KEY=dummy` (or a real key) before running
+  the council, since the openai_compatible adapter requires a
+  non-empty Authorization header even for unauthenticated local
+  servers.
+
 ## 0.4.7 - 2026-05-07
 
 ### Adapters

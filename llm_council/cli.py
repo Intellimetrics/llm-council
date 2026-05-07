@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -251,6 +252,17 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--no-mcp", action="store_true", help="Do not write .mcp.json")
     setup.add_argument(
         "--no-instructions", action="store_true", help="Do not write instruction snippets"
+    )
+    setup.add_argument(
+        "--probe-local",
+        action="store_true",
+        help=(
+            "Scan well-known local OpenAI-compatible ports during interactive "
+            "setup and offer to scaffold participant blocks for any reachable "
+            "endpoint (vLLM, sglang, LM Studio, llama.cpp --api, MLX). "
+            "Ignored under --yes (probing requires interactive prompts for "
+            "origin and family)."
+        ),
     )
 
     doctor = sub.add_parser("doctor", help="Check local council environment")
@@ -646,6 +658,171 @@ def _confirm(prompt: str, default: bool = True) -> bool:
     return answer in {"y", "yes"}
 
 
+def _pick_origin_interactive(default: str | None = None) -> str:
+    """Prompt the user to pick an origin from `KNOWN_ORIGIN_STRINGS` or
+    enter free text. Returns the chosen string verbatim — typo detection
+    via `config_warnings` will catch near-misses on canonical strings."""
+    from llm_council.defaults import KNOWN_ORIGIN_STRINGS
+
+    options = list(KNOWN_ORIGIN_STRINGS)
+    print("\n  Pick an origin (reflects the *model*, not the network location):")
+    for index, value in enumerate(options, start=1):
+        marker = " (default)" if value == default else ""
+        print(f"    {index}) {value}{marker}")
+    print(f"    {len(options) + 1}) Other (free text)")
+    while True:
+        prompt = "  Choice"
+        if default and default in options:
+            prompt = f"{prompt} [{options.index(default) + 1}]"
+        answer = input(f"{prompt}: ").strip()
+        if not answer and default and default in options:
+            return default
+        if answer.isdigit():
+            choice = int(answer)
+            if 1 <= choice <= len(options):
+                return options[choice - 1]
+            if choice == len(options) + 1:
+                free = input("  Custom origin string: ").strip()
+                if free:
+                    return free
+                print("  Origin must be non-empty.")
+                continue
+        print(f"  Invalid choice. Enter a number 1-{len(options) + 1}.")
+
+
+def _derive_default_family(model_id: str) -> str:
+    """Heuristic: pick a reasonable default `family` from a model id.
+
+    `Qwen/Qwen3.6-27B` → `qwen`
+    `meta-llama/Llama-3.3-70B-Instruct` → `llama`
+    `lmstudio-community/Meta-Llama-3.3-70B-…` → `llama`
+    `deepseek-ai/DeepSeek-V4` → `deepseek`
+
+    Best-effort substring match against well-known family keywords; falls
+    back to the model id's first segment when nothing matches.
+    """
+    lower = model_id.lower()
+    for keyword in (
+        "qwen", "deepseek", "llama", "mistral", "gemma",
+        "phi", "claude", "gemini", "kimi", "glm",
+    ):
+        if keyword in lower:
+            return keyword
+    if "/" in model_id:
+        first, _ = model_id.split("/", 1)
+        return re.sub(r"[^a-z0-9]+", "_", first.lower()) or "local"
+    return "local"
+
+
+def _derive_default_participant_name(model_id: str) -> str:
+    """Turn `Qwen/Qwen3.6-27B` into `local_qwen_qwen3_6_27b`."""
+    family = _derive_default_family(model_id)
+    last = model_id.rsplit("/", 1)[-1]
+    slug = re.sub(r"[^a-z0-9]+", "_", last.lower()).strip("_") or "model"
+    return f"local_{family}_{slug}"[:64]
+
+
+def _probe_and_collect_local_participants(
+    *, probe_url: str | None = None
+) -> dict[str, dict]:
+    """Probe local OpenAI-compatible endpoints, prompt the user to scaffold
+    each as a participant. Returns a {name: cfg} dict (possibly empty).
+
+    Caller is responsible for ensuring this only runs in interactive mode.
+    """
+    from llm_council.doctor import probe_local_openai
+
+    print("\nProbing local OpenAI-compatible endpoints…")
+    checks = probe_local_openai(probe_url)
+    extras: dict[str, dict] = {}
+    for check in checks:
+        if not check.ok:
+            print(f"  - {check.name}: {check.detail}")
+            continue
+        # Extract base URL: the check name is `probe:local-openai:<label>`
+        # for default scan, or `probe:local-openai:<full url>` for explicit.
+        # In both cases, the detail names the served models. We need the URL
+        # to scaffold a participant; rebuild it from the well-known label or
+        # the explicit form.
+        from llm_council.doctor import (
+            WELL_KNOWN_LOCAL_OPENAI_PORTS,
+            _normalize_local_openai_base_url,
+        )
+        label_to_port = {
+            label: port for port, label in WELL_KNOWN_LOCAL_OPENAI_PORTS
+        }
+        suffix = check.name[len("probe:local-openai:"):]
+        if suffix in label_to_port:
+            base_url = f"http://127.0.0.1:{label_to_port[suffix]}/v1"
+        else:
+            base_url = _normalize_local_openai_base_url(suffix)
+        # Pull served model ids out of the detail string
+        # ("N model(s): id1, id2, ..."); we'll prompt the user to confirm.
+        detail = check.detail
+        try:
+            ids_part = detail.split(":", 1)[1].strip()
+        except IndexError:
+            ids_part = ""
+        served_models = [s.strip() for s in ids_part.split(",") if s.strip()]
+        # Drop any "(+N)" tail produced by the probe's truncation marker.
+        served_models = [s for s in served_models if not s.startswith("…")]
+
+        print(f"\n  Found: {check.detail}")
+        print(f"  Endpoint: {base_url}")
+        if not _confirm("  Scaffold a council participant for this endpoint?", True):
+            continue
+        if served_models:
+            if len(served_models) == 1:
+                model_id = served_models[0]
+                print(f"  Model: {model_id}")
+            else:
+                print("  Available models:")
+                for i, mid in enumerate(served_models, 1):
+                    print(f"    {i}) {mid}")
+                while True:
+                    raw = input(
+                        f"  Pick a model [1-{len(served_models)}]: "
+                    ).strip()
+                    if raw.isdigit() and 1 <= int(raw) <= len(served_models):
+                        model_id = served_models[int(raw) - 1]
+                        break
+                    print(f"  Invalid choice.")
+        else:
+            model_id = input(
+                "  Endpoint did not list models — enter the model id manually: "
+            ).strip()
+            if not model_id:
+                print("  Skipping (no model id).")
+                continue
+        default_name = _derive_default_participant_name(model_id)
+        name_input = input(f"  Participant name [{default_name}]: ").strip()
+        name = name_input or default_name
+        default_family = _derive_default_family(model_id)
+        family_input = input(f"  Family [{default_family}]: ").strip()
+        family = family_input or default_family
+        origin = _pick_origin_interactive()
+        extras[name] = {
+            "type": "openai_compatible",
+            "family": family,
+            "origin": origin,
+            "base_url": base_url,
+            "model": model_id,
+            "api_key_env": "LOCAL_OPENAI_API_KEY",
+            "allow_private": True,
+            "timeout": 360,
+            "read_only": True,
+        }
+        print(f"  Will write participant {name!r}.")
+    if extras:
+        print(
+            "\n  Note: export LOCAL_OPENAI_API_KEY=dummy (or a real key) "
+            "before running the council. The openai_compatible adapter "
+            "requires a non-empty Authorization header even for "
+            "unauthenticated local servers."
+        )
+    return extras
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     load_project_env(root)
@@ -689,6 +866,17 @@ def cmd_setup(args: argparse.Namespace) -> int:
         write_instructions = not args.no_instructions
         us_only_default = args.us_only_default
 
+    extra_local_participants: dict[str, dict] = {}
+    if getattr(args, "probe_local", False):
+        if args.yes:
+            print(
+                "llm-council: --probe-local requires interactive prompts "
+                "(origin/family/model). Ignored under --yes.",
+                file=sys.stderr,
+            )
+        else:
+            extra_local_participants = _probe_and_collect_local_participants()
+
     try:
         written = write_setup_files(
             root,
@@ -699,6 +887,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             write_mcp=write_mcp,
             write_instructions=write_instructions,
             force=args.force,
+            extra_local_participants=extra_local_participants or None,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc

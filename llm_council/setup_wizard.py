@@ -118,7 +118,9 @@ def project_config(
     include_openrouter: bool = True,
     include_local: bool = True,
     us_only_default: bool = False,
+    extra_local_participants: dict[str, dict[str, Any]] | None = None,
 ) -> dict:
+    extra_local_participants = extra_local_participants or {}
     participant_names: set[str] = set()
     if include_native:
         participant_names.update({"claude", "codex", "gemini"})
@@ -130,11 +132,18 @@ def project_config(
         participant_names.update(OPENROUTER_PARTICIPANTS)
     if include_local:
         participant_names.add("local_qwen_coder")
+    participant_names.update(extra_local_participants.keys())
 
+    has_local = include_local or bool(extra_local_participants)
     modes = {
         name: mode
         for name, mode in DEFAULT_CONFIG["modes"].items()
-        if _mode_available(mode, participant_names, include_native=include_native)
+        if _mode_available(
+            mode,
+            participant_names,
+            include_native=include_native,
+            has_local=has_local,
+        )
     }
     if not include_native and include_openrouter:
         modes.update(_openrouter_only_modes())
@@ -161,6 +170,8 @@ def project_config(
         config["participants"]["local_qwen_coder"] = DEFAULT_CONFIG["participants"][
             "local_qwen_coder"
         ]
+    for name, cfg in extra_local_participants.items():
+        config["participants"][name] = cfg
     return config
 
 
@@ -171,18 +182,20 @@ def _mode_participants(mode: dict[str, Any]) -> set[str]:
 
 
 def _mode_available(
-    mode: dict[str, Any], participant_names: set[str], *, include_native: bool
+    mode: dict[str, Any],
+    participant_names: set[str],
+    *,
+    include_native: bool,
+    has_local: bool = False,
 ) -> bool:
     if mode.get("strategy") == "other_cli_peers" and not include_native:
         return False
     if mode.get("strategy") == "local_only_peers":
-        # `local-only` is only useful when the project has at least one
-        # local participant. Today that means the default `local_qwen_coder`
-        # (Ollama) — pulled in only when `include_local=True`. Any
-        # user-defined local openai_compatible peers will satisfy this too,
-        # but the wizard adds those after this filter runs, so we gate on
-        # the same `include_local` signal that drives `local_qwen_coder`.
-        return "local_qwen_coder" in participant_names
+        # `local-only` is only useful when at least one local participant
+        # is configured — either the built-in `local_qwen_coder` (gated by
+        # `include_local`) or any wizard-probed local openai_compatible
+        # peer (signalled via `has_local`).
+        return has_local
     return _mode_participants(mode).issubset(participant_names)
 
 
@@ -252,6 +265,7 @@ def write_setup_files(
     write_mcp: bool = True,
     write_instructions: bool = True,
     force: bool = False,
+    extra_local_participants: dict[str, dict[str, Any]] | None = None,
 ) -> list[Path]:
     written: list[Path] = []
     root.mkdir(parents=True, exist_ok=True)
@@ -262,6 +276,7 @@ def write_setup_files(
         include_openrouter=include_openrouter,
         include_local=include_local,
         us_only_default=us_only_default,
+        extra_local_participants=extra_local_participants,
     )
     if config_path.exists() and not force:
         existing_config = _read_yaml_mapping(config_path)

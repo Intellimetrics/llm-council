@@ -280,6 +280,118 @@ def test_clean_subprocess_env_strict_blocks_gemini_leak(monkeypatch):
     assert "GEMINI_MODEL" not in env
 
 
+# ---------------------------------------------------------------------------
+# setup_wizard --probe-local: helpers + integration with project_config
+# ---------------------------------------------------------------------------
+
+
+def test_derive_default_family_known_keywords():
+    from llm_council.cli import _derive_default_family
+
+    assert _derive_default_family("Qwen/Qwen3.6-27B") == "qwen"
+    assert _derive_default_family("meta-llama/Llama-3.3-70B-Instruct") == "llama"
+    assert _derive_default_family("deepseek-ai/DeepSeek-V4") == "deepseek"
+    assert _derive_default_family("mistralai/Mistral-Large") == "mistral"
+
+
+def test_derive_default_family_falls_back_to_first_segment():
+    from llm_council.cli import _derive_default_family
+
+    assert _derive_default_family("acme/some-model") == "acme"
+    # No slash, no keyword match, no other signal — generic fallback.
+    assert _derive_default_family("gguf-model") == "local"
+
+
+def test_derive_default_participant_name_uses_family_and_slug():
+    from llm_council.cli import _derive_default_participant_name
+
+    assert (
+        _derive_default_participant_name("Qwen/Qwen3.6-27B")
+        == "local_qwen_qwen3_6_27b"
+    )
+    assert _derive_default_participant_name("Qwen2.5-7B") == "local_qwen_qwen2_5_7b"
+
+
+def test_project_config_includes_extra_local_participants():
+    from llm_council.setup_wizard import project_config
+
+    extras = {
+        "local_vllm_qwen": {
+            "type": "openai_compatible",
+            "family": "qwen",
+            "origin": "China / Alibaba Qwen",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "model": "Qwen/Qwen3.6-27B",
+            "api_key_env": "LOCAL_OPENAI_API_KEY",
+            "allow_private": True,
+            "timeout": 360,
+            "read_only": True,
+        },
+    }
+    config = project_config(
+        include_native=True,
+        include_openrouter=False,
+        include_local=False,  # no built-in local_qwen_coder
+        extra_local_participants=extras,
+    )
+    assert "local_vllm_qwen" in config["participants"]
+    assert config["participants"]["local_vllm_qwen"]["base_url"] == "http://127.0.0.1:8000/v1"
+    # `local-only` mode must surface even without `local_qwen_coder`,
+    # because the wizard-probed participant satisfies has_local.
+    assert "local-only" in config["modes"]
+
+
+def test_project_config_omits_local_only_mode_without_any_local_participants():
+    from llm_council.setup_wizard import project_config
+
+    config = project_config(
+        include_native=True,
+        include_openrouter=False,
+        include_local=False,
+        extra_local_participants=None,
+    )
+    assert "local-only" not in config["modes"]
+
+
+def test_write_setup_files_passes_extras_through(tmp_path: Path):
+    from llm_council.setup_wizard import write_setup_files
+    import yaml as _yaml
+
+    extras = {
+        "local_lmstudio_llama": {
+            "type": "openai_compatible",
+            "family": "llama",
+            "origin": "US / Meta",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "model": "lmstudio-community/Meta-Llama-3.3-70B-Instruct-GGUF",
+            "api_key_env": "LOCAL_OPENAI_API_KEY",
+            "allow_private": True,
+            "timeout": 360,
+            "read_only": True,
+        },
+    }
+    write_setup_files(
+        tmp_path,
+        include_native=True,
+        include_openrouter=False,
+        include_local=False,
+        write_mcp=False,
+        write_instructions=False,
+        force=True,
+        extra_local_participants=extras,
+    )
+    written_config = _yaml.safe_load(
+        (tmp_path / ".llm-council.yaml").read_text(encoding="utf-8")
+    )
+    assert "local_lmstudio_llama" in written_config["participants"]
+    # The freshly-written config must validate cleanly.
+    config = load_config(tmp_path / ".llm-council.yaml")
+    assert "local-only" in config["modes"]
+    assert select_participants(config, "local-only", current=None) == [
+        "local_lmstudio_llama"
+    ]
+
+
 def test_env_strict_validation_rejects_non_bool(tmp_path: Path):
     config_path = tmp_path / ".llm-council.yaml"
     config_path.write_text(
