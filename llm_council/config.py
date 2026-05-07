@@ -131,6 +131,12 @@ def validate_config(config: dict[str, Any]) -> None:
             _validate_string_list(
                 participant, "env_passthrough", f"CLI participant '{name}'"
             )
+            if "env_strict" in participant and not isinstance(
+                participant["env_strict"], bool
+            ):
+                raise ValueError(
+                    f"CLI participant '{name}' env_strict must be a boolean"
+                )
             _validate_regex_list(
                 participant,
                 "cli_retry_stderr_patterns",

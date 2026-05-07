@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 0.4.7 - 2026-05-07
+
+### Adapters
+
+- New `env_strict: true` opt-in flag on CLI participants. When set, the
+  subprocess inherits ONLY the names in `_SAFE_ENV_NAMES` (PATH, HOME,
+  LANG, TERM, USER, SHELL, XDG_*, …) plus whatever is listed in
+  `env_passthrough` — every other env var the parent shell carries is
+  dropped, including non-secret ones like `GEMINI_MODEL`,
+  `OPENAI_BASE_URL`, `GOOGLE_CLOUD_PROJECT`. Default is `false`
+  (sieve mode — current behavior — drops only secret-named vars).
+- The motivating case is qwen-code (a gemini-cli fork): if
+  `GEMINI_API_KEY` / `GOOGLE_*` / `GEMINI_MODEL` is set in the parent
+  shell (e.g., for the council's `gemini` peer), qwen-code auto-detects
+  Gemini auth and silently routes there instead of the configured
+  OpenAI-compatible backend. With `env_strict: true` plus an explicit
+  `env_passthrough` of the OpenAI-compat vars, the child can no longer
+  see anything that would mis-route it. Belt-and-suspenders alongside
+  `--auth-type openai` (which only fixes the auth-routing leak; the
+  model-routing leak is separate).
+- Sieve-mode behavior unchanged for all existing CLI participants.
+  Existing configs see no change in env exposure unless they explicitly
+  opt in via `env_strict: true`.
+
+Validation
+- `env_strict` must be a boolean — config validator rejects strings
+  like `"yes"` with a clear error.
+
+CLAUDE.md
+- Custom-CLI template extended to document `env_passthrough` and
+  `env_strict`.
+
 ## 0.4.6 - 2026-05-07
 
 ### Orchestrator

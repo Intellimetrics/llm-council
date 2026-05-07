@@ -203,6 +203,100 @@ def test_clean_subprocess_env_strips_claudecode(monkeypatch):
     assert "OPENROUTER_API_KEY" not in env
 
 
+def test_clean_subprocess_env_sieve_passes_through_non_secret_vars(monkeypatch):
+    """Default (sieve) mode preserves harmless config like LANG, TERM,
+    GEMINI_MODEL — it only strips secret-named vars without an allowlist
+    entry."""
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-pro")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    env = clean_subprocess_env()
+    assert env.get("LANG") == "en_US.UTF-8"
+    assert env.get("GEMINI_MODEL") == "gemini-pro"
+    assert env.get("OPENAI_BASE_URL") == "https://api.openai.com/v1"
+
+
+def test_clean_subprocess_env_strict_drops_non_allowlisted_non_secret(monkeypatch):
+    """Strict mode is the GEMINI-key-leak fix: even non-secret env vars
+    that could mis-route a CLI fork (GEMINI_MODEL, OPENAI_BASE_URL,
+    GOOGLE_CLOUD_PROJECT) must be dropped unless explicitly allowlisted."""
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-pro")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "secret-project")
+    env = clean_subprocess_env(["OPENAI_API_KEY"], strict=True)
+    assert "GEMINI_MODEL" not in env
+    assert "OPENAI_BASE_URL" not in env
+    assert "GOOGLE_CLOUD_PROJECT" not in env
+
+
+def test_clean_subprocess_env_strict_keeps_essentials(monkeypatch):
+    """Even in strict mode, PATH/HOME/LANG/TERM and friends always survive
+    so the child process can actually run."""
+    # Don't rely on the test runner's existing env — set a few essentials
+    # explicitly so the assertion is independent.
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+    monkeypatch.setenv("HOME", "/home/test")
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    env = clean_subprocess_env([], strict=True)
+    assert env.get("PATH") == "/usr/local/bin:/usr/bin"
+    assert env.get("HOME") == "/home/test"
+    assert env.get("LANG") == "en_US.UTF-8"
+    assert env.get("LC_ALL") == "C.UTF-8"
+
+
+def test_clean_subprocess_env_strict_honors_env_passthrough(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "ds-test")
+    env = clean_subprocess_env(
+        ["OPENAI_API_KEY", "OPENAI_BASE_URL", "DASHSCOPE_API_KEY"],
+        strict=True,
+    )
+    assert env.get("OPENAI_API_KEY") == "sk-test"
+    assert env.get("OPENAI_BASE_URL") == "http://127.0.0.1:8000/v1"
+    assert env.get("DASHSCOPE_API_KEY") == "ds-test"
+
+
+def test_clean_subprocess_env_strict_blocks_gemini_leak(monkeypatch):
+    """The motivating case: a qwen-code (gemini-cli fork) participant must
+    not see GEMINI_API_KEY / GOOGLE_API_KEY / GEMINI_MODEL leaking from
+    the parent shell, because qwen-code auto-detects gemini auth and
+    silently routes there instead of the configured OpenAI-compat
+    backend."""
+    monkeypatch.setenv("GEMINI_API_KEY", "leaked-key")
+    monkeypatch.setenv("GOOGLE_API_KEY", "leaked-key")
+    monkeypatch.setenv("GOOGLE_GENAI_API_KEY", "leaked-key")
+    monkeypatch.setenv("GOOGLE_GENERATIVE_AI_API_KEY", "leaked-key")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-pro")
+    env = clean_subprocess_env(
+        ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"],
+        strict=True,
+    )
+    assert "GEMINI_API_KEY" not in env
+    assert "GOOGLE_API_KEY" not in env
+    assert "GOOGLE_GENAI_API_KEY" not in env
+    assert "GOOGLE_GENERATIVE_AI_API_KEY" not in env
+    assert "GEMINI_MODEL" not in env
+
+
+def test_env_strict_validation_rejects_non_bool(tmp_path: Path):
+    config_path = tmp_path / ".llm-council.yaml"
+    config_path.write_text(
+        """
+participants:
+  bad:
+    type: cli
+    family: bad
+    command: bad-cli
+    env_strict: "yes"
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="env_strict must be a boolean"):
+        load_config(config_path)
+
+
 def test_prompt_arg_is_redacted_and_literal_braces_are_safe(tmp_path: Path):
     prompt = "secret prompt"
     formatted = _format_arg("{cwd}/x/{literal}", prompt=prompt, cwd=tmp_path)

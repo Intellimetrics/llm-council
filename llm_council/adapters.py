@@ -341,7 +341,10 @@ async def _run_cli_once(
         )
     stdin_prompt = bool(cfg.get("stdin_prompt"))
     stdin_data = prompt if stdin_prompt else None
-    env = clean_subprocess_env(cfg.get("env_passthrough"))
+    env = clean_subprocess_env(
+        cfg.get("env_passthrough"),
+        strict=bool(cfg.get("env_strict", False)),
+    )
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1525,13 +1528,48 @@ def _redact_arg_value(part: str) -> str:
     return "[prompt]"
 
 
-def clean_subprocess_env(env_passthrough: list[str] | None = None) -> dict[str, str]:
+def clean_subprocess_env(
+    env_passthrough: list[str] | None = None,
+    *,
+    strict: bool = False,
+) -> dict[str, str]:
+    """Build the subprocess environment for a CLI participant.
+
+    Two modes:
+
+    - **Sieve (default, `strict=False`):** Inherit the parent environment
+      with secrets-by-name (KEY, AUTH, SECRET, TOKEN, …) stripped unless
+      they are explicitly listed in `env_passthrough`. This is the
+      historical behavior — preserves PATH/LANG/TERM and other harmless
+      configuration without requiring per-CLI allowlisting.
+
+    - **Strict (`strict=True`):** Allowlist-only. The child gets nothing
+      but the names in :data:`_SAFE_ENV_NAMES` (PATH/HOME/LANG/etc.) plus
+      whatever is in `env_passthrough`. Use this for CLI participants
+      that auto-detect provider configuration from env vars and could
+      mis-route given an unrelated `GEMINI_MODEL` or `OPENAI_BASE_URL`
+      leaking from the parent shell — the qwen-code (gemini-cli fork)
+      class of bug.
+
+    `LC_*` locale vars and `TERM` always pass through regardless of mode
+    so the child renders correctly. `CLAUDECODE` is always stripped.
+    """
     allowed = {key.upper() for key in (env_passthrough or [])}
     env: dict[str, str] = {}
     for key, value in os.environ.items():
         if key == "CLAUDECODE":
             continue
-        if _is_secret_env_name(key) and key.upper() not in allowed:
+        upper = key.upper()
+        if strict:
+            # Allowlist mode: only essentials + explicit pass-through.
+            if upper in _SAFE_ENV_NAMES or upper.startswith("LC_"):
+                env[key] = value
+            elif upper in allowed:
+                env[key] = value
+            # everything else: dropped
+            continue
+        # Sieve mode (legacy): inherit non-secrets, allowlist secrets.
+        if _is_secret_env_name(key) and upper not in allowed:
             continue
         env[key] = value
     return env

@@ -168,6 +168,15 @@ participants:
                            # `args` for the invariant to hold
     stdin_prompt: true     # whether the prompt is delivered via stdin (default)
                            # vs. {prompt} arg substitution
+    env_passthrough:       # secret-named env vars to forward to the child
+      - OPENAI_API_KEY     # (e.g. KEY/AUTH/TOKEN). Non-secret env vars
+                           # already inherit by default.
+    env_strict: false      # when true, the child sees ONLY the names in
+                           # _SAFE_ENV_NAMES (PATH/HOME/LANG/…) plus
+                           # `env_passthrough`. Use for CLIs that auto-
+                           # detect provider config from env (e.g. qwen-
+                           # code, a gemini-cli fork that prefers
+                           # GEMINI_* over OPENAI_* if both are set).
 ```
 
 Forget `family` and the participant works but config validation may flag it
