@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+## 0.4.6 - 2026-05-07
+
+### Orchestrator
+
+- New per-run pre-flight ping for local participants. Before the council
+  starts round 1, every selected participant whose `base_url` resolves
+  loopback or RFC1918 (Ollama and local `openai_compatible`) gets a
+  1-second `GET /v1/models` (or `/api/tags` for ollama). Probes run
+  concurrently; total pre-flight wall time is bounded by the single-probe
+  timeout, not the participant count. Reachable endpoints pass through
+  to the normal run path; unreachable ones short-circuit with a synthesized
+  `PreflightFailed: local endpoint unreachable for 'name' (base_url='…')`
+  result. Hosted participants (CLIs, openrouter, public
+  openai_compatible) are skipped silently — pre-flight is solely about
+  local-endpoint failure detection.
+- Turns the most common local-only failure mode (server stopped, port
+  wrong, model not loaded) from a multi-minute opaque `downstream_error`
+  at participant timeout into a sub-second legible failure that names
+  the participant and the URL.
+- New `preflight_failed` event in `progress_events` (with `participant`
+  and `error` fields) so the CLI's progress stream and the MCP tool's
+  metadata both surface the early failure.
+- New `pre_flight_check: false` per-participant opt-out. Useful when an
+  intermittently-reachable endpoint is fine for the user to retry but
+  shouldn't fail-fast at run start.
+- New `preflight_failed` `error_kind` in the failure taxonomy
+  (joins `timeout`, `context_overflow`, `prompt_too_large`,
+  `invalid_response`, `downstream_error`, `cli_nonzero_exit`,
+  `unknown`). Distinguishes "we knew this would fail before trying"
+  from "the call failed midway."
+
 ## 0.4.5 - 2026-05-07
 
 ### Validation

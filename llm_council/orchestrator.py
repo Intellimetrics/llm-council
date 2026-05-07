@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
+import httpx
+
 from llm_council.adapters import (
     CacheContext,
     ParticipantResult,
+    PREFLIGHT_FAILED_PREFIX,
     is_timeout_error,
     run_participants,
 )
@@ -16,6 +21,7 @@ from llm_council.cache import (
     is_caching_disabled_for_mode,
     resolve_ttl_seconds,
 )
+from llm_council.config import _is_local_participant
 from llm_council.convergence import (
     MIN_TOKENS_FOR_CLASSIFICATION,
     classify,
@@ -29,6 +35,108 @@ from llm_council.deliberation import (
     has_disagreement,
     labeled_quorum_count,
 )
+
+
+PREFLIGHT_TIMEOUT_SECONDS = 1.0
+
+
+async def _preflight_one(name: str, cfg: dict[str, Any]) -> str | None:
+    """Probe one local participant. Returns an error message on failure, None on success.
+
+    For `type: ollama` we hit `/api/tags` (matches the doctor probe). For
+    `type: openai_compatible` we hit `/v1/models` (matches the
+    --probe-local-openai probe). 1-second timeout — anything slower than
+    that on a loopback endpoint indicates a hung server, not a slow one.
+    """
+    ptype = cfg.get("type")
+    base_url = str(cfg.get("base_url") or "").rstrip("/")
+    if not base_url:
+        return None  # nothing to probe; let the run-time path produce the real error
+    if ptype == "ollama":
+        url = f"{base_url}/api/tags"
+    elif ptype == "openai_compatible":
+        # `/v1/models` lives under whatever path the user configured. The
+        # base_url canonical form ends at `/v1`; tolerate both shapes.
+        if base_url.endswith("/v1"):
+            url = f"{base_url}/models"
+        else:
+            url = f"{base_url}/v1/models"
+    else:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=PREFLIGHT_TIMEOUT_SECONDS) as client:
+            response = await client.get(url)
+    except Exception as exc:  # noqa: BLE001 — surface every failure mode legibly
+        return (
+            f"{PREFLIGHT_FAILED_PREFIX} local endpoint unreachable for "
+            f"{name!r} (base_url={base_url!r}): "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if response.status_code >= 500:
+        return (
+            f"{PREFLIGHT_FAILED_PREFIX} local endpoint at {base_url!r} returned "
+            f"HTTP {response.status_code} for {name!r}"
+        )
+    # 2xx, 3xx, 4xx: server is up enough for the run path to make progress
+    # or produce its own meaningful error. Don't pre-judge 4xx — some
+    # llama.cpp builds 404 on /v1/models but serve /v1/chat/completions fine.
+    return None
+
+
+async def preflight_local_participants(
+    participants: list[str],
+    participant_cfg: dict[str, Any],
+) -> dict[str, str]:
+    """Quick probe of every selected local participant.
+
+    Returns a mapping from participant name to a `PreflightFailed:` error
+    string for every participant whose endpoint is unreachable. Hosted
+    participants and any participant with `pre_flight_check: false` are
+    skipped silently.
+
+    Probes run concurrently — total wall time is bounded by the single-
+    probe timeout, not the participant count. Pre-flight is best-effort:
+    if the probe library itself raises an unexpected error, we let the
+    real run path report it.
+    """
+    candidates = [
+        (name, participant_cfg.get(name) or {})
+        for name in participants
+    ]
+    todo = [
+        (name, cfg)
+        for name, cfg in candidates
+        if _is_local_participant(cfg) and cfg.get("pre_flight_check", True)
+    ]
+    if not todo:
+        return {}
+    results = await asyncio.gather(
+        *(_preflight_one(name, cfg) for name, cfg in todo),
+        return_exceptions=False,
+    )
+    return {
+        name: error
+        for (name, _cfg), error in zip(todo, results)
+        if error is not None
+    }
+
+
+def _synth_preflight_failure(name: str, error: str) -> ParticipantResult:
+    """Construct a ParticipantResult that mirrors what a failed run looks like.
+
+    Synthesizing this here (rather than letting the participant attempt to
+    run and fail at the timeout) keeps the failure visible early and
+    uses our explicit `preflight_failed` error_kind instead of the
+    catch-all `downstream_error`.
+    """
+    return ParticipantResult(
+        name=name,
+        ok=False,
+        output="",
+        error=error,
+        elapsed_seconds=0.0,
+        model=None,
+    )
 
 
 def _resolve_convergence_thresholds(
@@ -174,17 +282,48 @@ async def execute_council(
                         "image_count": len(image_manifest),
                     }
                 )
-    results = await run_participants(
-        participants,
-        participant_cfg,
-        prompt,
-        cwd,
-        max_concurrency=max_concurrency,
-        progress=emit,
-        round_number=1,
-        image_manifest=image_manifest,
-        cache_ctx=cache_ctx_round1,
+    # Pre-flight ping for local participants. Turns opaque "downstream_error"
+    # at full timeout into a fast, legible "PreflightFailed: …" with the
+    # base_url named, so the user sees what's actually wrong (server not
+    # running, port wrong, model not loaded) without waiting through the
+    # participant timeout.
+    preflight_failures = await preflight_local_participants(
+        participants, participant_cfg
     )
+    if preflight_failures:
+        for name, error in preflight_failures.items():
+            emit(
+                {
+                    "event": "preflight_failed",
+                    "participant": name,
+                    "round": 1,
+                    "error": error,
+                }
+            )
+        run_targets = [name for name in participants if name not in preflight_failures]
+    else:
+        run_targets = participants
+
+    if run_targets:
+        run_results = await run_participants(
+            run_targets,
+            participant_cfg,
+            prompt,
+            cwd,
+            max_concurrency=max_concurrency,
+            progress=emit,
+            round_number=1,
+            image_manifest=image_manifest,
+            cache_ctx=cache_ctx_round1,
+        )
+    else:
+        run_results = []
+    # Merge pre-flight failures back in, preserving the original participant
+    # order so transcripts and the summary table stay deterministic.
+    by_name: dict[str, ParticipantResult] = {result.name: result for result in run_results}
+    for name, error in preflight_failures.items():
+        by_name[name] = _synth_preflight_failure(name, error)
+    results = [by_name[name] for name in participants if name in by_name]
     round_results = results
     round_number = 1
     initial_disagreement = has_disagreement(round_results)

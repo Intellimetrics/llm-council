@@ -140,6 +140,7 @@ failure path; do not let strings drift.
 | `invalid_response`   | CLI/HTTP succeeded but lacked `RECOMMENDATION:` label after one repair retry         |
 | `downstream_error`   | httpx / hosted-API failures (HTTPStatusError, ConnectError, ReadTimeout, etc.)       |
 | `cli_nonzero_exit`   | CLI participant exited with a nonzero status and empty stderr. Prefix: `CliExitNonZero:` |
+| `preflight_failed`   | Local participant's `base_url` was unreachable at run start. Prefix: `PreflightFailed:` |
 | `unknown`            | Non-empty error that did not match any known prefix — file a dogfood note            |
 
 ## Custom CLI participant: minimal template

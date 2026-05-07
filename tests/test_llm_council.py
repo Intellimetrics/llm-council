@@ -540,6 +540,127 @@ def test_config_warnings_flags_each_offender_independently():
     assert any("'second'" in w and "'China / DeepSeek'" in w for w in warnings)
 
 
+# ---------------------------------------------------------------------------
+# preflight_local_participants — fast-fail for unreachable local endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_skips_hosted_and_cli_participants():
+    """Hosted CLI / openrouter / public openai_compatible peers are not pinged
+    — pre-flight is solely about local-endpoint failure detection."""
+    from llm_council.orchestrator import preflight_local_participants
+
+    cfg = {
+        "claude": {"type": "cli", "command": "claude"},
+        "openrouter_peer": {
+            "type": "openrouter",
+            "model": "x",
+            "api_key_env": "OPENROUTER_API_KEY",
+        },
+        "hosted_compat": {
+            "type": "openai_compatible",
+            "base_url": "https://api.together.xyz/v1",
+            "model": "x",
+        },
+    }
+    failures = asyncio.run(
+        preflight_local_participants(list(cfg), cfg)
+    )
+    assert failures == {}
+
+
+def test_preflight_flags_unreachable_local_openai_compatible():
+    from llm_council.orchestrator import preflight_local_participants
+
+    cfg = {
+        "dead_vllm": {
+            "type": "openai_compatible",
+            "base_url": "http://127.0.0.1:9/v1",  # ":9" is the discard port
+            "model": "x",
+        },
+    }
+    failures = asyncio.run(
+        preflight_local_participants(["dead_vllm"], cfg)
+    )
+    assert "dead_vllm" in failures
+    assert failures["dead_vllm"].startswith("PreflightFailed:")
+    assert "http://127.0.0.1:9/v1" in failures["dead_vllm"]
+    assert "dead_vllm" in failures["dead_vllm"]
+
+
+def test_preflight_flags_unreachable_local_ollama():
+    from llm_council.orchestrator import preflight_local_participants
+
+    cfg = {
+        "dead_ollama": {
+            "type": "ollama",
+            "base_url": "http://127.0.0.1:9",
+            "model": "x",
+        },
+    }
+    failures = asyncio.run(
+        preflight_local_participants(["dead_ollama"], cfg)
+    )
+    assert "dead_ollama" in failures
+    assert "PreflightFailed:" in failures["dead_ollama"]
+
+
+def test_preflight_opt_out_via_pre_flight_check_false():
+    """A user who knows their endpoint is sometimes-reachable can opt out of
+    the pre-flight check on a specific participant."""
+    from llm_council.orchestrator import preflight_local_participants
+
+    cfg = {
+        "intermittent_local": {
+            "type": "openai_compatible",
+            "base_url": "http://127.0.0.1:9/v1",
+            "model": "x",
+            "pre_flight_check": False,
+        },
+    }
+    failures = asyncio.run(
+        preflight_local_participants(["intermittent_local"], cfg)
+    )
+    assert failures == {}
+
+
+def test_preflight_classify_error_kind():
+    """Synthesized pre-flight failures must classify as `preflight_failed`,
+    not the catch-all `unknown` or `downstream_error`."""
+    from llm_council.adapters import (
+        ERROR_KIND_PREFLIGHT_FAILED,
+        PREFLIGHT_FAILED_PREFIX,
+        classify_error,
+    )
+
+    error = f"{PREFLIGHT_FAILED_PREFIX} local endpoint unreachable for 'x'"
+    assert classify_error(error) == ERROR_KIND_PREFLIGHT_FAILED
+
+
+def test_preflight_concurrent_probes_are_fast():
+    """All probes run concurrently — total wall time is bounded by the
+    single-probe timeout, not N × timeout. With four dead local peers and a
+    1s per-probe timeout, the call must finish in well under 4s."""
+    from llm_council.orchestrator import preflight_local_participants
+
+    cfg = {
+        f"dead_{i}": {
+            "type": "openai_compatible",
+            "base_url": f"http://127.0.0.1:{9 + i}/v1",
+            "model": "x",
+        }
+        for i in range(4)
+    }
+    import time as _time
+    start = _time.monotonic()
+    failures = asyncio.run(preflight_local_participants(list(cfg), cfg))
+    elapsed = _time.monotonic() - start
+    assert len(failures) == 4
+    # Single-probe budget is 1s. If they were sequential, 4s+. Allow generous
+    # headroom for CI variance.
+    assert elapsed < 2.0, f"preflight took {elapsed:.2f}s — should run concurrently"
+
+
 def test_normalize_origin_drops_case_whitespace_punctuation():
     assert _normalize_origin("US / Anthropic") == "usanthropic"
     assert _normalize_origin("us/anthropic") == "usanthropic"

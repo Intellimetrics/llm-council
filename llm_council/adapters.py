@@ -1369,6 +1369,7 @@ ERROR_KIND_PROMPT_TOO_LARGE = "prompt_too_large"
 ERROR_KIND_INVALID_RESPONSE = "invalid_response"
 ERROR_KIND_DOWNSTREAM = "downstream_error"
 ERROR_KIND_CLI_NONZERO = "cli_nonzero_exit"
+ERROR_KIND_PREFLIGHT_FAILED = "preflight_failed"
 ERROR_KIND_UNKNOWN = "unknown"
 
 KNOWN_ERROR_KINDS = frozenset(
@@ -1379,9 +1380,12 @@ KNOWN_ERROR_KINDS = frozenset(
         ERROR_KIND_INVALID_RESPONSE,
         ERROR_KIND_DOWNSTREAM,
         ERROR_KIND_CLI_NONZERO,
+        ERROR_KIND_PREFLIGHT_FAILED,
         ERROR_KIND_UNKNOWN,
     }
 )
+
+PREFLIGHT_FAILED_PREFIX = "PreflightFailed:"
 
 
 def classify_error(error: str) -> str | None:
@@ -1405,6 +1409,8 @@ def classify_error(error: str) -> str | None:
         return ERROR_KIND_INVALID_RESPONSE
     if error.startswith("CliExitNonZero:"):
         return ERROR_KIND_CLI_NONZERO
+    if error.startswith(PREFLIGHT_FAILED_PREFIX):
+        return ERROR_KIND_PREFLIGHT_FAILED
     # httpx + downstream-API errors funnel through f"{type(exc).__name__}: ..."
     # in the openrouter / ollama paths; we don't try to introspect those
     # further here, just classify them as `downstream_error` so callers can
