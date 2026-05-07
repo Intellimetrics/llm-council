@@ -45,7 +45,14 @@ from llm_council.deliberation import (
     recommendation_counts,
     recommendation_label,
 )
-from llm_council.doctor import _probe_ollama, _probe_openrouter, check_environment
+from llm_council import doctor as doctor_module
+from llm_council.doctor import (
+    _normalize_local_openai_base_url,
+    _probe_ollama,
+    _probe_openrouter,
+    check_environment,
+    probe_local_openai,
+)
 from llm_council.doctor import Check
 from llm_council.env import load_project_env
 from llm_council.model_catalog import (
@@ -3736,6 +3743,166 @@ def test_ollama_probe_bad_port_is_clear():
     check = _probe_ollama("http://127.0.0.1:9")
     assert check.ok is False
     assert check.detail
+
+
+# ---------------------------------------------------------------------------
+# probe_local_openai — local OpenAI-compatible endpoint discovery
+# ---------------------------------------------------------------------------
+
+
+class _FakeHttpResponse:
+    """Minimal httpx.Response stand-in for monkeypatching `httpx.get`."""
+
+    def __init__(self, status_code: int, body: object = None, *, raw: str | None = None):
+        self.status_code = status_code
+        self._body = body
+        self._raw = raw
+
+    def json(self):
+        if self._raw is not None:
+            # Caller wants .json() to behave like a real httpx parse failure.
+            raise ValueError("not valid JSON")
+        return self._body
+
+
+def _patch_httpx(monkeypatch, responder):
+    """Replace `doctor.httpx.get` with a function that defers to `responder(url)`."""
+    monkeypatch.setattr(doctor_module.httpx, "get", lambda url, **_kw: responder(url))
+
+
+def test_local_openai_probe_accepts_canonical_shape(monkeypatch):
+    body = {
+        "object": "list",
+        "data": [
+            {"id": "Qwen/Qwen3.6-27B", "object": "model"},
+            {"id": "Qwen/Qwen3.6-7B", "object": "model"},
+        ],
+    }
+    _patch_httpx(monkeypatch, lambda _url: _FakeHttpResponse(200, body))
+
+    [check] = probe_local_openai("http://127.0.0.1:8000/v1")
+    assert check.ok is True
+    assert "2 model(s)" in check.detail
+    assert "Qwen/Qwen3.6-27B" in check.detail
+
+
+def test_local_openai_probe_rejects_django_dev_server(monkeypatch):
+    """Port :8000 commonly hosts Django/FastAPI dev servers. A 200 OK with
+    HTML must NOT be reported as a usable endpoint — that's the whole point
+    of validating shape, not just status."""
+
+    def responder(_url):
+        return _FakeHttpResponse(200, raw="<!DOCTYPE html><html>...</html>")
+
+    _patch_httpx(monkeypatch, responder)
+
+    [check] = probe_local_openai("http://127.0.0.1:8000/v1")
+    assert check.ok is False
+    assert "not JSON" in check.detail or "OpenAI-compatible" in check.detail
+
+
+def test_local_openai_probe_rejects_wrong_shape_json(monkeypatch):
+    """Some random JSON API on the same port must also be rejected."""
+    body = {"status": "ok", "service": "totally-not-an-llm"}
+    _patch_httpx(monkeypatch, lambda _url: _FakeHttpResponse(200, body))
+
+    [check] = probe_local_openai("http://127.0.0.1:8000/v1")
+    assert check.ok is False
+    assert "data" in check.detail.lower()
+
+
+def test_local_openai_probe_404_is_not_a_silent_pass(monkeypatch):
+    """Some llama.cpp builds return 404 on /v1/models. Surface that
+    explicitly so the user knows the endpoint is reachable but unusable for
+    enumeration."""
+    _patch_httpx(monkeypatch, lambda _url: _FakeHttpResponse(404, {}))
+
+    [check] = probe_local_openai("http://127.0.0.1:8080/v1")
+    assert check.ok is False
+    assert "404" in check.detail
+
+
+def test_local_openai_probe_empty_data_is_ok_with_caveat(monkeypatch):
+    body = {"object": "list", "data": []}
+    _patch_httpx(monkeypatch, lambda _url: _FakeHttpResponse(200, body))
+
+    [check] = probe_local_openai("http://127.0.0.1:8000/v1")
+    assert check.ok is True
+    assert "no models listed" in check.detail
+
+
+def test_local_openai_probe_connect_error_is_clear():
+    [check] = probe_local_openai("http://127.0.0.1:9/v1")
+    assert check.ok is False
+    assert check.detail
+
+
+def test_local_openai_probe_url_canonicalization():
+    # Accept all four common forms; canonical is `<base>/v1`.
+    assert _normalize_local_openai_base_url("http://h:8000") == "http://h:8000/v1"
+    assert _normalize_local_openai_base_url("http://h:8000/") == "http://h:8000/v1"
+    assert _normalize_local_openai_base_url("http://h:8000/v1") == "http://h:8000/v1"
+    assert _normalize_local_openai_base_url("http://h:8000/v1/") == "http://h:8000/v1"
+    assert _normalize_local_openai_base_url(" http://h:8000 ") == "http://h:8000/v1"
+
+
+def test_local_openai_port_scan_suppresses_silent_ports(monkeypatch):
+    """Port-scan output should only contain ports that actually responded.
+    Connection-refused noise on every default port would drown the signal."""
+    import httpx as _httpx
+
+    def responder(url):
+        # Pretend ONLY :8000 has an OpenAI server; every other port refuses.
+        if "127.0.0.1:8000" in url:
+            return _FakeHttpResponse(
+                200,
+                {"object": "list", "data": [{"id": "test-model", "object": "model"}]},
+            )
+        raise _httpx.ConnectError("connection refused")
+
+    _patch_httpx(monkeypatch, responder)
+
+    checks = probe_local_openai(None)
+    # Only the responding port should appear; the others are filtered as noise.
+    assert len(checks) == 1
+    assert checks[0].ok is True
+    assert "vLLM/sglang" in checks[0].name
+    assert "test-model" in checks[0].detail
+
+
+def test_local_openai_port_scan_with_no_responders_reports_clean_miss(monkeypatch):
+    import httpx as _httpx
+
+    def responder(_url):
+        raise _httpx.ConnectError("connection refused")
+
+    _patch_httpx(monkeypatch, responder)
+
+    checks = probe_local_openai(None)
+    # Single summary check rather than five identical "refused" lines.
+    assert len(checks) == 1
+    assert checks[0].ok is False
+    assert "no local OpenAI-compatible endpoints" in checks[0].detail
+
+
+def test_local_openai_port_scan_surfaces_wrong_shape_responder(monkeypatch):
+    """If something IS listening on a default port but isn't OpenAI-compatible
+    (e.g., a Django dev server on :8000), the user needs to see the rejection
+    — silently filtering a 200-OK-but-wrong-shape response would hide the bug
+    that motivated shape validation in the first place."""
+    import httpx as _httpx
+
+    def responder(url):
+        if "127.0.0.1:8000" in url:
+            return _FakeHttpResponse(200, raw="<!DOCTYPE html>...")
+        raise _httpx.ConnectError("connection refused")
+
+    _patch_httpx(monkeypatch, responder)
+
+    checks = probe_local_openai(None)
+    assert len(checks) == 1
+    assert checks[0].ok is False
+    assert "vLLM/sglang" in checks[0].name  # the port label tells the user where
 
 
 def test_tri_cli_setup_omits_openrouter_modes():

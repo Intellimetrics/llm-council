@@ -26,7 +26,7 @@ from llm_council.adapters import classify_error
 from llm_council.budget import image_attachment_violations
 from llm_council import display
 from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_prompt
-from llm_council.doctor import check_environment, checks_to_dict
+from llm_council.doctor import check_environment, checks_to_dict, probe_local_openai
 from llm_council.env import load_project_env
 from llm_council.estimate import estimate_council
 from llm_council.model_catalog import (
@@ -264,6 +264,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe-ollama",
         action="store_true",
         help="Validate Ollama is serving its tags endpoint",
+    )
+    doctor.add_argument(
+        "--probe-local-openai",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="BASE_URL",
+        help=(
+            "Probe local OpenAI-compatible inference servers (vLLM, LM "
+            "Studio, llama.cpp --api, sglang, TGI, MLX, Ollama /v1). With "
+            "no value, scans well-known ports on 127.0.0.1 (8000, 1234, "
+            "8080, 11434, 5000). With a URL, probes that endpoint only."
+        ),
     )
     doctor.add_argument(
         "--check-update",
@@ -928,6 +941,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         probe_openrouter=args.probe_openrouter,
         probe_ollama=args.probe_ollama,
     )
+    probe_local = getattr(args, "probe_local_openai", None)
+    if probe_local is not None:
+        # `--probe-local-openai` (no arg) → scan defaults; with a URL → probe
+        # that single endpoint. The empty-string sentinel comes from
+        # argparse's `const=""` for the bare flag.
+        explicit_url = probe_local or None
+        checks.extend(probe_local_openai(explicit_url))
     check_update = bool(getattr(args, "check_update", False))
     if args.json:
         if check_update:
@@ -964,6 +984,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
     if args.probe_ollama:
         required.extend(check for check in checks if check.name == "probe:ollama")
+    # Only gate on an explicit URL probe — the bare port-scan is discovery
+    # and "no local servers running" is not an error condition.
+    if probe_local:
+        required.extend(
+            check
+            for check in checks
+            if check.name.startswith("probe:local-openai")
+        )
     return 0 if all(check.ok for check in required) else 1
 
 

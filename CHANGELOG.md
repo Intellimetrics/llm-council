@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 0.4.3 - 2026-05-07
+
+### Diagnostics
+
+- `llm-council doctor --probe-local-openai [BASE_URL]` discovers local
+  OpenAI-compatible inference servers (vLLM, sglang, LM Studio,
+  llama.cpp `--api`, TGI, Ollama's `/v1` shim, MLX). With no value, it
+  scans well-known ports on `127.0.0.1` (`8000`, `1234`, `8080`,
+  `11434`, `5000`) with a 500ms per-port timeout. With a URL, it probes
+  that endpoint with a 5s timeout. The probe validates the JSON shape
+  of `GET /v1/models` — not just that the port answers — so a Django
+  or FastAPI dev server on `:8000` is reported as "HTTP 200 but body is
+  not JSON," not mis-identified as an LLM server. Connection-refused
+  noise is suppressed when scanning defaults so only ports that
+  actually responded appear in the report. Mirrors the opt-in pattern
+  of `--probe-openrouter` / `--probe-ollama`: not run unless asked.
+
+### Documentation
+
+- New `docs/local-models.md` — copy-paste recipes for wiring
+  `type: openai_compatible` participants at vLLM, sglang, LM Studio,
+  llama.cpp `--api`, TGI, Ollama `/v1`, and MLX. Calls out the two
+  load-bearing gotchas: (1) `origin` describes the model behind the
+  endpoint, not the network location (so `origin_policy: us` filters
+  correctly), and (2) the adapter requires a non-empty
+  `Authorization: Bearer` header even for unauthenticated local
+  servers — export `LOCAL_OPENAI_API_KEY=dummy` (or your real key)
+  before running. Also documents the `allow_private: true` requirement
+  for loopback `base_url`s, the long-context timeout floor (≥360s for
+  131K-context vLLM), and the concurrent-serving FAQ ("3 participants
+  on one vLLM = serialized").
+
 ## 0.4.2 - 2026-05-04
 
 ### CLI
