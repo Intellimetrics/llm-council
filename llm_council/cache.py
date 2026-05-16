@@ -154,6 +154,8 @@ def build_payload(
     cost_usd: float | None,
     model: str | None,
     command: list[str] | None,
+    recovered_after_timeout: bool = False,
+    prompt_chars: int | None = None,
 ) -> dict[str, Any]:
     preview = prompt[:PROMPT_PREVIEW_CHARS]
     return {
@@ -169,6 +171,18 @@ def build_payload(
         "cost_usd": cost_usd,
         "model": model,
         "command": list(command) if command else None,
+        # v0.7.0 receipts. `recovered_after_timeout` records that the
+        # original call timed out and the terse-retry rescued the
+        # response; persisting it through the cache means repeat runs
+        # still surface the recovery in transcripts and bump the
+        # `timeout_recoveries` stat. `prompt_chars` carries the
+        # cached run's prompt size for the timeout-by-prompt-size
+        # bucket. Old payloads written before v3 are evicted by the
+        # CACHE_SCHEMA_VERSION bump; readers also default-on-missing
+        # so a stale schema-3 payload (e.g. one written before this
+        # field landed within the v3 window) rehydrates cleanly.
+        "recovered_after_timeout": bool(recovered_after_timeout),
+        "prompt_chars": prompt_chars,
     }
 
 

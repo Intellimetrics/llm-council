@@ -159,6 +159,96 @@ def test_is_label_only_failure_retries_normal_missing_label():
     assert _is_label_only_failure(no_label, {}) is True
 
 
+# --- Cache round-trip preserves recovered_after_timeout (pass-8 #8) -----
+
+def test_with_envelope_rehydrate_from_cache_preserves_recovered_after_timeout(
+    tmp_path: Path,
+):
+    """A timeout-recovered result cached on the original run must
+    re-emerge from the cache with `recovered_after_timeout=True` and
+    survive the read-side `_with_envelope` pass. Pass-8 finding #8:
+    losing the receipt on cache hits undercounts `timeout_recoveries`
+    in stats and hides the recovery from operators."""
+    output = "RECOMMENDATION: tradeoff - terse recovered\nEFFORT: full"
+    r = ParticipantResult(
+        "peer", True, output, "", 1.0, recovered_after_timeout=True
+    )
+    cache_ctx = CacheContext(cwd=tmp_path, cache_mode="on", cache_disabled=False)
+    _maybe_persist_cache("peer", "the prompt", "fake-key", r, cache_ctx)
+    cached_files = list((tmp_path / ".llm-council" / "cache").glob("*.json"))
+    assert len(cached_files) == 1
+
+    # Read the payload back the same way `_cache_lookup` would.
+    from llm_council.adapters import _result_from_cache_payload
+    from llm_council.cache import read_cache
+
+    payload = read_cache(cached_files[0], expected_key="fake-key")
+    assert payload is not None
+    assert payload.get("recovered_after_timeout") is True
+
+    rehydrated = _result_from_cache_payload("peer", payload)
+    assert rehydrated.recovered_after_timeout is True
+    # `_with_envelope` must not clobber the receipt — it only touches
+    # envelope fields and (for abdications) the ok/error pair.
+    out = _with_envelope(rehydrated)
+    assert out.recovered_after_timeout is True
+    assert out.ok is True
+
+
+def test_result_from_cache_payload_defaults_missing_recovered_after_timeout():
+    """A payload written before v0.7.0's receipt field landed (or a
+    hand-rolled fixture without the key) must rehydrate with
+    `recovered_after_timeout=False`, not crash on KeyError."""
+    from llm_council.adapters import _result_from_cache_payload
+
+    legacy_payload = {
+        "output": "RECOMMENDATION: yes - fine",
+        "elapsed_seconds": 1.0,
+        "model": "test-model",
+        # Intentionally missing: recovered_after_timeout, prompt_chars
+    }
+    r = _result_from_cache_payload("peer", legacy_payload)
+    assert r.recovered_after_timeout is False
+    assert r.prompt_chars is None
+    assert r.ok is True
+
+
+def test_abdication_cache_rehydrate_does_not_clobber_recovered_after_timeout(
+    tmp_path: Path,
+):
+    """Cross-invariant check: an abdication output that the adapter
+    persisted with `recovered_after_timeout=True` must (a) re-flag
+    ok=False via `_with_envelope` on read AND (b) still carry the
+    timeout-recovery receipt. The two mechanisms are orthogonal: the
+    receipt records what happened on the original call; abdication
+    re-derivation records what the output shape says about the answer."""
+    abdication_output = (
+        "RECOMMENDATION: no - too complex\n"
+        "EFFORT: blocked\n"
+    )
+    r = ParticipantResult(
+        "peer", True, abdication_output, "", 1.0,
+        recovered_after_timeout=True,
+    )
+    cache_ctx = CacheContext(cwd=tmp_path, cache_mode="on", cache_disabled=False)
+    _maybe_persist_cache("peer", "the prompt", "fake-key", r, cache_ctx)
+    cached_files = list((tmp_path / ".llm-council" / "cache").glob("*.json"))
+    assert len(cached_files) == 1
+
+    from llm_council.adapters import _result_from_cache_payload
+    from llm_council.cache import read_cache
+
+    payload = read_cache(cached_files[0], expected_key="fake-key")
+    assert payload is not None
+    rehydrated = _result_from_cache_payload("peer", payload)
+    out = _with_envelope(rehydrated)
+    # `_with_envelope` flips ok=False for the abdication shape.
+    assert out.ok is False
+    assert classify_error(out.error) == "abdicated"
+    # And the receipt for the timeout recovery survives.
+    assert out.recovered_after_timeout is True
+
+
 # --- recommendation_line placeholder for fenced-only labels --------------
 
 def test_recommendation_line_placeholder_for_fenced_only_label():

@@ -205,6 +205,11 @@ def _participant_recommendation_label(output: str) -> str | None:
 def _result_from_cache_payload(
     name: str, payload: dict[str, Any]
 ) -> ParticipantResult:
+    # `recovered_after_timeout` and `prompt_chars` default to
+    # False/None when absent so older v3 payloads written before
+    # these receipts landed (and any hand-rolled fixtures) rehydrate
+    # cleanly. The CACHE_SCHEMA_VERSION bump to 3 already invalidates
+    # pre-v0.7.0 payloads; the defaults are belt-and-braces.
     return ParticipantResult(
         name=name,
         ok=True,
@@ -218,6 +223,8 @@ def _result_from_cache_payload(
         total_tokens=payload.get("total_tokens"),
         cost_usd=payload.get("cost_usd"),
         from_cache=True,
+        recovered_after_timeout=bool(payload.get("recovered_after_timeout", False)),
+        prompt_chars=payload.get("prompt_chars"),
     )
 
 
@@ -280,6 +287,8 @@ def _maybe_persist_cache(
         cost_usd=result.cost_usd,
         model=result.model,
         command=result.command,
+        recovered_after_timeout=result.recovered_after_timeout,
+        prompt_chars=result.prompt_chars,
     )
     try:
         cache_write(
