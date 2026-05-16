@@ -21,7 +21,7 @@ from typing import Any
 CACHE_SUBDIR = ".llm-council/cache"
 DEFAULT_TTL_SECONDS = 24 * 3600
 PROMPT_PREVIEW_CHARS = 200
-CACHE_SCHEMA_VERSION = 2  # v2 = envelope contract (effort/confidence/risk/blockers/...)
+CACHE_SCHEMA_VERSION = 3  # v3 = structured evidence shape (list[{text, tag}]), prompt_chars, recovered_after_timeout
 
 _MODES_THAT_SKIP_CACHE = frozenset({"consensus"})
 

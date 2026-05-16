@@ -39,7 +39,9 @@ def test_envelope_parses_full_shape():
     assert env["confidence"] == "high"
     assert env["risk"] == "medium"
     assert env["blockers"] == ["missing migration", "no tenant test"]
-    assert env["evidence"] == ["src/auth.py:42"]
+    # v0.7: evidence parsed into list[{text, tag}] for tag distribution
+    # telemetry. Untagged entries return `tag=None`.
+    assert env["evidence"] == [{"text": "src/auth.py:42", "tag": None}]
     assert env["tests_to_run"] == ["pytest tests/auth/"]
     assert env["assumptions"] == ["staging mirrors prod schema"]
 

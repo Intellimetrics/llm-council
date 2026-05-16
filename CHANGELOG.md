@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+## 0.7.0 - 2026-05-16
+
+Three council-surfaced changes addressing the failure modes the pass-7
+research-question run exposed (transcript:
+`.llm-council/runs/20260516_100758_*`). MCP output schema bumps to v3;
+cache schema bumps to v3.
+
+**Timeout policy** — `defaults.modes` now accept an optional
+`timeout_multiplier: float` (consensus 2.0×, deliberate 1.5×, diverse
+1.5×; others unchanged). Layered on top of per-participant `timeout`
+so users who already raised the base benefit too. When a peer times out
+the adapter performs one terse-retry with a fixed 60s budget and the
+`TERSE_RETRY_INSTRUCTION` directive appended; success sets
+`recovered_after_timeout=True`. New `timeout_by_prompt_size` and
+`timeout_recoveries` stats buckets let operators see whether the
+multiplier needs raising or chunking is the actual answer.
+
+**Section-coverage validator** — when a prompt contains
+`PART N — TITLE (REQUIRED)` headers, peer responses must reference each
+required section (literal `PART N` token OR all salient title tokens
+within a 200-char window). Missing sections trigger one repair-retry,
+then `error_kind=incomplete_response`. New `llm_council/sections.py`
+module. Disable via `defaults.require_sections: false` or
+`--no-require-sections`. PART 6 (RECOMMENDATION) is skipped — the
+existing label check covers it. Pass-7 anchor: gemini's three-bullet
+response that v0.6.0 silently accepted is now flagged.
+
+**Evidence tags as a first-class envelope contract** — each EVIDENCE
+bullet is parsed for a leading/trailing/inline
+`[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]` tag and stored as
+`list[{text, tag}]` on `ParticipantResult`. New `evidence_tag_distribution`
+stats bucket. `defaults.strict_evidence: false` by default;
+`--strict-evidence` (CLI) or `strict_evidence: true` (MCP) makes
+untagged entries fail with `error_kind=untagged_evidence` after one
+repair-retry. Optional → required rollout mirrors v0.5.0 envelope.
+Other envelope list fields (blockers/assumptions/tests_to_run) stay
+plain strings — tag semantics only apply to evidence claims.
+
+Two new `error_kind` values: `incomplete_response`, `untagged_evidence`.
+New `ParticipantResult` fields: `recovered_after_timeout: bool`,
+`prompt_chars: int | None`. New tests:
+`tests/test_pass7_regression.py` (8 tests anchored to the actual pass-7
+failure mode), `tests/test_timeout_policy.py` (24 tests covering
+Changes 1a-1c), `tests/test_section_coverage.py` (20 tests), and
+`tests/test_evidence_tags.py` (22 tests). Plus updates to the existing
+envelope test for the new structured evidence shape.
+
 ## 0.6.0 - 2026-05-16
 
 Cleanup chore recommended by pass-6 council review. **No behavior change**;

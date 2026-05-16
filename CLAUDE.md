@@ -138,6 +138,52 @@ Key modules:
 - **Prompt-size guard.** `max_prompt_chars` is enforced both globally and
   per-participant before any subprocess launches; preserve this so oversized
   prompts fail fast rather than after a long hosted/CLI timeout.
+- **Mode-aware timeouts.** `defaults.py:DEFAULT_CONFIG["modes"]` may carry
+  an optional `timeout_multiplier: float`. Resolution:
+  `effective = per_participant_timeout * mode_multiplier`. The
+  per-participant `timeout` stays the source of truth for the base; the
+  multiplier is layered on top so users who raised the base for a stubborn
+  host CLI also benefit on consensus/deliberate runs. Defaults: consensus
+  2.0x, deliberate 1.5x, diverse 1.5x; all other modes 1.0x (unchanged
+  behavior). Helper: `adapters._resolve_effective_timeout`.
+- **Terse-retry on timeout.** When a peer times out
+  (`is_timeout_error(error)`), the adapter performs one terse-retry with
+  `TERSE_RETRY_TIMEOUT_SECONDS` (60s, fixed) and `TERSE_RETRY_INSTRUCTION`
+  appended to the prompt. Success sets `ok=True,
+  recovered_after_timeout=True`. Failure falls through to normal timeout
+  failure — no chained label-retry, no chained section-repair (three
+  attempts past the cost ceiling). Mode-multiplier does NOT apply to the
+  retry. Disable per-participant with `terse_retry_on_timeout: false`.
+- **Section-coverage validator (default on).** When the user prompt
+  contains one or more `PART N — TITLE (REQUIRED)` or
+  `PART N — TITLE (REQUIRED BY ...)` headers
+  (`llm_council/sections.REQUIRED_SECTION_HEADER_RE`), the validator
+  scans each peer response for a matching marker (literal `PART N` token
+  OR all salient title tokens within a 200-char window). Missing
+  sections trigger one repair-retry with `SECTION_REPAIR_RETRY_INSTRUCTION`;
+  if the retry also misses, the result is
+  `ok=False, error_kind=incomplete_response`. PART 6 (`RECOMMENDATION`)
+  is intentionally skipped — the label check covers it. Disable via
+  `defaults.require_sections: false` or `--no-require-sections`.
+- **Strict evidence-tag enforcement (optional, default off).** Each
+  EVIDENCE bullet is parsed for a leading/trailing/inline
+  `[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]` tag and stored as
+  `list[{text, tag}]` on `ParticipantResult`. When
+  `defaults.strict_evidence: true` (or `--strict-evidence`), entries
+  without a tag fail validation with `error_kind=untagged_evidence` and
+  trigger the repair-retry path. Empty evidence list passes — the gate
+  is FORMAT of entries that exist, not PRESENCE. Watch
+  `evidence_tag_distribution["untagged"]` in stats before flipping the
+  default. Tag parsing only applies to `evidence` — blockers/assumptions/
+  tests_to_run stay `list[str]`.
+- **Timeout-by-prompt-size telemetry.** `stats.aggregate` buckets
+  timed-out runs into `timeout_by_prompt_size` (small / medium / large /
+  xlarge, char cutoffs at 4K / 20K / 60K) and tracks `timeout_recoveries`
+  for `recovered_after_timeout=True` successes. Lets the operator see
+  whether bigger prompts disproportionately trip the timeout wall — the
+  signal for raising `defaults.timeout` or a mode's `timeout_multiplier`
+  rather than chunking. Bucket cutoffs are tuned to
+  `MAX_PROMPT_CHARS=200_000`; revisit if the global cap changes.
 - **`.mcp.json` stays local.** Setup adds it to `.gitignore`. It contains
   absolute paths and must not be committed.
 - **Version bumps.** `__version__` in `llm_council/__init__.py` and the
@@ -161,6 +207,8 @@ failure path; do not let strings drift.
 | `cli_nonzero_exit`   | CLI participant exited with a nonzero status and empty stderr. Prefix: `CliExitNonZero:` |
 | `preflight_failed`   | Local participant's `base_url` was unreachable at run start. Prefix: `PreflightFailed:` |
 | `abdicated`          | Peer emitted `RECOMMENDATION:` and `EFFORT: blocked` with no concrete missing artifact in EITHER `BLOCKERS:` or `ASSUMPTIONS:`. Terminal for the round — no repair retry, drops quorum so consensus doesn't form on a non-vote. The cache DOES persist the raw output; `_with_envelope` re-derives `ok=False` on every read so repeat runs still drop quorum without paying the peer again. Prefix: `AbdicatedResponse:` |
+| `incomplete_response` | Response had the `RECOMMENDATION:` label but missed one or more `(REQUIRED)` sections from the prompt after one repair-retry. Prefix: `IncompleteResponse:` |
+| `untagged_evidence`  | `defaults.strict_evidence: true` AND one or more EVIDENCE bullets lacked a `[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]` tag after one repair-retry. Prefix: `UntaggedEvidence:` |
 | `unknown`            | Non-empty error that did not match any known prefix — file a dogfood note            |
 
 ## Custom CLI participant: minimal template

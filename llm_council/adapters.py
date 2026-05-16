@@ -57,6 +57,30 @@ REPAIR_RETRY_INSTRUCTION = (
     "reasoning. Do not change your reasoning, only add the missing label."
 )
 
+# When a peer times out, the adapter retries once with this directive and a
+# tight TERSE_RETRY_TIMEOUT_SECONDS budget. The mode multiplier does NOT
+# apply to the retry — the 60s ceiling is fixed by design: a peer that
+# can't produce a terse answer in a minute is in a state no further
+# multiplier-scaling will rescue, and the retry has to stay bounded so the
+# wall-clock cost ceiling of "one extra round" holds.
+SECTION_REPAIR_RETRY_INSTRUCTION = (
+    "Your previous response satisfied the RECOMMENDATION label but skipped "
+    "one or more REQUIRED sections from the prompt: {missing}. Re-emit your "
+    "full response with those sections present. Keep your existing reasoning; "
+    "add the missing sections as additional content. Each required section "
+    "must use a heading that matches the prompt's `PART N` title (or includes "
+    "the salient title tokens within a few lines)."
+)
+
+TERSE_RETRY_INSTRUCTION = (
+    "Your previous response timed out. Re-answer the question with the same "
+    "RECOMMENDATION discipline, but be terse: cover every REQUIRED section "
+    "concisely. Single sentence per field where applicable. Skip elaboration. "
+    "Keep the RECOMMENDATION: yes|no|tradeoff label and, at minimum, the "
+    "BLOCKERS or ASSUMPTIONS list if you would otherwise abdicate."
+)
+TERSE_RETRY_TIMEOUT_SECONDS = 60
+
 CLI_LAUNCH_RETRY_STDERR_LIMIT = 4096
 
 CONTEXT_OVERFLOW_ERROR_PREFIX = "ContextOverflowExcluded:"
@@ -86,14 +110,27 @@ class ParticipantResult:
     stance: str | None = None
     # Response envelope fields (Pick A v1 — all optional). Parsed from the
     # peer's text via _extract_response_envelope. Free-form for now; the
-    # only enforced contract is `RECOMMENDATION:` itself.
+    # only enforced contract is `RECOMMENDATION:` itself. `evidence`'s
+    # element type is `Any` (not `str`) so it can hold either plain
+    # strings (legacy / untagged) or `{text, tag}` dicts from the v0.7
+    # evidence-tag parser. The other list fields stay `list[str]` because
+    # tag-parsing only applies to evidence claims.
     effort: str | None = None
     confidence: str | None = None
     risk: str | None = None
     blockers: list[str] = field(default_factory=list)
-    evidence: list[str] = field(default_factory=list)
+    evidence: list[Any] = field(default_factory=list)
     tests_to_run: list[str] = field(default_factory=list)
     assumptions: list[str] = field(default_factory=list)
+    # Set True when the original call timed out and the terse-retry
+    # recovered with a valid response. Separate from
+    # `recovered_after_launch_retry` (launch-fail retry) and
+    # `repair_retry_recovered` (label-only retry) so stats and transcripts
+    # can attribute recoveries to the right mechanism.
+    recovered_after_timeout: bool = False
+    # Populated on timeout-failure paths so `stats.aggregate` can bucket
+    # timeouts by prompt size without re-parsing the error string.
+    prompt_chars: int | None = None
 
 
 @dataclass
@@ -290,6 +327,8 @@ async def run_cli_participant(
     cwd: Path,
     *,
     cache_ctx: CacheContext | None = None,
+    mode_multiplier: float | None = None,
+    mode: str | None = None,
 ) -> ParticipantResult:
     overflow = _context_overflow_result(name, cfg, prompt)
     if overflow is not None:
@@ -298,11 +337,43 @@ async def run_cli_participant(
     if cached is not None:
         return cached
     start = time.monotonic()
-    result, meta = await _run_cli_once(name, cfg, prompt, cwd, start=start)
+    result, meta = await _run_cli_once(
+        name, cfg, prompt, cwd, start=start,
+        mode_multiplier=mode_multiplier, mode=mode,
+    )
+    # Terse-retry on timeout. Mutually exclusive with launch-retry: a
+    # timeout never returns nonzero_exit+stderr (launch-retry's gate).
+    # The retry uses TERSE_RETRY_TIMEOUT_SECONDS regardless of the mode
+    # multiplier so the total wall-clock cost stays bounded.
+    if (
+        not result.ok
+        and is_timeout_error(result.error)
+        and _terse_retry_enabled(cfg)
+    ):
+        terse_prompt = _build_terse_retry_prompt(prompt)
+        max_prompt_chars = cfg.get("max_prompt_chars")
+        if max_prompt_chars is None or len(terse_prompt) <= int(max_prompt_chars):
+            terse_cfg = dict(cfg)
+            terse_cfg["timeout"] = TERSE_RETRY_TIMEOUT_SECONDS
+            terse_result, _terse_meta = await _run_cli_once(
+                name, terse_cfg, terse_prompt, cwd, start=start,
+                mode_multiplier=None,  # fixed 60s budget; no scaling
+                mode=mode,
+            )
+            if terse_result.ok:
+                from dataclasses import replace as _replace
+                merged = _replace(terse_result, recovered_after_timeout=True)
+                _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
+                return merged
+            # Terse retry also failed (re-timed, label-missing, abdication).
+            # Fall through to return the ORIGINAL timeout result so the
+            # error message and prompt_chars stay attributable to the call
+            # that actually exhausted the multiplier-scaled budget.
     if _should_launch_retry(meta, cfg):
         await asyncio.sleep(_launch_retry_backoff(0))
         retry_result, retry_meta = await _run_cli_once(
-            name, cfg, prompt, cwd, start=start
+            name, cfg, prompt, cwd, start=start,
+            mode_multiplier=mode_multiplier, mode=mode,
         )
         if retry_meta.get("exited") and not retry_meta.get("nonzero_exit"):
             retry_result.recovered_after_launch_retry = True
@@ -319,13 +390,51 @@ async def run_cli_participant(
             _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
             return result
         retry_result, _retry_meta = await _run_cli_once(
-            name, cfg, retry_prompt, cwd, start=start
+            name, cfg, retry_prompt, cwd, start=start,
+            mode_multiplier=mode_multiplier, mode=mode,
         )
         merged = _merge_cli_retry(result, retry_result)
         if result.recovered_after_launch_retry:
             merged.recovered_after_launch_retry = True
         _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
         return merged
+    # Section-coverage repair retry (label was present but required sections
+    # were missing). Distinct from the label-repair path above — different
+    # error prefix, different directive. Cap of one retry stands: a peer
+    # that misses sections twice has a deeper issue than this mechanism
+    # can fix. Skip when terse-retry already ran (cumulative call ceiling).
+    if (
+        not result.ok
+        and _retry_enabled(cfg)
+        and result.error.startswith(INCOMPLETE_RESPONSE_PREFIX)
+        and not getattr(result, "recovered_after_timeout", False)
+    ):
+        from llm_council.sections import required_sections_missing
+        missing = required_sections_missing(prompt, result.output)
+        if missing:
+            section_directive = SECTION_REPAIR_RETRY_INSTRUCTION.format(
+                missing=", ".join(missing)
+            )
+            retry_prompt = (
+                f"{prompt}\n\n"
+                "--- Your previous response (first attempt) ---\n"
+                f"{result.output.strip()}\n\n"
+                f"{section_directive}"
+            )
+            max_prompt_chars = cfg.get("max_prompt_chars")
+            if (
+                max_prompt_chars is None
+                or len(retry_prompt) <= int(max_prompt_chars)
+            ):
+                retry_result, _retry_meta = await _run_cli_once(
+                    name, cfg, retry_prompt, cwd, start=start,
+                    mode_multiplier=mode_multiplier, mode=mode,
+                )
+                merged = _merge_cli_retry(result, retry_result)
+                if result.recovered_after_launch_retry:
+                    merged.recovered_after_launch_retry = True
+                _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
+                return merged
     _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
     return result
 
@@ -337,8 +446,11 @@ async def _run_cli_once(
     cwd: Path,
     *,
     start: float,
+    mode_multiplier: float | None = None,
+    mode: str | None = None,
 ) -> tuple[ParticipantResult, dict[str, Any]]:
-    timeout = int(cfg.get("timeout") or 240)
+    base_timeout = int(cfg.get("timeout") or 240)
+    timeout = _resolve_effective_timeout(cfg, mode_multiplier)
     command = _build_cli_command(name, cfg, prompt, cwd)
     max_prompt_chars = cfg.get("max_prompt_chars")
     if max_prompt_chars is not None and len(prompt) > int(max_prompt_chars):
@@ -385,7 +497,9 @@ async def _run_cli_once(
         out = stdout.decode(errors="replace").strip()
         err = stderr.decode(errors="replace").strip()
         ok = proc.returncode == 0
-        validation_error = _response_validation_error(out, cfg) if ok else ""
+        validation_error = (
+            _response_validation_error(out, cfg, prompt=prompt) if ok else ""
+        )
         # Silent CLI failures (nonzero exit but empty stderr) used to land
         # with `error=""`, which made `classify_error` return None — a
         # taxonomy hole. Always synthesize a stable error string when ok is
@@ -414,10 +528,15 @@ async def _run_cli_once(
                 name=name,
                 ok=False,
                 output="",
-                error=_format_timeout_error(name, timeout, len(prompt)),
+                error=_format_timeout_error(
+                    name, timeout, len(prompt),
+                    mode_multiplier=mode_multiplier, mode=mode,
+                    base_timeout=base_timeout,
+                ),
                 elapsed_seconds=elapsed,
                 command=redact_prompt_args(command, prompt),
                 model=cfg.get("model"),
+                prompt_chars=len(prompt),
             ),
             {"nonzero_exit": False, "stderr": "", "exited": False},
         )
@@ -465,6 +584,14 @@ def _build_cli_retry_prompt(original_prompt: str, prior_response: str) -> str:
         "--- Your previous response (first attempt) ---\n"
         f"{prior_response.strip()}\n\n"
         f"{REPAIR_RETRY_INSTRUCTION}"
+    )
+
+
+def _build_terse_retry_prompt(original_prompt: str) -> str:
+    return (
+        f"{original_prompt}\n\n"
+        "--- Timeout recovery directive ---\n"
+        f"{TERSE_RETRY_INSTRUCTION}"
     )
 
 
@@ -542,6 +669,8 @@ async def run_openai_compatible_participant(
     *,
     image_manifest: list[dict[str, Any]] | None = None,
     cache_ctx: CacheContext | None = None,
+    mode_multiplier: float | None = None,
+    mode: str | None = None,
 ) -> ParticipantResult:
     overflow = _context_overflow_result(
         name, cfg, prompt, image_manifest=image_manifest
@@ -554,8 +683,31 @@ async def run_openai_compatible_participant(
     if cached is not None:
         return cached
     result = await _run_openai_compatible_inner(
-        name, cfg, prompt, image_manifest=image_manifest
+        name, cfg, prompt, image_manifest=image_manifest,
+        mode_multiplier=mode_multiplier, mode=mode,
     )
+    # Terse-retry on timeout. Hooks at the wrapper layer because the inner
+    # has many return paths; one outer retry against the bounded
+    # TERSE_RETRY_TIMEOUT_SECONDS budget is simpler than threading retry
+    # state through every branch.
+    if (
+        not result.ok
+        and is_timeout_error(result.error)
+        and _terse_retry_enabled(cfg)
+    ):
+        terse_prompt = _build_terse_retry_prompt(prompt)
+        max_prompt_chars = cfg.get("max_prompt_chars")
+        if max_prompt_chars is None or len(terse_prompt) <= int(max_prompt_chars):
+            terse_cfg = dict(cfg)
+            terse_cfg["timeout"] = TERSE_RETRY_TIMEOUT_SECONDS
+            terse_result = await _run_openai_compatible_inner(
+                name, terse_cfg, terse_prompt,
+                image_manifest=image_manifest,
+                mode_multiplier=None, mode=mode,
+            )
+            if terse_result.ok:
+                from dataclasses import replace as _replace
+                result = _replace(terse_result, recovered_after_timeout=True)
     _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
     return result
 
@@ -566,6 +718,8 @@ async def _run_openai_compatible_inner(
     prompt: str,
     *,
     image_manifest: list[dict[str, Any]] | None = None,
+    mode_multiplier: float | None = None,
+    mode: str | None = None,
 ) -> ParticipantResult:
     start = time.monotonic()
     key_env = cfg.get("api_key_env", "OPENROUTER_API_KEY")
@@ -598,7 +752,7 @@ async def _run_openai_compatible_inner(
         "usage": {"include": True},
     }
     headers = _build_openai_compatible_headers(api_key, cfg, is_openrouter=is_openrouter)
-    timeout = float(cfg.get("timeout") or 180)
+    timeout = float(_resolve_effective_timeout(cfg, mode_multiplier, base_default=180))
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             response = await _request_with_retries(
@@ -645,7 +799,7 @@ async def _run_openai_compatible_inner(
                 cost_usd=_float_or_none(usage.get("cost")),
             )
         finish_reason = choice.get("finish_reason")
-        validation_error = _response_validation_error(content, cfg)
+        validation_error = _response_validation_error(content, cfg, prompt=prompt)
         if validation_error:
             should_retry = (
                 _retry_enabled(cfg)
@@ -689,6 +843,7 @@ async def _run_openai_compatible_inner(
                             cfg=cfg,
                             start=start,
                             fallback_model=model,
+                            prompt=prompt,
                         )
             return ParticipantResult(
                 name=name,
@@ -796,6 +951,7 @@ def _resolve_openrouter_retry(
     cfg: dict[str, Any],
     start: float,
     fallback_model: Any,
+    prompt: str | None = None,
 ) -> ParticipantResult:
     retry_usage = retry_data.get("usage") or {}
     combined_usage = _combine_openrouter_usage(original_usage, retry_usage)
@@ -844,7 +1000,7 @@ def _resolve_openrouter_retry(
             total_tokens=_int_or_none(combined_usage.get("total_tokens")),
             cost_usd=_float_or_none(combined_usage.get("cost")),
         )
-    retry_validation = _response_validation_error(retry_content, cfg)
+    retry_validation = _response_validation_error(retry_content, cfg, prompt=prompt)
     if retry_validation:
         merged_output = _format_retry_transcript(
             original_output=original_content,
@@ -910,6 +1066,8 @@ async def run_ollama_participant(
     *,
     image_manifest: list[dict[str, Any]] | None = None,
     cache_ctx: CacheContext | None = None,
+    mode_multiplier: float | None = None,
+    mode: str | None = None,
 ) -> ParticipantResult:
     overflow = _context_overflow_result(
         name, cfg, prompt, image_manifest=image_manifest
@@ -921,7 +1079,28 @@ async def run_ollama_participant(
     )
     if cached is not None:
         return cached
-    result = await _run_ollama_inner(name, cfg, prompt, image_manifest=image_manifest)
+    result = await _run_ollama_inner(
+        name, cfg, prompt, image_manifest=image_manifest,
+        mode_multiplier=mode_multiplier, mode=mode,
+    )
+    if (
+        not result.ok
+        and is_timeout_error(result.error)
+        and _terse_retry_enabled(cfg)
+    ):
+        terse_prompt = _build_terse_retry_prompt(prompt)
+        max_prompt_chars = cfg.get("max_prompt_chars")
+        if max_prompt_chars is None or len(terse_prompt) <= int(max_prompt_chars):
+            terse_cfg = dict(cfg)
+            terse_cfg["timeout"] = TERSE_RETRY_TIMEOUT_SECONDS
+            terse_result = await _run_ollama_inner(
+                name, terse_cfg, terse_prompt,
+                image_manifest=image_manifest,
+                mode_multiplier=None, mode=mode,
+            )
+            if terse_result.ok:
+                from dataclasses import replace as _replace
+                result = _replace(terse_result, recovered_after_timeout=True)
     _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
     return result
 
@@ -932,6 +1111,8 @@ async def _run_ollama_inner(
     prompt: str,
     *,
     image_manifest: list[dict[str, Any]] | None = None,
+    mode_multiplier: float | None = None,
+    mode: str | None = None,
 ) -> ParticipantResult:
     start = time.monotonic()
     model = cfg.get("model")
@@ -948,7 +1129,7 @@ async def _run_ollama_inner(
         "stream": False,
     }
     try:
-        ollama_timeout = float(cfg.get("timeout") or 180)
+        ollama_timeout = float(_resolve_effective_timeout(cfg, mode_multiplier, base_default=180))
         async with httpx.AsyncClient(timeout=ollama_timeout) as client:
             response = await _request_with_retries(
                 client,
@@ -960,7 +1141,7 @@ async def _run_ollama_inner(
             data = response.json()
         content = data.get("message", {}).get("content", "")
         finish_reason = data.get("done_reason")
-        validation_error = _response_validation_error(content, cfg)
+        validation_error = _response_validation_error(content, cfg, prompt=prompt)
         if validation_error:
             should_retry = (
                 _retry_enabled(cfg)
@@ -1019,7 +1200,7 @@ async def _run_ollama_inner(
                                     model=model,
                                 )
                             retry_validation = _response_validation_error(
-                                retry_content, cfg
+                                retry_content, cfg, prompt=prompt
                             )
                             if retry_validation:
                                 merged = _format_retry_transcript(
@@ -1087,6 +1268,8 @@ async def run_participant(
     *,
     image_manifest: list[dict[str, Any]] | None = None,
     cache_ctx: CacheContext | None = None,
+    mode_multiplier: float | None = None,
+    mode: str | None = None,
 ) -> ParticipantResult:
     ptype = cfg.get("type")
     if ptype == "cli":
@@ -1096,14 +1279,19 @@ async def run_participant(
         # ## Images prompt section. Adding `vision: true` to a CLI cfg
         # therefore has no effect — the orchestrator's images_skipped check
         # treats CLI as always image-aware (orchestrator.py).
-        result = await run_cli_participant(name, cfg, prompt, cwd, cache_ctx=cache_ctx)
+        result = await run_cli_participant(
+            name, cfg, prompt, cwd, cache_ctx=cache_ctx,
+            mode_multiplier=mode_multiplier, mode=mode,
+        )
     elif ptype in ("openrouter", "openai_compatible"):
         result = await run_openai_compatible_participant(
-            name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx
+            name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx,
+            mode_multiplier=mode_multiplier, mode=mode,
         )
     elif ptype == "ollama":
         result = await run_ollama_participant(
-            name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx
+            name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx,
+            mode_multiplier=mode_multiplier, mode=mode,
         )
     else:
         result = ParticipantResult(
@@ -1163,13 +1351,15 @@ async def run_participants(
     round_number: int = 1,
     image_manifest: list[dict[str, Any]] | None = None,
     cache_ctx: CacheContext | None = None,
+    mode_multiplier: float | None = None,
+    mode: str | None = None,
 ) -> list[ParticipantResult]:
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
     async def run_one(name: str) -> ParticipantResult:
         async with semaphore:
             cfg = participant_cfg[name]
-            timeout = int(cfg.get("timeout") or 240)
+            timeout = _resolve_effective_timeout(cfg, mode_multiplier)
             override = cfg.get("slow_warn_after_seconds")
             if override is not None:
                 slow_after = float(override)
@@ -1204,6 +1394,8 @@ async def run_participants(
                     cwd,
                     image_manifest=image_manifest,
                     cache_ctx=cache_ctx,
+                    mode_multiplier=mode_multiplier,
+                    mode=mode,
                 )
             finally:
                 if slow_task is not None and not slow_task.done():
@@ -1291,18 +1483,57 @@ def _message_content_text(content: Any) -> str:
     return str(content)
 
 
-def _response_validation_error(output: str, cfg: dict[str, Any]) -> str:
+def _response_validation_error(
+    output: str,
+    cfg: dict[str, Any],
+    *,
+    prompt: str | None = None,
+) -> str:
     if cfg.get("require_recommendation") is False:
+        # Chair/synthesizer-style cfg: skip both label AND section checks.
+        # The chair produces a decision memo that wouldn't satisfy either.
         return ""
-    if _has_recommendation_label(output):
-        return ""
-    excerpt = _first_output_excerpt(output)
-    if excerpt:
-        return (
-            "InvalidParticipantResponse: missing required RECOMMENDATION label. "
-            f"First output: {excerpt}"
-        )
-    return "InvalidParticipantResponse: empty response"
+    if not _has_recommendation_label(output):
+        excerpt = _first_output_excerpt(output)
+        if excerpt:
+            return (
+                "InvalidParticipantResponse: missing required RECOMMENDATION label. "
+                f"First output: {excerpt}"
+            )
+        return "InvalidParticipantResponse: empty response"
+    # Label is present. Check the structured-section contract: when the
+    # prompt declared `PART N — TITLE (REQUIRED)` headers AND the per-run
+    # config has section validation enabled (default: True), the response
+    # must reference each required section. PART 6 (RECOMMENDATION) is
+    # skipped — the label check above already covers it.
+    if prompt and cfg.get("require_sections", True) is not False:
+        from llm_council.sections import required_sections_missing
+        missing = required_sections_missing(prompt, output)
+        if missing:
+            return (
+                f"{INCOMPLETE_RESPONSE_PREFIX} response had the RECOMMENDATION "
+                f"label but missed required sections: {', '.join(missing)}"
+            )
+    # Strict evidence-tagging (default off — optional → required staging
+    # mirrors v0.5.0 envelope rollout). When enabled, every EVIDENCE
+    # bullet must carry one of [PUBLISHED]/[OBSERVABLE]/[INFERRED]/
+    # [SPECULATIVE]. Untagged entries indicate the peer smuggled
+    # speculation as fact. Empty EVIDENCE list passes — strict-evidence
+    # gates the FORMAT of entries that exist, not their PRESENCE.
+    if cfg.get("strict_evidence", False):
+        envelope = _extract_response_envelope(output)
+        untagged = [
+            i for i, entry in enumerate(envelope.get("evidence") or [])
+            if isinstance(entry, dict) and entry.get("tag") is None
+            or isinstance(entry, str)
+        ]
+        if untagged:
+            return (
+                f"{UNTAGGED_EVIDENCE_PREFIX} {len(untagged)} EVIDENCE "
+                "entry/entries lack a [PUBLISHED]/[OBSERVABLE]/[INFERRED]/"
+                "[SPECULATIVE] tag while defaults.strict_evidence is true"
+            )
+    return ""
 
 
 def _retry_enabled(cfg: dict[str, Any]) -> bool:
@@ -1311,6 +1542,21 @@ def _retry_enabled(cfg: dict[str, Any]) -> bool:
     # An explicit `retries: 0` is the user saying "no extra calls of any
     # kind"; respect that for the application-level repair retry too,
     # otherwise the cost regression undoes commit 45b44ee.
+    if "retries" in cfg and _coerce_retries(cfg.get("retries"), default=1) == 0:
+        return False
+    return True
+
+
+def _terse_retry_enabled(cfg: dict[str, Any]) -> bool:
+    """Whether terse-retry-on-timeout is allowed for this participant.
+
+    Respects the same `retries: 0` kill-switch as label-repair retry — a
+    user who wrote "no extra calls of any kind" should not get an extra
+    timeout-recovery call either. Also gated by an explicit per-participant
+    `terse_retry_on_timeout: false` opt-out.
+    """
+    if cfg.get("terse_retry_on_timeout", True) is False:
+        return False
     if "retries" in cfg and _coerce_retries(cfg.get("retries"), default=1) == 0:
         return False
     return True
@@ -1382,6 +1628,49 @@ _ENVELOPE_LIST_HEADER_RE = re.compile(
 
 _ENVELOPE_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?P<item>.+?)\s*$")
 
+# Evidence-tag parser. Pass-7's R3 rule defined four tags for grading the
+# epistemic status of each EVIDENCE bullet. Tags may appear at the start
+# (`[PUBLISHED] foo`), end (`foo [PUBLISHED]`), or inline. Qualifiers
+# after a separator (`[OBSERVABLE — behavioral]`) are accepted but
+# stripped from the canonical tag.
+EVIDENCE_TAG_RE = re.compile(
+    r"""
+    \[
+        \s*
+        (?P<tag>PUBLISHED|OBSERVABLE|INFERRED|SPECULATIVE)
+        (?:\s*[—\-–:]\s*[^\]]+)?
+        \s*
+    \]
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+
+KNOWN_EVIDENCE_TAGS = frozenset({"published", "observable", "inferred", "speculative"})
+
+# Tag-parsing only applies to evidence claims today. BLOCKERS are
+# concrete missing artifacts (file paths, command output), not
+# empirical claims. ASSUMPTIONS are first-person ("we assume X").
+# TESTS_TO_RUN are commands. Promoting tags to those fields would
+# change their semantics — defer until a follow-up.
+TAG_PARSED_LIST_FIELDS = frozenset({"evidence"})
+
+
+def _parse_tagged_entry(raw: str) -> dict[str, Any]:
+    """Extract a tag from an evidence bullet; structure as `{text, tag}`.
+
+    Tag-less entries return `{"text": raw, "tag": None}` so the parsed
+    shape is uniform and downstream consumers (stats, transcripts) can
+    treat untagged entries as a distinct category.
+    """
+    if not raw:
+        return {"text": raw, "tag": None}
+    match = EVIDENCE_TAG_RE.search(raw)
+    if not match:
+        return {"text": raw, "tag": None}
+    tag = match.group("tag").lower()
+    cleaned = (raw[: match.start()] + raw[match.end():]).strip(" -—–:")
+    return {"text": cleaned or raw.strip(), "tag": tag}
+
 
 def _extract_response_envelope(output: str) -> dict[str, Any]:
     """Parse the optional Pick-A response envelope from a peer's output.
@@ -1421,7 +1710,11 @@ def _extract_response_envelope(output: str) -> dict[str, Any]:
         if active_list:
             bullet = _ENVELOPE_BULLET_RE.match(line)
             if bullet:
-                envelope[active_list].append(bullet.group("item"))
+                item = bullet.group("item")
+                if active_list in TAG_PARSED_LIST_FIELDS:
+                    envelope[active_list].append(_parse_tagged_entry(item))
+                else:
+                    envelope[active_list].append(item)
                 continue
             active_list = None
         single = _ENVELOPE_SINGLE_RE.match(line)
@@ -1527,9 +1820,51 @@ def _first_output_excerpt(output: str, max_chars: int = 240) -> str:
     return cleaned[: max_chars - 3].rstrip() + "..."
 
 
-def _format_timeout_error(name: str, timeout: int, prompt_chars: int) -> str:
+def _resolve_effective_timeout(
+    cfg: dict[str, Any],
+    mode_multiplier: float | None,
+    *,
+    base_default: int = 240,
+) -> int:
+    """Resolve the per-call timeout from per-participant base and mode multiplier.
+
+    Per-participant ``cfg["timeout"]`` stays the source of truth for the base
+    value; the multiplier is layered on top so users who raised the base for
+    a stubborn host CLI also benefit on consensus/deliberate runs. Pass-7's
+    14K-char prompt timed claude out at 240s; consensus mode's 2.0x raises
+    that to 480s without forcing the user to override the per-participant
+    config. Rounds up so 1.5x of 240 lands at 360, not 359.
+    """
+    base = int(cfg.get("timeout") or base_default)
+    if mode_multiplier is None or mode_multiplier <= 1.0:
+        return base
+    import math
+    return int(math.ceil(base * float(mode_multiplier)))
+
+
+def _format_timeout_error(
+    name: str,
+    timeout: int,
+    prompt_chars: int,
+    *,
+    mode_multiplier: float | None = None,
+    mode: str | None = None,
+    base_timeout: int | None = None,
+) -> str:
+    multiplier_note = ""
+    if (
+        mode_multiplier is not None
+        and mode_multiplier > 1.0
+        and base_timeout is not None
+        and mode
+    ):
+        multiplier_note = (
+            f" (mode '{mode}' applied {mode_multiplier}x multiplier, "
+            f"raising base {base_timeout}s -> {timeout}s)"
+        )
     return (
-        f"Timeout: `{name}` did not respond within {timeout}s "
+        f"Timeout: `{name}` did not respond within {timeout}s"
+        f"{multiplier_note} "
         f"(prompt was {prompt_chars} chars). "
         "To raise the limit, set `participants."
         f"{name}.timeout: <seconds>` in `.llm-council.yaml`. "
@@ -1540,7 +1875,24 @@ def _format_timeout_error(name: str, timeout: int, prompt_chars: int) -> str:
 
 
 def is_timeout_error(error: str) -> bool:
-    return error.startswith("Timeout:") or error.startswith("TimeoutError:")
+    # CLI subprocess timeouts use "Timeout:" / "TimeoutError:" prefixes.
+    # httpx-backed peers (openai_compatible, ollama) raise ReadTimeout /
+    # ConnectTimeout / WriteTimeout / PoolTimeout / TimeoutException which
+    # the generic `except Exception` in those adapters serializes as
+    # "ReadTimeout: ..." etc. Treat all of these as timeouts so terse-retry
+    # fires uniformly across adapter types.
+    if not error:
+        return False
+    if error.startswith("Timeout:") or error.startswith("TimeoutError:"):
+        return True
+    httpx_timeout_prefixes = (
+        "ReadTimeout:",
+        "ConnectTimeout:",
+        "WriteTimeout:",
+        "PoolTimeout:",
+        "TimeoutException:",
+    )
+    return any(error.startswith(p) for p in httpx_timeout_prefixes)
 
 
 # Stable, machine-readable classification of result errors. Callers can
@@ -1556,6 +1908,8 @@ ERROR_KIND_DOWNSTREAM = "downstream_error"
 ERROR_KIND_CLI_NONZERO = "cli_nonzero_exit"
 ERROR_KIND_PREFLIGHT_FAILED = "preflight_failed"
 ERROR_KIND_ABDICATED = "abdicated"
+ERROR_KIND_INCOMPLETE_RESPONSE = "incomplete_response"
+ERROR_KIND_UNTAGGED_EVIDENCE = "untagged_evidence"
 ERROR_KIND_UNKNOWN = "unknown"
 
 KNOWN_ERROR_KINDS = frozenset(
@@ -1568,12 +1922,16 @@ KNOWN_ERROR_KINDS = frozenset(
         ERROR_KIND_CLI_NONZERO,
         ERROR_KIND_PREFLIGHT_FAILED,
         ERROR_KIND_ABDICATED,
+        ERROR_KIND_INCOMPLETE_RESPONSE,
+        ERROR_KIND_UNTAGGED_EVIDENCE,
         ERROR_KIND_UNKNOWN,
     }
 )
 
 PREFLIGHT_FAILED_PREFIX = "PreflightFailed:"
 ABDICATED_ERROR_PREFIX = "AbdicatedResponse:"
+INCOMPLETE_RESPONSE_PREFIX = "IncompleteResponse:"
+UNTAGGED_EVIDENCE_PREFIX = "UntaggedEvidence:"
 
 
 def classify_error(error: str) -> str | None:
@@ -1601,6 +1959,10 @@ def classify_error(error: str) -> str | None:
         return ERROR_KIND_PREFLIGHT_FAILED
     if error.startswith(ABDICATED_ERROR_PREFIX):
         return ERROR_KIND_ABDICATED
+    if error.startswith(INCOMPLETE_RESPONSE_PREFIX):
+        return ERROR_KIND_INCOMPLETE_RESPONSE
+    if error.startswith(UNTAGGED_EVIDENCE_PREFIX):
+        return ERROR_KIND_UNTAGGED_EVIDENCE
     # httpx + downstream-API errors funnel through f"{type(exc).__name__}: ..."
     # in the openrouter / ollama paths; we don't try to introspect those
     # further here, just classify them as `downstream_error` so callers can

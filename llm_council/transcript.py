@@ -358,6 +358,10 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
         payload["recovered_after_launch_retry"] = True
     if result.repair_retry_recovered:
         payload["repair_retry_recovered"] = True
+    if result.recovered_after_timeout:
+        payload["recovered_after_timeout"] = True
+    if result.prompt_chars is not None:
+        payload["prompt_chars"] = result.prompt_chars
     if result.from_cache:
         payload["from_cache"] = True
         if result.cache_hit_seconds is not None:

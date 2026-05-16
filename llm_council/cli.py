@@ -127,6 +127,29 @@ def build_parser() -> argparse.ArgumentParser:
             "from peer votes. Costs one extra participant call."
         ),
     )
+    run.add_argument(
+        "--no-require-sections",
+        dest="require_sections",
+        action="store_false",
+        default=None,
+        help=(
+            "Disable section-coverage validation. By default, when the prompt "
+            "contains `PART N — TITLE (REQUIRED)` markers, peers must reference "
+            "each in their responses or fail with error_kind=incomplete_response."
+        ),
+    )
+    run.add_argument(
+        "--strict-evidence",
+        dest="strict_evidence",
+        action="store_true",
+        default=None,
+        help=(
+            "Require every EVIDENCE bullet to carry one of "
+            "[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE] tags. "
+            "Untagged entries trigger one repair retry then "
+            "error_kind=untagged_evidence. Off by default in v0.7."
+        ),
+    )
     run.add_argument("--max-rounds", type=int, help="Maximum deliberation rounds")
     run.add_argument(
         "--min-quorum",
@@ -2098,6 +2121,16 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                 ),
                 flush=True,
             )
+    # CLI flags override the config-file defaults for per-call toggles
+    # the validator reads off `cfg`. None means "no flag given — keep
+    # whatever the config has." Propagating into config["defaults"] lets
+    # execute_council push them into each peer's cfg consistently.
+    _cli_require_sections = getattr(args, "require_sections", None)
+    _cli_strict_evidence = getattr(args, "strict_evidence", None)
+    if _cli_require_sections is not None:
+        config.setdefault("defaults", {})["require_sections"] = bool(_cli_require_sections)
+    if _cli_strict_evidence is not None:
+        config.setdefault("defaults", {})["strict_evidence"] = bool(_cli_strict_evidence)
     results, metadata = await execute_council(
         participants,
         participant_cfg,
@@ -2196,6 +2229,8 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                             "cache_hit_seconds": result.cache_hit_seconds,
                             "recovered_after_launch_retry": result.recovered_after_launch_retry,
                             "repair_retry_recovered": result.repair_retry_recovered,
+                            "recovered_after_timeout": result.recovered_after_timeout,
+                            "prompt_chars": result.prompt_chars,
                             "stance": result.stance,
                             "effort": result.effort,
                             "confidence": result.confidence,

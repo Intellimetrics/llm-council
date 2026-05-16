@@ -392,6 +392,25 @@ def build_prompt(
         ]
     )
 
+    # Surface REQUIRED section markers found in the question body so peers
+    # know up-front that section coverage will be enforced. The validator
+    # is no-op when no markers are present, so this block stays silent for
+    # ordinary prompts.
+    from llm_council.sections import required_sections as _required_sections
+    _detected = _required_sections(question)
+    if _detected:
+        head_sections.extend(
+            [
+                "",
+                "REQUIRED sections detected in your prompt:",
+                *[f"- {req['label']}" for req in _detected],
+                "Each must appear in your response (literal `PART N` token or",
+                "all salient title tokens within a few lines). Responses missing",
+                "any required section will be retried once, then marked",
+                "`error_kind: incomplete_response` and dropped from quorum.",
+            ]
+        )
+
     context_sections: list[str] = []
     diff_section_index: int | None = None
     diff_raw: str = ""

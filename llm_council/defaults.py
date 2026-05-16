@@ -97,6 +97,22 @@ DEFAULT_CONFIG: dict = {
         # (default .llm-council-secrets-allow) covers test fixtures.
         "secret_scan": "warn",
         "secret_scan_allowlist": ".llm-council-secrets-allow",
+        # Section-coverage validator. When the user prompt contains
+        # `PART N — TITLE (REQUIRED)` headers, each peer response must
+        # reference each required section (literal `PART N` or salient
+        # title tokens within a 200-char window). Missing sections
+        # trigger one section-repair retry, then `error_kind=incomplete_response`.
+        # Opt-out for prompts where REQUIRED markers are used for reader
+        # clarity but not validation.
+        "require_sections": True,
+        # Strict evidence-tag enforcement. When True, each EVIDENCE bullet
+        # must carry one of [PUBLISHED]/[OBSERVABLE]/[INFERRED]/
+        # [SPECULATIVE] tags. Untagged entries trigger one repair retry,
+        # then `error_kind=untagged_evidence`. Default False — staged
+        # rollout mirrors v0.5.0 envelope optional→required pattern.
+        # Watch `evidence_tag_distribution["untagged"]` in stats for two
+        # releases before flipping the default.
+        "strict_evidence": False,
         "origin_policy": "any",
         "max_concurrency": 4,
         "transparent": False,
@@ -338,6 +354,7 @@ DEFAULT_CONFIG: dict = {
             "strategy": "other_cli_peers",
             "include_current": True,
             "add": ["deepseek_v4_pro", "glm_5_1", "kimi_k2_6"],
+            "timeout_multiplier": 1.5,
             "description": "Native triad plus cross-lab planning diversity.",
         },
         "private-local": {
@@ -365,6 +382,7 @@ DEFAULT_CONFIG: dict = {
             "include_current": True,
             "add": ["deepseek_v4_pro"],
             "deliberate": True,
+            "timeout_multiplier": 1.5,
             "description": "Expensive opt-in second round when first-round responses disagree.",
         },
         "consensus": {
@@ -375,6 +393,7 @@ DEFAULT_CONFIG: dict = {
                 "codex": "against",
                 "gemini": "neutral",
             },
+            "timeout_multiplier": 2.0,
             "description": (
                 "Assigned-stance debate to attack groupthink and sycophancy. "
                 "Each native CLI peer takes a for/against/neutral role; the "

@@ -123,6 +123,25 @@ def council_run_schema() -> dict[str, Any]:
                     "defaults.synthesizer to be set (fails loudly if not)."
                 ),
             },
+            "require_sections": {
+                "type": "boolean",
+                "description": (
+                    "Override defaults.require_sections (default True). "
+                    "When True and the prompt contains `PART N — TITLE "
+                    "(REQUIRED)` headers, peer responses must reference "
+                    "each required section or fail with "
+                    "error_kind=incomplete_response."
+                ),
+            },
+            "strict_evidence": {
+                "type": "boolean",
+                "description": (
+                    "Override defaults.strict_evidence (default False). "
+                    "When True, every EVIDENCE bullet must carry a "
+                    "[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE] "
+                    "tag or fail with error_kind=untagged_evidence."
+                ),
+            },
             "max_rounds": {"type": "integer", "minimum": 1, "maximum": 3},
             "min_quorum": {
                 "type": "integer",
@@ -188,7 +207,7 @@ def council_run_schema() -> dict[str, Any]:
     }
 
 
-COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 2  # v2 = envelope contract (effort/confidence/...)
+COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 3  # v3 = recovered_after_timeout, prompt_chars, incomplete_response/untagged_evidence error_kinds, structured evidence
 COUNCIL_RUN_VALID_STANCES = ("for", "against", "neutral")
 COUNCIL_RUN_VALID_ERROR_KINDS = (
     "timeout",
@@ -199,6 +218,8 @@ COUNCIL_RUN_VALID_ERROR_KINDS = (
     "cli_nonzero_exit",
     "preflight_failed",
     "abdicated",
+    "incomplete_response",
+    "untagged_evidence",
     "unknown",
 )
 
@@ -296,6 +317,27 @@ def council_run_output_schema() -> dict[str, Any]:
                         },
                         "recovered_after_launch_retry": {"type": "boolean"},
                         "repair_retry_recovered": {"type": "boolean"},
+                        "recovered_after_timeout": {
+                            "type": "boolean",
+                            "description": (
+                                "True when the original call timed out and the "
+                                "60s terse-retry recovered with a valid response. "
+                                "Distinguished from `recovered_after_launch_retry` "
+                                "(launch failure) and `repair_retry_recovered` "
+                                "(missing label) so stats can attribute recovery "
+                                "to the right mechanism."
+                            ),
+                        },
+                        "prompt_chars": {
+                            "type": ["integer", "null"],
+                            "description": (
+                                "Length of the assembled prompt for this peer, "
+                                "populated on timeout failures so stats can "
+                                "bucket timeouts by prompt size without "
+                                "re-parsing the error string. `null` on "
+                                "successful runs (the information is not needed)."
+                            ),
+                        },
                         "effort": {
                             "type": ["string", "null"],
                             "description": (
@@ -655,6 +697,14 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         or mode_cfg.get("synthesize")
         or config.get("defaults", {}).get("synthesize")
     )
+    # MCP per-call toggles for v0.7 validators. None means "use config";
+    # an explicit bool overrides config["defaults"] for this run.
+    _mcp_require_sections = arguments.get("require_sections")
+    _mcp_strict_evidence = arguments.get("strict_evidence")
+    if _mcp_require_sections is not None:
+        config.setdefault("defaults", {})["require_sections"] = bool(_mcp_require_sections)
+    if _mcp_strict_evidence is not None:
+        config.setdefault("defaults", {})["strict_evidence"] = bool(_mcp_strict_evidence)
     max_rounds = int(
         arguments.get("max_rounds")
         or mode_cfg.get("max_rounds")
@@ -879,6 +929,8 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
                     result.recovered_after_launch_retry
                 ),
                 "repair_retry_recovered": bool(result.repair_retry_recovered),
+                "recovered_after_timeout": bool(result.recovered_after_timeout),
+                "prompt_chars": result.prompt_chars,
                 "effort": result.effort,
                 "confidence": result.confidence,
                 "risk": result.risk,

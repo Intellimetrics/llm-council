@@ -309,6 +309,22 @@ async def execute_council(
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
     convergence_thresholds = _resolve_convergence_thresholds(config, mode)
 
+    # Push run-wide validation toggles from config["defaults"] into each
+    # participant cfg unless the participant already specifies its own
+    # override. The adapter-level `_response_validation_error` reads off
+    # `cfg`, not the global defaults block, so this propagation is what
+    # makes the global `defaults.require_sections` / `defaults.strict_evidence`
+    # actually affect peer responses.
+    _defaults_for_peers = config.get("defaults") or {}
+    for _propagated_key in ("require_sections", "strict_evidence"):
+        _propagated_val = _defaults_for_peers.get(_propagated_key)
+        if _propagated_val is None:
+            continue
+        for _peer_name in participants:
+            _peer_cfg = participant_cfg.get(_peer_name)
+            if isinstance(_peer_cfg, dict) and _propagated_key not in _peer_cfg:
+                _peer_cfg[_propagated_key] = _propagated_val
+
     cache_disabled_for_mode = is_caching_disabled_for_mode(mode)
     cache_ctx_round1 = CacheContext(
         cwd=cwd,
@@ -378,6 +394,18 @@ async def execute_council(
     else:
         run_targets = participants
 
+    # Mode-aware timeout: consensus/deliberate/diverse modes do harder work
+    # and can blow through the default 240s. Each mode's `timeout_multiplier`
+    # is layered on top of the per-participant base, so users who already
+    # raised `claude.timeout` to 600s get the same multiplicative bump.
+    mode_cfg_for_timeout = config.get("modes", {}).get(mode) if mode else None
+    mode_multiplier = (
+        float(mode_cfg_for_timeout.get("timeout_multiplier"))
+        if isinstance(mode_cfg_for_timeout, dict)
+        and mode_cfg_for_timeout.get("timeout_multiplier") is not None
+        else None
+    )
+
     if run_targets:
         run_results = await run_participants(
             run_targets,
@@ -389,6 +417,8 @@ async def execute_council(
             round_number=1,
             image_manifest=image_manifest,
             cache_ctx=cache_ctx_round1,
+            mode_multiplier=mode_multiplier,
+            mode=mode,
         )
     else:
         run_results = []
@@ -509,6 +539,8 @@ async def execute_council(
             round_number=round_number + 1,
             image_manifest=image_manifest,
             cache_ctx=cache_ctx_deliberation,
+            mode_multiplier=mode_multiplier,
+            mode=mode,
         )
         prior_round_results = list(round_results)
         round_number += 1

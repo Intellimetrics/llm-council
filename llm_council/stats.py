@@ -31,6 +31,28 @@ _ENVELOPE_FIELDS = (
 )
 _ENVELOPE_LIST_FIELDS = frozenset({"blockers", "evidence", "tests_to_run", "assumptions"})
 
+# Char-size buckets for timeout telemetry. Aligned with the realistic
+# prompt-build outcomes given the default `max_prompt_chars: 120_000`:
+# quick/peer-only typically lands under 4K; mid-sized council prompts
+# with one context file fall 4K-20K (pass-7 at 14.3K is exactly this);
+# plan/review with multiple --context files lands 20K-60K; full-codebase
+# diff runs push xlarge.
+TIMEOUT_PROMPT_SIZE_BUCKETS: tuple[tuple[str, int | None], ...] = (
+    ("small", 4_000),
+    ("medium", 20_000),
+    ("large", 60_000),
+    ("xlarge", None),  # None = no upper bound
+)
+
+
+def _timeout_prompt_size_bucket(prompt_chars: int | None) -> str:
+    if prompt_chars is None or prompt_chars <= 0:
+        return "small"
+    for name, ceiling in TIMEOUT_PROMPT_SIZE_BUCKETS:
+        if ceiling is None or prompt_chars <= ceiling:
+            return name
+    return "xlarge"
+
 
 def load_transcript_files(base_dir: Path) -> list[dict[str, Any]]:
     """Return raw transcript JSON dicts plus their on-disk mtime.
@@ -79,6 +101,30 @@ def _new_peer_bucket() -> dict[str, Any]:
         # Envelope field presence per peer. Prerequisite telemetry before
         # flipping optional envelope fields to required (Pick A rollout).
         "envelope_field_present": {field: 0 for field in _ENVELOPE_FIELDS},
+        # Timeout-by-prompt-size telemetry. Lets the operator see whether
+        # bigger prompts disproportionately trip the timeout wall, which
+        # is the signal for raising `defaults.timeout` or a mode's
+        # `timeout_multiplier` rather than chunking.
+        "timeout_by_prompt_size": {
+            name: 0 for name, _ in TIMEOUT_PROMPT_SIZE_BUCKETS
+        },
+        # Count of successful runs that recovered from a timeout via the
+        # terse-retry path. Together with `timeout_by_prompt_size` this
+        # tells the operator how often the recovery path actually saves
+        # the run vs. how often the prompt is just too big.
+        "timeout_recoveries": 0,
+        # Evidence-tag distribution per peer. Counts each EVIDENCE bullet
+        # by its tag, plus an `untagged` bin for entries without one.
+        # Drives the optional→required rollout decision for
+        # `defaults.strict_evidence`: when untagged stays small across
+        # representative runs, flip the default.
+        "evidence_tag_distribution": {
+            "published": 0,
+            "observable": 0,
+            "inferred": 0,
+            "speculative": 0,
+            "untagged": 0,
+        },
         "last_used": None,
     }
 
@@ -175,11 +221,35 @@ def aggregate(
                             bucket["envelope_field_present"][field_name] += 1
                     elif value is not None:
                         bucket["envelope_field_present"][field_name] += 1
+                if result.get("recovered_after_timeout"):
+                    bucket["timeout_recoveries"] += 1
+                # Evidence-tag distribution: count each EVIDENCE bullet
+                # by its tag. Entries shape from v0.7 onward is
+                # list[{text, tag}]; legacy list[str] entries (pre-v0.7
+                # cached transcripts) count as untagged.
+                for entry in result.get("evidence") or []:
+                    if isinstance(entry, dict):
+                        tag = entry.get("tag")
+                        bucket_key = tag if tag in (
+                            "published", "observable", "inferred", "speculative",
+                        ) else "untagged"
+                    else:
+                        bucket_key = "untagged"
+                    bucket["evidence_tag_distribution"][bucket_key] += 1
             else:
                 error_kind = result.get("error_kind") or "unknown"
                 bucket["error_kind_counts"][error_kind] = (
                     bucket["error_kind_counts"].get(error_kind, 0) + 1
                 )
+                if error_kind == "timeout":
+                    prompt_chars = result.get("prompt_chars")
+                    try:
+                        size_bucket = _timeout_prompt_size_bucket(
+                            int(prompt_chars) if prompt_chars else None
+                        )
+                    except (TypeError, ValueError):
+                        size_bucket = "small"
+                    bucket["timeout_by_prompt_size"][size_bucket] += 1
 
     participant_rows = []
     for name, bucket in sorted(peers.items()):
@@ -217,6 +287,9 @@ def aggregate(
                 ),
                 "error_kind_counts": dict(bucket["error_kind_counts"]),
                 "envelope_field_present": dict(bucket["envelope_field_present"]),
+                "timeout_by_prompt_size": dict(bucket["timeout_by_prompt_size"]),
+                "timeout_recoveries": bucket["timeout_recoveries"],
+                "evidence_tag_distribution": dict(bucket["evidence_tag_distribution"]),
                 "last_used": bucket["last_used"],
             }
         )
