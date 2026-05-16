@@ -8,11 +8,16 @@ and validation-error wiring in isolation.
 
 from __future__ import annotations
 
+import asyncio
+
+import llm_council.adapters as adapters_module
 from llm_council.adapters import (
     INCOMPLETE_RESPONSE_PREFIX,
     KNOWN_ERROR_KINDS,
     _response_validation_error,
     classify_error,
+    run_ollama_participant,
+    run_openai_compatible_participant,
 )
 from llm_council.sections import (
     REQUIRED_SECTION_HEADER_RE,
@@ -214,3 +219,300 @@ def test_classify_error_routes_incomplete_response():
 def test_known_error_kinds_includes_incomplete_response():
     """Guard against drift between adapters.py and mcp_server.py."""
     assert "incomplete_response" in KNOWN_ERROR_KINDS
+
+
+# --- Section-repair retry wired through hosted/local adapters ------------
+#
+# The CLI adapter has triggered the section-repair retry since v0.7.0.
+# Pass-8 finding #3 (codex) was that the `openai_compatible` and
+# `ollama` adapters only retried label-only failures and returned the
+# `IncompleteResponse:` failure directly without a repair attempt.
+# These tests pin the parity contract: hosted and local peers also get
+# exactly one section-repair retry, with the same gating
+# (`_should_section_repair`) and the same merge semantics as the CLI
+# path.
+
+_SECTION_PROMPT = (
+    "Please answer with these sections:\n"
+    "PART 2 — CONCEPT-BY-CONCEPT GRID (REQUIRED)\n"
+    "PART 6 — RECOMMENDATION (REQUIRED BY COUNCIL INVARIANTS)\n"
+)
+
+
+class _FakeResponse:
+    def __init__(self, body: dict):
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+def _openai_body(content: str, finish_reason: str = "stop") -> dict:
+    return {
+        "model": "x-ai/test",
+        "choices": [
+            {
+                "message": {"content": content},
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8,
+        },
+    }
+
+
+def _ollama_body(content: str, done_reason: str = "stop") -> dict:
+    return {
+        "model": "qwen3:test",
+        "message": {"content": content},
+        "done_reason": done_reason,
+    }
+
+
+def test_openai_compatible_section_repair_recovers(monkeypatch):
+    """openai_compatible peer returns response missing sections → triggers
+    repair retry → success on retry → ok=True."""
+    calls: list[dict] = []
+
+    bodies = [
+        # First response: label present, PART 2 missing.
+        _openai_body("RECOMMENDATION: yes - ok\nNo grid here, sorry.\n"),
+        # Section-repair retry: label + PART 2 grid present.
+        _openai_body(
+            "RECOMMENDATION: yes - ok\n## PART 2 — Concept Grid\nC1. foo\n"
+        ),
+    ]
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return _FakeResponse(bodies[len(calls) - 1])
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openai_compatible_participant(
+            "router",
+            {
+                "type": "openai_compatible",
+                "model": "x-ai/test",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+            },
+            _SECTION_PROMPT,
+        )
+    )
+
+    assert len(calls) == 2, "section-repair retry must fire a second HTTP call"
+    # Second call's prompt contains the section-repair directive and the
+    # missing-sections list.
+    retry_user_content = calls[1]["messages"][-1]["content"]
+    assert "PART 2 — CONCEPT-BY-CONCEPT GRID" in retry_user_content
+    assert "REQUIRED sections" in retry_user_content
+    # Merged result is OK with a section-themed recovery header.
+    assert result.ok is True
+    assert result.error == ""
+    assert "[recovered after retry]" in result.output
+    assert "REQUIRED sections" in result.output
+    assert "PART 2 — Concept Grid" in result.output
+    assert result.repair_retry_recovered is True
+
+
+def test_openai_compatible_section_repair_exhausted(monkeypatch):
+    """openai_compatible peer returns response missing sections → triggers
+    repair retry → still missing → ok=False, error_kind=incomplete_response."""
+    calls: list[dict] = []
+
+    bodies = [
+        # First response: label present, PART 2 missing.
+        _openai_body("RECOMMENDATION: yes - ok\nNo grid.\n"),
+        # Section-repair retry: label present, PART 2 still missing.
+        _openai_body("RECOMMENDATION: yes - ok\nStill no grid, sorry.\n"),
+    ]
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return _FakeResponse(bodies[len(calls) - 1])
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openai_compatible_participant(
+            "router",
+            {
+                "type": "openai_compatible",
+                "model": "x-ai/test",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+            },
+            _SECTION_PROMPT,
+        )
+    )
+
+    # Exactly two calls (original + one repair retry, no third).
+    assert len(calls) == 2
+    assert result.ok is False
+    assert result.error.startswith(INCOMPLETE_RESPONSE_PREFIX)
+    assert "after one repair retry" in result.error
+    assert classify_error(result.error) == "incomplete_response"
+    # Both attempts are visible in the merged output for the operator.
+    assert "[retry exhausted]" in result.output
+    assert "No grid." in result.output
+    assert "Still no grid, sorry." in result.output
+
+
+def test_openai_compatible_section_repair_disabled_by_require_sections_false(
+    monkeypatch,
+):
+    """`require_sections: False` skips the section check entirely, so no
+    section-repair retry can fire even on a response that would
+    otherwise trigger it."""
+    calls: list[dict] = []
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return _FakeResponse(
+            _openai_body("RECOMMENDATION: tradeoff - terse three-bullet response")
+        )
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openai_compatible_participant(
+            "router",
+            {
+                "type": "openai_compatible",
+                "model": "x-ai/test",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+                "require_sections": False,
+            },
+            _SECTION_PROMPT,
+        )
+    )
+
+    # Only the original call; the validator no-oped, so no retry.
+    assert len(calls) == 1
+    assert result.ok is True
+    assert result.error == ""
+
+
+def test_ollama_section_repair_recovers(monkeypatch):
+    """ollama peer returns response missing sections → triggers repair
+    retry → success on retry → ok=True."""
+    calls: list[dict] = []
+
+    bodies = [
+        _ollama_body("RECOMMENDATION: yes - ok\nNo grid here, sorry.\n"),
+        _ollama_body(
+            "RECOMMENDATION: yes - ok\n## PART 2 — Concept Grid\nC1. foo\n"
+        ),
+    ]
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return _FakeResponse(bodies[len(calls) - 1])
+
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_ollama_participant(
+            "local",
+            {
+                "type": "ollama",
+                "model": "qwen3:test",
+                "base_url": "http://localhost:11434",
+            },
+            _SECTION_PROMPT,
+        )
+    )
+
+    assert len(calls) == 2
+    retry_user_content = calls[1]["messages"][-1]["content"]
+    assert "PART 2 — CONCEPT-BY-CONCEPT GRID" in retry_user_content
+    assert "REQUIRED sections" in retry_user_content
+    assert result.ok is True
+    assert result.error == ""
+    assert "[recovered after retry]" in result.output
+    assert "REQUIRED sections" in result.output
+    assert "PART 2 — Concept Grid" in result.output
+    assert result.repair_retry_recovered is True
+
+
+def test_ollama_section_repair_exhausted(monkeypatch):
+    """ollama peer returns response missing sections → triggers repair
+    retry → still missing → ok=False, error_kind=incomplete_response."""
+    calls: list[dict] = []
+
+    bodies = [
+        _ollama_body("RECOMMENDATION: yes - ok\nNo grid.\n"),
+        _ollama_body("RECOMMENDATION: yes - ok\nStill no grid, sorry.\n"),
+    ]
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return _FakeResponse(bodies[len(calls) - 1])
+
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_ollama_participant(
+            "local",
+            {
+                "type": "ollama",
+                "model": "qwen3:test",
+                "base_url": "http://localhost:11434",
+            },
+            _SECTION_PROMPT,
+        )
+    )
+
+    assert len(calls) == 2
+    assert result.ok is False
+    assert result.error.startswith(INCOMPLETE_RESPONSE_PREFIX)
+    assert "after one repair retry" in result.error
+    assert classify_error(result.error) == "incomplete_response"
+    assert "[retry exhausted]" in result.output
+    assert "No grid." in result.output
+    assert "Still no grid, sorry." in result.output
+
+
+def test_openai_compatible_section_repair_respects_retries_zero(monkeypatch):
+    """`retries: 0` is the user's "no extra calls" kill-switch. It must
+    apply to section-repair just like label-repair — one HTTP call
+    total, even when sections are missing."""
+    calls: list[dict] = []
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return _FakeResponse(
+            _openai_body("RECOMMENDATION: yes - ok\nNo grid here.\n")
+        )
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openai_compatible_participant(
+            "router",
+            {
+                "type": "openai_compatible",
+                "model": "x-ai/test",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+                "retries": 0,
+            },
+            _SECTION_PROMPT,
+        )
+    )
+
+    assert len(calls) == 1
+    assert result.ok is False
+    assert result.error.startswith(INCOMPLETE_RESPONSE_PREFIX)
+    # Original error wording (single attempt) — no "after one repair retry".
+    assert "after one repair retry" not in result.error
