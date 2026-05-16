@@ -2777,7 +2777,10 @@ def test_recommendation_label_handles_common_markdown():
         )
         == "yes"
     )
-    assert recommendation_label("```text\nRECOMMENDATION: no - sample\n```") == "no"
+    # Fenced-only labels are example syntax, not real answers — they must
+    # not resolve to a valid label. A peer that emits ONLY a fenced label
+    # while abdicating in prose outside the fence should fail validation.
+    assert recommendation_label("```text\nRECOMMENDATION: no - sample\n```") == "unknown"
 
 
 def test_disagreement_requires_labeled_positions():

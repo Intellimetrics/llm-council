@@ -110,7 +110,20 @@ Key modules:
   remove these from `defaults.py` without an explicit reason.
 - **`RECOMMENDATION:` label.** CLI output is rejected if it lacks the label;
   prompts in `context.py` ask for it. Adapter and prompt changes must keep
-  these in sync.
+  these in sync. The label match is fence-aware: a `RECOMMENDATION:` line
+  inside a fenced code block is treated as example syntax, not a real vote
+  (`adapters._has_recommendation_label`, `deliberation.recommendation_label`,
+  `deliberation.recommendation_line` all share this rule).
+- **Optional response envelope.** Peers may emit `EFFORT:`, `CONFIDENCE:`,
+  `RISK:`, `BLOCKERS:`, `EVIDENCE:`, `TESTS_TO_RUN:`, `ASSUMPTIONS:` lines
+  alongside the `RECOMMENDATION:` label. Parsed by
+  `adapters._extract_response_envelope`, stored on `ParticipantResult`, and
+  emitted in transcripts / MCP `structured_results`. All fields are optional
+  in the current schema (v2). A peer that says `EFFORT: blocked` with NO
+  concrete `BLOCKERS:` is classified as abdication (`error_kind=abdicated`,
+  `ok=False`, drops quorum) — no repair retry. Track presence via the new
+  `envelope_field_present` bucket in `stats.aggregate` before any future
+  flip from optional to required.
 - **Config migration is silent.** `migrate_known_cli_defaults` rewrites old
   `OLD_CLAUDE_PLAN_ARGS` / `OLD_CODEX_APPROVAL_ARGS` and back-fills
   `peer-only` mode and `include_current` for built-in `other_cli_peers`
@@ -141,6 +154,7 @@ failure path; do not let strings drift.
 | `downstream_error`   | httpx / hosted-API failures (HTTPStatusError, ConnectError, ReadTimeout, etc.)       |
 | `cli_nonzero_exit`   | CLI participant exited with a nonzero status and empty stderr. Prefix: `CliExitNonZero:` |
 | `preflight_failed`   | Local participant's `base_url` was unreachable at run start. Prefix: `PreflightFailed:` |
+| `abdicated`          | Peer emitted `RECOMMENDATION:` and `EFFORT: blocked` but listed no concrete missing artifact in `BLOCKERS:`/`ASSUMPTIONS:`. Terminal for the round — no repair retry. Drops quorum so consensus doesn't form on a non-vote. Prefix: `AbdicatedResponse:` |
 | `unknown`            | Non-empty error that did not match any known prefix — file a dogfood note            |
 
 ## Custom CLI participant: minimal template

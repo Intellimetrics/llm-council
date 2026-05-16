@@ -40,38 +40,30 @@ def model_comparison(results: list[ParticipantResult]) -> list[str]:
 
 
 def recommendation_line(text: str) -> str:
-    fenced_line = ""
     in_fence = False
     for line in text.splitlines():
         if line.strip().startswith("```"):
             in_fence = not in_fence
             continue
-        if not RECOMMENDATION_RE.match(line):
+        if in_fence:
             continue
-        cleaned = line.strip()
-        if not in_fence:
-            return cleaned
-        if not fenced_line:
-            fenced_line = cleaned
-    return fenced_line or first_nonempty_line(text)
+        if RECOMMENDATION_RE.match(line):
+            return line.strip()
+    return first_nonempty_line(text)
 
 
 def recommendation_label(text: str) -> str:
-    fenced_label = "unknown"
     in_fence = False
     for line in text.splitlines():
         if line.strip().startswith("```"):
             in_fence = not in_fence
             continue
-        match = RECOMMENDATION_RE.match(line)
-        if not match:
+        if in_fence:
             continue
-        label = match.group(1).lower()
-        if not in_fence:
-            return label
-        if fenced_label == "unknown":
-            fenced_label = label
-    return fenced_label
+        match = RECOMMENDATION_RE.match(line)
+        if match:
+            return match.group(1).lower()
+    return "unknown"
 
 
 def recommendation_counts(results: list[ParticipantResult]) -> dict[str, int]:
@@ -191,7 +183,12 @@ def build_deliberation_prompt(
         "with, and try to converge on a practical recommendation. If consensus "
         "is impossible, state the remaining split clearly. "
         "Start your reply with `RECOMMENDATION: yes - ...`, "
-        "`RECOMMENDATION: no - ...`, or `RECOMMENDATION: tradeoff - ...`.",
+        "`RECOMMENDATION: no - ...`, or `RECOMMENDATION: tradeoff - ...`. "
+        "The optional envelope fields (`EFFORT:`, `CONFIDENCE:`, `RISK:`, "
+        "`BLOCKERS:`, `EVIDENCE:`, `TESTS_TO_RUN:`, `ASSUMPTIONS:`) apply "
+        "here too. If you cannot evaluate, emit `EFFORT: blocked` plus a "
+        "non-empty `BLOCKERS:` list naming what is missing — blocked "
+        "without blockers is treated as abdication and dropped from quorum.",
     ]
     prompt = "\n".join(pointer_lines) + "\n\n" + "\n\n".join(excerpts)
     if len(prompt) <= MAX_DELIBERATION_PROMPT_CHARS:

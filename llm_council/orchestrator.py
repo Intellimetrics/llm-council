@@ -302,6 +302,9 @@ async def execute_council(
     mode: str | None = None,
     cache_mode: str = "on",
     stances: dict[str, str] | None = None,
+    synthesize: bool | None = None,
+    current: str | None = None,
+    question: str | None = None,
 ) -> tuple[list[ParticipantResult], dict[str, Any]]:
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
     convergence_thresholds = _resolve_convergence_thresholds(config, mode)
@@ -568,6 +571,74 @@ async def execute_council(
             assigned = stances.get(base_name)
             if assigned is not None:
                 results[idx] = replace(result, stance=assigned)
+
+    # --- Synthesis chair (Pick B) -----------------------------------------
+    # Runs at most once per council run. Chair output is metadata; the
+    # headline `recommendation` (computed in mcp_server.run_council / cli)
+    # stays derived from peer votes only — see synthesis.run_synthesis_chair.
+    synthesize_flag = bool(
+        config.get("defaults", {}).get("synthesize")
+        if synthesize is None
+        else synthesize
+    )
+    from llm_council.synthesis import (
+        run_synthesis_chair,
+        select_synthesizer,
+        should_synthesize,
+        universal_abdication,
+    )
+
+    # Universal-abdication short-circuit: skip both synthesis and any
+    # speculative future deliberation when every peer abdicated. Stamps a
+    # merged-blockers payload the caller can surface.
+    final_round_results_only = [
+        r for r in results if r.name.split(":round", 1)[0] == r.name
+        or r.name.endswith(f":round{metadata.get('rounds')}")
+    ]
+    abdication_payload = universal_abdication(final_round_results_only or results)
+    if abdication_payload:
+        metadata["universal_abdication"] = abdication_payload
+        emit(
+            {
+                "event": "universal_abdication",
+                "blockers": abdication_payload["blockers"],
+                "abdicated_peers": abdication_payload["abdicated_peers"],
+            }
+        )
+
+    if synthesize_flag and should_synthesize(synthesize_flag, metadata):
+        try:
+            chair_name = select_synthesizer(
+                config,
+                participant_cfg,
+                stances=stances,
+                current=current,
+            )
+            emit({"event": "synthesis_start", "chair": chair_name})
+            convergence_for_chair = metadata.get("convergence")
+            synthesis_payload = await run_synthesis_chair(
+                question=(question or prompt),
+                results=results,
+                convergence=convergence_for_chair,
+                participant_cfg=participant_cfg,
+                cwd=cwd,
+                chair_name=chair_name,
+            )
+            metadata["synthesis"] = synthesis_payload
+            emit(
+                {
+                    "event": "synthesis_finish",
+                    "chair": chair_name,
+                    "ok": synthesis_payload.get("ok"),
+                    "decision_label": synthesis_payload.get("decision_label"),
+                }
+            )
+        except ValueError as exc:
+            # Pass-3 Q4: configuration error is loud, not silent — surface
+            # in metadata so the caller can show the user, but do not crash
+            # the whole council run (peer votes are already valid).
+            metadata["synthesis_error"] = str(exc)
+            emit({"event": "synthesis_error", "error": str(exc)})
 
     emit(
         {

@@ -8,7 +8,7 @@ import os
 import re
 import shlex
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -84,6 +84,16 @@ class ParticipantResult:
     # field documents how fast the cache hit actually returned.
     cache_hit_seconds: float | None = None
     stance: str | None = None
+    # Response envelope fields (Pick A v1 — all optional). Parsed from the
+    # peer's text via _extract_response_envelope. Free-form for now; the
+    # only enforced contract is `RECOMMENDATION:` itself.
+    effort: str | None = None
+    confidence: str | None = None
+    risk: str | None = None
+    blockers: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
+    tests_to_run: list[str] = field(default_factory=list)
+    assumptions: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1078,23 +1088,25 @@ async def run_participant(
         # ## Images prompt section. Adding `vision: true` to a CLI cfg
         # therefore has no effect — the orchestrator's images_skipped check
         # treats CLI as always image-aware (orchestrator.py).
-        return await run_cli_participant(name, cfg, prompt, cwd, cache_ctx=cache_ctx)
-    if ptype in ("openrouter", "openai_compatible"):
-        return await run_openai_compatible_participant(
+        result = await run_cli_participant(name, cfg, prompt, cwd, cache_ctx=cache_ctx)
+    elif ptype in ("openrouter", "openai_compatible"):
+        result = await run_openai_compatible_participant(
             name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx
         )
-    if ptype == "ollama":
-        return await run_ollama_participant(
+    elif ptype == "ollama":
+        result = await run_ollama_participant(
             name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx
         )
-    return ParticipantResult(
-        name=name,
-        ok=False,
-        output="",
-        error=f"Unsupported participant type: {ptype}",
-        elapsed_seconds=0,
-        model=cfg.get("model"),
-    )
+    else:
+        result = ParticipantResult(
+            name=name,
+            ok=False,
+            output="",
+            error=f"Unsupported participant type: {ptype}",
+            elapsed_seconds=0,
+            model=cfg.get("model"),
+        )
+    return _with_envelope(result)
 
 
 async def _request_with_retries(
@@ -1323,19 +1335,138 @@ def _format_retry_transcript(
     )
 
 
+_ENVELOPE_SINGLE_RE = re.compile(
+    r"""
+    ^\s*(?:>\s*)?(?:[-*]\s+)?(?:\*\*)?
+    (?P<key>EFFORT|CONFIDENCE|RISK)
+    (?:\*\*)?\s*:\s*(?:\*\*)?
+    (?P<value>[A-Za-z][A-Za-z\-_]*)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_ENVELOPE_LIST_HEADERS = {
+    "BLOCKERS": "blockers",
+    "EVIDENCE": "evidence",
+    "TESTS_TO_RUN": "tests_to_run",
+    "ASSUMPTIONS": "assumptions",
+}
+
+_ENVELOPE_LIST_HEADER_RE = re.compile(
+    r"""
+    ^\s*(?:>\s*)?(?:\*\*)?
+    (?P<key>BLOCKERS|EVIDENCE|TESTS_TO_RUN|ASSUMPTIONS)
+    (?:\*\*)?\s*:\s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_ENVELOPE_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?P<item>.+?)\s*$")
+
+
+def _extract_response_envelope(output: str) -> dict[str, Any]:
+    """Parse the optional Pick-A response envelope from a peer's output.
+
+    Fields are all optional in v1. List fields collect bullet lines under a
+    `FIELD:` header until the next blank line, header, or fence. Single
+    fields match `FIELD: value` on one line. Matches inside fenced blocks
+    are ignored — same rule as the recommendation label.
+    """
+    envelope: dict[str, Any] = {
+        "effort": None,
+        "confidence": None,
+        "risk": None,
+        "blockers": [],
+        "evidence": [],
+        "tests_to_run": [],
+        "assumptions": [],
+    }
+    if not output:
+        return envelope
+    in_fence = False
+    active_list: str | None = None
+    for line in output.splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            active_list = None
+            continue
+        if in_fence:
+            continue
+        if not line.strip():
+            active_list = None
+            continue
+        list_match = _ENVELOPE_LIST_HEADER_RE.match(line)
+        if list_match:
+            active_list = _ENVELOPE_LIST_HEADERS[list_match.group("key").upper()]
+            continue
+        if active_list:
+            bullet = _ENVELOPE_BULLET_RE.match(line)
+            if bullet:
+                envelope[active_list].append(bullet.group("item"))
+                continue
+            active_list = None
+        single = _ENVELOPE_SINGLE_RE.match(line)
+        if single:
+            key = single.group("key").lower()
+            if envelope.get(key) is None:
+                envelope[key] = single.group("value").lower()
+    return envelope
+
+
+def _is_abdication(envelope: dict[str, Any], output: str) -> bool:
+    """A peer abdicates when it self-reports ``EFFORT: blocked`` while
+    naming no concrete missing artifact. Substantive ``RECOMMENDATION: no``
+    answers that omit EFFORT entirely are NOT abdications — only the
+    explicit-blocked-without-blockers shape qualifies. Empty ASSUMPTIONS
+    is required too: a peer that lists what it assumed has at least named
+    the unknowns and is not abdicating."""
+    if (envelope.get("effort") or "").lower() != "blocked":
+        return False
+    if envelope.get("blockers"):
+        return False
+    if envelope.get("assumptions"):
+        return False
+    # Abdication only makes sense when there is also a label to vote with;
+    # without a label the response is already an invalid_response.
+    return _has_recommendation_label(output)
+
+
+def _with_envelope(result: ParticipantResult) -> ParticipantResult:
+    """Populate envelope fields on a result; mark abdications as terminal failures.
+
+    Abdication detection runs once here so quorum math (in the orchestrator)
+    sees ``ok=False`` and excludes the peer. Abdication is intentionally
+    NOT eligible for the label-only repair retry — see ``_is_label_only_failure``.
+    """
+    from dataclasses import replace
+
+    envelope = _extract_response_envelope(result.output)
+    updated = replace(result, **envelope)
+    if updated.ok and _is_abdication(envelope, updated.output):
+        return replace(
+            updated,
+            ok=False,
+            error=(
+                f"{ABDICATED_ERROR_PREFIX} peer reported EFFORT: blocked with no "
+                "concrete missing artifact in BLOCKERS or ASSUMPTIONS. "
+                "Abdication is treated as a non-vote; the council will not retry "
+                "the same prompt — re-run with more context or escalate the mode."
+            ),
+        )
+    return updated
+
+
 def _has_recommendation_label(output: str) -> bool:
     in_fence = False
-    fenced_match = False
     for line in output.splitlines():
         if line.strip().startswith("```"):
             in_fence = not in_fence
             continue
-        if not RECOMMENDATION_RE.match(line):
+        if in_fence:
             continue
-        if not in_fence:
+        if RECOMMENDATION_RE.match(line):
             return True
-        fenced_match = True
-    return fenced_match
+    return False
 
 
 def _first_output_excerpt(output: str, max_chars: int = 240) -> str:
@@ -1373,6 +1504,7 @@ ERROR_KIND_INVALID_RESPONSE = "invalid_response"
 ERROR_KIND_DOWNSTREAM = "downstream_error"
 ERROR_KIND_CLI_NONZERO = "cli_nonzero_exit"
 ERROR_KIND_PREFLIGHT_FAILED = "preflight_failed"
+ERROR_KIND_ABDICATED = "abdicated"
 ERROR_KIND_UNKNOWN = "unknown"
 
 KNOWN_ERROR_KINDS = frozenset(
@@ -1384,11 +1516,13 @@ KNOWN_ERROR_KINDS = frozenset(
         ERROR_KIND_DOWNSTREAM,
         ERROR_KIND_CLI_NONZERO,
         ERROR_KIND_PREFLIGHT_FAILED,
+        ERROR_KIND_ABDICATED,
         ERROR_KIND_UNKNOWN,
     }
 )
 
 PREFLIGHT_FAILED_PREFIX = "PreflightFailed:"
+ABDICATED_ERROR_PREFIX = "AbdicatedResponse:"
 
 
 def classify_error(error: str) -> str | None:
@@ -1414,6 +1548,8 @@ def classify_error(error: str) -> str | None:
         return ERROR_KIND_CLI_NONZERO
     if error.startswith(PREFLIGHT_FAILED_PREFIX):
         return ERROR_KIND_PREFLIGHT_FAILED
+    if error.startswith(ABDICATED_ERROR_PREFIX):
+        return ERROR_KIND_ABDICATED
     # httpx + downstream-API errors funnel through f"{type(exc).__name__}: ..."
     # in the openrouter / ollama paths; we don't try to introspect those
     # further here, just classify them as `downstream_error` so callers can

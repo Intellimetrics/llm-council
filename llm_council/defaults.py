@@ -85,6 +85,18 @@ DEFAULT_CONFIG: dict = {
         "mode": "quick",
         "read_only": True,
         "synthesize": False,
+        # When synthesize=True, this names the chair. Pass-3 Q4 decision:
+        # require explicit value, fail loudly if synthesis is invoked
+        # without one. Valid: a participant name | "neutral_peer" |
+        # "current". None = unset (loud-fail).
+        "synthesizer": None,
+        "synthesizer_max_prompt_chars": 60_000,
+        # Tier-2 secret scanner. "warn" (default) counts likely credentials
+        # in the prompt body and emits a progress event; "block" raises
+        # before any participant runs; "off" skips entirely. Allowlist
+        # (default .llm-council-secrets-allow) covers test fixtures.
+        "secret_scan": "warn",
+        "secret_scan_allowlist": ".llm-council-secrets-allow",
         "origin_policy": "any",
         "max_concurrency": 4,
         "transparent": False,

@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-05-16
+
+Post-council-review build (three council passes drove the scope; transcripts in
+`.llm-council/runs/20260515_175359_*`, `20260516_065100_*`, `20260516_070132_*`).
+
+### Pick A — Effort contract + abdication detection
+
+- New optional response envelope parsed alongside `RECOMMENDATION:`:
+  `EFFORT` / `CONFIDENCE` / `RISK` (scalars) and `BLOCKERS` / `EVIDENCE` /
+  `TESTS_TO_RUN` / `ASSUMPTIONS` (bullet lists). Fields are stored on
+  `ParticipantResult`, emitted in transcripts (md + json), CLI `--json`
+  output, and MCP `structured_results`. All fields stay optional in v1.
+- New `error_kind: "abdicated"`. A peer that emits `RECOMMENDATION:` plus
+  `EFFORT: blocked` with no `BLOCKERS:` / `ASSUMPTIONS:` is classified as
+  abdication: `ok=False`, drops quorum, terminal for the round (no repair
+  retry). Closes the silent-junk-verdict path where `RECOMMENDATION: no -
+  too complex` previously kept consensus quorum.
+- Cache schema bumped to v2 (`cache.CACHE_SCHEMA_VERSION = 2`) so any
+  pre-existing cache entries do not bypass the new validation contract.
+- MCP `COUNCIL_RUN_OUTPUT_SCHEMA_VERSION` bumped to v2 with envelope
+  fields and `abdicated` added to `COUNCIL_RUN_VALID_ERROR_KINDS`.
+
+### Pick B — Synthesis chair
+
+- New `llm_council.synthesis` module + `--synthesize` CLI flag + `synthesize`
+  MCP arg. After peers respond, a configured chair writes a structured
+  decision memo (consensus blockers / single-peer concerns / dissent /
+  verification plan). Chair output is **metadata, not a vote** — the headline
+  `recommendation` / `agreement_count` stay derived from peer votes only.
+- `defaults.synthesizer` (required when synthesize is on, fail-loudly per
+  pass-3 Q4): a participant name, `"neutral_peer"` (auto-pick whichever
+  peer has `stance=neutral`), or `"current"`. No silent default — requester
+  bias is opt-in only.
+- Auto-trigger fires only on `ran_max_rounds_unresolved`. Agreement does
+  NOT auto-trigger (avoids burning a peer call to summarize "everyone agreed").
+- Universal-abdication short-circuit: when every peer abdicates in round 1,
+  return `recommendation: "unknown"` plus merged-and-deduped blockers
+  without paying for round 2 or chair invocation.
+- Chair consumes pre-computed `metadata["convergence"]` instead of
+  re-deriving Jaccard drift state.
+
+### Tier 2 — Secret scanner
+
+- New `llm_council.safety.scan_prompt_for_secrets` + `apply_secret_scan_policy`.
+  Preflight regex sweep over the constructed prompt (AWS/GitHub/OpenAI/
+  Anthropic/Google/Slack/JWT/PEM block patterns). Default `secret_scan: warn`
+  (count + emit a progress event); `block` raises before any participant
+  runs; `off` skips. Allowlist file (`.llm-council-secrets-allow`, line-per-
+  regex) covers test fixtures.
+- Findings include kind + line + truncated preview (`first4...last4`) only.
+  Raw matched values never enter transcripts, progress events, or logs.
+- Closes the prompt-body credential leak: `_redact_credentials_in_text` at
+  `orchestrator.py:76` only redacted URL userinfo in error strings; `--diff`
+  / `--context` content shipped to hosted peers with no scanning.
+
+### Side fixes (council-surfaced during plan review)
+
+- **MCP summary bug (mcp_server.py:815)** — fixed. After deliberation,
+  `if ":round" not in row["name"]` was selecting round-1 rows (opposite of
+  the documented "final round" intent). Now filters against
+  `final_round_results(results)` and strips the `:roundN` suffix for display.
+- **Fenced-label validation tightened** — across `adapters._has_recommendation_label`,
+  `deliberation.recommendation_label`, and `deliberation.recommendation_line`.
+  A `RECOMMENDATION:` line inside a code fence is now treated as example
+  syntax and does not satisfy the label contract; if no out-of-fence label
+  exists, the response fails validation and triggers the standard repair
+  retry path.
+- **`stats.aggregate` now buckets by `error_kind`** and tracks
+  `envelope_field_present` per peer. Prerequisite telemetry before any
+  future flip of envelope fields from optional to required.
+
+### Docs / invariants
+
+- `CLAUDE.md` failure-taxonomy table now lists 9 `error_kind`s (added
+  `abdicated`).
+- `CLAUDE.md` documents the fence-aware label rule and the optional
+  envelope contract under the "Invariants worth preserving" section.
+
 ## 0.4.9 - 2026-05-07
 
 Council code-review pass on v0.4.3..v0.4.8. Fixes 13 items the council

@@ -17,6 +17,19 @@ from llm_council.transcript import _existing_paths, result_round
 
 
 _LABELS = ("yes", "no", "tradeoff", "unknown")
+# Subset of the response envelope we track presence-of for the optional→required
+# rollout decision. List fields count as "present" only when non-empty; scalars
+# count when non-null. Keep this in sync with the envelope contract in adapters.
+_ENVELOPE_FIELDS = (
+    "effort",
+    "confidence",
+    "risk",
+    "blockers",
+    "evidence",
+    "tests_to_run",
+    "assumptions",
+)
+_ENVELOPE_LIST_FIELDS = frozenset({"blockers", "evidence", "tests_to_run", "assumptions"})
 
 
 def load_transcript_files(base_dir: Path) -> list[dict[str, Any]]:
@@ -60,6 +73,12 @@ def _new_peer_bucket() -> dict[str, Any]:
         "cost_total": 0.0,
         "cost_runs": 0,
         "invalid_label_runs": 0,
+        # error_kind -> count, populated from failed runs. Stable enum from
+        # adapters.KNOWN_ERROR_KINDS; new kinds appear as new keys.
+        "error_kind_counts": {},
+        # Envelope field presence per peer. Prerequisite telemetry before
+        # flipping optional envelope fields to required (Pick A rollout).
+        "envelope_field_present": {field: 0 for field in _ENVELOPE_FIELDS},
         "last_used": None,
     }
 
@@ -149,6 +168,18 @@ def aggregate(
                 bucket["label_counts"][label] += 1
                 if label == "unknown":
                     bucket["invalid_label_runs"] += 1
+                for field_name in _ENVELOPE_FIELDS:
+                    value = result.get(field_name)
+                    if field_name in _ENVELOPE_LIST_FIELDS:
+                        if value:
+                            bucket["envelope_field_present"][field_name] += 1
+                    elif value is not None:
+                        bucket["envelope_field_present"][field_name] += 1
+            else:
+                error_kind = result.get("error_kind") or "unknown"
+                bucket["error_kind_counts"][error_kind] = (
+                    bucket["error_kind_counts"].get(error_kind, 0) + 1
+                )
 
     participant_rows = []
     for name, bucket in sorted(peers.items()):
@@ -184,6 +215,8 @@ def aggregate(
                 "invalid_label_rate": (
                     bucket["invalid_label_runs"] / successes if successes else 0.0
                 ),
+                "error_kind_counts": dict(bucket["error_kind_counts"]),
+                "envelope_field_present": dict(bucket["envelope_field_present"]),
                 "last_used": bucket["last_used"],
             }
         )

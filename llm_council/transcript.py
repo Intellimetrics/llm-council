@@ -364,6 +364,22 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
             payload["cache_hit_seconds"] = result.cache_hit_seconds
     if result.stance is not None:
         payload["stance"] = result.stance
+    # Envelope fields are emitted only when present so transcripts from
+    # peers that never supply them stay readable. List fields are emitted
+    # when non-empty; scalar fields when not None.
+    envelope_lists = {
+        "blockers": list(result.blockers or ()),
+        "evidence": list(result.evidence or ()),
+        "tests_to_run": list(result.tests_to_run or ()),
+        "assumptions": list(result.assumptions or ()),
+    }
+    for field_name in ("effort", "confidence", "risk"):
+        value = getattr(result, field_name, None)
+        if value is not None:
+            payload[field_name] = value
+    for field_name, items in envelope_lists.items():
+        if items:
+            payload[field_name] = items
     from llm_council.adapters import classify_error
 
     error_kind = classify_error(result.error)

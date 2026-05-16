@@ -117,6 +117,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run an expensive second round if first-round responses disagree",
     )
+    run.add_argument(
+        "--synthesize",
+        action="store_true",
+        help=(
+            "After peers respond, invoke the configured synthesis chair "
+            "(defaults.synthesizer) to produce a decision memo. Chair "
+            "output is metadata; the headline recommendation still comes "
+            "from peer votes. Costs one extra participant call."
+        ),
+    )
     run.add_argument("--max-rounds", type=int, help="Maximum deliberation rounds")
     run.add_argument(
         "--min-quorum",
@@ -1908,6 +1918,39 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 
+    from llm_council.safety import apply_secret_scan_policy
+
+    defaults_cfg = config.get("defaults", {}) or {}
+    scan_policy = str(defaults_cfg.get("secret_scan") or "warn").lower()
+    scan_allowlist = str(
+        defaults_cfg.get("secret_scan_allowlist")
+        or ".llm-council-secrets-allow"
+    )
+    try:
+        scan_result = apply_secret_scan_policy(
+            prompt,
+            policy=scan_policy,
+            cwd=cwd,
+            allowlist_filename=scan_allowlist,
+        )
+    except ValueError as exc:
+        # block-mode hit; surface and halt before any participant runs.
+        raise SystemExit(str(exc)) from exc
+    if scan_result.get("scrubbed_count"):
+        kinds_summary = ", ".join(
+            f"{k}={v}" for k, v in sorted(scan_result["kinds"].items())
+        )
+        print(
+            display.format_gutter(
+                "warn",
+                f"secret_scan: {scan_result['scrubbed_count']} likely "
+                f"credential(s) detected in prompt ({kinds_summary}). "
+                f"Allowlist: ./{scan_allowlist}. Policy: {scan_policy}.",
+                color=display.wants_color(sys.stdout),
+            ),
+            flush=True,
+        )
+
     mode_cfg = config.get("modes", {}).get(mode, {})
     transparent = bool(args.transparent or config.get("defaults", {}).get("transparent"))
     deliberate = bool(args.deliberate or mode_cfg.get("deliberate"))
@@ -2069,6 +2112,9 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         mode=mode,
         cache_mode=getattr(args, "cache_mode", "on"),
         stances=mode_stances if isinstance(mode_stances, dict) else None,
+        synthesize=bool(getattr(args, "synthesize", False)),
+        current=current,
+        question=question,
     )
     if image_manifest:
         metadata["images"] = [
@@ -2130,6 +2176,13 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                             "recovered_after_launch_retry": result.recovered_after_launch_retry,
                             "repair_retry_recovered": result.repair_retry_recovered,
                             "stance": result.stance,
+                            "effort": result.effort,
+                            "confidence": result.confidence,
+                            "risk": result.risk,
+                            "blockers": list(result.blockers),
+                            "evidence": list(result.evidence),
+                            "tests_to_run": list(result.tests_to_run),
+                            "assumptions": list(result.assumptions),
                         }
                         for result in results
                     ],

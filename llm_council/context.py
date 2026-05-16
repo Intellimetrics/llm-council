@@ -374,6 +374,21 @@ def build_prompt(
             "- List the strongest reasons.",
             "- List concrete risks or things to verify.",
             "- Keep implementation suggestions read-only unless explicitly asked to write code.",
+            "",
+            "Optional structured envelope (helps the council aggregate and",
+            "cuts abdication noise). Emit any fields that apply, each on",
+            "its own line, OUTSIDE any code fence:",
+            "- `EFFORT: full|limited|blocked` — how thoroughly you analysed.",
+            "- `CONFIDENCE: low|medium|high`",
+            "- `RISK: low|medium|high|critical`",
+            "- `BLOCKERS:` then bullet lines for each concrete missing artifact",
+            "  (file, command output, policy doc) that prevented full analysis.",
+            "- `EVIDENCE:` then bullet lines of `path:line` or `section` references.",
+            "- `TESTS_TO_RUN:` then bullet lines of verification commands.",
+            "- `ASSUMPTIONS:` then bullet lines of stated assumptions.",
+            "If you cannot evaluate, emit `EFFORT: blocked` AND a non-empty",
+            "`BLOCKERS:` list naming what is missing. `EFFORT: blocked`",
+            "without `BLOCKERS:` is treated as abdication and dropped from quorum.",
         ]
     )
 

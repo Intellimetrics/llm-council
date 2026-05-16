@@ -112,6 +112,17 @@ def council_run_schema() -> dict[str, Any]:
                 "default": False,
                 "description": "Run an expensive second round if first-round responses disagree.",
             },
+            "synthesize": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "After peers respond, invoke the configured synthesis "
+                    "chair (defaults.synthesizer) to produce a decision "
+                    "memo. Chair output is metadata; the headline "
+                    "recommendation still comes from peer votes. Requires "
+                    "defaults.synthesizer to be set (fails loudly if not)."
+                ),
+            },
             "max_rounds": {"type": "integer", "minimum": 1, "maximum": 3},
             "min_quorum": {
                 "type": "integer",
@@ -177,7 +188,7 @@ def council_run_schema() -> dict[str, Any]:
     }
 
 
-COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 1
+COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 2  # v2 = envelope contract (effort/confidence/...)
 COUNCIL_RUN_VALID_STANCES = ("for", "against", "neutral")
 COUNCIL_RUN_VALID_ERROR_KINDS = (
     "timeout",
@@ -187,6 +198,7 @@ COUNCIL_RUN_VALID_ERROR_KINDS = (
     "downstream_error",
     "cli_nonzero_exit",
     "preflight_failed",
+    "abdicated",
     "unknown",
 )
 
@@ -284,6 +296,46 @@ def council_run_output_schema() -> dict[str, Any]:
                         },
                         "recovered_after_launch_retry": {"type": "boolean"},
                         "repair_retry_recovered": {"type": "boolean"},
+                        "effort": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "Self-reported analysis depth: full|limited|blocked. "
+                                "Parsed from the peer's optional response envelope. "
+                                "`blocked` without non-empty `blockers` is treated "
+                                "as abdication and dropped from quorum."
+                            ),
+                        },
+                        "confidence": {
+                            "type": ["string", "null"],
+                            "description": "Self-reported confidence: low|medium|high.",
+                        },
+                        "risk": {
+                            "type": ["string", "null"],
+                            "description": "Self-reported risk: low|medium|high|critical.",
+                        },
+                        "blockers": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Concrete missing artifacts (file, command output, "
+                                "policy doc) that prevented full analysis."
+                            ),
+                        },
+                        "evidence": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Per-line `path:line` or section references.",
+                        },
+                        "tests_to_run": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Verification commands the peer suggests.",
+                        },
+                        "assumptions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Stated assumptions underpinning the answer.",
+                        },
                     },
                     "required": ["name", "ok", "label"],
                 },
@@ -580,10 +632,29 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         participants=participant_cfg_for_prompt or None,
         prior_context=prior_context,
     )
+    from llm_council.safety import apply_secret_scan_policy
+
+    _defaults_cfg = config.get("defaults", {}) or {}
+    _scan_policy = str(_defaults_cfg.get("secret_scan") or "warn").lower()
+    _scan_allowlist = str(
+        _defaults_cfg.get("secret_scan_allowlist")
+        or ".llm-council-secrets-allow"
+    )
+    secret_scan_payload = apply_secret_scan_policy(
+        prompt,
+        policy=_scan_policy,
+        cwd=cwd,
+        allowlist_filename=_scan_allowlist,
+    )
     transparent = bool(
         arguments.get("transparent") or config.get("defaults", {}).get("transparent")
     )
     deliberate = bool(arguments.get("deliberate") or mode_cfg.get("deliberate"))
+    synthesize = bool(
+        arguments.get("synthesize")
+        or mode_cfg.get("synthesize")
+        or config.get("defaults", {}).get("synthesize")
+    )
     max_rounds = int(
         arguments.get("max_rounds")
         or mode_cfg.get("max_rounds")
@@ -740,11 +811,16 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         min_quorum=min_quorum_value,
         mode=mode,
         stances=mode_stances if isinstance(mode_stances, dict) else None,
+        synthesize=synthesize,
+        current=current,
+        question=question,
     )
     if image_manifest:
         metadata["images"] = [
             _public_image_entry(entry, cwd) for entry in image_manifest
         ]
+    if secret_scan_payload.get("scrubbed_count") or _scan_policy != "off":
+        metadata["secret_scan"] = secret_scan_payload
     metadata["config_warnings"] = _pending_config_warnings
     write_transcript(
         md_path,
@@ -803,6 +879,13 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
                     result.recovered_after_launch_retry
                 ),
                 "repair_retry_recovered": bool(result.repair_retry_recovered),
+                "effort": result.effort,
+                "confidence": result.confidence,
+                "risk": result.risk,
+                "blockers": list(result.blockers),
+                "evidence": list(result.evidence),
+                "tests_to_run": list(result.tests_to_run),
+                "assumptions": list(result.assumptions),
             }
         )
     from llm_council.display import render_summary_markdown
@@ -812,15 +895,16 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
     # per-peer table reflects each peer's last position rather than
     # listing every round separately. The blockquoted transcript path
     # gives the user a copy-pasteable pointer to the full record.
+    final_names = {r.name for r in final}
     final_peer_rows = [
         {
-            "name": row["name"],
+            "name": row["name"].split(":round", 1)[0],
             "label": row.get("label"),
             "stance": row.get("stance"),
             "elapsed_seconds": row.get("elapsed_seconds") or 0,
         }
         for row in structured_results
-        if ":round" not in row["name"]
+        if row["name"] in final_names
     ]
     summary_markdown = render_summary_markdown(
         mode=mode,
