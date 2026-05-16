@@ -135,6 +135,53 @@ def test_skips_part6_recommendation():
     assert missing == []
 
 
+def test_skips_part6_recommendation_and_rationale():
+    """`PART 6 — RECOMMENDATION AND RATIONALE` yields title_tokens
+    `["RECOMMENDATION", "RATIONALE"]` (AND is a stopword). The exclusion
+    must still fire — otherwise peers that emit a valid `RECOMMENDATION:`
+    label get falsely failed for not paraphrasing "RATIONALE" in a
+    section header. Pass-8 codex+gemini finding."""
+    prompt = "PART 6 — RECOMMENDATION AND RATIONALE (REQUIRED)\n"
+    response = "RECOMMENDATION: yes - rationale follows in prose\n"
+    missing = required_sections_missing(prompt, response)
+    assert missing == []
+
+
+def test_skips_part6_recommendation_summary():
+    """`PART 6 — RECOMMENDATION SUMMARY` -> title_tokens
+    `["RECOMMENDATION", "SUMMARY"]`. Same shape as the AND RATIONALE
+    case; exclusion must fire."""
+    prompt = "PART 6 — RECOMMENDATION SUMMARY (REQUIRED)\n"
+    response = "RECOMMENDATION: tradeoff - summary in prose\n"
+    missing = required_sections_missing(prompt, response)
+    assert missing == []
+
+
+def test_skips_part_where_recommendation_is_leading_title_token():
+    """Approach A: any title whose FIRST salient token is RECOMMENDATION
+    is excluded — even if it isn't literally PART 6. This handles user
+    renumbering (`PART 3 — RECOMMENDATION COMPONENTS (REQUIRED)`) without
+    falling back to fragile num-based matching. Trade-off: a section
+    titled `RECOMMENDATION COMPONENTS` is treated as the label's
+    territory rather than gated independently. Reasonable because the
+    label-bearing line is what the title is about."""
+    prompt = "PART 3 — RECOMMENDATION COMPONENTS (REQUIRED)\n"
+    response = "RECOMMENDATION: tradeoff - components inline\n"
+    missing = required_sections_missing(prompt, response)
+    assert missing == []
+
+
+def test_does_not_skip_when_recommendation_is_secondary_modifier():
+    """Conservative side of Approach A: if RECOMMENDATION is NOT the
+    leading title token (e.g. `DETAILED RECOMMENDATION ANALYSIS`), the
+    section gates normally. The real subject is `DETAILED ... ANALYSIS`,
+    not the label."""
+    prompt = "PART 3 — DETAILED RECOMMENDATION ANALYSIS (REQUIRED)\n"
+    response = "RECOMMENDATION: yes - no analysis section\n"
+    missing = required_sections_missing(prompt, response)
+    assert missing == ["PART 3 — DETAILED RECOMMENDATION ANALYSIS"]
+
+
 def test_returns_specific_label_when_section_missing():
     """Missing PART 2 is reported with its label so the repair-retry
     instruction can name it."""
