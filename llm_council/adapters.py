@@ -480,23 +480,12 @@ async def run_cli_participant(
     # error prefix, different directive. Cap of one retry stands: a peer
     # that misses sections twice has a deeper issue than this mechanism
     # can fix. Skip when terse-retry already ran (cumulative call ceiling).
-    if (
-        not result.ok
-        and _retry_enabled(cfg)
-        and result.error.startswith(INCOMPLETE_RESPONSE_PREFIX)
-        and not getattr(result, "recovered_after_timeout", False)
-    ):
+    if _should_section_repair(result, cfg):
         from llm_council.sections import required_sections_missing
         missing = required_sections_missing(prompt, result.output)
         if missing:
-            section_directive = SECTION_REPAIR_RETRY_INSTRUCTION.format(
-                missing=", ".join(missing)
-            )
-            retry_prompt = (
-                f"{prompt}\n\n"
-                "--- Your previous response (first attempt) ---\n"
-                f"{result.output.strip()}\n\n"
-                f"{section_directive}"
+            retry_prompt = _build_section_repair_prompt(
+                prompt, result.output, missing
             )
             max_prompt_chars = cfg.get("max_prompt_chars")
             if (
@@ -507,7 +496,7 @@ async def run_cli_participant(
                     name, cfg, retry_prompt, cwd, start=start,
                     mode_multiplier=mode_multiplier, mode=mode,
                 )
-                merged = _merge_cli_retry(result, retry_result)
+                merged = _merge_cli_section_retry(result, retry_result)
                 if result.recovered_after_launch_retry:
                     merged.recovered_after_launch_retry = True
                 _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
@@ -698,6 +687,53 @@ def _build_cli_retry_prompt(original_prompt: str, prior_response: str) -> str:
     )
 
 
+def _build_section_repair_prompt(
+    original_prompt: str, prior_response: str, missing: list[str]
+) -> str:
+    """Compose the section-coverage repair prompt.
+
+    Used by all three adapter paths (CLI, openai_compatible, ollama) so
+    the directive wording stays consistent. The missing-sections list
+    comes from `sections.required_sections_missing` and is rendered as
+    a comma-joined string in the directive.
+    """
+    section_directive = SECTION_REPAIR_RETRY_INSTRUCTION.format(
+        missing=", ".join(missing)
+    )
+    return (
+        f"{original_prompt}\n\n"
+        "--- Your previous response (first attempt) ---\n"
+        f"{prior_response.strip()}\n\n"
+        f"{section_directive}"
+    )
+
+
+def _should_section_repair(result: ParticipantResult, cfg: dict[str, Any]) -> bool:
+    """Whether a result is eligible for the section-coverage repair retry.
+
+    Three conditions, all required:
+    1. The result failed with the `IncompleteResponse:` prefix (label
+       was present but one or more REQUIRED sections were missing).
+    2. The retry-on-missing-label kill-switch (`retry_on_missing_label`
+       / `retries: 0`) is NOT engaged — same gate as label-repair so an
+       opt-out user gets a single behavior across all repair retries.
+    3. The result is NOT a terse-retry recovery. The CLI/openai_compatible/
+       ollama wrappers each give every peer at most one extra round to
+       recover (terse-retry on timeout OR section-repair, never both),
+       so a peer that already exhausted its retry budget via terse-retry
+       does not get a third call here.
+    """
+    if result.ok:
+        return False
+    if not result.error.startswith(INCOMPLETE_RESPONSE_PREFIX):
+        return False
+    if not _retry_enabled(cfg):
+        return False
+    if getattr(result, "recovered_after_timeout", False):
+        return False
+    return True
+
+
 def _build_terse_retry_prompt(original_prompt: str) -> str:
     return (
         f"{original_prompt}\n\n"
@@ -838,6 +874,60 @@ def _merge_cli_retry(
     return original
 
 
+def _merge_cli_section_retry(
+    original: ParticipantResult, retry: ParticipantResult
+) -> ParticipantResult:
+    """Merge a CLI section-repair retry attempt with the original failure.
+
+    Mirrors `_merge_cli_retry` but for the section-coverage path:
+    - retry succeeded → ok=True with section-themed recovery header
+    - retry came back missing sections again → ok=False with the
+      `IncompleteResponse:` prefix preserved (so error_kind stays
+      `incomplete_response`) and a section-themed exhausted-retry header
+    - retry failed for an unrelated reason (downstream/timeout/etc.) →
+      preserve the original failure so the operator sees the section-
+      coverage error, not the retry's incidental failure
+    """
+    if retry.ok:
+        merged_output = _format_retry_transcript(
+            original_output=original.output,
+            retry_output=retry.output,
+            recovered=True,
+            header_kind="sections",
+        )
+        return ParticipantResult(
+            name=retry.name,
+            ok=True,
+            output=merged_output,
+            error="",
+            elapsed_seconds=retry.elapsed_seconds,
+            command=retry.command,
+            model=retry.model,
+            repair_retry_recovered=True,
+        )
+    if retry.error.startswith(INCOMPLETE_RESPONSE_PREFIX) and retry.output:
+        merged_output = _format_retry_transcript(
+            original_output=original.output,
+            retry_output=retry.output,
+            recovered=False,
+            header_kind="sections",
+        )
+        return ParticipantResult(
+            name=retry.name,
+            ok=False,
+            output=merged_output,
+            error=(
+                f"{INCOMPLETE_RESPONSE_PREFIX} response had the RECOMMENDATION "
+                "label but missed one or more REQUIRED sections after one "
+                "repair retry"
+            ),
+            elapsed_seconds=retry.elapsed_seconds,
+            command=retry.command,
+            model=retry.model,
+        )
+    return original
+
+
 async def _cleanup_timed_out_process(
     proc: asyncio.subprocess.Process,
     communicate: asyncio.Task[tuple[bytes, bytes]],
@@ -926,6 +1016,28 @@ async def run_openai_compatible_participant(
                 result = _annotate_timeout_retry_failure(
                     result, terse_result, name
                 )
+    # Retry layering invariant: terse-retry → section-repair → strict-evidence.
+    # Section-repair runs first because a section-fixed retry can introduce
+    # new untagged EVIDENCE bullets, which strict-evidence should then catch.
+    # Each gate caps at one extra round, and _should_section_repair /
+    # the strict-evidence guard both refuse to fire after terse-retry so
+    # a single peer never burns more than one extra call per turn.
+    #
+    # Section-coverage repair retry. Mirrors the CLI path: when the
+    # label is present but one or more REQUIRED sections are missing,
+    # re-ask once with `SECTION_REPAIR_RETRY_INSTRUCTION` appended.
+    # The retry runs through the SAME inner with `retry_on_missing_label:
+    # False` so the inner's own label-repair branch can't fire a chained
+    # third call.
+    result = await _maybe_section_repair_openai_compatible(
+        name=name,
+        cfg=cfg,
+        prompt=prompt,
+        result=result,
+        image_manifest=image_manifest,
+        mode_multiplier=mode_multiplier,
+        mode=mode,
+    )
     # Strict-evidence repair retry. The inner's label-retry path skips
     # untagged_evidence failures (gated by `_is_label_only_failure`), so we
     # apply the retry here at the wrapper layer. One shot, no chaining
@@ -948,6 +1060,99 @@ async def run_openai_compatible_participant(
             result = _merge_hosted_strict_evidence_retry(result, retry_result)
     _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
     return result
+
+
+async def _maybe_section_repair_openai_compatible(
+    *,
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    result: ParticipantResult,
+    image_manifest: list[dict[str, Any]] | None,
+    mode_multiplier: float | None,
+    mode: str | None,
+) -> ParticipantResult:
+    if not _should_section_repair(result, cfg):
+        return result
+    from llm_council.sections import required_sections_missing
+    missing = required_sections_missing(prompt, result.output)
+    if not missing:
+        return result
+    retry_prompt = _build_section_repair_prompt(prompt, result.output, missing)
+    max_prompt_chars = cfg.get("max_prompt_chars")
+    if max_prompt_chars is not None and len(retry_prompt) > int(max_prompt_chars):
+        return result
+    # Disable the inner's own label-repair retry for this call. The
+    # section-repair prompt explicitly tells the peer to keep its
+    # existing reasoning and add the missing sections, so a label-only
+    # failure on the retry is terminal — no chained third call.
+    retry_cfg = dict(cfg)
+    retry_cfg["retry_on_missing_label"] = False
+    retry_result = await _run_openai_compatible_inner(
+        name, retry_cfg, retry_prompt,
+        image_manifest=image_manifest,
+        mode_multiplier=mode_multiplier, mode=mode,
+    )
+    return _merge_hosted_section_retry(result, retry_result)
+
+
+def _merge_hosted_section_retry(
+    original: ParticipantResult, retry: ParticipantResult
+) -> ParticipantResult:
+    """Merge a hosted/local section-repair retry with the original failure.
+
+    Same semantics as `_merge_cli_section_retry` but written against
+    the hosted/local `ParticipantResult` shape (no `command`, has
+    `prompt_tokens`/`completion_tokens`/`total_tokens`/`cost_usd`).
+    """
+    if retry.ok:
+        merged_output = _format_retry_transcript(
+            original_output=original.output,
+            retry_output=retry.output,
+            recovered=True,
+            header_kind="sections",
+        )
+        return ParticipantResult(
+            name=retry.name,
+            ok=True,
+            output=merged_output,
+            error="",
+            elapsed_seconds=retry.elapsed_seconds,
+            model=retry.model,
+            prompt_tokens=retry.prompt_tokens,
+            completion_tokens=retry.completion_tokens,
+            total_tokens=retry.total_tokens,
+            cost_usd=retry.cost_usd,
+            repair_retry_recovered=True,
+        )
+    if retry.error.startswith(INCOMPLETE_RESPONSE_PREFIX) and retry.output:
+        merged_output = _format_retry_transcript(
+            original_output=original.output,
+            retry_output=retry.output,
+            recovered=False,
+            header_kind="sections",
+        )
+        return ParticipantResult(
+            name=retry.name,
+            ok=False,
+            output=merged_output,
+            error=(
+                f"{INCOMPLETE_RESPONSE_PREFIX} response had the RECOMMENDATION "
+                "label but missed one or more REQUIRED sections after one "
+                "repair retry"
+            ),
+            elapsed_seconds=retry.elapsed_seconds,
+            model=retry.model,
+            prompt_tokens=retry.prompt_tokens,
+            completion_tokens=retry.completion_tokens,
+            total_tokens=retry.total_tokens,
+            cost_usd=retry.cost_usd,
+        )
+    # Retry failed for an unrelated reason (downstream/timeout/empty
+    # response/etc.). Preserve the original failure so the operator
+    # sees the section-coverage error rather than the retry's
+    # incidental failure.
+    return original
 
 
 async def _run_openai_compatible_inner(
@@ -1367,6 +1572,23 @@ async def run_ollama_participant(
                 result = _annotate_timeout_retry_failure(
                     result, terse_result, name
                 )
+    # Retry layering invariant (see openai_compatible wrapper for full notes):
+    # terse-retry → section-repair → strict-evidence, each capped at one
+    # extra round per peer.
+    #
+    # Section-coverage repair retry. Same contract as the CLI and
+    # openai_compatible paths: label present + REQUIRED sections
+    # missing → one extra call with `SECTION_REPAIR_RETRY_INSTRUCTION`.
+    # `_should_section_repair` forbids chaining after terse-retry.
+    result = await _maybe_section_repair_ollama(
+        name=name,
+        cfg=cfg,
+        prompt=prompt,
+        result=result,
+        image_manifest=image_manifest,
+        mode_multiplier=mode_multiplier,
+        mode=mode,
+    )
     # Strict-evidence repair retry (parallels CLI + openai_compatible).
     # The inner's label-retry path skips untagged_evidence failures, so we
     # apply the retry here. One shot, no chaining with terse-retry.
@@ -1386,6 +1608,36 @@ async def run_ollama_participant(
             result = _merge_hosted_strict_evidence_retry(result, retry_result)
     _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
     return result
+
+
+async def _maybe_section_repair_ollama(
+    *,
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    result: ParticipantResult,
+    image_manifest: list[dict[str, Any]] | None,
+    mode_multiplier: float | None,
+    mode: str | None,
+) -> ParticipantResult:
+    if not _should_section_repair(result, cfg):
+        return result
+    from llm_council.sections import required_sections_missing
+    missing = required_sections_missing(prompt, result.output)
+    if not missing:
+        return result
+    retry_prompt = _build_section_repair_prompt(prompt, result.output, missing)
+    max_prompt_chars = cfg.get("max_prompt_chars")
+    if max_prompt_chars is not None and len(retry_prompt) > int(max_prompt_chars):
+        return result
+    retry_cfg = dict(cfg)
+    retry_cfg["retry_on_missing_label"] = False
+    retry_result = await _run_ollama_inner(
+        name, retry_cfg, retry_prompt,
+        image_manifest=image_manifest,
+        mode_multiplier=mode_multiplier, mode=mode,
+    )
+    return _merge_hosted_section_retry(result, retry_result)
 
 
 async def _run_ollama_inner(
@@ -1872,16 +2124,38 @@ def _is_label_only_failure(output: str, cfg: dict[str, Any]) -> bool:
 
 
 def _format_retry_transcript(
-    *, original_output: str, retry_output: str, recovered: bool
+    *,
+    original_output: str,
+    retry_output: str,
+    recovered: bool,
+    header_kind: str = "label",
 ) -> str:
-    header = (
-        "[recovered after retry] "
-        "First attempt was missing the required RECOMMENDATION label; "
-        "second attempt is shown below."
-        if recovered
-        else "[retry exhausted] "
-        "Both attempts were missing the required RECOMMENDATION label."
-    )
+    """Render a paired transcript of the original + retry attempts.
+
+    `header_kind` distinguishes which validation failure triggered the
+    repair retry so the human-readable header is accurate. "label" is
+    the original label-missing path; "sections" is the section-coverage
+    repair path (the response had the RECOMMENDATION label but skipped
+    one or more `PART N — TITLE (REQUIRED)` sections).
+    """
+    if header_kind == "sections":
+        header = (
+            "[recovered after retry] "
+            "First attempt was missing one or more REQUIRED sections; "
+            "second attempt is shown below."
+            if recovered
+            else "[retry exhausted] "
+            "Both attempts were missing one or more REQUIRED sections."
+        )
+    else:
+        header = (
+            "[recovered after retry] "
+            "First attempt was missing the required RECOMMENDATION label; "
+            "second attempt is shown below."
+            if recovered
+            else "[retry exhausted] "
+            "Both attempts were missing the required RECOMMENDATION label."
+        )
     return (
         f"{header}\n\n"
         "--- Repaired response ---\n"
