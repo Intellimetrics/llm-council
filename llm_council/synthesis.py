@@ -157,6 +157,26 @@ def select_synthesizer(
     return raw
 
 
+def _format_envelope_item(item: Any) -> str:
+    """Render an envelope-list entry as a human-readable bullet.
+
+    Evidence entries are stored as ``{"text": str, "tag": str | None}``
+    dicts (see ``adapters._parse_tagged_entry``); other envelope lists
+    (blockers / tests_to_run / assumptions) stay as plain strings. This
+    helper handles both so the chair LLM never sees raw stringified
+    dict literals like ``{'text': '...', 'tag': 'PUBLISHED'}`` in its
+    prompt. Format: ``[TAG] text`` when a tag is present, otherwise
+    ``text``.
+    """
+    if isinstance(item, dict):
+        text = item.get("text") or ""
+        tag = item.get("tag")
+        if tag:
+            return f"[{str(tag).upper()}] {text}"
+        return str(text)
+    return str(item)
+
+
 def _summary_rationale(output: str) -> str:
     """Compact rationale: the line after RECOMMENDATION, truncated."""
     in_label = False
@@ -256,7 +276,7 @@ def build_synthesis_prompt(
             if items:
                 lines.append(f"- {label_key}:")
                 for item in items:
-                    lines.append(f"  - {item}")
+                    lines.append(f"  - {_format_envelope_item(item)}")
         lines.append("")
     if convergence:
         lines.append("## Convergence (pre-computed; do not re-derive)")
