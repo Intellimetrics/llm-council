@@ -44,9 +44,9 @@ Two new `error_kind` values: `incomplete_response`, `untagged_evidence`.
 New `ParticipantResult` fields: `recovered_after_timeout: bool`,
 `prompt_chars: int | None`. New tests:
 `tests/test_pass7_regression.py` (8 tests anchored to the actual pass-7
-failure mode), `tests/test_timeout_policy.py` (24 tests covering
-Changes 1a-1c), `tests/test_section_coverage.py` (20 tests), and
-`tests/test_evidence_tags.py` (22 tests). Plus updates to the existing
+failure mode), `tests/test_timeout_policy.py` (23 tests covering
+Changes 1a-1c), `tests/test_section_coverage.py` (23 tests), and
+`tests/test_evidence_tags.py` (20 tests). Plus updates to the existing
 envelope test for the new structured evidence shape.
 
 ## 0.6.0 - 2026-05-16
