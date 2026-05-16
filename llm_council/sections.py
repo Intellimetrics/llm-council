@@ -122,9 +122,25 @@ def _section_present(response_upper: str, requirement: dict[str, object]) -> boo
 
 
 def _is_recommendation_part(requirement: dict[str, object]) -> bool:
-    """PART 6 (RECOMMENDATION) is checked by the existing label validator."""
-    tokens = requirement.get("title_tokens") or []
-    return tokens == ["RECOMMENDATION"] or tokens == ["RECOMMENDATION", "COUNCIL"]
+    """PART 6 (RECOMMENDATION) is checked by the existing label validator.
+
+    Any title whose first salient token is `RECOMMENDATION` is treated as
+    the RECOMMENDATION part and excluded from section-coverage checking.
+    The label check (`adapters._has_recommendation_label`) covers it, and
+    double-faulting would falsely fail peers that emit a valid label but
+    paraphrase the surrounding section title (e.g.
+    `PART 6 — RECOMMENDATION AND RATIONALE` yields title_tokens
+    `["RECOMMENDATION", "RATIONALE"]`; the peer's label-bearing line
+    alone shouldn't need to also paraphrase "RATIONALE").
+
+    Matching on the leading token rather than the `num` field keeps this
+    robust to users who renumber sections (RECOMMENDATION isn't always
+    PART 6) while staying conservative — a title where RECOMMENDATION is
+    a secondary modifier (e.g. `PART 3 — DETAILED RECOMMENDATION ANALYSIS`)
+    still gates on its real subject (`DETAILED`).
+    """
+    tokens = list(requirement.get("title_tokens") or [])
+    return bool(tokens) and tokens[0] == "RECOMMENDATION"
 
 
 def required_sections_missing(prompt: str, response: str) -> list[str]:
