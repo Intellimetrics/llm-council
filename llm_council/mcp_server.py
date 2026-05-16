@@ -365,8 +365,44 @@ def council_run_output_schema() -> dict[str, Any]:
                         },
                         "evidence": {
                             "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Per-line `path:line` or section references.",
+                            "items": {
+                                # v3 (v0.7.0): primary shape is `{text, tag}`
+                                # produced by `_parse_tagged_entry`. The
+                                # string branch is retained so legacy/
+                                # external producers (or a future opt-out
+                                # of tag parsing) cannot crash strict MCP
+                                # clients on output validation. The
+                                # ParticipantResult.evidence field is
+                                # typed `list[Any]` for the same reason.
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "text": {"type": "string"},
+                                            "tag": {
+                                                "type": ["string", "null"],
+                                                "enum": [
+                                                    "published",
+                                                    "observable",
+                                                    "inferred",
+                                                    "speculative",
+                                                    None,
+                                                ],
+                                            },
+                                        },
+                                        "required": ["text"],
+                                    },
+                                    {"type": "string"},
+                                ]
+                            },
+                            "description": (
+                                "Structured evidence entries (schema v3). "
+                                "Each item is `{text, tag}` where `tag` is one "
+                                "of `published|observable|inferred|speculative` "
+                                "or `null` for untagged entries. Plain strings "
+                                "are also accepted for legacy/external producers. "
+                                "`text` carries the path:line or section reference."
+                            ),
                         },
                         "tests_to_run": {
                             "type": "array",

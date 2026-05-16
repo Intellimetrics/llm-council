@@ -113,6 +113,28 @@ def _new_peer_bucket() -> dict[str, Any]:
         # tells the operator how often the recovery path actually saves
         # the run vs. how often the prompt is just too big.
         "timeout_recoveries": 0,
+        # Count of runs where the terse-retry path fired at all (success
+        # or failure). Pass-8 dogfood surfaced a silent-failure mode where
+        # the retry attempt was invisible in transcripts: only successful
+        # recoveries flipped a flag, so a transcript showing only the
+        # original timeout looked identical to "retry never fired".
+        # `terse_retry_attempts - timeout_recoveries` is the count of
+        # retries that fired but also failed; if that number stays high
+        # in a given prompt-size bucket, the 60s terse window itself
+        # needs raising (or the mode multiplier needs to apply to retries).
+        "terse_retry_attempts": 0,
+        # Recoveries broken out by prompt-size bucket. Cross-tab with
+        # `timeout_by_prompt_size`: a bucket where timeouts and recoveries
+        # both spike means the wall is real but terse-retry handles it; a
+        # bucket where timeouts climb but recoveries stay flat means the
+        # prompt is genuinely too big and `defaults.timeout` /
+        # `timeout_multiplier` need to go up. Populated from
+        # `result.prompt_chars` on the recovered result (set on every
+        # adapter return path, not just failures), with the same `small/
+        # medium/large/xlarge` cutoffs as `timeout_by_prompt_size`.
+        "timeout_recoveries_by_prompt_size": {
+            name: 0 for name, _ in TIMEOUT_PROMPT_SIZE_BUCKETS
+        },
         # Evidence-tag distribution per peer. Counts each EVIDENCE bullet
         # by its tag, plus an `untagged` bin for entries without one.
         # Drives the optional→required rollout decision for
@@ -206,6 +228,14 @@ def aggregate(
                 total_successes += 1
             bucket = peers.setdefault(name, _new_peer_bucket())
             bucket["runs"] += 1
+            # Count terse-retry attempts on every final-round result that
+            # has the flag set, regardless of ok status. Recovered results
+            # carry it (success path); annotated original-timeout results
+            # carry it too (failure path). Mutually exclusive at the same
+            # final-round entry: a single result is either a recovery or
+            # an annotated failure, never both.
+            if result.get("terse_retry_attempted"):
+                bucket["terse_retry_attempts"] += 1
             if ok:
                 bucket["successes"] += 1
                 label = recommendation_label(result.get("output") or "")
@@ -223,6 +253,18 @@ def aggregate(
                         bucket["envelope_field_present"][field_name] += 1
                 if result.get("recovered_after_timeout"):
                     bucket["timeout_recoveries"] += 1
+                    recovery_prompt_chars = result.get("prompt_chars")
+                    try:
+                        recovery_bucket = _timeout_prompt_size_bucket(
+                            int(recovery_prompt_chars)
+                            if recovery_prompt_chars
+                            else None
+                        )
+                    except (TypeError, ValueError):
+                        recovery_bucket = "small"
+                    bucket["timeout_recoveries_by_prompt_size"][
+                        recovery_bucket
+                    ] += 1
                 # Evidence-tag distribution: count each EVIDENCE bullet
                 # by its tag. Entries shape from v0.7 onward is
                 # list[{text, tag}]; legacy list[str] entries (pre-v0.7
@@ -289,6 +331,10 @@ def aggregate(
                 "envelope_field_present": dict(bucket["envelope_field_present"]),
                 "timeout_by_prompt_size": dict(bucket["timeout_by_prompt_size"]),
                 "timeout_recoveries": bucket["timeout_recoveries"],
+                "terse_retry_attempts": bucket["terse_retry_attempts"],
+                "timeout_recoveries_by_prompt_size": dict(
+                    bucket["timeout_recoveries_by_prompt_size"]
+                ),
                 "evidence_tag_distribution": dict(bucket["evidence_tag_distribution"]),
                 "last_used": bucket["last_used"],
             }

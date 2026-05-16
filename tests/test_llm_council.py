@@ -9706,6 +9706,152 @@ def test_council_run_output_schema_advertises_schema_version_and_enums():
     }
 
 
+def test_council_run_output_schema_accepts_structured_evidence():
+    """v0.7.0 changed `evidence` from `list[str]` to `list[{text, tag}]`
+    on ParticipantResult, but the MCP outputSchema kept declaring
+    string items — strict MCP hosts rejected the actual response
+    with `{'text': ..., 'tag': None} is not of type 'string'`.
+    Verified by validating a representative results payload against
+    the advertised schema.
+    """
+    import jsonschema
+
+    from llm_council.mcp_server import council_run_output_schema
+
+    schema = council_run_output_schema()
+    item_schema = schema["properties"]["results"]["items"]["properties"][
+        "evidence"
+    ]
+    # Both shapes must validate: tagged dicts (current producer) and
+    # plain strings (legacy/external producer fallback).
+    payload = [
+        {"text": "Bai et al. 2022", "tag": "published"},
+        {"text": "src/foo.py:42", "tag": "observable"},
+        {"text": "feature X breaks Y", "tag": None},
+        "legacy untagged string",
+    ]
+    jsonschema.validate(instance=payload, schema=item_schema)
+
+    # And the full structured results array round-trips:
+    full_payload = {
+        "schema_version": schema["properties"]["schema_version"]["const"],
+        "recommendation": "yes",
+        "agreement_count": 1,
+        "total_labeled": 1,
+        "degraded": False,
+        "rounds": 1,
+        "participants": ["claude"],
+        "results": [
+            {
+                "name": "claude",
+                "ok": True,
+                "label": "yes",
+                "evidence": [
+                    {"text": "Bai et al. 2022", "tag": "published"},
+                    {"text": "no tag here", "tag": None},
+                ],
+            }
+        ],
+    }
+    jsonschema.validate(instance=full_payload, schema=schema)
+
+    # Untagged entry MUST still validate (tag may be null or omitted).
+    jsonschema.validate(
+        instance=[{"text": "just text"}],
+        schema=item_schema,
+    )
+
+    # Unknown tag values are rejected (closed enum).
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(
+            instance=[{"text": "x", "tag": "made-up-tag"}],
+            schema=item_schema,
+        )
+
+
+def test_council_run_output_schema_evidence_serializes_from_participant_result(
+    tmp_path: Path,
+):
+    """End-to-end: a ParticipantResult populated by the real envelope
+    parser must serialize through `run_council`-style serialization and
+    validate against the advertised outputSchema. Guards against the
+    pass-8 dogfood crash where the council's own MCP response failed
+    output validation on its own structured evidence.
+    """
+    import jsonschema
+
+    from llm_council.adapters import (
+        ParticipantResult,
+        _extract_response_envelope,
+        classify_error,
+    )
+    from llm_council.mcp_server import (
+        COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
+        council_run_output_schema,
+    )
+
+    raw_output = (
+        "RECOMMENDATION: yes - looks good\n"
+        "EFFORT: full\n"
+        "EVIDENCE:\n"
+        "- src/foo.py:10 [OBSERVABLE]\n"
+        "- Goodhart 1975 [PUBLISHED]\n"
+        "- vibes say it works\n"
+    )
+    envelope = _extract_response_envelope(raw_output)
+    result = ParticipantResult(
+        name="claude",
+        ok=True,
+        output=raw_output,
+        error="",
+        elapsed_seconds=1.0,
+        effort=envelope["effort"],
+        evidence=envelope["evidence"],
+    )
+
+    # Spot-check the runtime shape so the test fails loudly if the
+    # producer ever silently regresses to plain strings.
+    assert all(isinstance(e, dict) for e in result.evidence), result.evidence
+
+    structured = {
+        "name": result.name,
+        "ok": result.ok,
+        "label": "yes",
+        "stance": result.stance,
+        "elapsed_seconds": result.elapsed_seconds,
+        "error": result.error,
+        "error_kind": classify_error(result.error),
+        "model": result.model,
+        "total_tokens": result.total_tokens,
+        "cost_usd": result.cost_usd,
+        "from_cache": False,
+        "cache_hit_seconds": None,
+        "recovered_after_launch_retry": False,
+        "repair_retry_recovered": False,
+        "recovered_after_timeout": False,
+        "prompt_chars": result.prompt_chars,
+        "effort": result.effort,
+        "confidence": result.confidence,
+        "risk": result.risk,
+        "blockers": list(result.blockers),
+        "evidence": list(result.evidence),
+        "tests_to_run": list(result.tests_to_run),
+        "assumptions": list(result.assumptions),
+    }
+
+    payload = {
+        "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
+        "recommendation": "yes",
+        "agreement_count": 1,
+        "total_labeled": 1,
+        "degraded": False,
+        "rounds": 1,
+        "participants": [result.name],
+        "results": [structured],
+    }
+    jsonschema.validate(instance=payload, schema=council_run_output_schema())
+
+
 def test_estimate_council_includes_repair_retry_safety_total(tmp_path: Path):
     """v0.4.1 polish: pre-flight estimate must include a retry-safety total
     so the budget cap accounts for the worst-case repair retry HTTP call

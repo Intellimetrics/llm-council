@@ -81,6 +81,22 @@ TERSE_RETRY_INSTRUCTION = (
 )
 TERSE_RETRY_TIMEOUT_SECONDS = 60
 
+# Suffix appended to the original timeout error when the terse-retry fired
+# but also failed. Pass-8 dogfood surfaced the silent-failure mode: a
+# user reading the transcript could not tell whether the retry attempt
+# happened (terse-retry budget burned silently, ~60s extra wall-clock not
+# visible in `elapsed_seconds`) or never fired at all (config gate /
+# code bug). The annotation makes the attempt visible and tells the
+# operator the next mitigation lever — raising `participants.<name>.timeout`
+# or the mode multiplier — since the 60s terse window also failed.
+TERSE_RETRY_FAILED_SUFFIX = (
+    " Terse-retry-on-timeout was attempted with a {budget}s budget and also "
+    "failed ({retry_kind}); the recorded `elapsed_seconds` reflects only the "
+    "original call, but wall-clock cost includes the failed retry. Raise "
+    "`participants.{name}.timeout` or the mode's `timeout_multiplier` if "
+    "this prompt-size band keeps tripping the timeout wall."
+)
+
 CLI_LAUNCH_RETRY_STDERR_LIMIT = 4096
 
 CONTEXT_OVERFLOW_ERROR_PREFIX = "ContextOverflowExcluded:"
@@ -128,8 +144,26 @@ class ParticipantResult:
     # `repair_retry_recovered` (label-only retry) so stats and transcripts
     # can attribute recoveries to the right mechanism.
     recovered_after_timeout: bool = False
-    # Populated on timeout-failure paths so `stats.aggregate` can bucket
-    # timeouts by prompt size without re-parsing the error string.
+    # Set True whenever the terse-retry-on-timeout path was attempted,
+    # regardless of outcome. Distinct from `recovered_after_timeout` which
+    # only flips when the retry SUCCEEDED. Pass-8 dogfood surfaced a
+    # silent-failure mode: the original timeout result was returned with
+    # `recovered_after_timeout=False`, indistinguishable from "retry never
+    # fired" — the only signal was the wall-clock cost (~60s extra past
+    # the original elapsed_seconds), which the transcript does not record.
+    # This field makes the retry attempt visible so operators can tell the
+    # two failure shapes apart and decide whether the terse window itself
+    # needs raising for the affected prompt-size bucket.
+    terse_retry_attempted: bool = False
+    # Length of the prompt this call was made against. Populated on every
+    # result produced by an adapter call attempt (success or failure, all
+    # paths) so `stats.aggregate` can bucket telemetry by prompt size
+    # without re-parsing the error string. In particular this lets
+    # `timeout_recoveries` (success after terse-retry) be cross-tab-able
+    # with prompt size — without it the recovery counter cannot tell
+    # whether bigger prompts disproportionately trip the timeout wall.
+    # Stays `None` only on results that never represented a real call
+    # attempt (e.g. cache hits, the unsupported-type fallback).
     prompt_chars: int | None = None
 
 
@@ -286,6 +320,7 @@ def _context_overflow_result(
         elapsed_seconds=0.0,
         model=cfg.get("model"),
         prompt_tokens=estimated,
+        prompt_chars=len(prompt),
     )
 
 
@@ -362,13 +397,29 @@ async def run_cli_participant(
             )
             if terse_result.ok:
                 from dataclasses import replace as _replace
-                merged = _replace(terse_result, recovered_after_timeout=True)
+                # `prompt_chars` reports the ORIGINAL prompt size (the one
+                # that tripped the timeout wall), not the terse retry's
+                # size. That keeps `timeout_recoveries` cross-tab-able with
+                # `timeout_by_prompt_size`: both report the prompt that
+                # caused the recovery path to fire.
+                merged = _replace(
+                    terse_result,
+                    recovered_after_timeout=True,
+                    terse_retry_attempted=True,
+                    prompt_chars=len(prompt),
+                )
                 _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
                 return merged
             # Terse retry also failed (re-timed, label-missing, abdication).
-            # Fall through to return the ORIGINAL timeout result so the
-            # error message and prompt_chars stay attributable to the call
-            # that actually exhausted the multiplier-scaled budget.
+            # Annotate the original result so the retry attempt is visible
+            # in transcripts/stats — without `terse_retry_attempted=True`
+            # the failure looks identical to "retry never fired". Keep the
+            # original error prefix intact so `classify_error` / quorum
+            # math still see "timeout". `elapsed_seconds` stays the
+            # original (multiplier-scaled) budget by design — wall-clock
+            # includes the retry, but the budget that gated the timeout
+            # decision was the original one.
+            result = _annotate_timeout_retry_failure(result, terse_result, name)
     if _should_launch_retry(meta, cfg):
         await asyncio.sleep(_launch_retry_backoff(0))
         retry_result, retry_meta = await _run_cli_once(
@@ -466,6 +517,7 @@ async def _run_cli_once(
                 elapsed_seconds=time.monotonic() - start,
                 command=redact_prompt_args(command, prompt),
                 model=cfg.get("model"),
+                prompt_chars=len(prompt),
             ),
             {"nonzero_exit": False, "stderr": "", "exited": False},
         )
@@ -518,6 +570,7 @@ async def _run_cli_once(
                 elapsed_seconds=elapsed,
                 command=redact_prompt_args(command, prompt),
                 model=cfg.get("model"),
+                prompt_chars=len(prompt),
             ),
             {"nonzero_exit": not ok, "stderr": err, "exited": True},
         )
@@ -551,6 +604,7 @@ async def _run_cli_once(
                 elapsed_seconds=elapsed,
                 command=redact_prompt_args(command, prompt),
                 model=cfg.get("model"),
+                prompt_chars=len(prompt),
             ),
             {"nonzero_exit": False, "stderr": "", "exited": False},
         )
@@ -595,9 +649,48 @@ def _build_terse_retry_prompt(original_prompt: str) -> str:
     )
 
 
+def _annotate_timeout_retry_failure(
+    original: "ParticipantResult",
+    terse: "ParticipantResult",
+    name: str,
+) -> "ParticipantResult":
+    """Return a copy of ``original`` annotated with terse-retry attempt info.
+
+    Invoked when the terse-retry path fired but also failed. Sets
+    ``terse_retry_attempted=True`` so transcripts/stats can distinguish
+    "retry fired and failed" from "retry never fired", and appends a
+    suffix to the error string naming the next mitigation lever. The
+    base error prefix stays unchanged so ``classify_error`` still
+    returns the original kind (typically ``timeout``).
+    """
+    from dataclasses import replace
+    retry_kind = classify_error(terse.error) or "unknown"
+    suffix = TERSE_RETRY_FAILED_SUFFIX.format(
+        budget=TERSE_RETRY_TIMEOUT_SECONDS,
+        retry_kind=retry_kind,
+        name=name,
+    )
+    # Avoid double-annotation if the suffix is already present (defensive
+    # against future code paths that might call this twice).
+    annotated_error = original.error
+    if suffix not in annotated_error:
+        annotated_error = original.error + suffix
+    return replace(
+        original,
+        terse_retry_attempted=True,
+        error=annotated_error,
+    )
+
+
 def _merge_cli_retry(
     original: ParticipantResult, retry: ParticipantResult
 ) -> ParticipantResult:
+    # The label-repair / section-repair retry replays the SAME prompt, so
+    # `prompt_chars` on the merged result reflects the same length as both
+    # the original and the retry. Prefer `original.prompt_chars` so the
+    # value is stable even if a future retry path reshapes the prompt; fall
+    # back to the retry's value otherwise.
+    merged_prompt_chars = original.prompt_chars or retry.prompt_chars
     if retry.ok:
         merged_output = _format_retry_transcript(
             original_output=original.output,
@@ -613,6 +706,7 @@ def _merge_cli_retry(
             command=retry.command,
             model=retry.model,
             repair_retry_recovered=True,
+            prompt_chars=merged_prompt_chars,
         )
     if retry.error.startswith("InvalidParticipantResponse: missing required") and retry.output:
         merged_output = _format_retry_transcript(
@@ -631,6 +725,7 @@ def _merge_cli_retry(
             elapsed_seconds=retry.elapsed_seconds,
             command=retry.command,
             model=retry.model,
+            prompt_chars=merged_prompt_chars,
         )
     return original
 
@@ -707,7 +802,22 @@ async def run_openai_compatible_participant(
             )
             if terse_result.ok:
                 from dataclasses import replace as _replace
-                result = _replace(terse_result, recovered_after_timeout=True)
+                # `prompt_chars` reports the ORIGINAL prompt size (the one
+                # that tripped the timeout wall), not the terse retry's
+                # size. Keeps `timeout_recoveries` cross-tab-able with
+                # `timeout_by_prompt_size`.
+                result = _replace(
+                    terse_result,
+                    recovered_after_timeout=True,
+                    terse_retry_attempted=True,
+                    prompt_chars=len(prompt),
+                )
+            else:
+                # Annotate the original result so the retry attempt is
+                # visible in transcripts/stats (matches CLI path).
+                result = _annotate_timeout_retry_failure(
+                    result, terse_result, name
+                )
     _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
     return result
 
@@ -733,6 +843,7 @@ async def _run_openai_compatible_inner(
             error=f"Missing {key_env}",
             elapsed_seconds=0,
             model=model,
+            prompt_chars=len(prompt),
         )
 
     base_url = str(cfg.get("base_url") or OPENROUTER_DEFAULT_BASE_URL).rstrip("/")
@@ -777,6 +888,7 @@ async def _run_openai_compatible_inner(
                 completion_tokens=_int_or_none(usage.get("completion_tokens")),
                 total_tokens=_int_or_none(usage.get("total_tokens")),
                 cost_usd=_float_or_none(usage.get("cost")),
+                prompt_chars=len(prompt),
             )
         choices = data.get("choices") or []
         choice = choices[0] if choices else {}
@@ -797,6 +909,7 @@ async def _run_openai_compatible_inner(
                 completion_tokens=_int_or_none(usage.get("completion_tokens")),
                 total_tokens=_int_or_none(usage.get("total_tokens")),
                 cost_usd=_float_or_none(usage.get("cost")),
+                prompt_chars=len(prompt),
             )
         finish_reason = choice.get("finish_reason")
         validation_error = _response_validation_error(content, cfg, prompt=prompt)
@@ -856,6 +969,7 @@ async def _run_openai_compatible_inner(
                 completion_tokens=_int_or_none(usage.get("completion_tokens")),
                 total_tokens=_int_or_none(usage.get("total_tokens")),
                 cost_usd=_float_or_none(usage.get("cost")),
+                prompt_chars=len(prompt),
             )
         return ParticipantResult(
             name=name,
@@ -868,6 +982,7 @@ async def _run_openai_compatible_inner(
             completion_tokens=_int_or_none(usage.get("completion_tokens")),
             total_tokens=_int_or_none(usage.get("total_tokens")),
             cost_usd=_float_or_none(usage.get("cost")),
+            prompt_chars=len(prompt),
         )
     except Exception as exc:
         return ParticipantResult(
@@ -877,6 +992,7 @@ async def _run_openai_compatible_inner(
             error=f"{type(exc).__name__}: {exc}",
             elapsed_seconds=time.monotonic() - start,
             model=model,
+            prompt_chars=len(prompt),
         )
 
 
@@ -963,6 +1079,9 @@ def _resolve_openrouter_retry(
         retry_content = _message_content_text(retry_message.get("reasoning"))
     retry_finish = retry_choice.get("finish_reason")
     model_id = retry_data.get("model") or fallback_model
+    # The label-repair retry replays the same logical prompt; record its
+    # length so telemetry stays consistent with non-retry paths.
+    prompt_chars = len(prompt) if prompt is not None else None
     if retry_data.get("error") or not retry_content or not retry_content.strip():
         return ParticipantResult(
             name=name,
@@ -978,6 +1097,7 @@ def _resolve_openrouter_retry(
             completion_tokens=_int_or_none(combined_usage.get("completion_tokens")),
             total_tokens=_int_or_none(combined_usage.get("total_tokens")),
             cost_usd=_float_or_none(combined_usage.get("cost")),
+            prompt_chars=prompt_chars,
         )
     if retry_finish == "length":
         merged_output = _format_retry_transcript(
@@ -999,6 +1119,7 @@ def _resolve_openrouter_retry(
             completion_tokens=_int_or_none(combined_usage.get("completion_tokens")),
             total_tokens=_int_or_none(combined_usage.get("total_tokens")),
             cost_usd=_float_or_none(combined_usage.get("cost")),
+            prompt_chars=prompt_chars,
         )
     retry_validation = _response_validation_error(retry_content, cfg, prompt=prompt)
     if retry_validation:
@@ -1021,6 +1142,7 @@ def _resolve_openrouter_retry(
             completion_tokens=_int_or_none(combined_usage.get("completion_tokens")),
             total_tokens=_int_or_none(combined_usage.get("total_tokens")),
             cost_usd=_float_or_none(combined_usage.get("cost")),
+            prompt_chars=prompt_chars,
         )
     merged_output = _format_retry_transcript(
         original_output=original_content,
@@ -1039,6 +1161,7 @@ def _resolve_openrouter_retry(
         total_tokens=_int_or_none(combined_usage.get("total_tokens")),
         cost_usd=_float_or_none(combined_usage.get("cost")),
         repair_retry_recovered=True,
+        prompt_chars=prompt_chars,
     )
 
 
@@ -1100,7 +1223,22 @@ async def run_ollama_participant(
             )
             if terse_result.ok:
                 from dataclasses import replace as _replace
-                result = _replace(terse_result, recovered_after_timeout=True)
+                # `prompt_chars` reports the ORIGINAL prompt size (the one
+                # that tripped the timeout wall), not the terse retry's
+                # size. Keeps `timeout_recoveries` cross-tab-able with
+                # `timeout_by_prompt_size`.
+                result = _replace(
+                    terse_result,
+                    recovered_after_timeout=True,
+                    terse_retry_attempted=True,
+                    prompt_chars=len(prompt),
+                )
+            else:
+                # Annotate the original result so the retry attempt is
+                # visible in transcripts/stats (matches CLI path).
+                result = _annotate_timeout_retry_failure(
+                    result, terse_result, name
+                )
     _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
     return result
 
@@ -1198,6 +1336,7 @@ async def _run_ollama_inner(
                                     ),
                                     elapsed_seconds=time.monotonic() - start,
                                     model=model,
+                                    prompt_chars=len(prompt),
                                 )
                             retry_validation = _response_validation_error(
                                 retry_content, cfg, prompt=prompt
@@ -1218,6 +1357,7 @@ async def _run_ollama_inner(
                                     ),
                                     elapsed_seconds=time.monotonic() - start,
                                     model=model,
+                                    prompt_chars=len(prompt),
                                 )
                             merged = _format_retry_transcript(
                                 original_output=content,
@@ -1232,6 +1372,7 @@ async def _run_ollama_inner(
                                 elapsed_seconds=time.monotonic() - start,
                                 model=model,
                                 repair_retry_recovered=True,
+                                prompt_chars=len(prompt),
                             )
             return ParticipantResult(
                 name=name,
@@ -1240,6 +1381,7 @@ async def _run_ollama_inner(
                 error=validation_error,
                 elapsed_seconds=time.monotonic() - start,
                 model=model,
+                prompt_chars=len(prompt),
             )
         return ParticipantResult(
             name=name,
@@ -1248,6 +1390,7 @@ async def _run_ollama_inner(
             error="",
             elapsed_seconds=time.monotonic() - start,
             model=model,
+            prompt_chars=len(prompt),
         )
     except Exception as exc:
         return ParticipantResult(
@@ -1257,6 +1400,7 @@ async def _run_ollama_inner(
             error=f"{type(exc).__name__}: {exc}",
             elapsed_seconds=time.monotonic() - start,
             model=model,
+            prompt_chars=len(prompt),
         )
 
 
@@ -1440,6 +1584,8 @@ async def run_participants(
                         "cache_hit_seconds": result.cache_hit_seconds,
                         "recovered_after_launch_retry": result.recovered_after_launch_retry,
                         "repair_retry_recovered": result.repair_retry_recovered,
+                        "recovered_after_timeout": result.recovered_after_timeout,
+                        "terse_retry_attempted": result.terse_retry_attempted,
                     }
                 )
             return result
