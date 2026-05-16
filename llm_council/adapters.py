@@ -188,14 +188,14 @@ def _maybe_persist_cache(
         return
     if result.from_cache:
         return
-    # Pass-5: do NOT add an abdication guard here (reverted from v0.5.1).
-    # On a cache hit, `run_participant` always pipes the rehydrated result
-    # back through `_with_envelope`, which re-derives the envelope from
-    # `output` and flips ok=False for abdication shapes — that runs OFFLINE
-    # with zero API cost. Refusing the cache write (v0.5.1 fix #10) instead
-    # forces every repeat run to re-pay the peer for the same abdication.
-    # The "failed runs are never cached" invariant is preserved at the
-    # RESULT layer by re-derivation, not at the cache-file layer.
+    # Abdication outputs are cached normally. The correctness mechanism
+    # is read-side: `run_participant` always pipes cache hits back through
+    # `_with_envelope`, which re-derives the envelope from `output` and
+    # flips ok=False for abdication shapes — offline, no API cost. The
+    # "failed runs are not counted" invariant lives at the RESULT layer
+    # via re-derivation, not at the cache-file layer. Adding a write-side
+    # abdication guard here would force every repeat run to re-pay the
+    # peer for the same abdication.
     payload = cache_build_payload(
         participant_name=name,
         prompt=prompt,
@@ -1322,12 +1322,12 @@ def _is_label_only_failure(output: str, cfg: dict[str, Any]) -> bool:
     error = _response_validation_error(output, cfg)
     if not error.startswith("InvalidParticipantResponse: missing required"):
         return False
-    # Pass-4 fix #6: a peer that emits `EFFORT: blocked` (with or without a
-    # label) has self-reported it cannot make this call. Retrying with the
-    # same prompt produces another abdication. Treat as terminal — the
-    # adapter records the original error, _with_envelope flips it to
-    # `abdicated` if a label was emitted, and the orchestrator drops it
-    # from quorum. Re-asking adds latency and cost for no signal.
+    # A peer that self-reports `EFFORT: blocked` is terminal — re-asking
+    # the same prompt produces another abdication for no new signal. The
+    # adapter records the original error, `_with_envelope` later flips
+    # ok=False if a label was present, and the orchestrator drops the
+    # peer from quorum. Label-only repair retry is for honest mistakes
+    # (label forgotten), not declined-effort responses.
     envelope = _extract_response_envelope(output)
     if (envelope.get("effort") or "").lower() == "blocked":
         return False
@@ -1454,22 +1454,16 @@ def _with_envelope(result: ParticipantResult) -> ParticipantResult:
     """Populate envelope fields on a result; mark abdications as terminal failures.
 
     Abdication detection runs once here so quorum math (in the orchestrator)
-    sees ``ok=False`` and excludes the peer. Abdication is intentionally
-    NOT eligible for the label-only repair retry — see ``_is_label_only_failure``.
+    sees ``ok=False`` and excludes the peer. Abdication is intentionally NOT
+    eligible for the label-only repair retry — see ``_is_label_only_failure``.
 
-    Pass-4 fix #4: a successful repair-retry result has its output set to a
-    `_format_retry_transcript` block that includes BOTH the repaired response
-    AND the original (which may have contained ``EFFORT: blocked``). Parsing
-    envelope from the combined text would re-flag the valid result as
-    abdication. ``_envelope_parse_source`` strips the original section so
-    only the repaired text is inspected here.
-
-    Pass-5 fix A: do NOT also skip abdication on ``repair_retry_recovered``.
-    With the parse-source strip in place, that belt-and-suspenders guard
-    would let a legitimately-abdicating *repaired* response slip through
-    as ok=True. The parse-source strip is the correctness mechanism; the
-    abdication check still runs on whatever the repaired attempt actually
-    contained.
+    Invariant: envelope parsing always runs on `_envelope_parse_source(output)`,
+    not on raw output. For repair-retry results this strips the original
+    attempt section out so an `EFFORT: blocked` in the (failed) original
+    cannot leak into the (valid) repaired response's envelope. The strip
+    is the lone correctness mechanism — do not gate the abdication check
+    on `repair_retry_recovered` here, because that would let a legitimately
+    abdicating *repaired* response slip through as ok=True.
     """
     from dataclasses import replace
 

@@ -85,10 +85,10 @@ DEFAULT_CONFIG: dict = {
         "mode": "quick",
         "read_only": True,
         "synthesize": False,
-        # When synthesize=True, this names the chair. Pass-3 Q4 decision:
-        # require explicit value, fail loudly if synthesis is invoked
-        # without one. Valid: a participant name | "neutral_peer" |
-        # "current". None = unset (loud-fail).
+        # When synthesize=True, this names the chair. No silent default —
+        # `select_synthesizer` raises ValueError when this is None so the
+        # requester does not bias the chair by accident. Valid values:
+        # a participant name | "neutral_peer" | "current".
         "synthesizer": None,
         "synthesizer_max_prompt_chars": 60_000,
         # Tier-2 secret scanner. "warn" (default) counts likely credentials

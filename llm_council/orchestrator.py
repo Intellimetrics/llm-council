@@ -431,19 +431,18 @@ async def execute_council(
             metadata["deliberation_status"] = "pending"
             emit({"event": "deliberation_pending", "round": round_number + 1})
 
-    # Universal-abdication short-circuit (Pass-4 fix #3): if every peer in
-    # round 1 abdicated, deliberating with the same prompt won't help —
-    # they'll abdicate again. Stamp the merged-blockers payload now and
-    # skip into the post-loop quorum/synthesis flow.
+    # Universal-abdication short-circuit: when every round-1 peer abdicates,
+    # round 2 would re-abdicate against the same prompt for the same reasons.
+    # Stamp the merged-blockers payload now; the while-loop guard below sees
+    # `universal_abdication` and refuses to enter. `deliberation_status` only
+    # changes when deliberation was actually on the table — for
+    # `deliberate=False` runs the status stays `"not_requested"` so the
+    # field is never misleading metadata.
     from llm_council.synthesis import universal_abdication as _universal_abdication
 
     _early_abdication = _universal_abdication(round_results)
     if _early_abdication:
         metadata["universal_abdication"] = _early_abdication
-        # Pass-5 fix F: only override `deliberation_status` when
-        # deliberation was actually requested. Stamping it for runs that
-        # had `deliberate=False` produced misleading metadata ("skipped"
-        # implies deliberation was considered, but it wasn't).
         if deliberate:
             metadata["deliberation_status"] = "skipped_universal_abdication"
         emit(
@@ -617,10 +616,11 @@ async def execute_council(
     )
     from llm_council.transcript import final_round_results
 
-    # Pass-4 fix #2: synthesis must see ONLY the final round, not the
-    # cumulative `results` list (which after deliberation also includes
-    # round-1 peer outputs). Reuse the established helper rather than
-    # filtering by name suffix here.
+    # The chair sees ONLY final-round peer outputs. After deliberation,
+    # `results` contains both round-1 entries (plain names) and round-2
+    # entries (`:round2` suffix); `final_round_results()` returns the
+    # latest round only. Passing the full cumulative list would feed the
+    # chair stale positions the peers have since moved off.
     if synthesize_flag and should_synthesize(synthesize_flag, metadata):
         try:
             chair_name = select_synthesizer(
@@ -650,9 +650,11 @@ async def execute_council(
                 }
             )
         except ValueError as exc:
-            # Pass-3 Q4: configuration error is loud, not silent — surface
-            # in metadata so the caller can show the user, but do not crash
-            # the whole council run (peer votes are already valid).
+            # Chair config errors (missing synthesizer, host CLI excluded
+            # from participants, etc.) surface as metadata + an emitted
+            # event for the CLI/MCP layer to render. Peer votes are
+            # already valid — we don't fail the whole council run over
+            # a missing chair configuration.
             metadata["synthesis_error"] = str(exc)
             emit({"event": "synthesis_error", "error": str(exc)})
 

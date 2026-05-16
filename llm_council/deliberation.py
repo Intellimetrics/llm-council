@@ -52,12 +52,11 @@ def recommendation_line(text: str) -> str:
             continue
         if RECOMMENDATION_RE.match(line):
             return line.strip()
-    # Pass-4 fix #7: a peer whose only label sits inside a code fence is
-    # invalid by the v0.5.0 label contract. Falling back to first_nonempty_line
-    # was injecting random intro prose ("Here is my analysis:") into the
-    # round-2 deliberation prompt as that peer's "position". Emit an
-    # explicit placeholder instead so the next-round chair/peers can see
-    # the peer had no usable vote.
+    # No out-of-fence label = no usable vote. Return an explicit
+    # placeholder so the next-round prompt clearly shows the peer had no
+    # position, instead of injecting arbitrary intro prose (the previous
+    # `first_nonempty_line` fallback would echo "Here is my analysis:"
+    # into the round-2 summary as if it were a recommendation).
     return _NO_LABEL_PLACEHOLDER
 
 

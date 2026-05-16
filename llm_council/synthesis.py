@@ -30,17 +30,21 @@ def should_synthesize(
     synthesize_flag: bool,
     metadata: dict[str, Any],
 ) -> bool:
-    """Pass-3 trigger logic: explicit flag OR unresolved deliberation only.
+    """Decide whether the synthesis chair should be invoked.
 
-    Crucially excludes ``ran_no_labeled_disagreement`` — synthesizing on
-    agreement spends a peer call to summarize "everyone agreed." If the
-    user wants a synthesis on agreement too, they pass ``--synthesize``
-    explicitly.
+    Returns True only when the chair has something useful to do:
 
-    Pass-5 fix D: also skip when ``universal_abdication`` already fired.
-    After abdicated peers are filtered out of the chair's input, the chair
-    would receive an empty peer list and produce a meaningless memo. The
-    universal-abdication metadata payload is the deliverable in that case.
+    - **Skip on universal abdication** (regardless of ``synthesize_flag``).
+      Abdicated peers are excluded from the chair's input, so a chair call
+      after universal abdication would receive an empty peer list. The
+      ``metadata["universal_abdication"]`` payload (merged blockers) is
+      already the deliverable.
+    - **Run on explicit ``synthesize_flag``** when not blocked by the
+      above. The user opted in; cost is on them.
+    - **Auto-run only on unresolved deliberation**
+      (``deliberation_status == "ran_max_rounds_unresolved"``). Never
+      auto-run on agreement — synthesizing "everyone agreed" wastes a
+      peer call.
     """
     if metadata.get("universal_abdication"):
         return False
@@ -86,20 +90,22 @@ def select_synthesizer(
     stances: dict[str, str] | None,
     current: str | None,
 ) -> str:
-    """Resolve the chair participant name. Pass-3 Q4: fail loudly when
-    synthesis is invoked without an explicit ``synthesizer`` setting.
+    """Resolve the chair participant name; fail loudly when unset.
+
+    There is intentionally no silent default — when ``synthesize=True``
+    and ``defaults.synthesizer`` is unset, this raises so the user has
+    to choose rather than the requester biasing the chair by default.
 
     Valid values for ``defaults.synthesizer``:
-    - a participant name in ``participant_cfg``
-    - ``"neutral_peer"``: pick whichever peer was assigned stance=neutral
-    - ``"current"``: use the host CLI; **requires** the host CLI to also be a
-      configured participant for this run. Peer-only modes (where the host
-      is intentionally excluded) raise rather than silently fall back. This
-      preserves the requester-bias-is-opt-in default.
 
-    No silent default — when ``synthesize=True`` and ``synthesizer`` is
-    unset, this raises so the caller can prompt the user rather than
-    picking arbitrarily.
+    - **a participant name** in ``participant_cfg`` (e.g. ``"gemini"``).
+    - **``"neutral_peer"``**: pick whichever peer was assigned
+      ``stance=neutral`` for this run. Requires a stance-assigning mode
+      (``consensus``/``deliberate``); raises otherwise.
+    - **``"current"``**: use the host CLI. The host MUST also be a
+      configured participant for this run. Peer-only modes that exclude
+      the host raise rather than silently falling back — keeping
+      requester-bias opt-in.
     """
     defaults = config.get("defaults") or {}
     raw = defaults.get("synthesizer")
@@ -118,9 +124,9 @@ def select_synthesizer(
                 "(execute_council current=None). Set synthesizer to a "
                 "participant name instead."
             )
-        # Pass-4 fix #5: when the host CLI is not in participant_cfg the
-        # caller intentionally excluded it from the council (peer-only
-        # modes etc.). Fall back loudly rather than silently picking it.
+        # Host CLI not configured as a participant = peer-only mode (or
+        # the host was intentionally excluded). Fall back loudly rather
+        # than silently injecting the requester as chair.
         if current not in participant_cfg:
             raise ValueError(
                 f"defaults.synthesizer='current' but host CLI '{current}' "
@@ -186,7 +192,8 @@ def build_synthesis_prompt(
     max_chars: int = MAX_SYNTHESIS_PROMPT_CHARS_DEFAULT,
 ) -> str:
     """Compact chair prompt. Cites peers by name; consumes pre-computed
-    convergence rather than re-deriving it (pass-2 finding)."""
+    convergence metadata rather than re-deriving Jaccard drift on
+    output text the orchestrator already analyzed."""
     lines: list[str] = [
         "You are the synthesis chair for an llm-council deliberation.",
         "Your job: produce a tight decision memo, NOT another vote. Your output",

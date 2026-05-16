@@ -2116,16 +2116,18 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         current=current,
         question=question,
     )
-    # Pass-4 fix #9: parity with mcp_server — record the secret-scan
-    # result in metadata so the transcript captures it. CLI's stderr
-    # warning is for the user-at-the-terminal; transcripts go to audit
-    # tooling that doesn't read the terminal.
+    # Record the secret-scan result in metadata for transcript-based
+    # audit tooling. The stderr warning above is for the live terminal;
+    # transcripts need their own copy because audit pipelines don't read
+    # stderr. Keep parity with mcp_server.run_council, which stamps the
+    # same field.
     if scan_result.get("scrubbed_count") or scan_policy != "off":
         metadata["secret_scan"] = scan_result
-    # Pass-4 fix #8: synthesis ran but the chair config was missing or
-    # invalid. orchestrator catches the ValueError and stamps the message;
-    # surface it here so the user sees WHY synthesis didn't happen
-    # instead of silently getting no synthesis section.
+    # Surface a synthesis configuration error inline. The orchestrator
+    # catches ValueError from the chair-resolution path and stamps it as
+    # metadata so peer votes still flow through; rendering it here gives
+    # the user a reason for the missing synthesis section instead of
+    # silent absence.
     if metadata.get("synthesis_error"):
         print(
             display.format_gutter(
