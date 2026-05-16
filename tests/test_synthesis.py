@@ -186,6 +186,43 @@ def test_build_synthesis_prompt_includes_convergence_when_provided():
     assert "0.92" in prompt
 
 
+def test_build_synthesis_prompt_renders_structured_evidence_readably():
+    """Evidence entries are ``list[{text, tag}]`` since v0.7.0
+    (``adapters._parse_tagged_entry``). The chair prompt must format
+    each entry as ``[TAG] text`` (or just ``text`` when untagged) rather
+    than injecting raw stringified Python dict literals like
+    ``{'text': '...', 'tag': 'PUBLISHED'}`` — those would be unreadable
+    noise for the chair LLM."""
+    results = [
+        ParticipantResult(
+            "gemini",
+            True,
+            "RECOMMENDATION: yes - ship\nLooks good.",
+            "",
+            1.0,
+            evidence=[
+                {"text": "tests pass in CI", "tag": "observable"},
+                {"text": "docs at example.com confirm", "tag": "published"},
+                {"text": "untagged claim with no source", "tag": None},
+            ],
+            blockers=["plain string blocker"],
+        ),
+    ]
+    prompt = build_synthesis_prompt("Q?", results, None)
+    # The bug we are guarding against: raw dict literals leaking into the
+    # prompt. Any of these substrings indicate the regression returned.
+    assert "{'text':" not in prompt
+    assert "'tag':" not in prompt
+    assert "{\"text\":" not in prompt
+    assert "'PUBLISHED'" not in prompt
+    # Tagged entries render as [TAG] text; untagged as bare text.
+    assert "[OBSERVABLE] tests pass in CI" in prompt
+    assert "[PUBLISHED] docs at example.com confirm" in prompt
+    assert "untagged claim with no source" in prompt
+    # Sibling list field (blockers) is still list[str]; render unchanged.
+    assert "plain string blocker" in prompt
+
+
 def test_build_synthesis_prompt_truncates_oversize():
     """When the assembled prompt exceeds max_chars, truncation marker appears.
 
