@@ -160,7 +160,7 @@ failure path; do not let strings drift.
 | `downstream_error`   | httpx / hosted-API failures (HTTPStatusError, ConnectError, ReadTimeout, etc.)       |
 | `cli_nonzero_exit`   | CLI participant exited with a nonzero status and empty stderr. Prefix: `CliExitNonZero:` |
 | `preflight_failed`   | Local participant's `base_url` was unreachable at run start. Prefix: `PreflightFailed:` |
-| `abdicated`          | Peer emitted `RECOMMENDATION:` and `EFFORT: blocked` with no concrete missing artifact in EITHER `BLOCKERS:` or `ASSUMPTIONS:`. Terminal for the round — no repair retry, no cache write, drops quorum so consensus doesn't form on a non-vote. Prefix: `AbdicatedResponse:` |
+| `abdicated`          | Peer emitted `RECOMMENDATION:` and `EFFORT: blocked` with no concrete missing artifact in EITHER `BLOCKERS:` or `ASSUMPTIONS:`. Terminal for the round — no repair retry, drops quorum so consensus doesn't form on a non-vote. The cache DOES persist the raw output; `_with_envelope` re-derives `ok=False` on every read so repeat runs still drop quorum without paying the peer again. Prefix: `AbdicatedResponse:` |
 | `unknown`            | Non-empty error that did not match any known prefix — file a dogfood note            |
 
 ## Custom CLI participant: minimal template
