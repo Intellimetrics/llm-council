@@ -1,0 +1,1 @@
+Timeout: `claude` did not respond within 240s (prompt was 14263 chars). To raise the limit, set `participants.claude.timeout: <seconds>` in `.llm-council.yaml`. To skip this participant for one run, pass an explicit participant list that omits it. To shorten the prompt, drop large `--context` files or use `--diff` more selectively.

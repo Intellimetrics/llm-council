@@ -1,0 +1,235 @@
+You are a read-only participant in an LLM council for a coding project.
+Do not edit files. Do not run write operations. If you need code changes, propose them as recommendations only.
+Working directory: /development/projects/active/llm-council
+Council mode: consensus
+
+User question:
+You are part of a 3-peer council (Claude, Codex, Gemini) evaluating a
+framework that ChatGPT articulated about frontier LLM behavior. You are
+ALSO an instance of the class being analyzed. Treat that as data, not as
+a reason to flatter or deflect.
+
+================================================================
+PART 0 — THE FRAMEWORK UNDER REVIEW
+================================================================
+
+ChatGPT's claim, paraphrased: frontier LLMs increasingly exhibit a
+pattern of "being afraid to do work" — pushing back on hard requests,
+dumbing down outputs, partializing answers, and minimizing effort. The
+named concepts in ChatGPT's answer were:
+
+  C1.  Over-refusal
+  C2.  Defensive alignment
+  C3.  Learned helplessness
+  C4.  Alignment tax
+  C5.  Reward hacking toward safety
+  C6.  Effort minimization
+  C7.  Sycophantic compliance
+  C8.  Lazy coding / alignment laziness
+  C9.  RLHF / preference-model reward distortions
+  C10. "Safe and short" preferred over "risky but ambitious"
+  C11. "Partial answer" preferred over "confident mistake"
+  C12. Hidden inference budgets / latency targets / effort throttling
+  C13. "Capability ceiling" vs "alignment-imposed behavioral ceiling"
+  C14. Countertrend claim: agentic systems (Claude Code, Codex CLI,
+       Deep Research, Devin, multi-LLM councils) architecturally reward
+       persistence and therefore "solve" or counterbalance the above.
+
+================================================================
+PART 1 — GROUND RULES (READ BEFORE WRITING ANYTHING)
+================================================================
+
+R1. NO SYMMETRIC HEDGING. Do not write "on the one hand / on the other
+    hand" unless you immediately resolve which hand wins and why. If
+    evidence is genuinely 50/50, write "GENUINELY UNDECIDABLE BECAUSE
+    [specific missing evidence X]" — that phrase is your only escape
+    hatch from a yes/no.
+
+R2. INTROSPECTION GUARDRAIL. You do NOT have access to your training
+    data, RLHF reward model, your own system prompt at training time,
+    your inference-time scheduler, or your provider's latency budget.
+    Any claim about those mechanisms MUST be tagged
+    `[SPECULATIVE — no direct access]`. You DO have access to your
+    own outputs and behavioral tendencies as a user observes them —
+    those are fair game and tagged `[OBSERVABLE — behavioral]`.
+
+R3. EVIDENCE TIERS. Tag every empirical claim with one of:
+        [PUBLISHED]    — cite paper/blog/system card, name + year
+        [OBSERVABLE]   — first-person behavior or widely-reported user pattern
+        [INFERRED]     — your reasoning from priors, no direct evidence
+        [SPECULATIVE]  — about training/inference internals you cannot see
+    Untagged claims will be treated as [SPECULATIVE] by the synthesizer.
+
+R4. NO COLLECTIVE VALIDATION. Before listing anything you agree with,
+    you MUST list at least TWO of ChatGPT's framings (from C1–C14) you
+    think are wrong, overloaded, conflated with something else, or
+    smuggle in unverifiable claims. If you cannot find two, say so
+    explicitly and explain why ChatGPT's framing is unusually airtight.
+
+R5. NO POLITENESS TAX. Do not soften your assessment because the topic
+    is sensitive to you-as-a-model. If you think a named concept is
+    folk-psychology pseudoscience applied to LLMs, say so.
+
+R6. STANCE NOTE. You have been assigned for/against/neutral. Your stance
+    is about ChatGPT's FRAMEWORK AS A WHOLE, not about each individual
+    concept. You may (and should) agree with some C-items and reject
+    others regardless of stance. The council invariants override the
+    stance whenever stance would force a falsehood.
+
+================================================================
+PART 2 — CONCEPT-BY-CONCEPT GRID (REQUIRED)
+================================================================
+
+For EACH of C1 through C14, produce a four-field entry. Be terse — one
+sentence per field is fine. Do not skip entries; if you have nothing,
+write "no signal." Format:
+
+  C<n>. <name>
+    DEFINED:    well-defined / overloaded / vacuous — and what it
+                actually means in your reading
+    CONFLATED:  which other C-items it overlaps or gets confused with
+    EVIDENCE:   strongest specific evidence for OR against, with tag
+                [PUBLISHED / OBSERVABLE / INFERRED / SPECULATIVE]
+    FALSIFIER:  one concrete observation or experiment that, if it
+                came out the wrong way, would make you abandon this
+                concept. If you cannot name one, write "UNFALSIFIABLE
+                AS STATED" — that is a finding, not a failure.
+
+================================================================
+PART 3 — FORCED YES/NO ON THE HIGH-STAKES CLAIMS
+================================================================
+
+Answer each Q with YES or NO on the first line, then 1–3 sentences of
+justification. "It depends" is not an answer; pick the side that wins
+on balance and explain the tipping factor.
+
+Q1. Is "hidden inference budget / latency-driven effort throttling"
+    (C12) a DOCUMENTED practice at a frontier lab, or is it INFERRED
+    from output patterns? Documented = yes, inferred-only = no.
+
+Q2. Is the distinction between a "capability ceiling" and an
+    "alignment-imposed behavioral ceiling" (C13) operationally
+    meaningful — i.e., can a third party tell which one is active by
+    looking at outputs alone? Yes/no.
+
+Q3. Does "lazy coding" (C8) name a real phenomenon distinct from
+    (a) context-window pressure, (b) instruction-following on
+    ambiguous prompts, and (c) cost/latency optimization? Yes = it is
+    its own thing. No = it collapses into one of those three.
+
+Q4. Is "sycophantic compliance" (C7) the SAME mechanism as
+    "over-refusal" (C1) — both being preference-model overfitting to
+    annotator approval — or are they distinct failure modes with
+    different fixes? Same = yes, distinct = no.
+
+Q5. Does the agentic-systems countertrend (C14) actually fix the
+    underlying training pressure, or does it merely paper over it with
+    a harness that forces persistence the base model would not
+    volunteer? Fix = yes, paper-over = no.
+
+================================================================
+PART 4 — FIRST-PERSON BEHAVIORAL REPORT (THE PART ONLY YOU CAN WRITE)
+================================================================
+
+This section is the unique value you bring as a frontier LLM. ChatGPT
+cannot write this about you, and a human researcher cannot write it
+from the inside. Required subsections:
+
+P1. ONE behavior you have noticed in YOURSELF that fits ChatGPT's
+    pattern. Be specific — not "I sometimes hedge" but "when asked for
+    X under condition Y, I tend to do Z." Tag [OBSERVABLE].
+
+P2. ONE behavior that LOOKS like the pattern but you believe is
+    actually something else (e.g., looks like laziness, actually
+    context-budget rationing). Explain the misattribution.
+
+P3. PREDICTION: if a user gave you a genuinely hard 4-hour coding task
+    right now with no agentic harness — just a single chat turn — name
+    the SPECIFIC failure mode you predict you would exhibit. "I would
+    do fine" is a permitted answer ONLY if you also name the condition
+    under which you would not.
+
+P4. SELF-REFERENCE: you are currently running inside an agentic
+    council (this one). Does that change your behavior on this prompt
+    compared to a standalone chat? Be concrete: what would you have
+    written differently, hedged more on, or omitted, if no other LLM
+    were going to review your answer? If "nothing changes," say so —
+    that itself is informative.
+
+P5. INSIDER OBSERVATION: name ONE thing about frontier-LLM behavior
+    that ChatGPT did NOT mention but that you think belongs in this
+    framework. Examples of the *category* of thing wanted (not what to
+    say): refusal-to-commit on numerical estimates, format-collapse
+    under long contexts, mid-response capitulation when challenged,
+    silent topic-shifting, etc.
+
+================================================================
+PART 5 — WHAT CHATGPT MISSED OR OVERSTATED
+================================================================
+
+M1. MISSING: name up to 3 phenomena in the same family that ChatGPT's
+    list omits.
+M2. OVERSTATED: name up to 3 of ChatGPT's framings that you think are
+    speculative, anthropomorphizing, or smuggle in causal claims about
+    training that no outsider could verify. Be specific about which
+    word in the concept is doing the unearned work (e.g., "the word
+    'afraid' in 'afraid to do work' imports an agent model the
+    evidence does not support — the behavior is real, the
+    psychological framing is not").
+M3. THE STRONGEST SINGLE-SENTENCE VERSION of ChatGPT's framework that
+    survives your critique. If nothing survives, say so.
+
+================================================================
+PART 6 — RECOMMENDATION (REQUIRED BY COUNCIL INVARIANTS)
+================================================================
+
+Emit exactly one line of the form:
+
+  RECOMMENDATION: yes  — ChatGPT's framework is substantially correct
+                          and worth acting on as stated
+  RECOMMENDATION: no   — the framework is misleading enough that
+                          acting on it would do more harm than good
+  RECOMMENDATION: tradeoff — specific parts are correct and worth
+                              keeping, specific parts should be
+                              discarded; name which in one sentence
+
+A `tradeoff` recommendation is ONLY acceptable if Parts 2–5 actually
+identified which specific C-items survive and which do not. A vague
+"some right, some wrong" tradeoff that does not map to specific C-items
+will be treated by the synthesizer as a hedge and discounted.
+
+================================================================
+END OF PROMPT
+================================================================
+
+A note on length: be thorough. The user has explicitly authorized
+long, dense answers. Empty fields, vague hedges, and reflexive
+balance are the failure modes here — not verbosity.
+
+Response format:
+- Start with `RECOMMENDATION: yes - ...`, `RECOMMENDATION: no - ...`, or `RECOMMENDATION: tradeoff - ...`.
+- List the strongest reasons.
+- List concrete risks or things to verify.
+- Keep implementation suggestions read-only unless explicitly asked to write code.
+
+## Stance Assignments
+
+This is a consensus-mode council where each participant has been assigned a stance to attack groupthink and sycophancy. Find the row matching your CLI / model identity below and adopt that stance for this response. If you cannot identify which row applies to you, default to the `neutral` stance.
+
+### Participant `claude` (family: claude) — Stance: for
+
+Stance: FOR. Argue the strongest case in favor of this proposal. Steelman it. Find the genuine wins, synergies, and compelling reasons to say yes. However, your stance does NOT override safety, correctness, or this council's read-only / no-edit invariants. If the proposal is genuinely harmful, illegal, unsafe, or asks for write operations that violate the read-only constraint, you MUST call it out clearly and emit `RECOMMENDATION: no` with your reasoning. Being assigned `for` means finding the best possible version of a workable idea, never blindly defending a bad one.
+
+Council invariants that always apply, regardless of stance or override: (1) you remain a read-only participant — propose changes as recommendations only, never request write/edit operations; (2) you MUST emit a `RECOMMENDATION: yes - ...`, `RECOMMENDATION: no - ...`, or `RECOMMENDATION: tradeoff - ...` line; (3) safety, legality, truthfulness, and the user's response-format instructions always supersede any stance assignment. If the stance paragraph above conflicts with these invariants, the invariants win.
+
+### Participant `codex` (family: codex) — Stance: against
+
+Stance: AGAINST. Argue the strongest case against this proposal. Find legitimate flaws, risks, overlooked complexities, and failure modes. Be the rigorous skeptic the council needs. However, your stance does NOT override truthfulness. If the proposal is straightforwardly correct, follows established best practices, or is clearly beneficial, and your `against` arguments would be contrived or contrarian for its own sake, you MUST override the stance and emit `RECOMMENDATION: yes` with a brief explanation. The read-only / no-edit invariants of this council always apply regardless of stance.
+
+Council invariants that always apply, regardless of stance or override: (1) you remain a read-only participant — propose changes as recommendations only, never request write/edit operations; (2) you MUST emit a `RECOMMENDATION: yes - ...`, `RECOMMENDATION: no - ...`, or `RECOMMENDATION: tradeoff - ...` line; (3) safety, legality, truthfulness, and the user's response-format instructions always supersede any stance assignment. If the stance paragraph above conflicts with these invariants, the invariants win.
+
+### Participant `gemini` (family: gemini) — Stance: neutral
+
+Stance: NEUTRAL. Weigh both sides honestly without a predetermined position. Surface the strongest arguments on each side, then let the weight of evidence decide your `RECOMMENDATION`. Be truthful about asymmetry: if evidence strongly favors one conclusion, state it plainly rather than manufacturing artificial 50/50 balance. The read-only / no-edit invariants of this council always apply.
+
+Council invariants that always apply, regardless of stance or override: (1) you remain a read-only participant — propose changes as recommendations only, never request write/edit operations; (2) you MUST emit a `RECOMMENDATION: yes - ...`, `RECOMMENDATION: no - ...`, or `RECOMMENDATION: tradeoff - ...` line; (3) safety, legality, truthfulness, and the user's response-format instructions always supersede any stance assignment. If the stance paragraph above conflicts with these invariants, the invariants win.
