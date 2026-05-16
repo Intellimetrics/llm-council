@@ -123,11 +123,13 @@ Key modules:
   alongside the `RECOMMENDATION:` label. Parsed by
   `adapters._extract_response_envelope`, stored on `ParticipantResult`, and
   emitted in transcripts / MCP `structured_results`. All fields are optional
-  in the current schema (v2). A peer that says `EFFORT: blocked` with NO
-  concrete `BLOCKERS:` is classified as abdication (`error_kind=abdicated`,
-  `ok=False`, drops quorum) — no repair retry. Track presence via the new
-  `envelope_field_present` bucket in `stats.aggregate` before any future
-  flip from optional to required.
+  in the current schema (v2). A peer that says `EFFORT: blocked` with no
+  concrete entries in EITHER `BLOCKERS:` OR `ASSUMPTIONS:` is classified
+  as abdication (`error_kind=abdicated`, `ok=False`, drops quorum) — no
+  repair retry. Naming concrete missing artifacts in either list is
+  treated as honest information, not abdication. Track presence via the
+  new `envelope_field_present` bucket in `stats.aggregate` before any
+  future flip from optional to required.
 - **Config migration is silent.** `migrate_known_cli_defaults` rewrites old
   `OLD_CLAUDE_PLAN_ARGS` / `OLD_CODEX_APPROVAL_ARGS` and back-fills
   `peer-only` mode and `include_current` for built-in `other_cli_peers`

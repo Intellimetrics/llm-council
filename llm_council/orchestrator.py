@@ -440,7 +440,12 @@ async def execute_council(
     _early_abdication = _universal_abdication(round_results)
     if _early_abdication:
         metadata["universal_abdication"] = _early_abdication
-        metadata["deliberation_status"] = "skipped_universal_abdication"
+        # Pass-5 fix F: only override `deliberation_status` when
+        # deliberation was actually requested. Stamping it for runs that
+        # had `deliberate=False` produced misleading metadata ("skipped"
+        # implies deliberation was considered, but it wasn't).
+        if deliberate:
+            metadata["deliberation_status"] = "skipped_universal_abdication"
         emit(
             {
                 "event": "universal_abdication",

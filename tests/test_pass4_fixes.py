@@ -271,32 +271,38 @@ def test_is_label_only_failure_still_retries_normal_missing_label():
 
 # --- Fix #10: abdications are never cached ------------------------------
 
-def test_maybe_persist_cache_refuses_abdication_shape(tmp_path: Path):
-    """Cache writes happen inside per-adapter run_*_participant calls,
-    BEFORE run_participant -> _with_envelope flips abdication to ok=False.
-    The cache write must therefore inspect the output shape and refuse
-    when it looks like abdication."""
+def test_maybe_persist_cache_writes_abdication_for_offline_rederivation(
+    tmp_path: Path,
+):
+    """Pass-5 reverted v0.5.1 fix #10: abdications DO get cached.
+
+    The cache hit path always pipes results back through `_with_envelope`,
+    which re-derives the envelope and flips abdication to ok=False with
+    zero API cost. Refusing the cache write (v0.5.1) instead forced every
+    repeat run to re-pay the peer for the same abdication — a real cost
+    regression for no correctness gain. The "failed runs are never cached"
+    invariant is preserved at the RESULT layer (via re-derivation) rather
+    than at the cache-file layer.
+    """
     abdication_output = (
         "RECOMMENDATION: no - too complex to evaluate\n"
         "EFFORT: blocked\n"
     )
     r = ParticipantResult(
         "peer",
-        True,  # adapter sets ok=True; flip happens later
+        True,  # adapter sets ok=True; flip happens later via _with_envelope
         abdication_output,
         "",
         1.0,
     )
     cache_ctx = CacheContext(cwd=tmp_path, cache_mode="on", cache_disabled=False)
 
-    # If _maybe_persist_cache writes anything, we'd see a file in the
-    # cache dir. Run the helper and assert nothing was written.
     _maybe_persist_cache("peer", "the prompt", "fake-key", r, cache_ctx)
     cache_dir = tmp_path / ".llm-council" / "cache"
     files = list(cache_dir.glob("*.json")) if cache_dir.exists() else []
-    assert files == [], (
-        "abdication outputs must not be persisted to the cache — "
-        "violates the failed-runs-not-cached invariant"
+    assert len(files) == 1, (
+        "abdication outputs must be cached so repeat runs don't re-pay "
+        "the peer; _with_envelope re-derives ok=False on the read side"
     )
 
 

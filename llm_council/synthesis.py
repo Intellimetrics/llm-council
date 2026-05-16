@@ -36,7 +36,14 @@ def should_synthesize(
     agreement spends a peer call to summarize "everyone agreed." If the
     user wants a synthesis on agreement too, they pass ``--synthesize``
     explicitly.
+
+    Pass-5 fix D: also skip when ``universal_abdication`` already fired.
+    After abdicated peers are filtered out of the chair's input, the chair
+    would receive an empty peer list and produce a meaningless memo. The
+    universal-abdication metadata payload is the deliverable in that case.
     """
+    if metadata.get("universal_abdication"):
+        return False
     if synthesize_flag:
         return True
     status = metadata.get("deliberation_status")
@@ -85,7 +92,10 @@ def select_synthesizer(
     Valid values for ``defaults.synthesizer``:
     - a participant name in ``participant_cfg``
     - ``"neutral_peer"``: pick whichever peer was assigned stance=neutral
-    - ``"current"``: use the host CLI (accepts requester bias)
+    - ``"current"``: use the host CLI; **requires** the host CLI to also be a
+      configured participant for this run. Peer-only modes (where the host
+      is intentionally excluded) raise rather than silently fall back. This
+      preserves the requester-bias-is-opt-in default.
 
     No silent default — when ``synthesize=True`` and ``synthesizer`` is
     unset, this raises so the caller can prompt the user rather than

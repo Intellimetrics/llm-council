@@ -188,15 +188,14 @@ def _maybe_persist_cache(
         return
     if result.from_cache:
         return
-    # Pass-4 fix #10: cache writes happen inside per-adapter functions,
-    # BEFORE run_participant -> _with_envelope flips abdication outputs
-    # to ok=False. The "ok=True" check above therefore lets abdication
-    # shapes slip through, persisting a terminal non-vote. Refuse the
-    # write when the output looks like abdication; the cache invariant
-    # "failed runs are never cached" must apply to abdication too.
-    envelope = _extract_response_envelope(result.output)
-    if _is_abdication(envelope, result.output):
-        return
+    # Pass-5: do NOT add an abdication guard here (reverted from v0.5.1).
+    # On a cache hit, `run_participant` always pipes the rehydrated result
+    # back through `_with_envelope`, which re-derives the envelope from
+    # `output` and flips ok=False for abdication shapes — that runs OFFLINE
+    # with zero API cost. Refusing the cache write (v0.5.1 fix #10) instead
+    # forces every repeat run to re-pay the peer for the same abdication.
+    # The "failed runs are never cached" invariant is preserved at the
+    # RESULT layer by re-derivation, not at the cache-file layer.
     payload = cache_build_payload(
         participant_name=name,
         prompt=prompt,
@@ -1462,19 +1461,22 @@ def _with_envelope(result: ParticipantResult) -> ParticipantResult:
     `_format_retry_transcript` block that includes BOTH the repaired response
     AND the original (which may have contained ``EFFORT: blocked``). Parsing
     envelope from the combined text would re-flag the valid result as
-    abdication. Detect retry transcripts by their stable marker prefix and
-    parse only the repaired section.
+    abdication. ``_envelope_parse_source`` strips the original section so
+    only the repaired text is inspected here.
+
+    Pass-5 fix A: do NOT also skip abdication on ``repair_retry_recovered``.
+    With the parse-source strip in place, that belt-and-suspenders guard
+    would let a legitimately-abdicating *repaired* response slip through
+    as ok=True. The parse-source strip is the correctness mechanism; the
+    abdication check still runs on whatever the repaired attempt actually
+    contained.
     """
     from dataclasses import replace
 
     parse_source = _envelope_parse_source(result.output)
     envelope = _extract_response_envelope(parse_source)
     updated = replace(result, **envelope)
-    if (
-        updated.ok
-        and not updated.repair_retry_recovered
-        and _is_abdication(envelope, parse_source)
-    ):
+    if updated.ok and _is_abdication(envelope, parse_source):
         return replace(
             updated,
             ok=False,

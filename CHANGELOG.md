@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+## 0.5.2 - 2026-05-16
+
+Pass-5 council review of v0.5.1 (transcript:
+`.llm-council/runs/20260516_091154_*`) returned RECOMMENDATION: tradeoff
+with one bug introduced by v0.5.1 itself, one regression to revert, and
+several polish items.
+
+### Bug fix (introduced by v0.5.1)
+
+- **Repaired-response abdication was masked (pass-5 codex).** v0.5.1
+  added `repair_retry_recovered=True` as a skip-abdication guard in
+  `_with_envelope`. Combined with `_envelope_parse_source` (which
+  already strips the original section), this belt-and-suspenders guard
+  meant a *legitimately* abdicating repaired response slipped through
+  as `ok=True`. Dropped the guard; parse-source strip alone is the
+  correctness mechanism.
+
+### Reverted
+
+- **Reverted v0.5.1 fix #10 (cache refuses abdications) — pass-5 gemini.**
+  Refusing the cache write was a cost regression: every repeat run paid
+  the peer to re-abdicate. The pre-v0.5.1 behavior was already correct
+  because `run_participant` pipes cache hits through `_with_envelope`,
+  which re-derives `ok=False` for abdication shapes **offline** with
+  zero API cost. The "failed runs are never cached" invariant is
+  preserved at the RESULT layer (re-derivation) rather than at the
+  cache-file layer. Documented inline.
+
+### Polish
+
+- `should_synthesize` now returns False when `universal_abdication`
+  fired, even with an explicit `--synthesize`. Chair input would be
+  empty after final-round + ok-only filtering — the merged-blockers
+  payload IS the deliverable in that case.
+- `deliberation_status="skipped_universal_abdication"` is only stamped
+  when `deliberate=True`. Non-deliberative runs keep
+  `deliberation_status="not_requested"` so the metadata isn't misleading.
+- `select_synthesizer` docstring documents the `"current"` requirement:
+  host CLI must also be a configured participant for the run; peer-only
+  modes fail loudly rather than silently falling back to a peer.
+- CLAUDE.md envelope invariant now consistently states "BLOCKERS OR
+  ASSUMPTIONS" — pass-4 doc fix had only updated the failure-taxonomy
+  table, not the invariants bullet.
+
+6 regression tests in `tests/test_pass5_fixes.py` covering the
+repaired-response-abdication case, abdication cache round-trip,
+`should_synthesize` interaction with universal-abdication,
+non-deliberative metadata gating, and the `select_synthesizer("current")`
+host-excluded case. Full suite: 594 passed; same 4 pre-existing env
+failures unchanged.
+
 ## 0.5.1 - 2026-05-16
 
 Pass-4 council review of v0.5.0 (transcript:
