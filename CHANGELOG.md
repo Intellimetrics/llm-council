@@ -5,7 +5,7 @@
 ## 0.6.0 - 2026-05-16
 
 Cleanup chore recommended by pass-6 council review. **No behavior change**;
-all 594 v0.5.2 tests still pass.
+v0.5.2's 594 functional tests still pass with one consolidation noted below.
 
 - Rewrote 17 `Pass-N fix #M` comments across `adapters.py`,
   `orchestrator.py`, `synthesis.py`, `deliberation.py`, `defaults.py`, and

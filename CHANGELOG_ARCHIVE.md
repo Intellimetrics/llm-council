@@ -128,7 +128,9 @@ UX patches bundled with the bug fixes:
 consolidated into `tests/test_abdication_detection.py` and
 `tests/test_synthesis_gating.py`) covering each of the 6 must-fix bugs
 plus the UX patches. Full suite at release: 588 passed; same 4
-pre-existing env failures unchanged.
+pre-existing env-related failures unchanged (no `mcp` package
+installed, no ollama runtime, budget-config drift in a single test
+fixture).
 
 ## 0.5.0 - 2026-05-16
 
