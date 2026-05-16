@@ -199,11 +199,11 @@ failure path; do not let strings drift.
 
 | `error_kind`         | When                                                                                |
 |----------------------|-------------------------------------------------------------------------------------|
-| `timeout`            | Participant exceeded its `timeout`. Prefix: `Timeout:` or `TimeoutError:`           |
+| `timeout`            | Participant exceeded its `timeout`. Prefixes: `Timeout:` / `TimeoutError:` (CLI subprocess) or `ReadTimeout:` / `ConnectTimeout:` / `WriteTimeout:` / `PoolTimeout:` / `TimeoutException:` (httpx, used by openai_compatible + ollama). The full set lives in `adapters._TIMEOUT_PREFIXES` and is shared by `is_timeout_error` (terse-retry gate) and `classify_error` (telemetry). |
 | `context_overflow`   | Estimated tokens exceed `max_context_tokens`. Prefix: `ContextOverflowExcluded:`    |
 | `prompt_too_large`   | Prompt skipped before launch (per-participant `max_prompt_chars`)                    |
 | `invalid_response`   | CLI/HTTP succeeded but lacked `RECOMMENDATION:` label after one repair retry         |
-| `downstream_error`   | httpx / hosted-API failures (HTTPStatusError, ConnectError, ReadTimeout, etc.)       |
+| `downstream_error`   | httpx / hosted-API failures other than timeouts (HTTPStatusError, ConnectError, RemoteProtocolError, ReadError, WriteError, ProxyError). httpx timeout class names are classified as `timeout` instead. |
 | `cli_nonzero_exit`   | CLI participant exited with a nonzero status and empty stderr. Prefix: `CliExitNonZero:` |
 | `preflight_failed`   | Local participant's `base_url` was unreachable at run start. Prefix: `PreflightFailed:` |
 | `abdicated`          | Peer emitted `RECOMMENDATION:` and `EFFORT: blocked` with no concrete missing artifact in EITHER `BLOCKERS:` or `ASSUMPTIONS:`. Terminal for the round — no repair retry, drops quorum so consensus doesn't form on a non-vote. The cache DOES persist the raw output; `_with_envelope` re-derives `ok=False` on every read so repeat runs still drop quorum without paying the peer again. Prefix: `AbdicatedResponse:` |

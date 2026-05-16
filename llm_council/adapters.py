@@ -2029,25 +2029,35 @@ def _format_timeout_error(
     )
 
 
+# Single source of truth for "this error string is a timeout". Used by
+# both `is_timeout_error` (gates the terse-retry path) and
+# `classify_error` (produces the stable `error_kind=timeout` consumed by
+# stats / transcripts / MCP --json). Keeping these in sync matters
+# because `stats.aggregate` only buckets timed-out runs into
+# `timeout_by_prompt_size` / `timeout_recoveries` when
+# `error_kind == "timeout"` — drift here loses telemetry on hosted
+# httpx timeouts.
+#
+# CLI subprocess timeouts use "Timeout:" / "TimeoutError:" prefixes.
+# httpx-backed peers (openai_compatible, ollama) raise ReadTimeout /
+# ConnectTimeout / WriteTimeout / PoolTimeout / TimeoutException which
+# the generic `except Exception` in those adapters serializes as
+# "ReadTimeout: ..." etc.
+_TIMEOUT_PREFIXES: tuple[str, ...] = (
+    "Timeout:",
+    "TimeoutError:",
+    "ReadTimeout:",
+    "ConnectTimeout:",
+    "WriteTimeout:",
+    "PoolTimeout:",
+    "TimeoutException:",
+)
+
+
 def is_timeout_error(error: str) -> bool:
-    # CLI subprocess timeouts use "Timeout:" / "TimeoutError:" prefixes.
-    # httpx-backed peers (openai_compatible, ollama) raise ReadTimeout /
-    # ConnectTimeout / WriteTimeout / PoolTimeout / TimeoutException which
-    # the generic `except Exception` in those adapters serializes as
-    # "ReadTimeout: ..." etc. Treat all of these as timeouts so terse-retry
-    # fires uniformly across adapter types.
     if not error:
         return False
-    if error.startswith("Timeout:") or error.startswith("TimeoutError:"):
-        return True
-    httpx_timeout_prefixes = (
-        "ReadTimeout:",
-        "ConnectTimeout:",
-        "WriteTimeout:",
-        "PoolTimeout:",
-        "TimeoutException:",
-    )
-    return any(error.startswith(p) for p in httpx_timeout_prefixes)
+    return any(error.startswith(p) for p in _TIMEOUT_PREFIXES)
 
 
 # Stable, machine-readable classification of result errors. Callers can
@@ -2100,7 +2110,12 @@ def classify_error(error: str) -> str | None:
     """
     if not error:
         return None
-    if error.startswith("Timeout:") or error.startswith("TimeoutError:"):
+    # Timeout check must precede the `downstream_markers` substring scan
+    # below — otherwise "ReadTimeout: ..." would match the
+    # "ReadTimeout" downstream marker and get classified as
+    # downstream_error instead of timeout, breaking
+    # `stats.timeout_by_prompt_size` / `timeout_recoveries`.
+    if is_timeout_error(error):
         return ERROR_KIND_TIMEOUT
     if error.startswith(CONTEXT_OVERFLOW_ERROR_PREFIX):
         return ERROR_KIND_CONTEXT_OVERFLOW
@@ -2122,10 +2137,12 @@ def classify_error(error: str) -> str | None:
     # in the openrouter / ollama paths; we don't try to introspect those
     # further here, just classify them as `downstream_error` so callers can
     # distinguish "their service blew up" from "our validation rejected it".
+    # NOTE: httpx timeout class names (ReadTimeout, ConnectTimeout, etc.)
+    # are intentionally NOT in this list — they're classified as `timeout`
+    # above so timeout telemetry counts hosted timeouts uniformly.
     downstream_markers = (
         "HTTPStatusError",
         "ConnectError",
-        "ReadTimeout",
         "RemoteProtocolError",
         "ReadError",
         "WriteError",

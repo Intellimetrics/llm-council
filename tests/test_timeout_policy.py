@@ -9,17 +9,22 @@ actual failure mode the council surfaced, see
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import pytest
 
+from llm_council import adapters as adapters_module
 from llm_council.adapters import (
+    ERROR_KIND_TIMEOUT,
     ParticipantResult,
     TERSE_RETRY_TIMEOUT_SECONDS,
     _build_terse_retry_prompt,
     _resolve_effective_timeout,
     _terse_retry_enabled,
+    classify_error,
     is_timeout_error,
 )
 from llm_council.stats import _timeout_prompt_size_bucket
@@ -584,3 +589,116 @@ def test_stats_recovery_without_prompt_chars_falls_back_to_small():
     by_peer = {row["name"]: row for row in result["participants"]}
     assert by_peer["claude"]["timeout_recoveries"] == 1
     assert by_peer["claude"]["timeout_recoveries_by_prompt_size"]["small"] == 1
+# --- pass-8 finding #6: classify_error/is_timeout_error symmetry ---------
+# v0.7.0 extended is_timeout_error to recognize httpx timeout class names
+# so terse-retry fires on hosted (openai_compatible / ollama) timeouts.
+# classify_error was NOT updated, so unrecovered hosted timeouts landed in
+# `downstream_error` (or `unknown`) instead of `timeout`, breaking
+# `stats.timeout_by_prompt_size` and `timeout_recoveries`. These tests
+# lock in the symmetry: every prefix is_timeout_error accepts MUST map to
+# error_kind="timeout".
+
+def test_classify_error_recognizes_cli_timeout_prefixes():
+    """CLI subprocess prefixes — the original two."""
+    assert classify_error("Timeout: claude did not respond") == ERROR_KIND_TIMEOUT
+    assert classify_error("TimeoutError: timed out") == ERROR_KIND_TIMEOUT
+
+
+def test_classify_error_recognizes_httpx_timeout_prefixes():
+    """httpx-backed peers serialize timeouts as f"{class_name}: ...".
+    All five must classify as `timeout` so hosted timeouts show up in
+    stats.timeout_by_prompt_size instead of being lost to downstream_error."""
+    assert classify_error("ReadTimeout: 30s elapsed") == ERROR_KIND_TIMEOUT
+    assert classify_error("ConnectTimeout: connect failed") == ERROR_KIND_TIMEOUT
+    assert classify_error("WriteTimeout: send failed") == ERROR_KIND_TIMEOUT
+    assert classify_error("PoolTimeout: pool exhausted") == ERROR_KIND_TIMEOUT
+    assert classify_error("TimeoutException: general timeout") == ERROR_KIND_TIMEOUT
+
+
+def test_classify_error_and_is_timeout_error_share_prefix_set():
+    """Belt-and-braces: every prefix is_timeout_error accepts MUST classify
+    as timeout. If someone adds a new httpx exception to _TIMEOUT_PREFIXES
+    but forgets to think about classify_error, this fails fast."""
+    for prefix in adapters_module._TIMEOUT_PREFIXES:
+        sample = f"{prefix} some details"
+        assert is_timeout_error(sample), f"is_timeout_error rejected {prefix!r}"
+        assert classify_error(sample) == ERROR_KIND_TIMEOUT, (
+            f"classify_error did not return 'timeout' for {prefix!r}"
+        )
+
+
+def test_classify_error_keeps_non_timeout_downstream_errors_downstream():
+    """The fix must not turn HTTPStatusError / ConnectError etc into timeouts.
+    These remain `downstream_error` so the "service blew up vs. timed out"
+    distinction stays intact in stats."""
+    assert classify_error("HTTPStatusError: 503") == "downstream_error"
+    assert classify_error("ConnectError: connection refused") == "downstream_error"
+    assert classify_error("RemoteProtocolError: bad framing") == "downstream_error"
+
+
+# --- End-to-end: hosted httpx ReadTimeout → error_kind="timeout" ---------
+# Mocks _request_with_retries to always raise httpx.ReadTimeout. Both the
+# initial call AND the terse-retry will fail, so the final result must
+# carry an error string whose classify_error() is "timeout". Pre-fix this
+# would be "downstream_error" because "ReadTimeout" substring-matched the
+# downstream_markers list.
+
+def _always_read_timeout():
+    async def _raise(client, method, url, **kwargs):
+        raise httpx.ReadTimeout("simulated read timeout", request=None)
+    return _raise
+
+
+def test_openai_compatible_read_timeout_classifies_as_timeout(monkeypatch):
+    """A ReadTimeout that survives the terse-retry must produce
+    error_kind="timeout" for stats / transcripts / MCP --json."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(
+        adapters_module, "_request_with_retries", _always_read_timeout()
+    )
+
+    result = asyncio.run(
+        adapters_module.run_openai_compatible_participant(
+            "router",
+            {
+                "type": "openai_compatible",
+                "model": "z-ai/glm-test",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+                "timeout": 1,
+                # Skip cache hits in this test environment.
+                "cache_ttl_seconds": 0,
+            },
+            "what is 2+2?",
+        )
+    )
+    assert result.ok is False
+    assert result.error.startswith("ReadTimeout:"), result.error
+    assert classify_error(result.error) == ERROR_KIND_TIMEOUT
+    # Sanity: terse-retry was actually attempted (not recovered).
+    assert result.recovered_after_timeout is False
+
+
+def test_ollama_read_timeout_classifies_as_timeout(monkeypatch):
+    """Same contract for the ollama adapter path."""
+    monkeypatch.setattr(
+        adapters_module, "_request_with_retries", _always_read_timeout()
+    )
+
+    result = asyncio.run(
+        adapters_module.run_ollama_participant(
+            "local",
+            {
+                "type": "ollama",
+                "model": "qwen3:q4",
+                "base_url": "http://localhost:11434",
+                "timeout": 1,
+                "cache_ttl_seconds": 0,
+            },
+            "what is 2+2?",
+        )
+    )
+    assert result.ok is False
+    assert result.error.startswith("ReadTimeout:"), result.error
+    assert classify_error(result.error) == ERROR_KIND_TIMEOUT
+    assert result.recovered_after_timeout is False
