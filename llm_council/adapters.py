@@ -72,6 +72,23 @@ SECTION_REPAIR_RETRY_INSTRUCTION = (
     "the salient title tokens within a few lines)."
 )
 
+# Strict-evidence repair-retry. Fires when defaults.strict_evidence is true
+# AND one or more EVIDENCE bullets lack a canonical epistemic tag. The
+# instruction names the four legal tags explicitly so the peer can fix the
+# response without re-reading the original prompt. Mirrors the
+# section-repair pattern: one shot, no chaining with terse-retry, label-
+# retry, or section-repair (each gate's retry is independent so the
+# cumulative wall-clock cost ceiling of "one extra round" holds).
+STRICT_EVIDENCE_REPAIR_RETRY_INSTRUCTION = (
+    "Your previous response satisfied the RECOMMENDATION label but one or "
+    "more EVIDENCE bullets lacked an epistemic tag. Re-emit your full "
+    "response and tag EVERY EVIDENCE bullet with exactly one of "
+    "`[PUBLISHED]` (cited in published literature), `[OBSERVABLE]` "
+    "(directly observable behavior), `[INFERRED]` (reasoned from priors), "
+    "or `[SPECULATIVE]` (informed guess). Tags may appear at the start or "
+    "end of each bullet. Keep your existing reasoning; only add the tags."
+)
+
 TERSE_RETRY_INSTRUCTION = (
     "Your previous response timed out. Re-answer the question with the same "
     "RECOMMENDATION discipline, but be terse: cover every REQUIRED section "
@@ -435,6 +452,37 @@ async def run_cli_participant(
                     merged.recovered_after_launch_retry = True
                 _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
                 return merged
+    # Strict-evidence repair retry (label present, sections satisfied, but
+    # one or more EVIDENCE bullets lacked an epistemic tag). Cap of one
+    # retry. No chaining with terse-retry, label-retry, or section-repair —
+    # they're independent error-paths, and chaining would push past the
+    # documented "one extra round" wall-clock ceiling.
+    if (
+        not result.ok
+        and _retry_enabled(cfg)
+        and result.error.startswith(UNTAGGED_EVIDENCE_PREFIX)
+        and not getattr(result, "recovered_after_timeout", False)
+    ):
+        retry_prompt = (
+            f"{prompt}\n\n"
+            "--- Your previous response (first attempt) ---\n"
+            f"{result.output.strip()}\n\n"
+            f"{STRICT_EVIDENCE_REPAIR_RETRY_INSTRUCTION}"
+        )
+        max_prompt_chars = cfg.get("max_prompt_chars")
+        if (
+            max_prompt_chars is None
+            or len(retry_prompt) <= int(max_prompt_chars)
+        ):
+            retry_result, _retry_meta = await _run_cli_once(
+                name, cfg, retry_prompt, cwd, start=start,
+                mode_multiplier=mode_multiplier, mode=mode,
+            )
+            merged = _merge_cli_retry(result, retry_result)
+            if result.recovered_after_launch_retry:
+                merged.recovered_after_launch_retry = True
+            _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
+            return merged
     _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
     return result
 
@@ -595,6 +643,56 @@ def _build_terse_retry_prompt(original_prompt: str) -> str:
     )
 
 
+def _build_strict_evidence_retry_prompt(
+    original_prompt: str, prior_response: str
+) -> str:
+    """Compose the strict-evidence repair retry prompt for hosted/local
+    transports. Shape mirrors `_build_cli_retry_prompt`: original prompt +
+    prior response excerpt + repair directive. The CLI path constructs
+    the equivalent string inline at the retry site rather than calling
+    this helper because the section-repair branch wants the same
+    structure; both end up with the directive trailing the prior output.
+    """
+    return (
+        f"{original_prompt}\n\n"
+        "--- Your previous response (first attempt) ---\n"
+        f"{prior_response.strip()}\n\n"
+        f"{STRICT_EVIDENCE_REPAIR_RETRY_INSTRUCTION}"
+    )
+
+
+def _merge_hosted_strict_evidence_retry(
+    original: ParticipantResult, retry: ParticipantResult
+) -> ParticipantResult:
+    """Merge a strict-evidence retry result for openai_compatible / ollama.
+
+    Success: return the retry with `repair_retry_recovered=True` plus a
+    formatted transcript that preserves both attempts. Failure: keep the
+    original `UntaggedEvidence:` error string so downstream error_kind
+    classification stays stable. If the retry itself surfaced a different
+    failure (e.g. timeout, downstream HTTP error), we still prefer the
+    ORIGINAL error — the retry is a best-effort repair, not a replacement
+    for the original verdict.
+    """
+    if retry.ok:
+        merged_output = _format_retry_transcript(
+            original_output=original.output,
+            retry_output=retry.output,
+            recovered=True,
+        )
+        from dataclasses import replace as _replace
+        return _replace(
+            retry,
+            ok=True,
+            output=merged_output,
+            error="",
+            repair_retry_recovered=True,
+        )
+    # Retry failed (still untagged, or a different error). Keep the
+    # original verdict so error_kind stays `untagged_evidence`.
+    return original
+
+
 def _merge_cli_retry(
     original: ParticipantResult, retry: ParticipantResult
 ) -> ParticipantResult:
@@ -708,6 +806,26 @@ async def run_openai_compatible_participant(
             if terse_result.ok:
                 from dataclasses import replace as _replace
                 result = _replace(terse_result, recovered_after_timeout=True)
+    # Strict-evidence repair retry. The inner's label-retry path skips
+    # untagged_evidence failures (gated by `_is_label_only_failure`), so we
+    # apply the retry here at the wrapper layer. One shot, no chaining
+    # with terse-retry above: a peer that already needed terse recovery
+    # shouldn't get a third call. Mirrors the CLI strict-evidence path so
+    # all three transports behave identically.
+    if (
+        not result.ok
+        and _retry_enabled(cfg)
+        and result.error.startswith(UNTAGGED_EVIDENCE_PREFIX)
+        and not getattr(result, "recovered_after_timeout", False)
+    ):
+        retry_prompt = _build_strict_evidence_retry_prompt(prompt, result.output)
+        max_prompt_chars = cfg.get("max_prompt_chars")
+        if max_prompt_chars is None or len(retry_prompt) <= int(max_prompt_chars):
+            retry_result = await _run_openai_compatible_inner(
+                name, cfg, retry_prompt, image_manifest=image_manifest,
+                mode_multiplier=mode_multiplier, mode=mode,
+            )
+            result = _merge_hosted_strict_evidence_retry(result, retry_result)
     _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
     return result
 
@@ -1101,6 +1219,23 @@ async def run_ollama_participant(
             if terse_result.ok:
                 from dataclasses import replace as _replace
                 result = _replace(terse_result, recovered_after_timeout=True)
+    # Strict-evidence repair retry (parallels CLI + openai_compatible).
+    # The inner's label-retry path skips untagged_evidence failures, so we
+    # apply the retry here. One shot, no chaining with terse-retry.
+    if (
+        not result.ok
+        and _retry_enabled(cfg)
+        and result.error.startswith(UNTAGGED_EVIDENCE_PREFIX)
+        and not getattr(result, "recovered_after_timeout", False)
+    ):
+        retry_prompt = _build_strict_evidence_retry_prompt(prompt, result.output)
+        max_prompt_chars = cfg.get("max_prompt_chars")
+        if max_prompt_chars is None or len(retry_prompt) <= int(max_prompt_chars):
+            retry_result = await _run_ollama_inner(
+                name, cfg, retry_prompt, image_manifest=image_manifest,
+                mode_multiplier=mode_multiplier, mode=mode,
+            )
+            result = _merge_hosted_strict_evidence_retry(result, retry_result)
     _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
     return result
 

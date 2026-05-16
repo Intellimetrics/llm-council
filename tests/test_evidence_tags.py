@@ -205,6 +205,364 @@ def test_stats_evidence_tag_distribution_counts_each_tag():
     assert dist["inferred"] == 0
 
 
+# --- Strict-evidence repair-retry --------------------------------------
+#
+# The strict_evidence validator flags untagged EVIDENCE bullets with
+# `UntaggedEvidence:`. The repair-retry path re-asks the peer with a
+# directive naming the four legal tags. Success on retry → ok=True with
+# `repair_retry_recovered=True`. Failure → ok=False, error_kind retained
+# as `untagged_evidence`. The retry must compose correctly with (but not
+# chain through) terse-retry-on-timeout, label-retry, and section-repair.
+#
+# These tests mock the inner adapter calls directly so the retry-loop
+# logic is exercised without spinning up subprocesses or HTTP clients.
+
+import asyncio
+from pathlib import Path
+from unittest.mock import patch
+
+import llm_council.adapters as adapters_module
+from llm_council.adapters import (
+    ParticipantResult,
+    STRICT_EVIDENCE_REPAIR_RETRY_INSTRUCTION,
+    classify_error,
+    run_cli_participant,
+    run_ollama_participant,
+    run_openai_compatible_participant,
+)
+
+
+_UNTAGGED_OUTPUT = (
+    "RECOMMENDATION: yes - looks fine\n"
+    "EVIDENCE:\n"
+    "- plain bullet with no tag\n"
+)
+_TAGGED_OUTPUT = (
+    "RECOMMENDATION: yes - looks fine\n"
+    "EVIDENCE:\n"
+    "- plain bullet [PUBLISHED]\n"
+)
+
+
+# ----- CLI path -----------------------------------------------------------
+
+def test_strict_evidence_cli_retry_recovers_on_success():
+    """CLI: untagged first attempt → repair-retry returns tagged → ok=True."""
+    call_count = {"n": 0}
+    captured_prompts: list[str] = []
+
+    async def fake_run_cli_once(name, cfg, prompt, cwd, *, start, mode_multiplier=None, mode=None):
+        call_count["n"] += 1
+        captured_prompts.append(prompt)
+        if call_count["n"] == 1:
+            return (
+                ParticipantResult(
+                    name=name,
+                    ok=False,
+                    output=_UNTAGGED_OUTPUT,
+                    error=(
+                        "UntaggedEvidence: 1 EVIDENCE entry/entries lack a "
+                        "[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE] tag "
+                        "while defaults.strict_evidence is true"
+                    ),
+                    elapsed_seconds=2.0,
+                ),
+                {"nonzero_exit": False, "stderr": "", "exited": True},
+            )
+        # Retry: fully tagged, no validation error.
+        return (
+            ParticipantResult(
+                name=name,
+                ok=True,
+                output=_TAGGED_OUTPUT,
+                error="",
+                elapsed_seconds=2.5,
+            ),
+            {"nonzero_exit": False, "stderr": "", "exited": True},
+        )
+
+    with patch("llm_council.adapters._run_cli_once", side_effect=fake_run_cli_once), \
+         patch("llm_council.adapters._cache_lookup", return_value=(None, None)), \
+         patch("llm_council.adapters._maybe_persist_cache"):
+        result = asyncio.run(
+            run_cli_participant(
+                "peer",
+                {"type": "cli", "command": "peer", "strict_evidence": True, "timeout": 60},
+                "Original question",
+                Path("/tmp"),
+            )
+        )
+
+    assert call_count["n"] == 2, "expected one repair retry"
+    assert result.ok is True
+    assert result.repair_retry_recovered is True
+    # Retry prompt contains the strict-evidence directive
+    assert STRICT_EVIDENCE_REPAIR_RETRY_INSTRUCTION[:40] in captured_prompts[1]
+
+
+def test_strict_evidence_cli_retry_fails_returns_untagged_evidence():
+    """CLI: both attempts untagged → ok=False, error_kind=untagged_evidence."""
+    call_count = {"n": 0}
+
+    async def fake_run_cli_once(name, cfg, prompt, cwd, *, start, mode_multiplier=None, mode=None):
+        call_count["n"] += 1
+        return (
+            ParticipantResult(
+                name=name,
+                ok=False,
+                output=_UNTAGGED_OUTPUT,
+                error=(
+                    "UntaggedEvidence: 1 EVIDENCE entry/entries lack a "
+                    "[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE] tag "
+                    "while defaults.strict_evidence is true"
+                ),
+                elapsed_seconds=2.0,
+            ),
+            {"nonzero_exit": False, "stderr": "", "exited": True},
+        )
+
+    with patch("llm_council.adapters._run_cli_once", side_effect=fake_run_cli_once), \
+         patch("llm_council.adapters._cache_lookup", return_value=(None, None)), \
+         patch("llm_council.adapters._maybe_persist_cache"):
+        result = asyncio.run(
+            run_cli_participant(
+                "peer",
+                {"type": "cli", "command": "peer", "strict_evidence": True, "timeout": 60},
+                "Original question",
+                Path("/tmp"),
+            )
+        )
+
+    assert call_count["n"] == 2, "expected one repair retry then give up"
+    assert result.ok is False
+    assert classify_error(result.error) == "untagged_evidence"
+
+
+# ----- openai_compatible path --------------------------------------------
+
+def _openai_response(content: str, finish: str = "stop") -> dict:
+    return {
+        "model": "test/model",
+        "choices": [
+            {
+                "message": {"content": content},
+                "finish_reason": finish,
+            }
+        ],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+    }
+
+
+def test_strict_evidence_openai_retry_recovers_on_success(monkeypatch):
+    """openai_compatible: untagged → repair-retry → tagged → ok=True."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    call_count = {"n": 0}
+    captured_payloads: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    async def fake_request(client, method, url, **kwargs):
+        call_count["n"] += 1
+        captured_payloads.append(kwargs.get("json") or {})
+        if call_count["n"] == 1:
+            return FakeResponse(_openai_response(_UNTAGGED_OUTPUT))
+        return FakeResponse(_openai_response(_TAGGED_OUTPUT))
+
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openai_compatible_participant(
+            "endpoint",
+            {
+                "type": "openai_compatible",
+                "model": "test/model",
+                "base_url": "https://api.example.com/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+                "strict_evidence": True,
+            },
+            "Original question",
+        )
+    )
+
+    assert call_count["n"] == 2, "expected one repair retry"
+    assert result.ok is True
+    assert result.repair_retry_recovered is True
+    # Retry payload contains the directive in the user message
+    retry_messages = captured_payloads[1].get("messages") or []
+    user_blob = "\n".join(
+        m.get("content", "") for m in retry_messages if isinstance(m.get("content"), str)
+    )
+    assert STRICT_EVIDENCE_REPAIR_RETRY_INSTRUCTION[:40] in user_blob
+
+
+def test_strict_evidence_openai_retry_fails_returns_untagged_evidence(monkeypatch):
+    """openai_compatible: both untagged → ok=False, error_kind=untagged_evidence."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    call_count = {"n": 0}
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    async def fake_request(client, method, url, **kwargs):
+        call_count["n"] += 1
+        return FakeResponse(_openai_response(_UNTAGGED_OUTPUT))
+
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openai_compatible_participant(
+            "endpoint",
+            {
+                "type": "openai_compatible",
+                "model": "test/model",
+                "base_url": "https://api.example.com/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+                "strict_evidence": True,
+            },
+            "Original question",
+        )
+    )
+
+    assert call_count["n"] == 2, "expected one repair retry then give up"
+    assert result.ok is False
+    assert classify_error(result.error) == "untagged_evidence"
+
+
+# ----- ollama path -------------------------------------------------------
+
+def _ollama_response(content: str, done_reason: str = "stop") -> dict:
+    return {
+        "message": {"content": content},
+        "done_reason": done_reason,
+    }
+
+
+def test_strict_evidence_ollama_retry_recovers_on_success(monkeypatch):
+    """ollama: untagged → repair-retry → tagged → ok=True."""
+    call_count = {"n": 0}
+    captured_payloads: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    async def fake_request(client, method, url, **kwargs):
+        call_count["n"] += 1
+        captured_payloads.append(kwargs.get("json") or {})
+        if call_count["n"] == 1:
+            return FakeResponse(_ollama_response(_UNTAGGED_OUTPUT))
+        return FakeResponse(_ollama_response(_TAGGED_OUTPUT))
+
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_ollama_participant(
+            "local",
+            {
+                "type": "ollama",
+                "model": "test:local",
+                "base_url": "http://localhost:11434",
+                "strict_evidence": True,
+            },
+            "Original question",
+        )
+    )
+
+    assert call_count["n"] == 2, "expected one repair retry"
+    assert result.ok is True
+    assert result.repair_retry_recovered is True
+    retry_messages = captured_payloads[1].get("messages") or []
+    user_blob = "\n".join(
+        m.get("content", "") for m in retry_messages if isinstance(m.get("content"), str)
+    )
+    assert STRICT_EVIDENCE_REPAIR_RETRY_INSTRUCTION[:40] in user_blob
+
+
+def test_strict_evidence_ollama_retry_fails_returns_untagged_evidence(monkeypatch):
+    """ollama: both untagged → ok=False, error_kind=untagged_evidence."""
+    call_count = {"n": 0}
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    async def fake_request(client, method, url, **kwargs):
+        call_count["n"] += 1
+        return FakeResponse(_ollama_response(_UNTAGGED_OUTPUT))
+
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_ollama_participant(
+            "local",
+            {
+                "type": "ollama",
+                "model": "test:local",
+                "base_url": "http://localhost:11434",
+                "strict_evidence": True,
+            },
+            "Original question",
+        )
+    )
+
+    assert call_count["n"] == 2, "expected one repair retry then give up"
+    assert result.ok is False
+    assert classify_error(result.error) == "untagged_evidence"
+
+
+# ----- Empty-evidence sanity check (FORMAT not PRESENCE) -----------------
+
+def test_strict_evidence_empty_list_does_not_trigger_retry():
+    """A response with no EVIDENCE entries passes strict_evidence and
+    therefore never reaches the retry path. The gate is FORMAT of entries
+    that exist, not PRESENCE. Asserts the retry path is gated by the
+    UntaggedEvidence error string, not by empty evidence."""
+    call_count = {"n": 0}
+
+    async def fake_run_cli_once(name, cfg, prompt, cwd, *, start, mode_multiplier=None, mode=None):
+        call_count["n"] += 1
+        return (
+            ParticipantResult(
+                name=name,
+                ok=True,
+                output="RECOMMENDATION: yes - empty evidence is fine\n",
+                error="",
+                elapsed_seconds=1.0,
+            ),
+            {"nonzero_exit": False, "stderr": "", "exited": True},
+        )
+
+    with patch("llm_council.adapters._run_cli_once", side_effect=fake_run_cli_once), \
+         patch("llm_council.adapters._cache_lookup", return_value=(None, None)), \
+         patch("llm_council.adapters._maybe_persist_cache"):
+        result = asyncio.run(
+            run_cli_participant(
+                "peer",
+                {"type": "cli", "command": "peer", "strict_evidence": True, "timeout": 60},
+                "Original question",
+                Path("/tmp"),
+            )
+        )
+
+    assert call_count["n"] == 1, "no retry should fire for empty evidence"
+    assert result.ok is True
+
+
 def test_stats_legacy_string_evidence_counts_as_untagged():
     """Pre-v0.7 cached transcripts have `evidence: list[str]`. Each
     string entry counts as untagged so old data flows into the new shape
