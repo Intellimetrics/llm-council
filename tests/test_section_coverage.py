@@ -106,11 +106,19 @@ def test_section_present_rejects_distant_tokens():
     assert _section_present(response_upper, req) is False
 
 
-def test_section_present_no_tokens_defaults_to_present():
-    """A title with no salient tokens defaults to present (don't false-pos)."""
-    response_upper = "anything"
+def test_section_present_no_tokens_requires_header_shaped_part_n():
+    """A title with no salient tokens has no paraphrase route to fall back
+    on, so the only acceptance signal is a header-shaped `PART N`
+    mention. A bare response with neither is treated as missing — we
+    cannot tell whether the peer addressed the section without some
+    structural anchor."""
     req = {"num": "2", "title_tokens": []}
-    assert _section_present(response_upper, req) is True
+    # No anchor at all -> missing.
+    assert _section_present("ANYTHING", req) is False
+    # Header-shaped PART N at line start -> present.
+    assert _section_present("## PART 2\nCONTENT", req) is True
+    # Prose-only mention -> still missing.
+    assert _section_present("I SKIPPED PART 2.", req) is False
 
 
 # --- required_sections_missing end-to-end --------------------------------
@@ -214,3 +222,230 @@ def test_classify_error_routes_incomplete_response():
 def test_known_error_kinds_includes_incomplete_response():
     """Guard against drift between adapters.py and mcp_server.py."""
     assert "incomplete_response" in KNOWN_ERROR_KINDS
+
+
+# --- pass-8 finding #9 (codex): prose mentions don't satisfy sections ----
+
+def test_skipped_part_n_does_not_count_as_present():
+    """`I skipped PART 2 because of time` is a disclaimer, not a section.
+    Pass-8 finding #9 (codex) anchor."""
+    req = {"num": "2", "title_tokens": ["CONCEPT", "GRID"]}
+    assert _section_present("I SKIPPED PART 2 BECAUSE OF TIME.", req) is False
+
+
+def test_not_addressed_part_n_does_not_count_as_present():
+    """`PART 2 was not addressed` is a disclaimer, not a section."""
+    req = {"num": "2", "title_tokens": ["CONCEPT", "GRID"]}
+    assert _section_present("PART 2 WAS NOT ADDRESSED.", req) is False
+
+
+def test_part_n_referenced_in_prose_does_not_count():
+    """`see PART 2 instructions` references the prompt, not the response.
+    A peer pointing back at the user prompt has not delivered the section."""
+    req = {"num": "2", "title_tokens": ["CONCEPT", "GRID"]}
+    assert (
+        _section_present("SEE PART 2 INSTRUCTIONS IN THE USER PROMPT.", req)
+        is False
+    )
+
+
+def test_unable_to_complete_part_n_does_not_count():
+    """`I was unable to complete PART 2` is a disclaimer."""
+    req = {"num": "2", "title_tokens": ["CONCEPT", "GRID"]}
+    assert (
+        _section_present("I WAS UNABLE TO COMPLETE PART 2.", req) is False
+    )
+
+
+def test_part_n_missing_from_response_does_not_count():
+    """`PART 2 missing` is a disclaimer."""
+    req = {"num": "2", "title_tokens": ["CONCEPT", "GRID"]}
+    assert (
+        _section_present("PART 2 MISSING FROM THIS ANALYSIS.", req) is False
+    )
+
+
+def test_part_n_omitted_does_not_count():
+    """`PART 2 was omitted` is a disclaimer."""
+    req = {"num": "2", "title_tokens": ["CONCEPT", "GRID"]}
+    assert _section_present("PART 2 WAS OMITTED.", req) is False
+
+
+def test_markdown_header_part_n_counts_as_present():
+    """`## PART 2: Concept Grid` is a header — peer is delivering."""
+    req = {"num": "2", "title_tokens": ["CONCEPT", "GRID"]}
+    assert (
+        _section_present("## PART 2: CONCEPT GRID\nC1. FOO", req) is True
+    )
+
+
+def test_bold_wrapped_part_n_counts_as_present():
+    """`**PART 2 — CONCEPT GRID**` is a header — peer is delivering."""
+    req = {"num": "2", "title_tokens": ["CONCEPT", "GRID"]}
+    assert (
+        _section_present("**PART 2 — CONCEPT GRID**\nC1. FOO", req) is True
+    )
+
+
+def test_part_n_at_line_start_with_no_marker_counts():
+    """Plain `PART 2 — CONCEPT GRID` at line start is a header. The
+    structural route picks it up without `##`/`**` markers."""
+    req = {"num": "2", "title_tokens": ["CONCEPT", "GRID"]}
+    assert (
+        _section_present("PART 2 — CONCEPT GRID\nC1. FOO", req) is True
+    )
+
+
+def test_inline_part_n_with_title_nearby_counts():
+    """`My concept grid analysis for PART 2: ...` puts the salient title
+    token within the confirmation window of the literal PART N. The peer
+    is at least claiming to address this section."""
+    req = {"num": "2", "title_tokens": ["CONCEPT", "GRID"]}
+    assert (
+        _section_present(
+            "MY CONCEPT GRID ANALYSIS FOR PART 2: INCLUDES 14 ENTRIES.",
+            req,
+        )
+        is True
+    )
+
+
+def test_title_tokens_route_unaffected_by_skip_prose_on_literal_route():
+    """Documented edge: the literal-PART-N skip-prose guard only rejects
+    the literal route. If the title tokens themselves happen to live
+    near a skip-prose mention, the paraphrased-title fallback still
+    fires. This stays close to the spirit of the original two-route
+    matcher — narrowing only the literal-mention path, not the
+    paraphrase path.
+
+    Pass-8 finding #9 intentionally tightens the LITERAL route only.
+    Tightening the paraphrase route would risk false-negatives on
+    genuine paraphrased headers, which is the more dangerous failure
+    mode."""
+    req = {"num": "2", "title_tokens": ["CONCEPT", "GRID"]}
+    # Literal route alone rejects (skip-prose in window).
+    assert (
+        _section_present("I SKIPPED PART 2 DUE TO TIME.", req) is False
+    )
+    # Paraphrase route still fires when title tokens are co-located,
+    # even if the surrounding sentence skip-disclaims the section.
+    # This is the documented escape valve.
+    assert (
+        _section_present(
+            "I SKIPPED PART 2 (THE CONCEPT GRID) DUE TO TIME.", req
+        )
+        is True
+    )
+
+
+# --- pass-8 finding #9 (codex): prompt regex tolerates more header shapes ---
+
+def test_regex_matches_markdown_header_prefix():
+    """`## PART 2 — CONCEPT GRID (REQUIRED)` should match. v0.7.0
+    required bare `PART N` at line start; pass-8 loosens this."""
+    matches = list(REQUIRED_SECTION_HEADER_RE.finditer(
+        "## PART 2 — CONCEPT GRID (REQUIRED)"
+    ))
+    assert len(matches) == 1
+    assert matches[0].group("num") == "2"
+
+
+def test_regex_matches_triple_hash_header_prefix():
+    """`### PART 3 — FORCED YES/NO (REQUIRED)` should match."""
+    matches = list(REQUIRED_SECTION_HEADER_RE.finditer(
+        "### PART 3 — FORCED YES/NO (REQUIRED)"
+    ))
+    assert len(matches) == 1
+    assert matches[0].group("num") == "3"
+
+
+def test_regex_matches_colon_separator():
+    """`PART 2: Concept Grid (REQUIRED)` should match. Colon is a
+    common heading style alternative to em-dash."""
+    matches = list(REQUIRED_SECTION_HEADER_RE.finditer(
+        "PART 2: Concept Grid (REQUIRED)"
+    ))
+    assert len(matches) == 1
+    assert matches[0].group("num") == "2"
+
+
+def test_regex_matches_markdown_bold_wrapper():
+    """`**PART 2 — CONCEPT GRID (REQUIRED)**` should match. Bold-wrapped
+    headings appear in markdown prompts."""
+    matches = list(REQUIRED_SECTION_HEADER_RE.finditer(
+        "**PART 2 — CONCEPT GRID (REQUIRED)**"
+    ))
+    assert len(matches) == 1
+    assert matches[0].group("num") == "2"
+
+
+def test_regex_matches_title_case():
+    """`PART 2 — Concept Grid (REQUIRED)` should match. Some prompt
+    authors write titles in title case rather than ALL CAPS."""
+    matches = list(REQUIRED_SECTION_HEADER_RE.finditer(
+        "PART 2 — Concept Grid (REQUIRED)"
+    ))
+    assert len(matches) == 1
+    assert matches[0].group("num") == "2"
+
+
+def test_regex_matches_lowercase_part_and_required():
+    """`Part 2 — concept grid (required)` should match. Case-insensitive
+    matching covers paraphrased prompts that come back from automated
+    tools or non-native-English authors."""
+    matches = list(REQUIRED_SECTION_HEADER_RE.finditer(
+        "Part 2 — concept grid (required)"
+    ))
+    assert len(matches) == 1
+    assert matches[0].group("num") == "2"
+
+
+def test_regex_matches_combined_md_header_and_colon():
+    """`## PART 2: Concept Grid (REQUIRED)` — markdown header AND colon
+    separator together."""
+    matches = list(REQUIRED_SECTION_HEADER_RE.finditer(
+        "## PART 2: Concept Grid (REQUIRED)"
+    ))
+    assert len(matches) == 1
+    assert matches[0].group("num") == "2"
+
+
+def test_regex_extracts_salient_tokens_from_title_case():
+    """`Concept Grid` title-case title still extracts uppercase tokens
+    via title.upper() — paraphrase matching is unaffected."""
+    reqs = required_sections("## PART 2: Concept Grid (REQUIRED)")
+    assert len(reqs) == 1
+    assert reqs[0]["title_tokens"] == ["CONCEPT", "GRID"]
+
+
+def test_regex_still_rejects_inline_prose_required():
+    """`Required subsections:` must still not match — the regex must
+    only fire on actual section headers, not prose."""
+    text = "Required subsections:\nP1. ONE behavior...\n"
+    assert not list(REQUIRED_SECTION_HEADER_RE.finditer(text))
+
+
+def test_regex_still_rejects_part_n_without_required_marker():
+    """`PART 3 — FORCED YES/NO` without `(REQUIRED)` still doesn't
+    match. The validator stays opt-in."""
+    text = "## PART 3 — FORCED YES/NO ON THE HIGH-STAKES CLAIMS"
+    assert not list(REQUIRED_SECTION_HEADER_RE.finditer(text))
+
+
+def test_end_to_end_with_loosened_prompt_and_strict_response():
+    """Full path: a prompt with markdown-bold + colon heading is
+    detected, and a prose disclaimer in the response is flagged as
+    missing."""
+    prompt = "## PART 2: Concept Grid (REQUIRED)\n"
+    response = "RECOMMENDATION: tradeoff\nI skipped PART 2 due to time."
+    missing = required_sections_missing(prompt, response)
+    assert missing == ["PART 2: Concept Grid"]
+
+
+def test_end_to_end_with_loosened_prompt_and_paraphrased_response():
+    """Full path: a markdown-bold prompt heading is detected, and a
+    paraphrased response heading passes the salient-tokens route."""
+    prompt = "**PART 2 — CONCEPT GRID (REQUIRED)**\n"
+    response = "RECOMMENDATION: tradeoff\n## Concept Grid\nC1. foo"
+    missing = required_sections_missing(prompt, response)
+    assert missing == []
