@@ -2,6 +2,74 @@
 
 ## Unreleased
 
+## 0.5.1 - 2026-05-16
+
+Pass-4 council review of v0.5.0 (transcript:
+`.llm-council/runs/20260516_073739_*`) returned RECOMMENDATION: no with
+6 concrete correctness bugs the implementation missed. This patch
+addresses each.
+
+- **Synthesis chair label validation (council #1).** Chair output is a
+  decision memo by design, NOT a vote. v0.5.0 invoked the chair through
+  the standard `run_participant` path which enforces the `RECOMMENDATION:`
+  label — chair responses would fail validation and burn a repair retry.
+  Fix: `synthesis.run_synthesis_chair` now sets
+  `require_recommendation: False` and `retry_on_missing_label: False`
+  on the chair's per-run cfg.
+- **Synthesis sees final round only (council #2).** v0.5.0 passed the
+  cumulative `results` list (round-1 + `:round2`-suffixed entries) to
+  the chair, while the prompt headed them "final round." Fix:
+  `orchestrator.execute_council` now calls
+  `transcript.final_round_results(results)` before invoking the chair.
+- **Universal-abdication short-circuits BEFORE round 2 (council #3).**
+  v0.5.0 stamped the merged-blockers payload AFTER the deliberation
+  loop, defeating the "save spend" intent. Fix: the check now runs
+  immediately after round 1; if it fires, the deliberation while-loop
+  guard refuses to enter and `deliberation_status` records
+  `skipped_universal_abdication`.
+- **Repair-retry no longer misclassified as abdication (council #4).**
+  A successful repair-retry's `output` is a `_format_retry_transcript`
+  block containing BOTH the repaired AND original sections. If the
+  original had `EFFORT: blocked`, `_extract_response_envelope` would
+  see it on the combined text and flip the (valid) repaired result
+  to abdicated. Fix: new `_envelope_parse_source` strips the original
+  section before parsing; `_with_envelope` also skips abdication
+  detection when `repair_retry_recovered=True`.
+- **`EFFORT: blocked` without label is terminal (council #6).** A peer
+  that self-reported blocked without emitting a label was still
+  eligible for the label-only repair retry — wasted spend on a
+  definitively blocked peer. Fix: `_is_label_only_failure` now refuses
+  retry when `EFFORT: blocked` is present, even without a label.
+- **Abdications never cached (council #10).** Cache writes happen
+  inside per-adapter functions BEFORE `run_participant` -> `_with_envelope`
+  flips abdication to `ok=False`. The `if not result.ok` cache guard
+  therefore let abdication shapes slip through. Fix: `_maybe_persist_cache`
+  now scans the output shape with `_is_abdication` and refuses the
+  write — preserving the "failed runs are never cached" invariant.
+
+UX patches bundled with the bug fixes:
+
+- `recommendation_line` for fenced-only labels now returns the explicit
+  placeholder `(no RECOMMENDATION label emitted)` instead of falling back
+  to arbitrary intro prose. Prevents round-2 deliberation prompts from
+  echoing peer intro sentences as if they were positions.
+- `select_synthesizer("current")` documents that the host CLI must be a
+  configured participant — peer-only modes fail loudly instead of
+  silently picking the requester.
+- CLI now stamps `metadata["secret_scan"]` in transcripts (parity with
+  MCP server) and surfaces `synthesis_error` on stderr so the user sees
+  WHY synthesis didn't happen instead of getting no synthesis section
+  with no explanation.
+- CLAUDE.md updated: failure-taxonomy note for `abdicated` now correctly
+  states EITHER `BLOCKERS:` OR `ASSUMPTIONS:` satisfies the bar; the
+  `RECOMMENDATION:` label invariant clarifies that `recommendation_line`'s
+  fallback differs from the strict label-match helpers.
+
+11 regression tests added in `tests/test_pass4_fixes.py` covering each
+of the 6 must-fix bugs plus the UX patches. Full suite: 588 passed; the
+same 4 pre-existing environment failures (no `mcp` package, no ollama,
+budget-config drift) are unchanged.
+
 ## 0.5.0 - 2026-05-16
 
 Post-council-review build (three council passes drove the scope; transcripts in

@@ -188,6 +188,15 @@ def _maybe_persist_cache(
         return
     if result.from_cache:
         return
+    # Pass-4 fix #10: cache writes happen inside per-adapter functions,
+    # BEFORE run_participant -> _with_envelope flips abdication outputs
+    # to ok=False. The "ok=True" check above therefore lets abdication
+    # shapes slip through, persisting a terminal non-vote. Refuse the
+    # write when the output looks like abdication; the cache invariant
+    # "failed runs are never cached" must apply to abdication too.
+    envelope = _extract_response_envelope(result.output)
+    if _is_abdication(envelope, result.output):
+        return
     payload = cache_build_payload(
         participant_name=name,
         prompt=prompt,
@@ -1312,7 +1321,18 @@ def _is_label_only_failure(output: str, cfg: dict[str, Any]) -> bool:
     if not output or not output.strip():
         return False
     error = _response_validation_error(output, cfg)
-    return error.startswith("InvalidParticipantResponse: missing required")
+    if not error.startswith("InvalidParticipantResponse: missing required"):
+        return False
+    # Pass-4 fix #6: a peer that emits `EFFORT: blocked` (with or without a
+    # label) has self-reported it cannot make this call. Retrying with the
+    # same prompt produces another abdication. Treat as terminal — the
+    # adapter records the original error, _with_envelope flips it to
+    # `abdicated` if a label was emitted, and the orchestrator drops it
+    # from quorum. Re-asking adds latency and cost for no signal.
+    envelope = _extract_response_envelope(output)
+    if (envelope.get("effort") or "").lower() == "blocked":
+        return False
+    return True
 
 
 def _format_retry_transcript(
@@ -1437,12 +1457,24 @@ def _with_envelope(result: ParticipantResult) -> ParticipantResult:
     Abdication detection runs once here so quorum math (in the orchestrator)
     sees ``ok=False`` and excludes the peer. Abdication is intentionally
     NOT eligible for the label-only repair retry — see ``_is_label_only_failure``.
+
+    Pass-4 fix #4: a successful repair-retry result has its output set to a
+    `_format_retry_transcript` block that includes BOTH the repaired response
+    AND the original (which may have contained ``EFFORT: blocked``). Parsing
+    envelope from the combined text would re-flag the valid result as
+    abdication. Detect retry transcripts by their stable marker prefix and
+    parse only the repaired section.
     """
     from dataclasses import replace
 
-    envelope = _extract_response_envelope(result.output)
+    parse_source = _envelope_parse_source(result.output)
+    envelope = _extract_response_envelope(parse_source)
     updated = replace(result, **envelope)
-    if updated.ok and _is_abdication(envelope, updated.output):
+    if (
+        updated.ok
+        and not updated.repair_retry_recovered
+        and _is_abdication(envelope, parse_source)
+    ):
         return replace(
             updated,
             ok=False,
@@ -1454,6 +1486,29 @@ def _with_envelope(result: ParticipantResult) -> ParticipantResult:
             ),
         )
     return updated
+
+
+def _envelope_parse_source(output: str) -> str:
+    """Strip the original-attempt section out of a repair-retry transcript.
+
+    ``_format_retry_transcript`` produces output of the shape::
+
+        [recovered after retry] ...
+        --- Repaired response ---
+        <repaired>
+        --- Original response (first attempt) ---
+        <original>
+
+    We want the envelope to reflect only the repaired (valid) attempt, so
+    the original section is dropped. Non-retry outputs are returned as-is.
+    """
+    if not output or "--- Repaired response ---" not in output:
+        return output
+    head, _, tail = output.partition("--- Repaired response ---")
+    repaired_section, _, _original_section = tail.partition(
+        "--- Original response (first attempt) ---"
+    )
+    return repaired_section.strip()
 
 
 def _has_recommendation_label(output: str) -> bool:

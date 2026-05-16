@@ -39,6 +39,9 @@ def model_comparison(results: list[ParticipantResult]) -> list[str]:
     return lines
 
 
+_NO_LABEL_PLACEHOLDER = "(no RECOMMENDATION label emitted)"
+
+
 def recommendation_line(text: str) -> str:
     in_fence = False
     for line in text.splitlines():
@@ -49,7 +52,13 @@ def recommendation_line(text: str) -> str:
             continue
         if RECOMMENDATION_RE.match(line):
             return line.strip()
-    return first_nonempty_line(text)
+    # Pass-4 fix #7: a peer whose only label sits inside a code fence is
+    # invalid by the v0.5.0 label contract. Falling back to first_nonempty_line
+    # was injecting random intro prose ("Here is my analysis:") into the
+    # round-2 deliberation prompt as that peer's "position". Emit an
+    # explicit placeholder instead so the next-round chair/peers can see
+    # the peer had no usable vote.
+    return _NO_LABEL_PLACEHOLDER
 
 
 def recommendation_label(text: str) -> str:

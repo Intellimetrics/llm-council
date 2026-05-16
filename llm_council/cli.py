@@ -2116,6 +2116,25 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         current=current,
         question=question,
     )
+    # Pass-4 fix #9: parity with mcp_server — record the secret-scan
+    # result in metadata so the transcript captures it. CLI's stderr
+    # warning is for the user-at-the-terminal; transcripts go to audit
+    # tooling that doesn't read the terminal.
+    if scan_result.get("scrubbed_count") or scan_policy != "off":
+        metadata["secret_scan"] = scan_result
+    # Pass-4 fix #8: synthesis ran but the chair config was missing or
+    # invalid. orchestrator catches the ValueError and stamps the message;
+    # surface it here so the user sees WHY synthesis didn't happen
+    # instead of silently getting no synthesis section.
+    if metadata.get("synthesis_error"):
+        print(
+            display.format_gutter(
+                "warn",
+                f"synthesis skipped: {metadata['synthesis_error']}",
+                color=display.wants_color(sys.stdout),
+            ),
+            flush=True,
+        )
     if image_manifest:
         metadata["images"] = [
             {

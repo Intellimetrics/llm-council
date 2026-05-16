@@ -108,10 +108,15 @@ def select_synthesizer(
                 "(execute_council current=None). Set synthesizer to a "
                 "participant name instead."
             )
+        # Pass-4 fix #5: when the host CLI is not in participant_cfg the
+        # caller intentionally excluded it from the council (peer-only
+        # modes etc.). Fall back loudly rather than silently picking it.
         if current not in participant_cfg:
             raise ValueError(
-                f"defaults.synthesizer='current' but host CLI '{current}' is "
-                f"not configured as a participant."
+                f"defaults.synthesizer='current' but host CLI '{current}' "
+                "is not a configured participant for this run (peer-only "
+                "mode, or `current` excluded from the council). Set "
+                "synthesizer to a configured participant name."
             )
         return current
     if raw == "neutral_peer":
@@ -275,6 +280,12 @@ async def run_synthesis_chair(
     """
     prompt = build_synthesis_prompt(question, results, convergence, max_chars=max_chars)
     cfg = dict(participant_cfg.get(chair_name) or {})
+    # Chair output is a decision memo, not a vote. Override
+    # require_recommendation so the standard label-validation path does NOT
+    # reject the chair's structured ## Decision / ## Consensus blockers /
+    # ## Dissent sections, and so the label-only repair retry does not fire.
+    cfg["require_recommendation"] = False
+    cfg["retry_on_missing_label"] = False
     cache_ctx = CacheContext(cwd=cwd, cache_disabled=True)
     chair_result = await run_participant(
         chair_name, cfg, prompt, cwd, cache_ctx=cache_ctx

@@ -431,11 +431,35 @@ async def execute_council(
             metadata["deliberation_status"] = "pending"
             emit({"event": "deliberation_pending", "round": round_number + 1})
 
+    # Universal-abdication short-circuit (Pass-4 fix #3): if every peer in
+    # round 1 abdicated, deliberating with the same prompt won't help —
+    # they'll abdicate again. Stamp the merged-blockers payload now and
+    # skip into the post-loop quorum/synthesis flow.
+    from llm_council.synthesis import universal_abdication as _universal_abdication
+
+    _early_abdication = _universal_abdication(round_results)
+    if _early_abdication:
+        metadata["universal_abdication"] = _early_abdication
+        metadata["deliberation_status"] = "skipped_universal_abdication"
+        emit(
+            {
+                "event": "universal_abdication",
+                "round": round_number,
+                "blockers": _early_abdication["blockers"],
+                "abdicated_peers": _early_abdication["abdicated_peers"],
+            }
+        )
+
     cumulative_excluded: set[str] = set()
     aborted_all_excluded = False
     convergence_by_round: dict[int, list[dict[str, Any]]] = {}
     deliberation_prompts: dict[int, str] = {}
-    while deliberate and max_rounds > round_number and has_disagreement(round_results):
+    while (
+        deliberate
+        and max_rounds > round_number
+        and has_disagreement(round_results)
+        and not metadata.get("universal_abdication")
+    ):
         cumulative_excluded.update(_failed_for_deliberation(round_results))
         deliberation_participants = [
             name for name in participants if name not in cumulative_excluded
@@ -585,27 +609,13 @@ async def execute_council(
         run_synthesis_chair,
         select_synthesizer,
         should_synthesize,
-        universal_abdication,
     )
+    from llm_council.transcript import final_round_results
 
-    # Universal-abdication short-circuit: skip both synthesis and any
-    # speculative future deliberation when every peer abdicated. Stamps a
-    # merged-blockers payload the caller can surface.
-    final_round_results_only = [
-        r for r in results if r.name.split(":round", 1)[0] == r.name
-        or r.name.endswith(f":round{metadata.get('rounds')}")
-    ]
-    abdication_payload = universal_abdication(final_round_results_only or results)
-    if abdication_payload:
-        metadata["universal_abdication"] = abdication_payload
-        emit(
-            {
-                "event": "universal_abdication",
-                "blockers": abdication_payload["blockers"],
-                "abdicated_peers": abdication_payload["abdicated_peers"],
-            }
-        )
-
+    # Pass-4 fix #2: synthesis must see ONLY the final round, not the
+    # cumulative `results` list (which after deliberation also includes
+    # round-1 peer outputs). Reuse the established helper rather than
+    # filtering by name suffix here.
     if synthesize_flag and should_synthesize(synthesize_flag, metadata):
         try:
             chair_name = select_synthesizer(
@@ -616,9 +626,10 @@ async def execute_council(
             )
             emit({"event": "synthesis_start", "chair": chair_name})
             convergence_for_chair = metadata.get("convergence")
+            chair_input = final_round_results(results)
             synthesis_payload = await run_synthesis_chair(
                 question=(question or prompt),
-                results=results,
+                results=chair_input,
                 convergence=convergence_for_chair,
                 participant_cfg=participant_cfg,
                 cwd=cwd,
