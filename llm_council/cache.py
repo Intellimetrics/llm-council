@@ -21,7 +21,7 @@ from typing import Any
 CACHE_SUBDIR = ".llm-council/cache"
 DEFAULT_TTL_SECONDS = 24 * 3600
 PROMPT_PREVIEW_CHARS = 200
-CACHE_SCHEMA_VERSION = 3  # v3 = structured evidence shape (list[{text, tag}]), prompt_chars, recovered_after_timeout
+CACHE_SCHEMA_VERSION = 3  # v3 = structured evidence shape (list[{text, tag}]), prompt_chars, recovered_after_timeout, section_repair_attempted
 
 _MODES_THAT_SKIP_CACHE = frozenset({"consensus"})
 
@@ -156,6 +156,7 @@ def build_payload(
     command: list[str] | None,
     recovered_after_timeout: bool = False,
     prompt_chars: int | None = None,
+    section_repair_attempted: bool = False,
 ) -> dict[str, Any]:
     preview = prompt[:PROMPT_PREVIEW_CHARS]
     return {
@@ -183,6 +184,12 @@ def build_payload(
         # field landed within the v3 window) rehydrates cleanly.
         "recovered_after_timeout": bool(recovered_after_timeout),
         "prompt_chars": prompt_chars,
+        # Pass-9 fix: persist whether the section-repair retry path fired
+        # for this run. Only relevant on successful results (failed runs
+        # aren't cached), but threading it through means a cache hit on a
+        # sections-recovered result still sees the flag, which keeps the
+        # strict-evidence wrapper's guard correct across cache hits.
+        "section_repair_attempted": bool(section_repair_attempted),
     }
 
 

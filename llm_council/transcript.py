@@ -362,6 +362,8 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
         payload["recovered_after_timeout"] = True
     if result.terse_retry_attempted:
         payload["terse_retry_attempted"] = True
+    if result.section_repair_attempted:
+        payload["section_repair_attempted"] = True
     if result.prompt_chars is not None:
         payload["prompt_chars"] = result.prompt_chars
     if result.from_cache:

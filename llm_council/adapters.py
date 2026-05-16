@@ -182,6 +182,22 @@ class ParticipantResult:
     # Stays `None` only on results that never represented a real call
     # attempt (e.g. cache hits, the unsupported-type fallback).
     prompt_chars: int | None = None
+    # Set True whenever the section-coverage repair retry path FIRED
+    # (regardless of outcome), as opposed to `repair_retry_recovered`
+    # which only flips on success of any repair retry. Pass-9 dogfood
+    # surfaced a coupled failure mode: a section-repair retry can fix
+    # the missing sections but surface a NEW UntaggedEvidence error
+    # (label → sections → evidence validation order, see
+    # `_response_validation_error`). Without this flag the
+    # strict-evidence wrapper would chain a SECOND repair retry on top
+    # of the section-repair merge result, breaking the "one extra call
+    # per peer per round" invariant. The merge functions
+    # (`_merge_cli_section_retry`, `_merge_hosted_section_retry`) set
+    # this flag so the strict-evidence wrapper can refuse to fire.
+    # Distinct from `repair_retry_recovered`: BOTH can be True in the
+    # case where sections recovered but the now-visible evidence is
+    # untagged (handled by the new third merge branch).
+    section_repair_attempted: bool = False
 
 
 @dataclass
@@ -242,6 +258,9 @@ def _result_from_cache_payload(
         from_cache=True,
         recovered_after_timeout=bool(payload.get("recovered_after_timeout", False)),
         prompt_chars=payload.get("prompt_chars"),
+        section_repair_attempted=bool(
+            payload.get("section_repair_attempted", False)
+        ),
     )
 
 
@@ -306,6 +325,7 @@ def _maybe_persist_cache(
         command=result.command,
         recovered_after_timeout=result.recovered_after_timeout,
         prompt_chars=result.prompt_chars,
+        section_repair_attempted=result.section_repair_attempted,
     )
     try:
         cache_write(
@@ -505,12 +525,17 @@ async def run_cli_participant(
     # one or more EVIDENCE bullets lacked an epistemic tag). Cap of one
     # retry. No chaining with terse-retry, label-retry, or section-repair —
     # they're independent error-paths, and chaining would push past the
-    # documented "one extra round" wall-clock ceiling.
+    # documented "one extra round" wall-clock ceiling. The
+    # `section_repair_attempted` guard is the pass-9 fix: when the
+    # section-repair retry already fired and surfaced new
+    # `UntaggedEvidence:`, chaining a strict-evidence retry on top would
+    # be the third outer-visible call per peer.
     if (
         not result.ok
         and _retry_enabled(cfg)
         and result.error.startswith(UNTAGGED_EVIDENCE_PREFIX)
         and not getattr(result, "recovered_after_timeout", False)
+        and not getattr(result, "section_repair_attempted", False)
     ):
         retry_prompt = (
             f"{prompt}\n\n"
@@ -884,9 +909,22 @@ def _merge_cli_section_retry(
     - retry came back missing sections again → ok=False with the
       `IncompleteResponse:` prefix preserved (so error_kind stays
       `incomplete_response`) and a section-themed exhausted-retry header
+    - retry came back with sections OK but EVIDENCE untagged
+      (`UntaggedEvidence:` — strict-evidence is the gate AFTER
+      sections in `_response_validation_error`) → ok=False with the
+      retry's `UntaggedEvidence:` error preserved so `classify_error`
+      returns `untagged_evidence`. Pass-9 dogfood found this case used
+      to fall through to `return original`, silently discarding the
+      section-fixed retry and undercounting `untagged_evidence`.
     - retry failed for an unrelated reason (downstream/timeout/etc.) →
       preserve the original failure so the operator sees the section-
       coverage error, not the retry's incidental failure
+
+    ALL non-fall-through branches set `section_repair_attempted=True`
+    so the strict-evidence wrapper can refuse to fire on the
+    sections-recovered-but-evidence-untagged result (without that
+    guard, the wrapper would chain a third call, breaking the "one
+    extra call per peer per round" invariant).
     """
     if retry.ok:
         merged_output = _format_retry_transcript(
@@ -904,6 +942,7 @@ def _merge_cli_section_retry(
             command=retry.command,
             model=retry.model,
             repair_retry_recovered=True,
+            section_repair_attempted=True,
         )
     if retry.error.startswith(INCOMPLETE_RESPONSE_PREFIX) and retry.output:
         merged_output = _format_retry_transcript(
@@ -924,6 +963,31 @@ def _merge_cli_section_retry(
             elapsed_seconds=retry.elapsed_seconds,
             command=retry.command,
             model=retry.model,
+            section_repair_attempted=True,
+        )
+    if retry.error.startswith(UNTAGGED_EVIDENCE_PREFIX) and retry.output:
+        # Pass-9 fix: section-repair retry recovered the missing sections
+        # but the now-visible EVIDENCE bullets lack epistemic tags.
+        # Preserve the retry's `UntaggedEvidence:` error so error_kind
+        # routes correctly, and surface BOTH attempts in the merged
+        # output so the operator can see what happened. The
+        # strict-evidence wrapper checks `section_repair_attempted`
+        # and refuses to chain another retry.
+        merged_output = _format_retry_transcript(
+            original_output=original.output,
+            retry_output=retry.output,
+            recovered=False,
+            header_kind="sections_then_evidence",
+        )
+        return ParticipantResult(
+            name=retry.name,
+            ok=False,
+            output=merged_output,
+            error=retry.error,
+            elapsed_seconds=retry.elapsed_seconds,
+            command=retry.command,
+            model=retry.model,
+            section_repair_attempted=True,
         )
     return original
 
@@ -1043,18 +1107,29 @@ async def run_openai_compatible_participant(
     # apply the retry here at the wrapper layer. One shot, no chaining
     # with terse-retry above: a peer that already needed terse recovery
     # shouldn't get a third call. Mirrors the CLI strict-evidence path so
-    # all three transports behave identically.
+    # all three transports behave identically. The
+    # `section_repair_attempted` guard is the pass-9 fix: when the
+    # section-repair retry already fired and surfaced new
+    # `UntaggedEvidence:`, chaining a strict-evidence retry on top would
+    # be the third outer-visible call per peer.
     if (
         not result.ok
         and _retry_enabled(cfg)
         and result.error.startswith(UNTAGGED_EVIDENCE_PREFIX)
         and not getattr(result, "recovered_after_timeout", False)
+        and not getattr(result, "section_repair_attempted", False)
     ):
         retry_prompt = _build_strict_evidence_retry_prompt(prompt, result.output)
         max_prompt_chars = cfg.get("max_prompt_chars")
         if max_prompt_chars is None or len(retry_prompt) <= int(max_prompt_chars):
+            # Disable the inner's own label-repair retry for this call so a
+            # strict-evidence retry response that drops the RECOMMENDATION
+            # label cannot fire a chained third outer call. Mirrors the
+            # section-repair pattern above.
+            retry_cfg = dict(cfg)
+            retry_cfg["retry_on_missing_label"] = False
             retry_result = await _run_openai_compatible_inner(
-                name, cfg, retry_prompt, image_manifest=image_manifest,
+                name, retry_cfg, retry_prompt, image_manifest=image_manifest,
                 mode_multiplier=mode_multiplier, mode=mode,
             )
             result = _merge_hosted_strict_evidence_retry(result, retry_result)
@@ -1104,6 +1179,9 @@ def _merge_hosted_section_retry(
     Same semantics as `_merge_cli_section_retry` but written against
     the hosted/local `ParticipantResult` shape (no `command`, has
     `prompt_tokens`/`completion_tokens`/`total_tokens`/`cost_usd`).
+    See `_merge_cli_section_retry` for the third-branch rationale
+    (sections recovered but EVIDENCE untagged → preserve the retry's
+    `UntaggedEvidence:` error and set `section_repair_attempted=True`).
     """
     if retry.ok:
         merged_output = _format_retry_transcript(
@@ -1124,6 +1202,7 @@ def _merge_hosted_section_retry(
             total_tokens=retry.total_tokens,
             cost_usd=retry.cost_usd,
             repair_retry_recovered=True,
+            section_repair_attempted=True,
         )
     if retry.error.startswith(INCOMPLETE_RESPONSE_PREFIX) and retry.output:
         merged_output = _format_retry_transcript(
@@ -1147,6 +1226,30 @@ def _merge_hosted_section_retry(
             completion_tokens=retry.completion_tokens,
             total_tokens=retry.total_tokens,
             cost_usd=retry.cost_usd,
+            section_repair_attempted=True,
+        )
+    if retry.error.startswith(UNTAGGED_EVIDENCE_PREFIX) and retry.output:
+        # Pass-9 fix: section-repair retry recovered the missing sections
+        # but the now-visible EVIDENCE bullets lack epistemic tags. See
+        # `_merge_cli_section_retry` for the full rationale.
+        merged_output = _format_retry_transcript(
+            original_output=original.output,
+            retry_output=retry.output,
+            recovered=False,
+            header_kind="sections_then_evidence",
+        )
+        return ParticipantResult(
+            name=retry.name,
+            ok=False,
+            output=merged_output,
+            error=retry.error,
+            elapsed_seconds=retry.elapsed_seconds,
+            model=retry.model,
+            prompt_tokens=retry.prompt_tokens,
+            completion_tokens=retry.completion_tokens,
+            total_tokens=retry.total_tokens,
+            cost_usd=retry.cost_usd,
+            section_repair_attempted=True,
         )
     # Retry failed for an unrelated reason (downstream/timeout/empty
     # response/etc.). Preserve the original failure so the operator
@@ -1591,18 +1694,29 @@ async def run_ollama_participant(
     )
     # Strict-evidence repair retry (parallels CLI + openai_compatible).
     # The inner's label-retry path skips untagged_evidence failures, so we
-    # apply the retry here. One shot, no chaining with terse-retry.
+    # apply the retry here. One shot, no chaining with terse-retry. The
+    # `section_repair_attempted` guard is the pass-9 fix: when the
+    # section-repair retry already fired and surfaced new
+    # `UntaggedEvidence:`, chaining a strict-evidence retry on top would
+    # be the third outer-visible call per peer.
     if (
         not result.ok
         and _retry_enabled(cfg)
         and result.error.startswith(UNTAGGED_EVIDENCE_PREFIX)
         and not getattr(result, "recovered_after_timeout", False)
+        and not getattr(result, "section_repair_attempted", False)
     ):
         retry_prompt = _build_strict_evidence_retry_prompt(prompt, result.output)
         max_prompt_chars = cfg.get("max_prompt_chars")
         if max_prompt_chars is None or len(retry_prompt) <= int(max_prompt_chars):
+            # Disable the inner's own label-repair retry for this call so a
+            # strict-evidence retry response that drops the RECOMMENDATION
+            # label cannot fire a chained third outer call. Mirrors the
+            # section-repair pattern above.
+            retry_cfg = dict(cfg)
+            retry_cfg["retry_on_missing_label"] = False
             retry_result = await _run_ollama_inner(
-                name, cfg, retry_prompt, image_manifest=image_manifest,
+                name, retry_cfg, retry_prompt, image_manifest=image_manifest,
                 mode_multiplier=mode_multiplier, mode=mode,
             )
             result = _merge_hosted_strict_evidence_retry(result, retry_result)
@@ -1983,6 +2097,7 @@ async def run_participants(
                         "repair_retry_recovered": result.repair_retry_recovered,
                         "recovered_after_timeout": result.recovered_after_timeout,
                         "terse_retry_attempted": result.terse_retry_attempted,
+                        "section_repair_attempted": result.section_repair_attempted,
                     }
                 )
             return result
@@ -2136,9 +2251,22 @@ def _format_retry_transcript(
     repair retry so the human-readable header is accurate. "label" is
     the original label-missing path; "sections" is the section-coverage
     repair path (the response had the RECOMMENDATION label but skipped
-    one or more `PART N — TITLE (REQUIRED)` sections).
+    one or more `PART N — TITLE (REQUIRED)` sections);
+    "sections_then_evidence" is the pass-9 case where the section-repair
+    retry produced sections OK but EVIDENCE bullets without epistemic
+    tags — the retry IS preserved (not silently dropped) but the result
+    is still ok=False because strict_evidence flagged it.
     """
-    if header_kind == "sections":
+    if header_kind == "sections_then_evidence":
+        header = (
+            "[retry exhausted] "
+            "Section-repair retry recovered the missing REQUIRED sections "
+            "but the now-visible EVIDENCE bullets lack a [PUBLISHED]/"
+            "[OBSERVABLE]/[INFERRED]/[SPECULATIVE] tag (strict_evidence is "
+            "enabled). No further repair retry will fire — the cumulative "
+            "wall-clock cost ceiling caps at one extra round per peer."
+        )
+    elif header_kind == "sections":
         header = (
             "[recovered after retry] "
             "First attempt was missing one or more REQUIRED sections; "
@@ -2187,6 +2315,25 @@ _ENVELOPE_LIST_HEADER_RE = re.compile(
     ^\s*(?:>\s*)?(?:\*\*)?
     (?P<key>BLOCKERS|EVIDENCE|TESTS_TO_RUN|ASSUMPTIONS)
     (?:\*\*)?\s*:\s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Inline single-entry form: ``EVIDENCE: <content>`` on one line. Peers
+# in the wild (qwen, observed in pass-9) emit each evidence claim as its
+# own ``EVIDENCE: ...`` line instead of a bare ``EVIDENCE:`` header
+# followed by ``- bullet`` lines. Without this fallback those entries
+# are silently dropped, which ALSO silently disables strict-evidence
+# validation for the response — the validator only fires on parsed
+# entries that lack a tag (empty list passes by design). Requires at
+# least one non-whitespace character after the colon so it doesn't
+# collide with the bare-header form already handled above.
+_ENVELOPE_LIST_INLINE_RE = re.compile(
+    r"""
+    ^\s*(?:>\s*)?(?:[-*+]\s+)?(?:\*\*)?
+    (?P<key>BLOCKERS|EVIDENCE|TESTS_TO_RUN|ASSUMPTIONS)
+    (?:\*\*)?\s*:\s*
+    (?P<item>\S.*?)\s*$
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -2282,6 +2429,20 @@ def _extract_response_envelope(output: str) -> dict[str, Any]:
                     envelope[active_list].append(item)
                 continue
             active_list = None
+        inline = _ENVELOPE_LIST_INLINE_RE.match(line)
+        if inline:
+            # `EVIDENCE: <content>` (and the BLOCKERS / TESTS_TO_RUN /
+            # ASSUMPTIONS analogues) as a single-line entry. Treat each
+            # such line as one item under the named list, and set
+            # active_list so any following `- bullet` lines accrue too.
+            target = _ENVELOPE_LIST_HEADERS[inline.group("key").upper()]
+            item = inline.group("item")
+            if target in TAG_PARSED_LIST_FIELDS:
+                envelope[target].append(_parse_tagged_entry(item))
+            else:
+                envelope[target].append(item)
+            active_list = target
+            continue
         single = _ENVELOPE_SINGLE_RE.match(line)
         if single:
             key = single.group("key").lower()

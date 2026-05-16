@@ -796,3 +796,421 @@ def test_openai_compatible_section_repair_respects_retries_zero(monkeypatch):
     assert result.error.startswith(INCOMPLETE_RESPONSE_PREFIX)
     # Original error wording (single attempt) — no "after one repair retry".
     assert "after one repair retry" not in result.error
+
+
+# --- Pass-9 fix: section-repair recovers sections but evidence untagged ---
+#
+# Bug (pass-9 finding A, codex + claude-round-2 + gemini-round-2 +
+# qwen-round-2): the section-repair merge functions
+# (`_merge_cli_section_retry`, `_merge_hosted_section_retry`) only had
+# branches for retry.ok==True and retry.error startswith
+# INCOMPLETE_RESPONSE_PREFIX. When strict_evidence is enabled AND the
+# section-repair retry succeeded at adding the missing sections BUT
+# now-visible EVIDENCE bullets lacked epistemic tags, the retry
+# produced `UntaggedEvidence:` (label → sections → evidence ordering
+# in `_response_validation_error`). The fall-through `return original`
+# silently discarded the retry, and the operator saw only the original
+# `IncompleteResponse:` error. The fix preserves the retry's
+# `UntaggedEvidence:` result (so `classify_error` returns
+# `untagged_evidence`) with both attempts in the merged transcript,
+# and sets `section_repair_attempted=True` to guard the
+# strict-evidence wrapper from chaining a third call.
+
+from pathlib import Path as _Path
+from unittest.mock import patch as _patch
+
+from llm_council.adapters import (
+    UNTAGGED_EVIDENCE_PREFIX,
+    ParticipantResult as _ParticipantResult,
+    _merge_cli_section_retry,
+    _merge_hosted_section_retry,
+    run_cli_participant,
+)
+
+
+_UNTAGGED_AFTER_SECTIONS_OUTPUT = (
+    "RECOMMENDATION: yes - sections now present\n"
+    "## PART 2 — Concept Grid\n"
+    "C1. foo\n"
+    "EVIDENCE:\n"
+    "- plain bullet with no tag\n"
+)
+_TAGGED_AFTER_SECTIONS_OUTPUT = (
+    "RECOMMENDATION: yes - sections now present\n"
+    "## PART 2 — Concept Grid\n"
+    "C1. foo\n"
+    "EVIDENCE:\n"
+    "- plain bullet [PUBLISHED]\n"
+)
+
+
+def _untagged_after_sections_error() -> str:
+    return (
+        f"{UNTAGGED_EVIDENCE_PREFIX} 1 EVIDENCE entry/entries lack a "
+        "[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE] tag while "
+        "defaults.strict_evidence is true"
+    )
+
+
+def test_merge_cli_section_retry_preserves_untagged_evidence_retry():
+    """Unit-test for the new third branch in `_merge_cli_section_retry`.
+
+    A retry that fixes sections but has untagged EVIDENCE used to fall
+    through `return original`. The fix preserves the retry's
+    `UntaggedEvidence:` error, the merged transcript with both
+    attempts, and sets `section_repair_attempted=True`."""
+    original = _ParticipantResult(
+        name="peer",
+        ok=False,
+        output="RECOMMENDATION: yes - ok\nNo grid here.\n",
+        error=(
+            f"{INCOMPLETE_RESPONSE_PREFIX} response had the RECOMMENDATION "
+            "label but missed required sections: PART 2 — CONCEPT-BY-CONCEPT GRID"
+        ),
+        elapsed_seconds=1.0,
+        model="peer-model",
+    )
+    retry = _ParticipantResult(
+        name="peer",
+        ok=False,
+        output=_UNTAGGED_AFTER_SECTIONS_OUTPUT,
+        error=_untagged_after_sections_error(),
+        elapsed_seconds=1.5,
+        model="peer-model",
+    )
+
+    merged = _merge_cli_section_retry(original, retry)
+
+    assert merged.ok is False
+    assert merged.error.startswith(UNTAGGED_EVIDENCE_PREFIX)
+    assert classify_error(merged.error) == "untagged_evidence"
+    assert merged.section_repair_attempted is True
+    # Both attempts must be visible in the merged transcript.
+    assert "[retry exhausted]" in merged.output
+    assert "Section-repair retry recovered" in merged.output
+    assert "No grid here." in merged.output
+    assert "PART 2 — Concept Grid" in merged.output
+
+
+def test_merge_hosted_section_retry_preserves_untagged_evidence_retry():
+    """Same as above but for the hosted/local merge function."""
+    original = _ParticipantResult(
+        name="endpoint",
+        ok=False,
+        output="RECOMMENDATION: yes - ok\nNo grid here.\n",
+        error=(
+            f"{INCOMPLETE_RESPONSE_PREFIX} response had the RECOMMENDATION "
+            "label but missed required sections: PART 2 — CONCEPT-BY-CONCEPT GRID"
+        ),
+        elapsed_seconds=1.0,
+        model="x-ai/test",
+        prompt_tokens=10,
+        completion_tokens=5,
+        total_tokens=15,
+    )
+    retry = _ParticipantResult(
+        name="endpoint",
+        ok=False,
+        output=_UNTAGGED_AFTER_SECTIONS_OUTPUT,
+        error=_untagged_after_sections_error(),
+        elapsed_seconds=1.5,
+        model="x-ai/test",
+        prompt_tokens=12,
+        completion_tokens=8,
+        total_tokens=20,
+    )
+
+    merged = _merge_hosted_section_retry(original, retry)
+
+    assert merged.ok is False
+    assert merged.error.startswith(UNTAGGED_EVIDENCE_PREFIX)
+    assert classify_error(merged.error) == "untagged_evidence"
+    assert merged.section_repair_attempted is True
+    # The hosted variant carries token usage from the retry.
+    assert merged.prompt_tokens == 12
+    assert merged.completion_tokens == 8
+    assert merged.total_tokens == 20
+    # Both attempts visible.
+    assert "[retry exhausted]" in merged.output
+    assert "Section-repair retry recovered" in merged.output
+
+
+def test_merge_cli_section_retry_success_path_sets_section_repair_attempted():
+    """The success branch also flags `section_repair_attempted=True`
+    so the wrapper guard fires uniformly across all merge branches.
+    `repair_retry_recovered` and `section_repair_attempted` are both
+    True in this case — they answer different questions."""
+    original = _ParticipantResult(
+        name="peer",
+        ok=False,
+        output="RECOMMENDATION: yes - ok\nNo grid here.\n",
+        error=f"{INCOMPLETE_RESPONSE_PREFIX} missed: PART 2",
+        elapsed_seconds=1.0,
+    )
+    retry = _ParticipantResult(
+        name="peer",
+        ok=True,
+        output="RECOMMENDATION: yes\n## PART 2 — Concept Grid\nC1. foo\n",
+        error="",
+        elapsed_seconds=1.5,
+    )
+    merged = _merge_cli_section_retry(original, retry)
+    assert merged.ok is True
+    assert merged.repair_retry_recovered is True
+    assert merged.section_repair_attempted is True
+
+
+def test_openai_compatible_section_repair_surfaces_untagged_evidence(
+    monkeypatch,
+):
+    """End-to-end: section-repair retry on openai_compatible produces
+    sections + untagged evidence. Result must have
+    `error_kind=untagged_evidence`, `section_repair_attempted=True`,
+    and exactly TWO outer HTTP calls (NO third strict-evidence retry)."""
+    calls: list[dict] = []
+
+    bodies = [
+        # First response: label present, PART 2 missing.
+        _openai_body("RECOMMENDATION: yes - ok\nNo grid here.\n"),
+        # Section-repair retry: PART 2 fixed BUT evidence has no tag.
+        _openai_body(_UNTAGGED_AFTER_SECTIONS_OUTPUT),
+    ]
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return _FakeResponse(bodies[len(calls) - 1])
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openai_compatible_participant(
+            "router",
+            {
+                "type": "openai_compatible",
+                "model": "x-ai/test",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+                "strict_evidence": True,
+            },
+            _SECTION_PROMPT,
+        )
+    )
+
+    # Exactly two calls — no third strict-evidence repair retry.
+    assert len(calls) == 2, (
+        "expected one section-repair retry, no chained strict-evidence retry"
+    )
+    assert result.ok is False
+    assert result.error.startswith(UNTAGGED_EVIDENCE_PREFIX)
+    assert classify_error(result.error) == "untagged_evidence"
+    assert result.section_repair_attempted is True
+    # Both attempts must be visible in the merged transcript.
+    assert "Section-repair retry recovered" in result.output
+    assert "No grid here." in result.output
+    assert "PART 2 — Concept Grid" in result.output
+
+
+def test_ollama_section_repair_surfaces_untagged_evidence(monkeypatch):
+    """Same coverage on the ollama path."""
+    calls: list[dict] = []
+
+    bodies = [
+        _ollama_body("RECOMMENDATION: yes - ok\nNo grid here.\n"),
+        _ollama_body(_UNTAGGED_AFTER_SECTIONS_OUTPUT),
+    ]
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return _FakeResponse(bodies[len(calls) - 1])
+
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_ollama_participant(
+            "local",
+            {
+                "type": "ollama",
+                "model": "qwen3:test",
+                "base_url": "http://localhost:11434",
+                "strict_evidence": True,
+            },
+            _SECTION_PROMPT,
+        )
+    )
+
+    assert len(calls) == 2
+    assert result.ok is False
+    assert result.error.startswith(UNTAGGED_EVIDENCE_PREFIX)
+    assert classify_error(result.error) == "untagged_evidence"
+    assert result.section_repair_attempted is True
+    assert "Section-repair retry recovered" in result.output
+
+
+def test_cli_section_repair_surfaces_untagged_evidence():
+    """CLI path: section-repair retry produces sections + untagged
+    evidence. Result must surface `untagged_evidence`, set
+    `section_repair_attempted=True`, AND not chain a third retry."""
+    call_count = {"n": 0}
+
+    async def fake_run_cli_once(
+        name, cfg, prompt, cwd, *, start, mode_multiplier=None, mode=None
+    ):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return (
+                _ParticipantResult(
+                    name=name,
+                    ok=False,
+                    output="RECOMMENDATION: yes - ok\nNo grid here.\n",
+                    error=(
+                        f"{INCOMPLETE_RESPONSE_PREFIX} response had the "
+                        "RECOMMENDATION label but missed required sections: "
+                        "PART 2 — CONCEPT-BY-CONCEPT GRID"
+                    ),
+                    elapsed_seconds=1.0,
+                ),
+                {"nonzero_exit": False, "stderr": "", "exited": True},
+            )
+        # Retry: sections fixed, evidence untagged.
+        return (
+            _ParticipantResult(
+                name=name,
+                ok=False,
+                output=_UNTAGGED_AFTER_SECTIONS_OUTPUT,
+                error=_untagged_after_sections_error(),
+                elapsed_seconds=1.5,
+            ),
+            {"nonzero_exit": False, "stderr": "", "exited": True},
+        )
+
+    with _patch(
+        "llm_council.adapters._run_cli_once", side_effect=fake_run_cli_once
+    ), _patch(
+        "llm_council.adapters._cache_lookup", return_value=(None, None)
+    ), _patch("llm_council.adapters._maybe_persist_cache"):
+        result = asyncio.run(
+            run_cli_participant(
+                "peer",
+                {
+                    "type": "cli",
+                    "command": "peer",
+                    "strict_evidence": True,
+                    "timeout": 60,
+                },
+                _SECTION_PROMPT,
+                _Path("/tmp"),
+            )
+        )
+
+    # Two _run_cli_once calls: original + section-repair retry. NO third.
+    assert call_count["n"] == 2, (
+        "expected one section-repair retry, no chained strict-evidence retry"
+    )
+    assert result.ok is False
+    assert result.error.startswith(UNTAGGED_EVIDENCE_PREFIX)
+    assert classify_error(result.error) == "untagged_evidence"
+    assert result.section_repair_attempted is True
+    assert "Section-repair retry recovered" in result.output
+
+
+def test_strict_evidence_wrapper_guards_on_section_repair_attempted(
+    monkeypatch,
+):
+    """Direct guard test: a result already carrying
+    `section_repair_attempted=True` with `UntaggedEvidence:` must NOT
+    trigger a strict-evidence repair retry. Constructed by having the
+    section-repair retry surface untagged evidence and asserting only
+    two HTTP calls total."""
+    calls: list[dict] = []
+    bodies = [
+        _openai_body("RECOMMENDATION: yes\nNo grid here.\n"),
+        _openai_body(_UNTAGGED_AFTER_SECTIONS_OUTPUT),
+        # If the wrapper guard were missing, a third call would land
+        # here with the strict-evidence retry directive. The assertion
+        # below catches that — but we still seed a body just in case so
+        # the test fails with a clear assert rather than IndexError.
+        _openai_body(_TAGGED_AFTER_SECTIONS_OUTPUT),
+    ]
+
+    async def fake_request(client, method, url, **kwargs):
+        calls.append(kwargs.get("json"))
+        return _FakeResponse(bodies[len(calls) - 1])
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
+
+    result = asyncio.run(
+        run_openai_compatible_participant(
+            "router",
+            {
+                "type": "openai_compatible",
+                "model": "x-ai/test",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+                "strict_evidence": True,
+            },
+            _SECTION_PROMPT,
+        )
+    )
+
+    assert len(calls) == 2, (
+        f"strict-evidence wrapper must not fire on a section-repair "
+        f"result; got {len(calls)} calls"
+    )
+    assert result.section_repair_attempted is True
+
+
+def test_section_repair_attempted_persists_through_cache(tmp_path):
+    """Pass-8 fix #8 pattern: `section_repair_attempted` must round-trip
+    through the cache so a cache hit on a sections-recovered result
+    still carries the flag and the wrapper guard remains correct."""
+    from llm_council.adapters import (
+        CacheContext,
+        _maybe_persist_cache,
+        _result_from_cache_payload,
+    )
+    from llm_council.cache import read_cache
+
+    output = (
+        "[recovered after retry] First attempt was missing one or more "
+        "REQUIRED sections; second attempt is shown below.\n\n"
+        "--- Repaired response ---\n"
+        "RECOMMENDATION: yes - ok\n## PART 2 — Concept Grid\nC1. foo\n\n"
+        "--- Original response (first attempt) ---\n"
+        "RECOMMENDATION: yes - ok\nNo grid here."
+    )
+    r = _ParticipantResult(
+        name="peer",
+        ok=True,
+        output=output,
+        error="",
+        elapsed_seconds=2.0,
+        repair_retry_recovered=True,
+        section_repair_attempted=True,
+    )
+    cache_ctx = CacheContext(cwd=tmp_path, cache_mode="on", cache_disabled=False)
+    _maybe_persist_cache("peer", "the prompt", "fake-key", r, cache_ctx)
+    cached_files = list((tmp_path / ".llm-council" / "cache").glob("*.json"))
+    assert len(cached_files) == 1
+    payload = read_cache(cached_files[0], expected_key="fake-key")
+    assert payload is not None
+    assert payload.get("section_repair_attempted") is True
+    rehydrated = _result_from_cache_payload("peer", payload)
+    assert rehydrated.section_repair_attempted is True
+
+
+def test_result_from_cache_payload_defaults_missing_section_repair_attempted():
+    """Legacy payloads without the new key must rehydrate cleanly
+    (default False), not crash on KeyError."""
+    from llm_council.adapters import _result_from_cache_payload
+
+    legacy_payload = {
+        "output": "RECOMMENDATION: yes - fine",
+        "elapsed_seconds": 1.0,
+        "model": "test-model",
+        # Intentionally missing: section_repair_attempted
+    }
+    r = _result_from_cache_payload("peer", legacy_payload)
+    assert r.section_repair_attempted is False
+    assert r.ok is True
