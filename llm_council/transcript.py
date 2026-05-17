@@ -788,6 +788,55 @@ def write_transcript(
             )
             lines.append("")
 
+    finding_matrix_md = metadata.get("finding_matrix")
+    if isinstance(finding_matrix_md, dict) and (
+        finding_matrix_md.get("consensus_blockers")
+        or finding_matrix_md.get("single_peer_concerns")
+    ):
+        lines.extend(["## Finding Matrix", ""])
+        consensus = finding_matrix_md.get("consensus_blockers") or []
+        if consensus:
+            lines.append("**Consensus blockers** (>=2 peers, overlapping verified ranges):")
+            lines.append("")
+            for entry in consensus:
+                peers = ", ".join(entry.get("peers") or [])
+                location = ""
+                path = entry.get("path")
+                if path:
+                    lo = entry.get("start_line")
+                    hi = entry.get("end_line")
+                    location = f" at `{path}:{lo}-{hi}`"
+                lines.append(
+                    f"- {entry.get('id')} [{entry.get('severity')}]{location} — {peers}"
+                )
+                claim = (entry.get("claim") or "").strip()
+                if claim:
+                    lines.append(f"  - {claim}")
+            lines.append("")
+        singles = finding_matrix_md.get("single_peer_concerns") or []
+        if singles:
+            lines.append("**Single-peer concerns:**")
+            lines.append("")
+            for entry in singles:
+                peer = entry.get("peer") or "?"
+                location = ""
+                path = entry.get("path")
+                if path:
+                    lo = entry.get("start_line")
+                    hi = entry.get("end_line")
+                    location = f" at `{path}:{lo}-{hi}`"
+                    if entry.get("unverified"):
+                        location += " (unverified)"
+                elif entry.get("unverified"):
+                    location = " (unverified)"
+                lines.append(
+                    f"- {peer} [{entry.get('severity')}]{location}"
+                )
+                claim = (entry.get("claim") or "").strip()
+                if claim:
+                    lines.append(f"  - {claim}")
+            lines.append("")
+
     fence = markdown_fence(prompt)
     lines.extend(["## Prompt Sent", "", f"{fence}text", prompt, fence, ""])
 
@@ -810,6 +859,19 @@ def write_transcript(
             )
     markdown_path.write_text("\n".join(lines), encoding="utf-8")
 
+    # `finding_matrix` lives at the TOP level of the JSON payload for
+    # downstream consumers (eval harness, dashboards). We extract it
+    # from `metadata` and remove it there to avoid double-serialization
+    # (the same dict appearing under both `metadata.finding_matrix` and
+    # `json_payload.finding_matrix`).
+    finding_matrix_payload = None
+    if isinstance(metadata, dict) and "finding_matrix" in metadata:
+        # Shallow copy so the in-memory `metadata` mutation does not
+        # surprise the caller (orchestrator continues to use its own
+        # reference after `write_transcript` returns).
+        metadata = dict(metadata)
+        finding_matrix_payload = metadata.pop("finding_matrix")
+
     json_payload: dict[str, Any] = {
         "question": question,
         "mode": mode,
@@ -828,6 +890,12 @@ def write_transcript(
     overflow_records = context_overflow_records(results)
     if overflow_records:
         json_payload["context_overflow_excluded"] = overflow_records
+    if isinstance(finding_matrix_payload, dict) and (
+        finding_matrix_payload.get("consensus_blockers")
+        or finding_matrix_payload.get("single_peer_concerns")
+    ):
+        # Mirrors the shape used in MCP `structured_results`.
+        json_payload["finding_matrix"] = finding_matrix_payload
     json_path.write_text(
         json.dumps(json_payload, indent=2) + "\n",
         encoding="utf-8",

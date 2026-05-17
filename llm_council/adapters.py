@@ -23,7 +23,8 @@ from llm_council.cache import (
     read_cache as cache_read,
     write_cache as cache_write,
 )
-from llm_council.context import IMAGE_MIME_ALLOWLIST
+from llm_council.citations import parse_verified_tag, strip_verified_tag
+from llm_council.context import IMAGE_MIME_ALLOWLIST, apply_per_peer_directives
 
 
 OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
@@ -198,6 +199,13 @@ class ParticipantResult:
     # case where sections recovered but the now-visible evidence is
     # untagged (handled by the new third merge branch).
     section_repair_attempted: bool = False
+    # Failed [VERIFIED:path:start-end] citations recorded by
+    # citations.verify_evidence_citations after the orchestrator returns
+    # participant results. Each entry is a `path:start-end` string. Empty
+    # by default — VERIFIED tags are optional. Surfaced in transcripts +
+    # MCP structured_results so operators can see when a peer cited code
+    # that does not exist at the claimed range.
+    evidence_verification_failures: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -260,6 +268,9 @@ def _result_from_cache_payload(
         prompt_chars=payload.get("prompt_chars"),
         section_repair_attempted=bool(
             payload.get("section_repair_attempted", False)
+        ),
+        evidence_verification_failures=list(
+            payload.get("evidence_verification_failures") or []
         ),
     )
 
@@ -326,6 +337,7 @@ def _maybe_persist_cache(
         recovered_after_timeout=result.recovered_after_timeout,
         prompt_chars=result.prompt_chars,
         section_repair_attempted=result.section_repair_attempted,
+        evidence_verification_failures=result.evidence_verification_failures or None,
     )
     try:
         cache_write(
@@ -2014,6 +2026,14 @@ async def run_participants(
     async def run_one(name: str) -> ParticipantResult:
         async with semaphore:
             cfg = participant_cfg[name]
+            # Apply per-peer prompt directives (e.g. the review-with-tools
+            # tool-use block, scoped to CLI families with tool flags). The
+            # helper returns `prompt` unchanged for every other mode +
+            # peer combination, so hosted/local peers and non-tool modes
+            # remain backward-compatible.
+            peer_prompt = apply_per_peer_directives(
+                prompt, mode=mode, family=cfg.get("family")
+            )
             timeout = _resolve_effective_timeout(cfg, mode_multiplier)
             override = cfg.get("slow_warn_after_seconds")
             if override is not None:
@@ -2045,7 +2065,7 @@ async def run_participants(
                 result = await run_participant(
                     name,
                     cfg,
-                    prompt,
+                    peer_prompt,
                     cwd,
                     image_manifest=image_manifest,
                     cache_ctx=cache_ctx,
@@ -2368,14 +2388,26 @@ TAG_PARSED_LIST_FIELDS = frozenset({"evidence"})
 
 
 def _parse_tagged_entry(raw: str) -> dict[str, Any]:
-    """Extract a tag from an evidence bullet; structure as `{text, tag}`.
+    """Extract a tag from an evidence bullet; structure as `{text, tag, ...}`.
 
-    Tag-less entries return `{"text": raw, "tag": None}` so the parsed
-    shape is uniform and downstream consumers (stats, transcripts) can
-    treat untagged entries as a distinct category.
+    Three shapes returned:
+    - `[VERIFIED:path:start-end]` → `{text, tag: "verified", path, start_line, end_line, verified: None}`
+      (`verified` is set later by `citations.verify_evidence_citations`)
+    - `[PUBLISHED|OBSERVABLE|INFERRED|SPECULATIVE]` → `{text, tag: <lowercase>}`
+    - untagged → `{text, tag: None}`
     """
     if not raw:
         return {"text": raw, "tag": None}
+    verified = parse_verified_tag(raw)
+    if verified is not None:
+        return {
+            "text": strip_verified_tag(raw) or raw.strip(),
+            "tag": "verified",
+            "path": verified.path,
+            "start_line": verified.start_line,
+            "end_line": verified.end_line,
+            "verified": None,
+        }
     match = EVIDENCE_TAG_RE.search(raw)
     if not match:
         return {"text": raw, "tag": None}

@@ -418,6 +418,63 @@ def council_run_output_schema() -> dict[str, Any]:
                     "required": ["name", "ok", "label"],
                 },
             },
+            "consensus_blockers": {
+                "type": "array",
+                "description": (
+                    "Per-finding agreement matrix (Phase F). Findings >=2 peers "
+                    "anchored to overlapping `[VERIFIED:path:start-end]` ranges. "
+                    "Omitted entirely (along with `single_peer_concerns`) when "
+                    "no peer emitted FINDINGS or no cluster met the consensus "
+                    "threshold. Mechanical clustering only — no fuzzy prose "
+                    "match. Surfaces for synthesis input only; peers in round "
+                    "2 never see this."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "severity": {
+                            "type": "string",
+                            "enum": ["blocker", "medium", "nit"],
+                        },
+                        "peers": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "claim": {"type": "string"},
+                        "path": {"type": "string"},
+                        "start_line": {"type": "integer"},
+                        "end_line": {"type": "integer"},
+                    },
+                    "required": ["id", "severity", "peers", "claim"],
+                },
+            },
+            "single_peer_concerns": {
+                "type": "array",
+                "description": (
+                    "Findings only one peer raised — either no verified ref "
+                    "or no overlapping peer ref. Worth surfacing but not "
+                    "consensus-grade. Omitted entirely (along with "
+                    "`consensus_blockers`) when no peer emitted FINDINGS."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "peer": {"type": "string"},
+                        "id": {"type": "string"},
+                        "severity": {
+                            "type": "string",
+                            "enum": ["blocker", "medium", "nit"],
+                        },
+                        "claim": {"type": "string"},
+                        "path": {"type": ["string", "null"]},
+                        "start_line": {"type": ["integer", "null"]},
+                        "end_line": {"type": ["integer", "null"]},
+                        "unverified": {"type": "boolean"},
+                    },
+                    "required": ["peer", "severity", "claim"],
+                },
+            },
             "metadata": {"type": "object"},
             "summary_markdown": {
                 "type": "string",
@@ -1005,7 +1062,18 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         deliberated=bool(metadata.get("deliberated")),
         rounds=int(metadata.get("rounds") or 1),
     )
-    return {
+    # `finding_matrix` is lifted to the top-level `consensus_blockers` /
+    # `single_peer_concerns` keys below. Strip it from `metadata` before
+    # surfacing the payload so the same data is not serialized in two
+    # places (metadata.finding_matrix AND the top-level lists).
+    if isinstance(metadata, dict) and "finding_matrix" in metadata:
+        metadata = dict(metadata)
+        finding_matrix_payload = metadata.pop("finding_matrix") or {}
+    else:
+        finding_matrix_payload = {}
+    consensus_blockers = list(finding_matrix_payload.get("consensus_blockers") or [])
+    single_peer_concerns = list(finding_matrix_payload.get("single_peer_concerns") or [])
+    payload: dict[str, Any] = {
         "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
         "recommendation": recommendation,
         "agreement_count": agreement,
@@ -1022,6 +1090,14 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         "results": structured_results,
         "summary_markdown": summary_markdown,
     }
+    # Mirror the transcript JSON precedent: only emit the per-finding
+    # matrix keys when at least one of them has content. Runs without a
+    # FINDINGS envelope leave the keys absent rather than emitting empty
+    # arrays.
+    if consensus_blockers or single_peer_concerns:
+        payload["consensus_blockers"] = consensus_blockers
+        payload["single_peer_concerns"] = single_peer_concerns
+    return payload
 
 
 def last_transcript(arguments: dict[str, Any]) -> dict[str, Any]:

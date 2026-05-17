@@ -1,6 +1,182 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 - 2026-05-17
+
+v0.8.0 ships a closed-loop measurement pipeline. The keystone is the new
+`[VERIFIED:path:start-end]` evidence tag with mechanical verification;
+it generates the signal that powers both an eval harness with
+Signal-to-Noise Ratio (SNR) tracking and a minimal per-peer reliability
+layer. Architecture direction set by a council-on-itself
+meta-consultation (transcript
+`20260517_072537_meta-consultation-llm-council-product-roadmap-you-are-being.md`)
+plus a 2024–2026 literature review (citations below). 745 → 906 passing
+tests (+161); same 3 pre-existing environmental failures unchanged.
+Cache schema stays at v3 — the new `evidence_verification_failures`
+field defaults gracefully via `payload.get(...) or []` on rehydrate.
+
+**Closed-loop pipeline (Parts 1, 4, 7).** Three features that only
+deliver as a bundle:
+
+- *Verified citations.* `[VERIFIED:path:start-end]` joins the existing
+  `[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]` tag set. New
+  module `llm_council/citations.py` (`VerifiedRef`,
+  `parse_verified_tag`, `verify_ref`, `verify_evidence_citations`);
+  `adapters._parse_tagged_entry` extended to recognize the new tag;
+  `orchestrator.execute_council` calls `verify_evidence_citations`
+  after every round (`orchestrator.py:424,547`). Failed refs are
+  recorded on `ParticipantResult.evidence_verification_failures` but
+  the entry is NOT dropped — coverage > filtering, per Anthropic Claude
+  4 prompting guidance. Prompt directive added in `context.py`
+  envelope block asks peers to prefer the tag and explicitly states
+  unverifiable cites are kept, not dropped.
+
+- *Eval harness.* New `llm_council/eval/` package — `metrics.py`
+  (`blocker_recall`, `false_blocker_rate`, `citation_accuracy`,
+  `evidence_density`, `signal_to_noise_ratio`), `runner.py`
+  (`load_fixture`, `run_suite`, `to_json`, `check_promotion_gate`),
+  bundled minimal `fixtures/` directory. New CLI surface:
+  `llm-council eval run [--mode <m>] [--fixtures <path>] [--out <path>]
+  [--require-cached] [--compare-against <baseline.json>]`. SNR metric
+  matches the CR-Bench convention (true-positive findings / total
+  findings emitted). The seed fixture set is intentionally minimal —
+  building a real eval suite is a separate ongoing effort. Scorecards
+  land under `.llm-council/eval-runs/` for trend aggregation via
+  `llm-council stats --eval`.
+
+- *Outcome tracking + per-peer reliability.* New module
+  `llm_council/outcomes.py` — `OutcomeRecord` persisted as sidecar
+  `.llm-council/outcomes/<run-id>.json` so transcript JSON shape stays
+  immutable. New CLI:
+  `llm-council outcome mark <run-id-or-prefix> --decision
+  shipped|reverted|rejected|unknown [--bug-found yes|no]
+  [--winning-peer X] [--note "..."]` and `llm-council outcome list`.
+  New `llm-council stats --reliability [--peer <name>]` surfaces
+  per-peer counters from `stats.aggregate_reliability`:
+  `outcomes_marked`, `useful_count` (peer voted `yes|tradeoff` AND
+  outcome was shipped+no-bug), `false_blocker_count` (peer voted `no`
+  AND outcome was shipped+no-bug — mutually exclusive with the useful
+  bucket), `unique_blocker_catch_count`, `verified_citation_rate`
+  (mechanical; no user label required). NO IRT-style scoring yet —
+  revisit at ≥200 marked outcomes per the council deliberation.
+
+**CLI-tool-use mode (experimental, Phase E).** New `review-with-tools`
+mode in `DEFAULT_CONFIG["modes"]` (`defaults.py:381`). CLI peers only
+(`other_cli_peers` strategy; hosted peers do not participate).
+`experimental: true` surfaced as `[EXPERIMENTAL]` in `llm-council list`
+and included in MCP `council_list_modes` output.
+`timeout_multiplier: 1.8` (≈432s against the 240s baseline). The
+per-peer tool-use directive is applied in `adapters.run_one`
+(`adapters.py:2029`), NOT `context.build_prompt` — family info is
+per-peer, so hosted peers do not receive the directive even when
+explicitly routed to this mode. *Promotion gate*:
+`eval/runner.py:check_promotion_gate` requires
+`blocker_recall(review-with-tools) ≥ blocker_recall(review) + 0.05`
+AND `signal_to_noise_ratio(review-with-tools) ≥
+0.85 × signal_to_noise_ratio(review)` before the mode can graduate
+from `experimental: true`. CLI flags: `--compare-against`,
+`--promotion-recall-lift`, `--promotion-snr-floor-ratio`. SWE-PRBench
+(arxiv 2603.26130) finding that more context monotonically degrades
+review quality motivates the gate: don't ship a regression.
+
+**Per-finding agreement matrix (Phase F, synthesis aid only).** New
+module `llm_council/findings.py` — `Finding`, `FindingCluster`,
+`FindingMatrix`, `extract_findings`, `cluster_findings`,
+`build_matrix_from_results`, `matrix_to_dict`. Peers may emit an
+optional `FINDINGS:` envelope block (`id`, `severity`, `claim`,
+`evidence` as a `[VERIFIED:...]` tag). `cluster_findings` mechanically
+clusters across peers by overlapping verified line ranges + severity
+class; consensus = ≥2 distinct peers with overlapping verified refs.
+The matrix is computed ONCE post-deliberation on the final round's
+results (`orchestrator.py:666`) — explicitly NOT fed back to peers
+during round-2 deliberation, because the MAD literature
+(arxiv 2402.18272) warns that in-round convergence forcing depresses
+signal-to-noise. Surfaced in transcript markdown (`## Finding
+Matrix`), transcript JSON top-level (`finding_matrix`), and MCP
+`structured_results` (`consensus_blockers` + `single_peer_concerns`,
+omitted entirely when no peer emitted findings — gated to match
+transcript JSON precedent). `synthesis.run_synthesis_chair` accepts
+`finding_matrix: FindingMatrix | None = None`; non-empty renders
+"CONSENSUS BLOCKERS" / "SINGLE-PEER CONCERNS" sections so the chair
+weights agreement properly. `None` produces the v0.7.x prompt
+unchanged.
+
+**Per-mode model overrides (Phase D, persona-routing replacement).**
+New optional `modes.<name>.model_overrides: {peer_name: model_id}` in
+`.llm-council.yaml`. Resolution chain:
+`participants.<peer>.model` (base) → `tiers.<tier>.<peer>` (existing
+`--tier` swap) → `modes.<name>.model_overrides` (highest priority
+within a mode). Validated at config-load (`config.py:251`); honored
+during participant selection (`config.py:904`). No built-in modes ship
+overrides — operators add their own once eval harness signal supports
+the affinity. *Cuts*: persona auto-routing (Plan Phase 5) and cascade
+routing (Plan Phase 3) were deliberately dropped. PRISM
+(arxiv 2603.18507) finds persona prompting is net-negative for
+accuracy on knowledge/coding tasks on GPT-4-class+ models; the useful
+sub-feature (model affinity per task) is captured by `model_overrides`
+without the persona-theatre risk. Published cascade-routing gains are
+on code GENERATION, zero on code REVIEW, and the user dropped cost as
+a constraint so the headline benefit no longer applies.
+
+**Cleanup pass + breadcrumb fixes.** Renamed `--cache-only` →
+`--require-cached` (honest naming — peers still execute; the flag
+detects cache misses post-hoc and exits non-zero so CI can gate on
+"all fixtures pre-warmed"). Dropped redundant runtime type checks in
+`config.select_participants` (`validate_config` already enforces shape
+at config-load). Reverted cache schema bump (v3 stays valid; the new
+`evidence_verification_failures` field defaults to `[]` on rehydrate
+— see `cache.py:24` rationale comment). Fixed
+`useful_count`/`false_blocker_count` mutual-exclusivity in
+`stats.aggregate_reliability` (`stats.py:636`) — a peer voting `no` on
+a shipped+no-bug PR is a false blocker, not useful. Dropped unused
+`PeerScore.error` / `.ok` / `.from_cache` fields and
+`blocker_recall_mean` from fixture scorecards (populated but never
+consumed by aggregators; `from_cache` is now read off raw results in
+`_aggregate_fixture`). Gated MCP `consensus_blockers` /
+`single_peer_concerns` arrays — omitted from the payload entirely
+when no peer emitted findings, matching transcript JSON precedent
+(`mcp_server.py:1089`).
+
+**Second cleanup pass (post-council-review).** A critical code-review
+pass (transcript `20260517_125529_critical-code-review-...`) surfaced
+4 real bugs and 9 dead-code items missed by the first cleanup. Fixed:
+`PromotionResult.snr_ratio` infinity sentinel (was conflating
+"trivially passed over zero baseline" with "candidate has zero
+signal" — now serializes as `None`); duplicate `finding_matrix`
+serialization in transcripts and MCP (now top-level only, removed
+from `metadata`); a duplicate-branch JSON print in `cli.py`; ambiguous
+metric naming between `_aggregate_fixture` and `_aggregate_suite`
+documented via docstrings on `SuiteScorecard` / `_aggregate_suite`
+enumerating per-key aggregation rules. Deletions: `FindingMatrix.by_peer`
+(write-only), `FindingCluster.consensus` (always True), unused
+`verify_ref` import in `findings.py`, `Fixture.to_dict` and
+`Fixture.path` (no callers), unused `Awaitable` import, two
+function-local imports in `adapters.py` hoisted, duplicate
+`final_round_results(results)` call collapsed, `check_promotion_gate`
+parameters renamed `scorecards_a/b` → `baseline/candidate`,
+`_result_field` getattr-shim inlined at its four call sites.
+
+**Known operational gotcha (carries forward from v0.7.1).** The MCP
+server is a long-running stdio process. After `pip install -e .`
+brings these changes in, the MCP server must be restarted before the
+new `eval run` / `outcome` / `review-with-tools` surface is reachable
+from MCP-mediated runs. Editable installs do not auto-reload long-
+running child processes.
+
+**Key papers cited.** Verify accessibility before relying on:
+- arxiv 2402.18272 — Rethinking the Bounds of LLM Reasoning
+  (multi-agent debate often hurts vs strong single-agent on objective
+  benchmarks).
+- arxiv 2603.26130 — SWE-PRBench (no frontier model detects >31% of
+  human-flagged PR issues; more context monotonically degrades review
+  quality).
+- arxiv 2512.12117 — Citation-Grounded Code Comprehension (92%
+  accuracy with verified file:line citations vs 14–18pp worse
+  uncited).
+- arxiv 2603.18507 — PRISM (persona prompting net-negative for
+  knowledge/coding accuracy).
+- CR-Bench — Signal-to-Noise Ratio for code review (Reflexion-style
+  agents collapse SNR 5.11 → 1.95).
+- Anthropic Claude 4 prompting best-practices — coverage > filtering.
 
 ## 0.7.1 - 2026-05-17
 

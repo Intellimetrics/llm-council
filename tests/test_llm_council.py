@@ -4885,6 +4885,10 @@ def test_tri_cli_setup_loaded_config_does_not_restore_defaults(tmp_path: Path):
         "us-only",
         "consensus",
         "opus-versions",
+        # Experimental `review-with-tools` (v0.8 Phase E) — CLI-peers-only,
+        # so it survives tri-cli pruning. Still ships flagged
+        # `experimental: true` until the eval harness gate promotes it.
+        "review-with-tools",
     }
 
 
@@ -4937,7 +4941,16 @@ def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path):
         "claude_4_6",
         "claude_4_7",
     }
-    assert set(config["modes"]) == {"quick", "peer-only", "consensus", "opus-versions"}
+    # `review-with-tools` (v0.8 Phase E, experimental) routes only to CLI
+    # peers, so tri-cli setup retains it alongside the other CLI-only modes.
+    # `us-only` is dropped by the `us_only_default=True` branch above.
+    assert set(config["modes"]) == {
+        "quick",
+        "peer-only",
+        "consensus",
+        "opus-versions",
+        "review-with-tools",
+    }
     assert config["defaults"]["origin_policy"] == "us"
     assert not (tmp_path / ".mcp.json").exists()
     assert not (tmp_path / ".llm-council" / "instructions").exists()
@@ -4970,6 +4983,9 @@ def test_setup_yes_auto_selects_tri_cli_when_native_clis_exist(
         "us-only",
         "consensus",
         "opus-versions",
+        # `review-with-tools` (v0.8 Phase E, experimental) is CLI-only and
+        # therefore retained in tri-cli setups.
+        "review-with-tools",
     }
     assert "Auto preset selected: tri-cli" in capsys.readouterr().out
 

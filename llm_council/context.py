@@ -383,7 +383,9 @@ def build_prompt(
             "- `RISK: low|medium|high|critical`",
             "- `BLOCKERS:` then bullet lines for each concrete missing artifact",
             "  (file, command output, policy doc) that prevented full analysis.",
-            "- `EVIDENCE:` then bullet lines of `path:line` or `section` references.",
+            "- `EVIDENCE:` bullet lines, each tagged `[PUBLISHED]`/`[OBSERVABLE]`/`[INFERRED]`/`[SPECULATIVE]`,",
+            "  or `[VERIFIED:path:start-end]` for code claims (orchestrator mechanically verifies file/range). Report findings broadly; a downstream step filters.",
+            "- `FINDINGS:` optional bullets (`id`, `severity`, `claim`, `evidence`) for cross-peer dedup; not fed to round 2.",
             "- `TESTS_TO_RUN:` then bullet lines of verification commands.",
             "- `ASSUMPTIONS:` then bullet lines of stated assumptions.",
             "If you cannot evaluate, emit `EFFORT: blocked` AND a non-empty",
@@ -515,3 +517,53 @@ def build_prompt(
             "budget. Raise max_prompt_chars or drop --context/--diff."
         )
     return prompt
+
+
+# Families that ship with file-read / grep / glob tools enabled by the
+# read-only sandbox flags baked into their CLI baseline args
+# (`defaults.py:DEFAULT_CONFIG["participants"]`). Hosted families
+# (openrouter / openai_compatible) and local Ollama peers never see tool
+# access at the council layer, even if they're forcibly routed into a
+# tool-mode run via `--include`.
+_TOOL_CAPABLE_CLI_FAMILIES = frozenset({"claude", "codex", "gemini"})
+
+REVIEW_WITH_TOOLS_DIRECTIVE = (
+    "You have file-read, grep, and glob tools available via your CLI "
+    "sandbox. Use them when the diff alone is insufficient to verify a "
+    "claim — open the cited files, search for related callers, check "
+    "surrounding context. Cite specific findings with "
+    "`[VERIFIED:path:start-end]` so the orchestrator can mechanically "
+    "validate them. Keep tool use proportional: investigate suspected "
+    "issues, do not enumerate the entire repo. Hosted/local peers do "
+    "not see this instruction."
+)
+
+
+def apply_per_peer_directives(
+    prompt: str,
+    *,
+    mode: str | None,
+    family: str | None,
+) -> str:
+    """Append per-peer prompt directives based on mode + peer family.
+
+    Returns the prompt unchanged when no directive applies (the default
+    path for `mode=None`, hosted/local peers, and every mode except
+    `review-with-tools`). Backward-compatible by design — callers that
+    do not need per-peer variation can ignore this function.
+
+    Currently the only directive is the `review-with-tools` tool-use
+    block, appended when:
+    - `mode == "review-with-tools"`, AND
+    - `family` is one of `_TOOL_CAPABLE_CLI_FAMILIES`.
+
+    Hosted/local participants get the unchanged base prompt even when
+    routed into a `review-with-tools` run (defensive — the mode SHOULD
+    only route to CLI peers per the mode config, but `--include` can
+    override).
+    """
+    if mode != "review-with-tools":
+        return prompt
+    if family is None or family not in _TOOL_CAPABLE_CLI_FAMILIES:
+        return prompt
+    return prompt + "\n\n" + REVIEW_WITH_TOOLS_DIRECTIVE

@@ -21,7 +21,7 @@ from typing import Any
 CACHE_SUBDIR = ".llm-council/cache"
 DEFAULT_TTL_SECONDS = 24 * 3600
 PROMPT_PREVIEW_CHARS = 200
-CACHE_SCHEMA_VERSION = 3  # v3 = structured evidence shape (list[{text, tag}]), prompt_chars, recovered_after_timeout, section_repair_attempted
+CACHE_SCHEMA_VERSION = 3  # v3 = structured evidence shape (list[{text, tag}]), prompt_chars, recovered_after_timeout, section_repair_attempted. evidence_verification_failures is optional with a `[]` default on rehydrate, so we deliberately do NOT bump for it — keeps old v3 caches readable.
 
 _MODES_THAT_SKIP_CACHE = frozenset({"consensus"})
 
@@ -157,9 +157,10 @@ def build_payload(
     recovered_after_timeout: bool = False,
     prompt_chars: int | None = None,
     section_repair_attempted: bool = False,
+    evidence_verification_failures: list[str] | None = None,
 ) -> dict[str, Any]:
     preview = prompt[:PROMPT_PREVIEW_CHARS]
-    return {
+    payload: dict[str, Any] = {
         "participant_name": participant_name,
         "prompt_sha256": key,
         "prompt_preview": preview,
@@ -191,6 +192,13 @@ def build_payload(
         # strict-evidence wrapper's guard correct across cache hits.
         "section_repair_attempted": bool(section_repair_attempted),
     }
+    # v4: only include the key when there's something to record so payloads
+    # stay tight for the overwhelming majority of runs (no VERIFIED tags
+    # cited, or all VERIFIED refs verified). Readers default to `[]` on
+    # missing, so the absence is semantically identical to an empty list.
+    if evidence_verification_failures:
+        payload["evidence_verification_failures"] = list(evidence_verification_failures)
+    return payload
 
 
 def resolve_ttl_seconds(

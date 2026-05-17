@@ -248,6 +248,32 @@ def validate_config(config: dict[str, Any]) -> None:
                         f"one of {', '.join(VALID_STANCES)}"
                     )
 
+        # `model_overrides` pins a specific model id on a peer, but only
+        # for runs that resolve to this mode. Validation is intentionally
+        # light: a stale entry naming a peer not in the resolved roster
+        # is a silent no-op at select_participants time, so we don't
+        # require the peer to exist at config-load time. We do require
+        # the shape to be `dict[str, str]` so a typo (list / int / empty
+        # string) fails loudly rather than being silently ignored.
+        model_overrides = mode.get("model_overrides")
+        if model_overrides is not None:
+            if not isinstance(model_overrides, dict):
+                raise ValueError(
+                    f"Mode '{name}' model_overrides must be a mapping of "
+                    "peer-name to model-id string"
+                )
+            for peer_name, model_id in model_overrides.items():
+                if not isinstance(peer_name, str) or not peer_name:
+                    raise ValueError(
+                        f"Mode '{name}' model_overrides keys must be "
+                        "non-empty strings"
+                    )
+                if not isinstance(model_id, str) or not model_id:
+                    raise ValueError(
+                        f"Mode '{name}' model_overrides['{peer_name}'] must "
+                        "be a non-empty model-id string"
+                    )
+
     defaults = config.get("defaults", {})
     if not isinstance(defaults, dict):
         raise ValueError("Config defaults must be a mapping")
@@ -865,4 +891,23 @@ def select_participants(
                 else ""
             )
         )
+
+    # Per-mode model overrides. Highest priority in the resolution chain
+    # (base participants.<peer>.model -> tiers.<tier>.<peer> swap, already
+    # applied by apply_tier_override before we get here -> this). Mutates
+    # config["participants"][peer]["model"] in place so downstream code
+    # that reads the participant dict picks up the pin. Silent on stale
+    # entries: an override naming a peer absent from the resolved roster
+    # is a no-op rather than an error. Shape (dict[str, str] non-empty)
+    # is already enforced by validate_config; we only re-check membership
+    # in the resolved roster + that the participant entry exists.
+    model_overrides = mode_cfg.get("model_overrides") if mode_cfg else None
+    if isinstance(model_overrides, dict):
+        for peer, model_id in model_overrides.items():
+            if peer not in deduped:
+                continue
+            participant_entry = participants.get(peer)
+            if isinstance(participant_entry, dict):
+                participant_entry["model"] = model_id
+
     return deduped

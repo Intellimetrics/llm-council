@@ -23,6 +23,7 @@ from llm_council.cache import (
     is_caching_disabled_for_mode,
     resolve_ttl_seconds,
 )
+from llm_council.citations import verify_evidence_citations
 from llm_council.config import is_local_participant, is_loopback_base_url
 from llm_council.convergence import (
     MIN_TOKENS_FOR_CLASSIFICATION,
@@ -420,6 +421,7 @@ async def execute_council(
             mode_multiplier=mode_multiplier,
             mode=mode,
         )
+        verify_evidence_citations(run_results, cwd)
     else:
         run_results = []
     # Merge pre-flight failures back in, preserving the original participant
@@ -542,6 +544,7 @@ async def execute_council(
             mode_multiplier=mode_multiplier,
             mode=mode,
         )
+        verify_evidence_citations(next_results, cwd)
         prior_round_results = list(round_results)
         round_number += 1
         round_results = [
@@ -647,12 +650,26 @@ async def execute_council(
         should_synthesize,
     )
     from llm_council.transcript import final_round_results
+    from llm_council.findings import build_matrix_from_results, matrix_to_dict
 
     # The chair sees ONLY final-round peer outputs. After deliberation,
     # `results` contains both round-1 entries (plain names) and round-2
     # entries (`:round2` suffix); `final_round_results()` returns the
     # latest round only. Passing the full cumulative list would feed the
     # chair stale positions the peers have since moved off.
+    #
+    # Build the per-finding agreement matrix ONCE over the final-round
+    # results (Phase F). The matrix is post-deliberation, post-results-
+    # merge by design — peers in round 2 must NEVER see it, or we recreate
+    # the convergence-forcing pattern MAD literature warns against.
+    # Compute `final_round_results(results)` once and share between the
+    # finding-matrix pass and the synthesis chair below. Both consumers
+    # want the same view: only the latest-round entries per peer.
+    final_results = final_round_results(results)
+    finding_matrix = build_matrix_from_results(final_results)
+    if not finding_matrix.is_empty():
+        metadata["finding_matrix"] = matrix_to_dict(finding_matrix)
+
     if synthesize_flag and should_synthesize(synthesize_flag, metadata):
         try:
             chair_name = select_synthesizer(
@@ -663,14 +680,14 @@ async def execute_council(
             )
             emit({"event": "synthesis_start", "chair": chair_name})
             convergence_for_chair = metadata.get("convergence")
-            chair_input = final_round_results(results)
             synthesis_payload = await run_synthesis_chair(
                 question=(question or prompt),
-                results=chair_input,
+                results=final_results,
                 convergence=convergence_for_chair,
                 participant_cfg=participant_cfg,
                 cwd=cwd,
                 chair_name=chair_name,
+                finding_matrix=finding_matrix,
             )
             metadata["synthesis"] = synthesis_payload
             emit(
