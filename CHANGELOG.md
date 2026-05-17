@@ -2,6 +2,115 @@
 
 ## Unreleased
 
+## 0.7.1 - 2026-05-17
+
+Patch release bundling 15 council-surfaced fixes (12 from pass-8 of
+v0.7.0, 3 from pass-9 of the v0.7.1 integration itself). 20 commits
+since v0.7.0; +3038/-181 lines. 745 tests pass; same 3 pre-existing
+environmental failures unchanged. Cache schema stays at v3 (one new
+field, `section_repair_attempted`, defaults to False on rehydrate);
+MCP output schema body now matches the v3 version declared in v0.7.0.
+
+**Retry layer correctness (pass-8 fixes #3, #4, #6, #8, #12; pass-9
+fixes A, B).** Section-repair retry is now wired into the
+`openai_compatible` and `ollama` adapter wrappers in addition to CLI,
+with the documented layering `terse-retry → section-repair →
+strict-evidence` and each gate capped at one extra call per peer per
+round. Strict-evidence retry is wired across all three transports.
+Both hosted/local strict-evidence and section-repair retries pass
+`retry_cfg["retry_on_missing_label"] = False` to the inner adapter so
+the inner's own label-repair branch cannot chain into a third call.
+`_merge_*_section_retry` now has a third branch that preserves an
+`UntaggedEvidence:` retry result (with a `sections_then_evidence`
+themed transcript header) instead of silently discarding it; the
+result carries a new `section_repair_attempted: bool` flag that
+gates the strict-evidence wrapper so a section-fixed-but-untagged
+response cannot trigger yet another retry. `recovered_after_timeout`
+and `section_repair_attempted` are persisted through cache so warm-
+cache repeats preserve the operator-visible retry receipts.
+`classify_error` and `is_timeout_error` now share a single
+`_TIMEOUT_PREFIXES` tuple covering all 7 httpx/CLI timeout prefixes;
+hosted timeouts that previously misclassified as `downstream_error`
+(because `ReadTimeout` was in the downstream-markers list) now
+correctly bucket as `timeout` in `timeout_by_prompt_size`.
+
+**Terse-retry visibility (pass-8 fix #12).** v0.7.0's terse-retry
+was firing correctly but its failure was invisible — `result.elapsed_
+seconds` reported only the original call's time and the failure path
+returned the original result with `recovered_after_timeout=False`,
+byte-identical to "retry never fired". New `terse_retry_attempted:
+bool` field on `ParticipantResult` set True on both success and
+failure of the retry. `_annotate_timeout_retry_failure()` helper
+appends `TERSE_RETRY_FAILED_SUFFIX` to the error string on failure,
+preserving the `Timeout:` prefix so `classify_error` still returns
+`timeout`. Suffix names the mitigation lever (raise per-peer
+`timeout` in project YAML). New `terse_retry_attempts` stats counter;
+`attempts - timeout_recoveries` = silent failures. `prompt_chars` now
+populated on every `ParticipantResult` construction site (CLI,
+openai_compatible, ollama, OpenRouter label-repair, retry merges,
+`_context_overflow_result`, `PromptTooLarge` skip) — terse-retry
+merges record `len(original_prompt)` so recoveries land in the same
+size bucket as the timeout that triggered them. New
+`timeout_recoveries_by_prompt_size` stats bucket.
+
+**Envelope parser correctness (pass-9 fix C).** This is the largest
+silent-correctness fix in v0.7.1: `_ENVELOPE_LIST_HEADER_RE` was
+anchored on `$`, so the parser rejected EVERY inline `EVIDENCE:
+<text>` line (tagged or untagged). Strict-evidence validation had
+been a no-op on any peer using inline form since v0.7.0 shipped —
+likely also explains why pass-7's celebrated "codex emitted tagged
+evidence because of R3 ground rule" appeared to work without
+structural enforcement. New `_ENVELOPE_LIST_INLINE_RE` plus inline
+branch in `_extract_response_envelope` captures these entries; bare-
+header-plus-bullets form still matches first (no regression on the
+canonical shape). Verified end-to-end on qwen's pass-9 response:
+parser now captures all 20 evidence entries (14 tagged + 6 untagged),
+strict-evidence then correctly produces
+`UntaggedEvidence: 6 EVIDENCE entry/entries lack a tag` which
+triggers the now-hardened repair retry.
+
+**Section validator scope (pass-8 fixes #2, #9).** `REQUIRED_SECTION
+_HEADER_RE` now accepts `##` markdown headers, `**bold**` wrappers,
+colon separators, and mixed case (was: em-dash + ALL-CAPS only).
+Response-side `_section_present` tightened: a literal `PART N` only
+counts when header-shaped (line start optionally with `#`/`##`/`**`)
+AND no skip-prose verb (`skipped|omitted|was not|did not|unable|not
+addressed|see PART|refer to`) appears in an 80-char window before or
+after. Title-token paraphrase route unchanged.
+`_is_recommendation_part` loosened from exact-list `["RECOMMENDATION"]
+` / `["RECOMMENDATION", "COUNCIL"]` to `tokens[0] == "RECOMMENDATION"`
+so titles like `PART 6 — RECOMMENDATION AND RATIONALE` are correctly
+excluded from section-coverage (the existing label check still
+governs them).
+
+**Synthesis + MCP schema (pass-8 fixes #1, #5).** `synthesis.py:
+_format_envelope_item` renders evidence dicts as `[TAG] text` (or
+bare `text` when tag is None/missing) into the chair prompt, with
+str-passthrough for the other envelope fields. MCP
+`council_run_output_schema` evidence items now use `oneOf` (v3 dict
+form with required `text` and closed-enum `tag`, plus defensive
+string fallback) — pass-8's live MCP-validation crash on its own
+response is fixed.
+
+**Test reorganization (pass-8 fix #11).** `test_pass7_regression.py`
+now loads pass-7 prompt/responses from verbatim fixture files under
+`tests/fixtures/` (the `.llm-council/runs/` transcripts are
+gitignored). The exercise exposed that one existing test
+(`test_pass7_codex_evidence_all_tagged`) was a false witness — the
+real codex pass-7 response has zero top-level `EVIDENCE:` envelope;
+all four tag kinds appear inline in concept prose. Test reframed to
+assert the real shape plus a separate synthetic-untagged-block
+anchor for the validator.
+
+**Known operational gotcha.** The MCP server is a long-running stdio
+process. An editable install (`pip install -e .`) does not auto-
+reload long-running child processes — code changes to
+`llm_council/` will not take effect in an MCP-server-mediated
+council run until the server is restarted. Symptoms: stale schema
+declarations (cause MCP output validation errors on otherwise-
+successful runs), missing terse-retry annotation on timeouts. Three
+consecutive pass-8 / pass-9 / pass-10 dogfood runs bit on this.
+
 ## 0.7.0 - 2026-05-16
 
 Three council-surfaced changes addressing the failure modes the pass-7
