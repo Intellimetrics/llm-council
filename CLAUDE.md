@@ -150,8 +150,8 @@ Key modules:
   string `(no RECOMMENDATION label emitted)` for round-2 prompt summaries
   rather than falling back to arbitrary prose.
 - **Optional response envelope.** Peers may emit `EFFORT:`, `CONFIDENCE:`,
-  `RISK:`, `BLOCKERS:`, `EVIDENCE:`, `TESTS_TO_RUN:`, `ASSUMPTIONS:` lines
-  alongside the `RECOMMENDATION:` label. Parsed by
+  `RISK:`, `BLOCKERS:`, `EVIDENCE:`, `TESTS_TO_RUN:`, `ASSUMPTIONS:`,
+  `CONTINUE_DEBATE:` lines alongside the `RECOMMENDATION:` label. Parsed by
   `adapters._extract_response_envelope`, stored on `ParticipantResult`, and
   emitted in transcripts / MCP `structured_results`. All fields are optional
   in the current schema (v2). A peer that says `EFFORT: blocked` with no
@@ -160,7 +160,16 @@ Key modules:
   repair retry. Naming concrete missing artifacts in either list is
   treated as honest information, not abdication. Track presence via the
   new `envelope_field_present` bucket in `stats.aggregate` before any
-  future flip from optional to required.
+  future flip from optional to required. `CONTINUE_DEBATE: yes|no`
+  (v0.8.1) is a per-peer vote on whether round-2 deliberation is worth
+  running; when ALL label-producing peers emit `no` in round 1
+  (denominator excludes abdicated / `invalid_response` / unlabeled),
+  the orchestrator skips round-2 and stamps
+  `deliberation_status: skipped_continue_debate_unanimous` plus a
+  `deliberation_skipped` progress event with `no_votes` + `denominator`
+  counts. Unanimity (not 66%) is conservative-until-measured — revisit
+  once a transcript corpus exists to audit gaming risk
+  (`orchestrator.py:489-525`).
 - **Config migration is silent.** `migrate_known_cli_defaults` rewrites old
   `OLD_CLAUDE_PLAN_ARGS` / `OLD_CODEX_APPROVAL_ARGS` and back-fills
   `peer-only` mode and `include_current` for built-in `other_cli_peers`
@@ -168,7 +177,15 @@ Key modules:
   constants too.
 - **Prompt-size guard.** `max_prompt_chars` is enforced both globally and
   per-participant before any subprocess launches; preserve this so oversized
-  prompts fail fast rather than after a long hosted/CLI timeout.
+  prompts fail fast rather than after a long hosted/CLI timeout. Both
+  `--diff` payloads AND `context_files` (v0.8.1+) route through
+  `llm_council/diff_chunking.py`'s hash-aware chunker before assembly so
+  large multi-file context drops don't trip the cap. New entry point
+  `diff_chunking.chunk_context_files()` reuses the existing scoring
+  helpers (filename mentions, extension affinity, smaller-first
+  tiebreak). A single file larger than `max_prompt_chars - framing` is
+  dropped entirely with a `context_files_chunked` progress event listing
+  `oversize_files` — operator-visible rather than silently truncated.
 - **Mode-aware timeouts.** `defaults.py:DEFAULT_CONFIG["modes"]` may carry
   an optional `timeout_multiplier: float`. Resolution:
   `effective = per_participant_timeout * mode_multiplier`. The

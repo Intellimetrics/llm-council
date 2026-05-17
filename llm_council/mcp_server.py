@@ -386,9 +386,14 @@ def council_run_output_schema() -> dict[str, Any]:
                                                     "observable",
                                                     "inferred",
                                                     "speculative",
+                                                    "verified",
                                                     None,
                                                 ],
                                             },
+                                            "path": {"type": "string"},
+                                            "start_line": {"type": "integer"},
+                                            "end_line": {"type": "integer"},
+                                            "verified": {"type": ["boolean", "null"]},
                                         },
                                         "required": ["text"],
                                     },
@@ -398,10 +403,14 @@ def council_run_output_schema() -> dict[str, Any]:
                             "description": (
                                 "Structured evidence entries (schema v3). "
                                 "Each item is `{text, tag}` where `tag` is one "
-                                "of `published|observable|inferred|speculative` "
-                                "or `null` for untagged entries. Plain strings "
-                                "are also accepted for legacy/external producers. "
-                                "`text` carries the path:line or section reference."
+                                "of `published|observable|inferred|speculative|"
+                                "verified` or `null` for untagged entries. When "
+                                "`tag` is `verified` (from a `[VERIFIED:path:start-end]` "
+                                "citation), the item also carries `path`, `start_line`, "
+                                "`end_line`, and `verified` (mechanical-check result, "
+                                "may be null pre-verification). Plain strings are also "
+                                "accepted for legacy/external producers. `text` carries "
+                                "the path:line or section reference."
                             ),
                         },
                         "tests_to_run": {

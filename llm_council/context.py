@@ -13,7 +13,11 @@ from llm_council.defaults import (
     STANCE_INVARIANT_SUFFIX,
     VALID_STANCES,
 )
-from llm_council.diff_chunking import VALID_STRATEGIES, chunk_diff
+from llm_council.diff_chunking import (
+    VALID_STRATEGIES,
+    chunk_context_files,
+    chunk_diff,
+)
 
 
 MAX_CONTEXT_FILE_CHARS = 120_000
@@ -388,6 +392,7 @@ def build_prompt(
             "- `FINDINGS:` optional bullets (`id`, `severity`, `claim`, `evidence`) for cross-peer dedup; not fed to round 2.",
             "- `TESTS_TO_RUN:` then bullet lines of verification commands.",
             "- `ASSUMPTIONS:` then bullet lines of stated assumptions.",
+            "- `CONTINUE_DEBATE: yes|no` — unanimous `no` skips round-2.",
             "If you cannot evaluate, emit `EFFORT: blocked` AND a non-empty",
             "`BLOCKERS:` list naming what is missing. `EFFORT: blocked`",
             "without `BLOCKERS:` is treated as abdication and dropped from quorum.",
@@ -417,6 +422,10 @@ def build_prompt(
     diff_section_index: int | None = None
     diff_raw: str = ""
     diff_default_section: str = ""
+    # Track context-file sections so we can route them through the hash-aware
+    # chunker on overflow. `context_file_indices` maps section index ->
+    # path label (the same label rendered into the section header).
+    context_file_indices: dict[int, str] = {}
     manifest_for_render = image_manifest
     if manifest_for_render is None and image_paths:
         manifest_for_render = build_image_manifest(
@@ -430,9 +439,20 @@ def build_prompt(
         diff_section_index = len(context_sections)
         context_sections.append(diff_default_section)
     for item in context_paths:
-        context_sections.append(
-            read_context_file(item, cwd=cwd, allow_outside_cwd=allow_outside_cwd)
+        rendered = read_context_file(
+            item, cwd=cwd, allow_outside_cwd=allow_outside_cwd
         )
+        # Derive the label the same way read_context_file did so the chunker
+        # can match path-mentions in the question.
+        source = Path(item)
+        if not source.is_absolute():
+            source = cwd / source
+        try:
+            label = str(source.resolve().relative_to(cwd.resolve()))
+        except ValueError:
+            label = str(source)
+        context_file_indices[len(context_sections)] = label
+        context_sections.append(rendered)
     if stdin_text:
         context_sections.append("## Stdin Context\n\n```\n" + stdin_text + "\n```")
 
@@ -457,6 +477,83 @@ def build_prompt(
 
     prompt = assemble(context_sections)
     if max_prompt_chars is not None and len(prompt) > max_prompt_chars:
+        # Context-files chunking is automatic (no `chunk_strategy` opt-in
+        # required) because context_files are explicitly-requested attachments
+        # — the user's intent is "include as much of this as fits", not "fail
+        # if it doesn't". Hash-aware scoring preserves files mentioned by name
+        # in the question; files larger than the available budget on their
+        # own are dropped entirely with a `config_warning`-shaped progress
+        # event so the operator can see what was lost.
+        if context_file_indices:
+            file_items: list[tuple[str, str]] = [
+                (path_label, context_sections[idx])
+                for idx, path_label in sorted(context_file_indices.items())
+            ]
+            # Compute framing exactly: assemble the prompt with each
+            # context-file slot replaced by an empty string, then subtract
+            # from `max_prompt_chars`. This accounts for the separators
+            # added by `assemble`'s "\n".join — empty slots still take 1
+            # char (the separator) each, which exactly matches the chunker's
+            # accounting where M surviving sections contribute (M-1)
+            # internal separators.
+            scratch = list(context_sections)
+            for idx in context_file_indices:
+                scratch[idx] = ""
+            framing_chars = len(assemble(scratch))
+            file_budget = max_prompt_chars - framing_chars
+            chunked = chunk_context_files(
+                file_items, budget=file_budget, question=question
+            )
+            if chunked.triggered:
+                # Rebuild context_sections with the surviving file sections
+                # in their original positions. Files dropped entirely are
+                # removed; other sections (images/diff/stdin) stay put.
+                # Map original path_label -> surviving section text using
+                # exact text equality (rendered sections are unique per file
+                # since they contain the file's path in the header).
+                text_to_label = {text: label for label, text in file_items}
+                surviving_label_to_text: dict[str, str] = {}
+                for section_text in chunked.sections:
+                    label = text_to_label.get(section_text, "<unknown>")
+                    surviving_label_to_text[label] = section_text
+                rebuilt: list[str] = []
+                for idx, section in enumerate(context_sections):
+                    label = context_file_indices.get(idx)
+                    if label is None:
+                        rebuilt.append(section)
+                        continue
+                    if label in surviving_label_to_text:
+                        rebuilt.append(surviving_label_to_text[label])
+                    # else: file was dropped — omit entirely
+                rebuilt_prompt = assemble(rebuilt)
+                if chunk_progress is not None:
+                    chunk_progress(
+                        {
+                            "event": "context_files_chunked",
+                            "strategy": "hash-aware",
+                            "original_chars": chunked.original_chars,
+                            "chunked_chars": chunked.chunked_chars,
+                            "dropped_chars": chunked.dropped_chars,
+                            "dropped_files": list(chunked.dropped_files),
+                            "oversize_files": list(chunked.oversize_files),
+                        }
+                    )
+                # If the rebuilt prompt now fits, return immediately. If not,
+                # fall through to diff-chunking / fail-fast paths below with
+                # the updated context list.
+                if len(rebuilt_prompt) <= max_prompt_chars:
+                    return rebuilt_prompt
+                context_sections = rebuilt
+                # Recompute diff_section_index against the rebuilt list since
+                # files may have been removed before the diff section.
+                if diff_section_index is not None and diff_default_section:
+                    try:
+                        diff_section_index = context_sections.index(
+                            diff_default_section
+                        )
+                    except ValueError:
+                        diff_section_index = None
+                prompt = rebuilt_prompt
         if (
             chunk_strategy != "fail"
             and include_diff

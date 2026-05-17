@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.8.1 - 2026-05-17
+
+v0.8.1 ships three items: hash-aware chunking for `context_files`
+(matching `--diff`'s existing pattern); a latent v0.8.0 MCP-schema bug
+fix (the new `[VERIFIED:...]` tag was not in the schema's tag enum, so
+any MCP-mediated council where a peer emitted a verified citation
+failed output validation); and a new optional
+`CONTINUE_DEBATE: yes|no` envelope tag that lets peers vote to skip
+round-2 deliberation. 906 → 935 passing tests (+29 across two new test
+files); same 3 pre-existing environmental failures unchanged.
+
+**`context_files` chunking.** Today's planning-pass dogfood surfaced
+that passing many real files trips the 120K per-participant prompt cap
+(the original failure was
+`Prompt exceeds max_prompt_chars: 375023 > 120000` with 9 context
+files). `--diff` already handles this via hash-aware chunking in
+`llm_council/diff_chunking.py`; `context_files` did not. v0.8.1 routes
+them through the same chunker. New public function
+`chunk_context_files()` reuses the existing scoring helpers (filename
+mentions, extension affinity, smaller-first tiebreak). Oversize-alone
+files — a single file larger than `max_prompt_chars - framing` — are
+dropped entirely with a `context_files_chunked` progress event listing
+`oversize_files`. Dogfood-verified: the original 375K-char payload
+chunks to ~104K and runs cleanly
+(`.llm-council/runs/20260517_170455_dogfood-test-1-*`). The behavior
+change inverts an old fail-fast test
+(`test_long_context_overflow_fails_fast_instead_of_truncating` renamed
+and rewritten to assert loud chunking events, not silent truncation).
+The chunker-budget test
+`test_build_prompt_hash_aware_drops_unrelated_files` was bumped 8K → 9K
+chars to leave headroom for natural envelope growth. New test file
+`tests/test_context_chunking.py` (14 tests).
+
+**MCP schema accepts `verified` tag.** v0.8.0's Phase A
+`[VERIFIED:path:start-end]` citation parsing produces evidence entries
+with `tag="verified"` and accompanying `path`/`start_line`/`end_line`/
+`verified` fields, but `council_run_output_schema` in `mcp_server.py`
+(around line 385) did not include `"verified"` in the evidence-tag
+enum. Any MCP-mediated council where a peer emitted a verified
+citation crashed with
+`'verified' is not one of ['published', 'observable', 'inferred', 'speculative', None]`.
+The bug was latent during v0.8 development because the MCP server was
+still on v0.7.1 code; it surfaced the first moment the operator
+restarted into v0.8 (dogfood test 1). Fixed by adding `"verified"` to
+the tag enum and the four accompanying optional structured properties
+(`path`, `start_line`, `end_line`, `verified`); description string
+updated to document the new shape. Carry-forward to v0.9.0: continue
+to test new envelope features through the actual MCP path during
+dogfood, not only via pytest.
+
+**`CONTINUE_DEBATE: yes|no` envelope tag (Feature 4 from the
+post-v0.8 competitor-comparison pass).** A new optional envelope field
+peers may emit alongside `EFFORT`/`CONFIDENCE`/`RISK`. New regex in
+`_ENVELOPE_SINGLE_RE` (`adapters.py:2316`); new field on
+`ParticipantResult` (`adapters.py:160-169`); unanimity gate in
+`orchestrator.py:489-525`; one-line envelope-doc addition in
+`context.py:395`. When **all** label-producing peers in round 1 emit
+`CONTINUE_DEBATE: no`, the orchestrator skips the optional round-2
+deliberation and stamps
+`deliberation_status: skipped_continue_debate_unanimous` plus a
+`deliberation_skipped` progress event carrying `no_votes` +
+`denominator` counts. Denominator mirrors the existing label-producing
+semantics: abdicated peers, `error_kind=invalid_response`, and peers
+without a usable `RECOMMENDATION` label are excluded. The unanimity
+threshold (not 66%) is deliberately conservative — relaxation
+deferred to v0.9.x once a transcript corpus exists to audit gaming
+risk. Cache round-trip preserved (the new field on `ParticipantResult`
+is persisted; schema version unchanged because absence rehydrates to
+None). Dogfood-verified: a deliberate-mode council with all three
+peers emitting `CONTINUE_DEBATE: no` triggers
+`deliberation_status: "skipped_continue_debate_unanimous"` +
+`deliberation_skipped` event with `no_votes: 3, denominator: 3`
+(`.llm-council/runs/20260517_170522_dogfood-test-2-*`). New test file
+`tests/test_continue_debate.py` (15 tests). Inspired by ai-counsel's
+`continue_debate: bool` per-vote field; full competitor-comparison
+context lives in `reference_council_projects.md` in the auto-memory.
+
+**Operational gotcha (carry forward).** The v0.7.1 MCP-server-
+restart-after-install warning still applies. Both v0.8.1 surfaces
+(chunking, `CONTINUE_DEBATE`) require a restart before MCP-mediated
+councils pick them up. The Fix B bug above was caught precisely
+because the restart-after-v0.8.0 was the first moment the MCP server
+saw verified citations; dogfood the new surface through MCP
+immediately after restart to catch this class of issue.
+
 ## 0.8.0 - 2026-05-17
 
 v0.8.0 ships a closed-loop measurement pipeline. The keystone is the new

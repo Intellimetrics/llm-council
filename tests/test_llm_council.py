@@ -7907,6 +7907,15 @@ def test_build_prompt_hash_aware_drops_unrelated_files(tmp_path: Path):
         },
     )
     events: list[dict] = []
+    # 9_000 char budget gives ~1_000 chars of headroom over the framing
+    # block (~1_900 chars on pytest's long /tmp/pytest-of-clindell/...
+    # working-directory path) so the budget can absorb the natural
+    # one-line growth that occasionally lands in the envelope-bullet
+    # block (e.g. CONTINUE_DEBATE in v0.8.1) without flipping this
+    # specific test from "hash-aware preserved the named file" to "no
+    # file fits the budget at all". The intent under test is the
+    # hash-aware scoring preferring `gamma.py` over alpha/beta — NOT
+    # the absolute byte cost of the framing.
     prompt = build_prompt(
         "review the bug in gamma.py please",
         mode="quick",
@@ -7914,11 +7923,11 @@ def test_build_prompt_hash_aware_drops_unrelated_files(tmp_path: Path):
         context_paths=[],
         include_diff=True,
         stdin_text=None,
-        max_prompt_chars=8_000,
+        max_prompt_chars=9_000,
         chunk_strategy="hash-aware",
         chunk_progress=events.append,
     )
-    assert len(prompt) <= 8_000
+    assert len(prompt) <= 9_000
     assert "gamma.py" in prompt
     assert events
     last = events[-1]

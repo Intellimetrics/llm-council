@@ -37,6 +37,7 @@ from llm_council.deliberation import (
     default_min_quorum,
     has_disagreement,
     labeled_quorum_count,
+    recommendation_label,
 )
 
 
@@ -486,6 +487,42 @@ async def execute_council(
             }
         )
 
+    # v0.8.1 CONTINUE_DEBATE unanimity short-circuit. After round 1, if
+    # every label-producing peer voted ``CONTINUE_DEBATE: no``, skip the
+    # optional round-2 deliberation. Denominator MIRRORS the abdication
+    # exclusions used elsewhere: peers without a usable RECOMMENDATION
+    # label (no labeled vote, abdicated, invalid_response, etc.) are
+    # excluded from BOTH numerator and denominator. The ``>= 2`` floor
+    # avoids a degenerate single-peer council voting itself out of
+    # deliberation. Unanimity (not 66%) per council recommendation —
+    # conservative until corpus data audits gaming risk. Only fires when
+    # deliberation was actually on the table (pending status).
+    continue_debate_unanimous_no = False
+    if (
+        deliberate
+        and metadata.get("deliberation_status") == "pending"
+        and not metadata.get("universal_abdication")
+    ):
+        denominator = [
+            r for r in round_results
+            if r.ok and recommendation_label(r.output) in {"yes", "no", "tradeoff"}
+        ]
+        no_votes = sum(
+            1 for r in denominator
+            if (r.continue_debate or "").lower() == "no"
+        )
+        if no_votes >= len(denominator) and len(denominator) >= 2:
+            continue_debate_unanimous_no = True
+            metadata["deliberation_status"] = "skipped_continue_debate_unanimous"
+            emit(
+                {
+                    "event": "deliberation_skipped",
+                    "reason": "continue_debate_unanimous",
+                    "no_votes": no_votes,
+                    "denominator": len(denominator),
+                }
+            )
+
     cumulative_excluded: set[str] = set()
     aborted_all_excluded = False
     convergence_by_round: dict[int, list[dict[str, Any]]] = {}
@@ -495,6 +532,7 @@ async def execute_council(
         and max_rounds > round_number
         and has_disagreement(round_results)
         and not metadata.get("universal_abdication")
+        and not continue_debate_unanimous_no
     ):
         cumulative_excluded.update(_failed_for_deliberation(round_results))
         deliberation_participants = [

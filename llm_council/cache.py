@@ -158,6 +158,7 @@ def build_payload(
     prompt_chars: int | None = None,
     section_repair_attempted: bool = False,
     evidence_verification_failures: list[str] | None = None,
+    continue_debate: str | None = None,
 ) -> dict[str, Any]:
     preview = prompt[:PROMPT_PREVIEW_CHARS]
     payload: dict[str, Any] = {
@@ -198,6 +199,13 @@ def build_payload(
     # missing, so the absence is semantically identical to an empty list.
     if evidence_verification_failures:
         payload["evidence_verification_failures"] = list(evidence_verification_failures)
+    # v0.8.1: persist the peer's CONTINUE_DEBATE vote so cached rehydrates
+    # still drive the unanimity gate. Only stored when present — readers
+    # default to None on absence, so absence is semantically identical to
+    # "peer did not emit the tag". Schema version is NOT bumped because
+    # the default is None (no behavioral change for old payloads).
+    if continue_debate is not None:
+        payload["continue_debate"] = str(continue_debate)
     return payload
 
 

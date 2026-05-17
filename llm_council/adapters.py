@@ -156,6 +156,15 @@ class ParticipantResult:
     evidence: list[Any] = field(default_factory=list)
     tests_to_run: list[str] = field(default_factory=list)
     assumptions: list[str] = field(default_factory=list)
+    # v0.8.1: peer-emitted vote on whether to deliberate further. Values
+    # are "yes" / "no" / None. The orchestrator gates round-2 deliberation
+    # on a unanimous-"no" from the label-producing peers (denominator
+    # excludes abdicated / invalid-response / unlabeled peers). The
+    # threshold is unanimity (not 66%) in v0.8.1 — conservative until
+    # corpus data can audit gaming risk. None means the peer did not
+    # emit the tag and is treated as "no vote to skip" (round 2 still
+    # runs).
+    continue_debate: str | None = None
     # Set True when the original call timed out and the terse-retry
     # recovered with a valid response. Separate from
     # `recovered_after_launch_retry` (launch-fail retry) and
@@ -272,6 +281,7 @@ def _result_from_cache_payload(
         evidence_verification_failures=list(
             payload.get("evidence_verification_failures") or []
         ),
+        continue_debate=payload.get("continue_debate"),
     )
 
 
@@ -338,6 +348,7 @@ def _maybe_persist_cache(
         prompt_chars=result.prompt_chars,
         section_repair_attempted=result.section_repair_attempted,
         evidence_verification_failures=result.evidence_verification_failures or None,
+        continue_debate=result.continue_debate,
     )
     try:
         cache_write(
@@ -2316,7 +2327,7 @@ def _format_retry_transcript(
 _ENVELOPE_SINGLE_RE = re.compile(
     r"""
     ^\s*(?:>\s*)?(?:[-*]\s+)?(?:\*\*)?
-    (?P<key>EFFORT|CONFIDENCE|RISK)
+    (?P<key>EFFORT|CONFIDENCE|RISK|CONTINUE_DEBATE)
     (?:\*\*)?\s*:\s*(?:\*\*)?
     (?P<value>[A-Za-z][A-Za-z\-_]*)
     """,
@@ -2432,6 +2443,7 @@ def _extract_response_envelope(output: str) -> dict[str, Any]:
         "evidence": [],
         "tests_to_run": [],
         "assumptions": [],
+        "continue_debate": None,
     }
     if not output:
         return envelope
