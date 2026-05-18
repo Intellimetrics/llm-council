@@ -234,8 +234,18 @@ def render_summary_markdown(
 # completed work units). All other "interesting" events emit messages
 # with delta=0. Events not listed in `format_progress_message` are
 # suppressed entirely (noise vs signal — see plan §3 table).
+#
+# `preflight_failed` peers are stripped from `run_targets` and never
+# emit `participant_finish`, so without listing it here the progress
+# counter would stall whenever a local peer's preflight ping failed.
+# The peer's "work" is morally done — it just failed before it started.
 PROGRESS_ADVANCING_EVENTS = frozenset(
-    {"participant_finish", "cross_rank_complete", "synthesis_finish"}
+    {
+        "participant_finish",
+        "preflight_failed",
+        "cross_rank_complete",
+        "synthesis_finish",
+    }
 )
 
 

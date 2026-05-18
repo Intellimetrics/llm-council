@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.10.1 - 2026-05-18
+
+v0.10.1 fixes two correctness bugs the council surfaced when dogfooding
+v0.10.0 — both verified against source by claude + gemini. 1035 → 1037
+passing tests (+2 fix-validating); same 3 pre-existing environmental
+failures unchanged. Cache schema v3 unchanged. No new dependencies.
+
+Heads-up: the v0.10.0 MCP progress notifications dogfooded green in
+the council loop (the new code paths execute and pytest covers the
+shape), but Claude Code did NOT visibly render the
+`notifications/progress.message` text in the host UI during the
+dogfood run. This was Risk #1 in the original plan ("host-agent
+rendering variance — unverified"). Investigation tracked separately
+— the v0.10.1 fixes ship regardless because they're real correctness
+bugs even if the notifications never render anywhere.
+
+**asyncio orphan-task GC risk.** `asyncio.create_task` is what bridges
+the orchestrator's sync `emit()` to async
+`session.send_progress_notification`. The event loop only holds **weak
+references** to tasks (CPython docs warning), so without a strong ref
+the GC can collect an in-flight task mid-await and the notification
+disappears silently. Fix: closure-local `_pending_tasks: set` keeps
+strong refs until each task's `done_callback` discards itself
+(`mcp_server.py:765-789`). New burst test fires 50 advancing events,
+forces `gc.collect()` mid-burst, asserts all 50 notifications were
+delivered. Surfaced by gemini + claude in the v0.10.0 dogfood council.
+
+**Off-by-one in `planned_total` when preflight fails.** Local
+participants (Ollama) run a preflight ping before the orchestrator's
+work begins; peers that fail preflight are stripped from `run_targets`
+(`orchestrator.py:383-397`) and never reach `participant_finish`. The
+total stays `peers * rounds + 1`, so a 4-peer run with 1 preflight
+failure goes 0/9 → 3/9 → suddenly 9/9 at `council_finish`. Fix: added
+`preflight_failed` to `display.PROGRESS_ADVANCING_EVENTS` so those
+peers tick the counter once (`display.py:237-251`). Counter-advance
+logic also moved BEFORE the `message is None` early-return in the
+MCP callback (`mcp_server.py:792-801`) — minor cleanup that makes the
+two concerns (does this event advance? does this event emit a
+message?) independent, which they should always have been. Surfaced
+by gemini in the v0.10.0 dogfood council.
+
 ## 0.10.0 - 2026-05-18
 
 v0.10.0 ships two coupled visibility features: MCP progress

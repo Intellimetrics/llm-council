@@ -756,6 +756,13 @@ def _build_mcp_progress_callback(
     Returns a callable suitable for `execute_council(..., progress=cb)`,
     or `None` when no token is set / quiet mode is active (caller falls
     back to no progress callback).
+
+    The event loop only holds **weak** references to tasks created via
+    `asyncio.create_task`, so without a strong reference the GC can
+    collect a task mid-flight and the notification silently disappears
+    (CPython `asyncio` docs warning). We keep a closure-local set of
+    pending tasks and discard each on completion — references live just
+    long enough for `_send` to finish.
     """
     if progress_token is None or session is None:
         return None
@@ -763,6 +770,7 @@ def _build_mcp_progress_callback(
         return None
 
     counter = {"value": 0.0}
+    _pending_tasks: set[asyncio.Task[Any]] = set()
 
     async def _send(progress: float, message: str) -> None:
         try:
@@ -779,20 +787,30 @@ def _build_mcp_progress_callback(
             pass
 
     def callback(event: dict[str, Any]) -> None:
-        message = display.format_progress_message(event)
-        if message is None:
-            return
         kind = event.get("event")
+        # Counter logic runs FIRST so suppressed-message events still
+        # advance progress where appropriate. `preflight_failed` peers
+        # never emit `participant_finish` (they're stripped from
+        # `run_targets`), so without this they'd never tick the counter
+        # and the bar would stall until `council_finish` clamps.
         if kind in display.PROGRESS_ADVANCING_EVENTS:
             counter["value"] += 1
         elif kind == "council_finish":
             counter["value"] = planned_total
+        message = display.format_progress_message(event)
+        if message is None:
+            return
         try:
-            asyncio.create_task(_send(counter["value"], message))
+            task = asyncio.create_task(_send(counter["value"], message))
         except RuntimeError:
             # No running loop (sync test contexts). Drop silently —
             # progress notifications are advisory.
-            pass
+            return
+        # Hold a strong ref until `_send` finishes; without this the
+        # event loop's weak-ref policy lets the task get GC'd mid-await
+        # and the notification vanishes silently.
+        _pending_tasks.add(task)
+        task.add_done_callback(_pending_tasks.discard)
 
     return callback
 
