@@ -4911,6 +4911,15 @@ def test_setup_interactive_uses_preset_and_suppression_flags(
 ):
     answers: list[str] = []
     monkeypatch.setattr("builtins.input", lambda _prompt: answers.pop(0) if answers else "")
+    # `tri-cli` preset is gated by `_preset_status` on whether claude /
+    # codex / gemini are on PATH. CI runners don't ship those binaries,
+    # so mock shutil.which the same way the adjacent passing setup
+    # tests do.
+    monkeypatch.setattr(
+        cli_module.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"claude", "codex", "gemini"} else None,
+    )
     args = argparse.Namespace(
         root=str(tmp_path),
         preset="tri-cli",
@@ -4935,7 +4944,14 @@ def test_setup_interactive_uses_preset_and_suppression_flags(
     assert not (tmp_path / ".llm-council" / "instructions").exists()
 
 
-def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path):
+def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path, monkeypatch):
+    # Same `_preset_status` gating as above — mock claude / codex / gemini
+    # presence so the tri-cli preset passes on a clean CI runner.
+    monkeypatch.setattr(
+        cli_module.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"claude", "codex", "gemini"} else None,
+    )
     args = argparse.Namespace(
         root=str(tmp_path),
         preset="tri-cli",
