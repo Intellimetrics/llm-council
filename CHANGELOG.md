@@ -11,10 +11,18 @@ Heads-up: the v0.10.0 MCP progress notifications dogfooded green in
 the council loop (the new code paths execute and pytest covers the
 shape), but Claude Code did NOT visibly render the
 `notifications/progress.message` text in the host UI during the
-dogfood run. This was Risk #1 in the original plan ("host-agent
-rendering variance — unverified"). Investigation tracked separately
-— the v0.10.1 fixes ship regardless because they're real correctness
-bugs even if the notifications never render anywhere.
+dogfood run. **Confirmed via post-merge investigation: Claude Code does
+not currently implement `notifications/progress` rendering.** Tracked
+upstream at
+[anthropics/claude-code#4157](https://github.com/anthropics/claude-code/issues/4157)
+(open) and #3174 (closed as "not planned" — covers the related
+`notifications/message` channel with the same UI-silence root cause).
+Other MCP hosts (Claude Desktop, Claude web, third-party clients) DO
+render the notifications correctly. Our implementation is spec-
+compliant; the gap is in Claude Code's feature roadmap. When #4157
+ships, v0.10.0 lights up in Claude Code automatically — no code
+changes required. The v0.10.1 fixes ship regardless because they're
+real correctness bugs even when no host renders the notifications.
 
 **asyncio orphan-task GC risk.** `asyncio.create_task` is what bridges
 the orchestrator's sync `emit()` to async
