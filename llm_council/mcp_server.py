@@ -31,6 +31,7 @@ from llm_council.config import (
     select_participants,
 )
 from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_prompt
+from llm_council import display
 from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env
 from llm_council.estimate import estimate_council
@@ -739,7 +740,69 @@ def query_transcripts_schema() -> dict[str, Any]:
     }
 
 
-async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
+def _build_mcp_progress_callback(
+    session: Any,
+    progress_token: Any,
+    *,
+    planned_total: float,
+):
+    """Build a sync `progress` callback that emits MCP progress notifications.
+
+    The orchestrator's `emit` is sync; `session.send_progress_notification`
+    is async. We bridge via `asyncio.create_task(...)` so we never block
+    round progression on a slow client, and we swallow transport errors so
+    a wedged client cannot fail the council run.
+
+    Returns a callable suitable for `execute_council(..., progress=cb)`,
+    or `None` when no token is set / quiet mode is active (caller falls
+    back to no progress callback).
+    """
+    if progress_token is None or session is None:
+        return None
+    if display.wants_quiet():
+        return None
+
+    counter = {"value": 0.0}
+
+    async def _send(progress: float, message: str) -> None:
+        try:
+            await session.send_progress_notification(
+                progress_token,
+                progress,
+                total=planned_total,
+                message=message,
+            )
+        except Exception:
+            # Transport errors must never break the council run. The
+            # final tool-result envelope still ships every event in
+            # metadata.progress_events, so nothing is permanently lost.
+            pass
+
+    def callback(event: dict[str, Any]) -> None:
+        message = display.format_progress_message(event)
+        if message is None:
+            return
+        kind = event.get("event")
+        if kind in display.PROGRESS_ADVANCING_EVENTS:
+            counter["value"] += 1
+        elif kind == "council_finish":
+            counter["value"] = planned_total
+        try:
+            asyncio.create_task(_send(counter["value"], message))
+        except RuntimeError:
+            # No running loop (sync test contexts). Drop silently —
+            # progress notifications are advisory.
+            pass
+
+    return callback
+
+
+async def run_council(
+    arguments: dict[str, Any],
+    *,
+    mcp_session: Any | None = None,
+    progress_token: Any | None = None,
+) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
     config = load_config(find_config(cwd), search=False)
@@ -1024,6 +1087,15 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
     # populate the metadata field once execute_council has returned its
     # own dict, but hold the list locally so it doesn't fall out of scope.
     _pending_config_warnings = warnings
+    # Plan §5 progress semantics: `total = peers * effective_rounds + 1`
+    # (the +1 reserves headroom for synthesis or cross-rank). Clamps
+    # apply on `council_finish`. Skipped entirely when no progressToken
+    # was set by the client (silent no-op fallback).
+    _effective_rounds = max_rounds if deliberate else 1
+    _planned_total = float(len(participants) * _effective_rounds + 1)
+    _progress_cb = _build_mcp_progress_callback(
+        mcp_session, progress_token, planned_total=_planned_total
+    )
     results, metadata = await execute_council(
         participants,
         cfg,
@@ -1032,6 +1104,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         config,
         deliberate=deliberate,
         max_rounds=max_rounds,
+        progress=_progress_cb,
         image_manifest=image_manifest or None,
         min_quorum=min_quorum_value,
         mode=mode,
@@ -1472,7 +1545,27 @@ async def _serve() -> None:
     @app.call_tool()
     async def call_tool(name: str, arguments: dict):
         if name == "council_run":
-            result = await run_council(arguments)
+            # Grab the per-call MCP context to enable mid-run progress
+            # notifications. Both fields are None-safe: a client that
+            # didn't set `_meta.progressToken` (the on-the-wire shape)
+            # gets the silent no-op fallback documented in
+            # `_build_mcp_progress_callback`.
+            session: Any = None
+            progress_token: Any = None
+            try:
+                rc = app.request_context
+                session = getattr(rc, "session", None)
+                meta = getattr(rc, "meta", None)
+                progress_token = (
+                    getattr(meta, "progressToken", None) if meta is not None else None
+                )
+            except (LookupError, AttributeError):
+                pass
+            result = await run_council(
+                arguments,
+                mcp_session=session,
+                progress_token=progress_token,
+            )
         elif name == "council_recommend":
             use, mode, reason = should_use_council(
                 arguments["task"],

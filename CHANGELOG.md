@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.10.0 - 2026-05-18
+
+v0.10.0 ships two coupled visibility features: MCP progress
+notifications so host agents see mid-run progress on the existing
+`council_run` tool call, and a brand-identity layer that makes council
+output unambiguous in a stream of regular agent chatter. Comes out of
+the Symphony-research pass — three candidates were shelved (stall
+detection, `PROMPT.md` overlay, `council_active_runs` sidecar), and
+this is the one that landed cheaply by extending `display.py`'s
+existing brand affordances rather than introducing new state. 1035 →
+1053 passing tests (+18 net new); same 3 pre-existing environmental
+failures unchanged. Cache schema v3 unchanged. No new dependencies.
+
+**MCP progress notifications.** New `_build_mcp_progress_callback` in
+`mcp_server.py:744-799` bridges the orchestrator's sync `emit` callback
+to async `session.send_progress_notification` via
+`asyncio.create_task` — fire-and-forget so a slow client cannot wedge
+the council run; transport errors swallowed for the same reason. In
+`call_tool`, `app.request_context.meta.progressToken` is captured and
+threaded into `run_council` (`mcp_server.py:1493-1517`); silent no-op
+when the client did not set a token. Progress fraction:
+`completed_peer_runs / (peers * effective_rounds + 1)`, the `+1`
+reserving headroom for synthesis or cross-rank; clamps to total on
+`council_finish`. Replaces the rejected `council_active_runs` sidecar
+design (one MCP call now surfaces mid-run progress; no second call,
+no on-disk state, no GC, no CLI subcommand).
+
+**Event-to-notification mapping.** Only "interesting" events emit
+notifications (`display.format_progress_message`); `participant_start`
+is suppressed (per-peer noise multiplier when N peers fire
+concurrently; `participant_finish` is the visible signal), along with
+`images_skipped`, `truncated_for_deliberation`,
+`deliberation_skip_participants`, `convergence`, and
+`context_files_chunked`. 12–14 notifications per 4-peer 2-round run.
+The `PROGRESS_ADVANCING_EVENTS` frozenset enumerates the three events
+that advance the counter: `participant_finish`, `cross_rank_complete`,
+`synthesis_finish`.
+
+**Brand identity token.** `display.BRAND_TOKEN = "LLM Council"` plus
+`BRAND_SEP = " · "`. Every progress message is plain-text prefixed
+`LLM Council · …` — no ANSI (hosts strip), no emoji (font-fallback
+risk on macOS Terminal default + CI logs), no markdown bold (some
+hosts render `**` as literal in progress messages). Matches the
+existing `**LLM Council**` header in `render_summary_markdown`
+(`display.py:205`) so CLI and MCP say the same word. Plain ASCII is
+greppable and survives every rendering path.
+
+**Per-peer color accent (CLI).** New `PEER_ACCENT_PALETTE`
+(cyan/magenta/yellow/green/blue/red) rotated deterministically by
+roster index in `display.peer_accent()`. CLI `_print_progress_event`
+becomes `_make_progress_printer(participants)` — a factory that
+closes over the roster so the sync `progress` callback contract stays
+single-argument while still giving deterministic per-peer color.
+Custom CLIs defined in `.llm-council.yaml` slot into the cycle by
+roster position. `format_gutter` gains an optional `token_color`
+parameter (`display.py:113-138`); default bold-cyan gutter applies
+when no override is provided or when the peer is not in the roster
+(stranger peer fallback). MCP `message` field stays plain text — per-
+peer color isn't expressible in one-line notifications.
+
+**`LLM_COUNCIL_QUIET=1` opt-out.** Single env switch suppresses (a)
+all MCP progress notifications (treated as if no `progressToken` was
+sent) and (b) all CLI gutter colorization. Layout still prints under
+QUIET — accessibility and pipe-friendliness are the goals, not
+silence. Env-only because MCP servers have no per-call CLI flags;
+parity with the existing `NO_COLOR` honoring in `display.wants_color`.
+
+**Honest gaps.** Claude Code's exact rendering of
+`notifications/progress.message` is unverified; the plain-text-only
+design is the safe-under-uncertainty choice and works under
+worst-case "strip everything but text" rendering. If Claude Code
+turns out to render markdown in progress messages, future patches can
+add bold under the same token without breaking older renderers.
+
+**Test surface.** New `tests/test_display_branding.py` (+18 tests):
+peer-accent determinism + palette wrap-around, `wants_quiet` truthy
+/ falsy parsing, message prefix on every interesting event,
+suppression of `participant_start` + noise events, no-token /
+no-session / quiet-env no-op, monotonic progress + clamp-to-total,
+transport-error swallowing, CLI quiet-mode strips ANSI but preserves
+gutter layout, CLI per-peer accent matches palette, stranger peers
+fall back to `ANSI_GUTTER`.
+
 ## 0.9.0 - 2026-05-18
 
 v0.9.0 ships four items driven by the post-v0.8 competitor-comparison

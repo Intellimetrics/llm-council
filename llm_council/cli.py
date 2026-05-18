@@ -2087,135 +2087,167 @@ def _fmt_usd(value: float | None) -> str:
     return f"${value:.4f}"
 
 
-def _print_progress_event(event: dict) -> None:
-    kind = event.get("event")
-    participant = event.get("participant")
-    round_label = f"round {event.get('round')}" if event.get("round") else "round ?"
-    color = display.wants_color(sys.stderr)
-    if kind == "participant_start":
-        print(
-            display.format_gutter(
-                participant or "peer",
-                f"start {round_label}",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "participant_slow":
-        elapsed = float(event.get("elapsed_seconds") or 0)
-        timeout = float(event.get("timeout_seconds") or 0)
-        slow = display.colorize_status("slow", color=color)
-        print(
-            display.format_gutter(
-                participant or "peer",
-                f"{slow} after {elapsed:.1f}s (hard timeout at {timeout:.0f}s)",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "participant_finish":
-        status = event.get("status") or ("ok" if event.get("ok") else "error")
-        details = [f"{float(event.get('elapsed_seconds') or 0):.1f}s"]
-        if event.get("total_tokens") is not None:
-            details.append(f"{event['total_tokens']} tokens")
-        if event.get("cost_usd") is not None:
-            details.append(f"${float(event['cost_usd']):.6f}")
-        if event.get("from_cache"):
-            details.append("cached")
-        colored_status = display.colorize_status(status, color=color)
-        print(
-            display.format_gutter(
-                participant or "peer",
-                f"{colored_status} {round_label} ({'; '.join(details)})",
-                color=color,
-            ),
-            flush=True,
-        )
-        if event.get("error"):
+def _make_progress_printer(ordered_peers: list[str] | tuple[str, ...] | None = None):
+    """Build a `_print_progress_event`-shaped callback with a peer roster
+    closure for per-peer color accents.
+
+    Closure exists so `execute_council`'s sync `progress` callback contract
+    stays single-argument while still giving us deterministic per-peer
+    color rotation. Falls back to the bold-cyan gutter for peers that
+    aren't in the roster (e.g., custom CLIs registered late, future peer
+    types).
+    """
+    peers = list(ordered_peers or [])
+
+    def _accent_for(name: str | None) -> str | None:
+        if not name or not peers:
+            return None
+        return display.peer_accent(name, peers)
+
+    def _emit(event: dict) -> None:
+        kind = event.get("event")
+        participant = event.get("participant")
+        round_label = f"round {event.get('round')}" if event.get("round") else "round ?"
+        # `wants_quiet()` suppresses color (layout stays); NO_COLOR / non-TTY
+        # is already handled by `wants_color`.
+        color = display.wants_color(sys.stderr) and not display.wants_quiet()
+        peer_color = _accent_for(participant) if color else None
+        if kind == "participant_start":
             print(
-                display.format_gutter("", event["error"], color=color),
+                display.format_gutter(
+                    participant or "peer",
+                    f"start {round_label}",
+                    color=color,
+                    token_color=peer_color,
+                ),
                 flush=True,
             )
-        return
-    if kind == "deliberation_skip_participants":
-        skipped = ", ".join(event.get("skipped") or [])
-        print(
-            display.format_gutter(
-                display.VERB_DELIBERATING,
-                f"skipping {skipped} from round {event.get('round')} "
-                f"({event.get('reason')})",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "deliberation_pending":
-        print(
-            display.format_gutter(
-                display.VERB_DELIBERATING,
-                f"disagreement detected; starting round {event.get('round')}",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "deliberation_round_start":
-        print(
-            display.format_gutter(
-                display.VERB_ROUND,
-                f"{event.get('round')} (deliberation)",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "deliberation_skip":
-        print(
-            display.format_gutter(
-                display.VERB_DELIBERATING,
-                f"skipped ({event.get('reason')})",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "deliberation_finish":
-        status = event.get("status") or "done"
-        colored_status = display.colorize_status(status, color=color)
-        print(
-            display.format_gutter(
-                display.VERB_DELIBERATING,
-                f"{colored_status} after {event.get('rounds')} rounds",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "degraded_consensus":
-        labeled = event.get("labeled_quorum")
-        threshold = event.get("min_quorum")
-        degraded = display.colorize_status("DEGRADED", color=color)
-        print(
-            display.format_gutter(
-                "Quorum",
-                f"{labeled} of {threshold} required peers labeled — {degraded}",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "images_skipped":
-        print(
-            display.format_gutter(
-                participant or "peer",
-                f"image attachments skipped ({event.get('reason')}; "
-                f"{event.get('image_count')} image(s) referenced as text only)",
-                color=color,
-            ),
-            flush=True,
-        )
+            return
+        if kind == "participant_slow":
+            elapsed = float(event.get("elapsed_seconds") or 0)
+            timeout = float(event.get("timeout_seconds") or 0)
+            slow = display.colorize_status("slow", color=color)
+            print(
+                display.format_gutter(
+                    participant or "peer",
+                    f"{slow} after {elapsed:.1f}s (hard timeout at {timeout:.0f}s)",
+                    color=color,
+                    token_color=peer_color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "participant_finish":
+            status = event.get("status") or ("ok" if event.get("ok") else "error")
+            details = [f"{float(event.get('elapsed_seconds') or 0):.1f}s"]
+            if event.get("total_tokens") is not None:
+                details.append(f"{event['total_tokens']} tokens")
+            if event.get("cost_usd") is not None:
+                details.append(f"${float(event['cost_usd']):.6f}")
+            if event.get("from_cache"):
+                details.append("cached")
+            colored_status = display.colorize_status(status, color=color)
+            print(
+                display.format_gutter(
+                    participant or "peer",
+                    f"{colored_status} {round_label} ({'; '.join(details)})",
+                    color=color,
+                    token_color=peer_color,
+                ),
+                flush=True,
+            )
+            if event.get("error"):
+                print(
+                    display.format_gutter("", event["error"], color=color),
+                    flush=True,
+                )
+            return
+        if kind == "deliberation_skip_participants":
+            skipped = ", ".join(event.get("skipped") or [])
+            print(
+                display.format_gutter(
+                    display.VERB_DELIBERATING,
+                    f"skipping {skipped} from round {event.get('round')} "
+                    f"({event.get('reason')})",
+                    color=color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "deliberation_pending":
+            print(
+                display.format_gutter(
+                    display.VERB_DELIBERATING,
+                    f"disagreement detected; starting round {event.get('round')}",
+                    color=color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "deliberation_round_start":
+            print(
+                display.format_gutter(
+                    display.VERB_ROUND,
+                    f"{event.get('round')} (deliberation)",
+                    color=color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "deliberation_skip":
+            print(
+                display.format_gutter(
+                    display.VERB_DELIBERATING,
+                    f"skipped ({event.get('reason')})",
+                    color=color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "deliberation_finish":
+            status = event.get("status") or "done"
+            colored_status = display.colorize_status(status, color=color)
+            print(
+                display.format_gutter(
+                    display.VERB_DELIBERATING,
+                    f"{colored_status} after {event.get('rounds')} rounds",
+                    color=color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "degraded_consensus":
+            labeled = event.get("labeled_quorum")
+            threshold = event.get("min_quorum")
+            degraded = display.colorize_status("DEGRADED", color=color)
+            print(
+                display.format_gutter(
+                    "Quorum",
+                    f"{labeled} of {threshold} required peers labeled — {degraded}",
+                    color=color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "images_skipped":
+            print(
+                display.format_gutter(
+                    participant or "peer",
+                    f"image attachments skipped ({event.get('reason')}; "
+                    f"{event.get('image_count')} image(s) referenced as text only)",
+                    color=color,
+                    token_color=peer_color,
+                ),
+                flush=True,
+            )
+
+    return _emit
+
+
+# Back-compat: the previous module-level callback kept for tests/imports
+# that call it directly. Built without a peer roster, so the per-peer
+# accent rotation degrades to the default gutter.
+_print_progress_event = _make_progress_printer()
 
 
 def cmd_models(args: argparse.Namespace) -> int:
@@ -2632,7 +2664,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         config,
         deliberate=deliberate,
         max_rounds=max_rounds,
-        progress=None if args.json else _print_progress_event,
+        progress=None if args.json else _make_progress_printer(participants),
         image_manifest=image_manifest or None,
         min_quorum=min_quorum_value,
         mode=mode,
