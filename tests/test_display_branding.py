@@ -97,8 +97,16 @@ def test_progress_message_suppresses_noise_events():
 
 
 def test_progress_advancing_events_set_matches_doc():
+    # `preflight_failed` is the v0.10.1 addition — without it, the
+    # progress bar stalled when a local peer's preflight ping failed
+    # because those peers never reach `participant_finish`.
     assert display.PROGRESS_ADVANCING_EVENTS == frozenset(
-        {"participant_finish", "cross_rank_complete", "synthesis_finish"}
+        {
+            "participant_finish",
+            "preflight_failed",
+            "cross_rank_complete",
+            "synthesis_finish",
+        }
     )
 
 
@@ -271,3 +279,89 @@ def test_cli_default_peer_uses_gutter_color_when_not_in_roster(monkeypatch, caps
     out = capsys.readouterr().out
     # No accent color matches → falls back to default ANSI_GUTTER.
     assert display.ANSI_GUTTER in out
+
+
+# ----- v0.10.1 fixes (council-surfaced) ---------------------------------
+
+
+def test_preflight_failed_advances_progress_counter(monkeypatch):
+    """v0.10.1 fix: preflight_failed peers are stripped from run_targets
+    and never emit participant_finish. Without listing them in
+    PROGRESS_ADVANCING_EVENTS the bar stalls until council_finish clamps.
+    """
+    from llm_council.mcp_server import _build_mcp_progress_callback
+
+    sent: list[dict] = []
+
+    class FakeSession:
+        async def send_progress_notification(self, progress_token, progress, total=None, message=None, related_request_id=None):
+            sent.append({"progress": progress, "message": message})
+
+    monkeypatch.delenv("LLM_COUNCIL_QUIET", raising=False)
+
+    async def _exercise():
+        # 3 peers; one preflight-fails. planned_total = 3*1 + 1 = 4.
+        cb = _build_mcp_progress_callback(FakeSession(), "tok", planned_total=4.0)
+        assert cb is not None
+        cb({"event": "council_start", "participants": ["claude", "codex", "ollama"]})
+        cb({"event": "preflight_failed", "participant": "ollama", "round": 1, "error": "unreachable"})
+        cb({"event": "participant_finish", "participant": "claude", "status": "ok", "elapsed_seconds": 5.0})
+        cb({"event": "participant_finish", "participant": "codex", "status": "ok", "elapsed_seconds": 6.0})
+        cb({"event": "council_finish", "ok": 2, "total": 3})
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    asyncio.run(_exercise())
+
+    progresses = [entry["progress"] for entry in sent]
+    # council_start (0) → preflight (1) → claude (2) → codex (3) → finish (4 clamp).
+    # Without the fix, preflight wouldn't advance → 0, 0, 1, 2, 4 — visible stall.
+    assert progresses == [0.0, 1.0, 2.0, 3.0, 4.0], progresses
+    # Preflight-failed message is also visible.
+    assert any("preflight failed" in m for m in (entry["message"] for entry in sent))
+
+
+def test_progress_callback_keeps_strong_refs_under_burst(monkeypatch):
+    """v0.10.1 fix: asyncio.create_task uses weak refs in the event loop.
+    Without strong refs, an in-flight notification can be GC'd mid-await
+    and silently disappear. Fire 50 events, force a GC pass mid-burst,
+    assert every notification was delivered.
+    """
+    import gc
+    from llm_council.mcp_server import _build_mcp_progress_callback
+
+    delivered: list[float] = []
+
+    class SlowSession:
+        async def send_progress_notification(self, progress_token, progress, total=None, message=None, related_request_id=None):
+            # Yield once so the task is mid-await when GC runs. Without
+            # the strong-ref fix, the task can be collected at this point.
+            await asyncio.sleep(0)
+            delivered.append(progress)
+
+    monkeypatch.delenv("LLM_COUNCIL_QUIET", raising=False)
+
+    async def _exercise():
+        cb = _build_mcp_progress_callback(SlowSession(), "tok", planned_total=100.0)
+        assert cb is not None
+        # 50 advancing events; each schedules an asyncio task.
+        for _ in range(50):
+            cb({
+                "event": "participant_finish",
+                "participant": "claude",
+                "status": "ok",
+                "elapsed_seconds": 1.0,
+            })
+        # Force a GC pass — without strong refs in the closure set, any
+        # task suspended at the `await asyncio.sleep(0)` above is fair
+        # game and would be collected before delivery.
+        gc.collect()
+        gc.collect()
+        # Drain.
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    asyncio.run(_exercise())
+
+    # All 50 notifications delivered.
+    assert len(delivered) == 50, f"expected 50 delivered, got {len(delivered)}"
