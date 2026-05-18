@@ -93,9 +93,13 @@ def test_mcp_doctor_returns_serialized_checks(tmp_path: Path, monkeypatch):
 
     result = run_doctor({"working_directory": str(tmp_path)})
 
+    # `config_warnings` was added to the doctor payload so MCP clients can
+    # surface the same advisory the CLI prints. An empty list on a clean
+    # default config is the expected baseline.
     assert result == {
         "checks": [{"name": "cli:codex", "ok": True, "detail": "ok"}],
         "version": __version__,
+        "config_warnings": [],
     }
 
 

@@ -705,8 +705,16 @@ def test_deliberate_mode_adds_deepseek_and_marks_expensive():
 def test_local_only_mode_picks_up_default_ollama_participant():
     """The shipped `local-only` mode should resolve to the built-in
     Ollama-backed participant on a clean default config — no extra wiring
-    needed."""
-    config = load_config(None)
+    needed.
+
+    `search=False` is load-bearing: without it, `load_config(None)` walks
+    upward from cwd and picks up the developer's own project-level
+    `.llm-council.yaml`, which often adds extra `type: openai_compatible`
+    local peers (vLLM, llama.cpp, etc.) and makes the assertion below
+    flake by env. The test is about *defaults*, so isolate from
+    discovery.
+    """
+    config = load_config(None, search=False)
     assert "local-only" in config["modes"]
     selected = select_participants(config, "local-only", current=None)
     assert selected == ["local_qwen_coder"]
@@ -4573,6 +4581,10 @@ def test_council_run_emits_summary_markdown(monkeypatch, tmp_path):
     from llm_council.mcp_server import run_council
 
     monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    # Inline pricing is required: enforce_mcp_budget rejects paid hosted
+    # participants (anything not `:free`) that lack `input_per_million`
+    # AND have no cached catalog entry. Test isolation has no catalog,
+    # so pin the price on the fixture.
     (tmp_path / ".llm-council.yaml").write_text(
         """
 defaults:
@@ -4582,6 +4594,8 @@ participants:
     type: openrouter
     model: openai/gpt-4o-mini
     api_key_env: X
+    input_per_million: 0.15
+    output_per_million: 0.6
 modes:
   review-cheap:
     participants: [cheap]
