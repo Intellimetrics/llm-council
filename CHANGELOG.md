@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.10.2 - 2026-05-18
+
+v0.10.2 fixes three envelope-parser bugs surfaced when the council
+reviewed itself, plus the four pre-existing test failures that had
+been carried since v0.10.0 (two real test-staleness bugs, two CI/env-
+specific). 1041 → 1048 passing tests on the venv suite; CI now green.
+No production code changes for the test fixes; the parser fix is the
+only behavior change. Cache schema v3 unchanged. No new dependencies.
+
+**Envelope parser correctness (`adapters.py`).** Three bugs in
+`_extract_response_envelope` mangled `structured_results` while
+leaving the raw markdown intact, so MCP clients reading the parsed
+envelope got garbage even though humans reading transcripts didn't
+notice:
+
+1. `RISK:` shared the single-word enum value pattern with
+   `EFFORT:` / `CONFIDENCE:` / `CONTINUE_DEBATE:`, truncating
+   sentences like "The single biggest risk is external-contract
+   drift…" to `"the"`. Split into `_ENVELOPE_ENUM_RE` (closed-vocab
+   fields) and a dedicated `_ENVELOPE_RISK_RE` that captures
+   rest-of-line preserving case and tolerates trailing `**`
+   markdown emphasis.
+2. The inline list form (`EVIDENCE: a, b, c` on one line) treated
+   the whole post-colon string as a single item. Real peers emit
+   multiple `[VERIFIED:path:start-end]` cites or pytest commands on
+   one line per the prompt contract in `context.py`. Now split on
+   comma; per-line bullet form is unchanged.
+3. `BLOCKERS: none` stored `["none"]` (truthy), defeating abdication
+   detection — a peer with `EFFORT: blocked` + `BLOCKERS: none` +
+   `ASSUMPTIONS: none` was treated as a real vote instead of an
+   abdication. Added `_LIST_NONE_SENTINELS` so `none`/`n/a`/`-`/`—`
+   normalize to no entries. Concrete fallout: abdication now fires
+   correctly when both list fields hold only the sentinel.
+
+All three were dogfood-surfaced when the council reviewed itself:
+codex and gemini both emitted comma-separated `[VERIFIED:...]` cites
+that came back as `text=", , , ,"` with only the first cite's
+metadata, and their sentence-form `RISK:` values came back as a
+single word.
+
+**Pre-existing test fixes.** Four failures that had ridden along
+since v0.10.0 — three real test-staleness bugs and two CI-env-
+specific gaps in shutil.which mocking:
+
+- `test_local_only_mode_picks_up_default_ollama_participant` called
+  `load_config(None)` which walks up cwd and merges the developer's
+  project-level `.llm-council.yaml`. Devs with local-server peers
+  (vLLM / llama.cpp) saw `local-only` resolve to multiple
+  participants instead of the single Ollama default the test
+  asserts. Switched to `load_config(None, search=False)`.
+- `test_council_run_emits_summary_markdown` declared an openrouter
+  `cheap` participant without inline pricing. `enforce_mcp_budget`
+  rejects paid hosted peers that lack `input_per_million` AND have
+  no cached catalog entry, so the test tripped a budget violation
+  before reaching the summary_markdown assertion. Pinned inline
+  pricing on the fixture.
+- `test_mcp_doctor_returns_serialized_checks` asserted exact dict
+  equality, but `run_doctor` now returns `config_warnings` so MCP
+  clients can surface the same advisory the CLI prints. Added
+  `"config_warnings": []` to the expected dict.
+- `test_setup_interactive_uses_preset_and_suppression_flags` and
+  `test_setup_yes_uses_preset_and_suppression_flags` gated on the
+  `tri-cli` preset, which requires 2+ of claude/codex/gemini on
+  PATH. CI runners have none, so `_preset_status` blocked setup.
+  Added the same `cli_module.shutil.which` mock the adjacent passing
+  setup tests already use.
+
 ## 0.10.1 - 2026-05-18
 
 v0.10.1 fixes two correctness bugs the council surfaced when dogfooding
