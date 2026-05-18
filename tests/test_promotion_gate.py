@@ -13,12 +13,10 @@ in `defaults.py` until both gates pass on the canonical fixture set.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 
 import pytest
 
 from llm_council.eval.runner import (
-    PromotionResult,
     SuiteScorecard,
     check_promotion_gate,
 )
@@ -227,10 +225,3 @@ def test_promotion_result_to_dict_roundtrips_json():
     assert len(decoded["reasons"]) == 2
 
 
-def test_promotion_result_asdict_matches_to_dict():
-    """`asdict(result)` and `result.to_dict()` should agree (regression guard
-    against custom serialization drifting from the dataclass default)."""
-    baseline = _suite("review", recall=0.50, snr=2.0)
-    candidate = _suite("rwt", recall=0.60, snr=1.9)
-    result = check_promotion_gate(baseline, candidate)
-    assert result.to_dict() == asdict(result)

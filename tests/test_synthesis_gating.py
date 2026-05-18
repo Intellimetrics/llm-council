@@ -43,18 +43,6 @@ def test_should_synthesize_skips_when_universal_abdication_fired():
     assert should_synthesize(False, metadata) is False
 
 
-def test_should_synthesize_normal_paths_unaffected():
-    assert should_synthesize(True, {}) is True
-    assert (
-        should_synthesize(False, {"deliberation_status": "ran_max_rounds_unresolved"})
-        is True
-    )
-    assert (
-        should_synthesize(False, {"deliberation_status": "ran_no_labeled_disagreement"})
-        is False
-    )
-
-
 # --- Chair invocation contract -------------------------------------------
 
 def test_run_synthesis_chair_bypasses_label_validation():

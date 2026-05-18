@@ -62,7 +62,7 @@ the same core:
 2. `mcp_server.py` (`llm-council mcp-server`, exposing `council_run`,
    `council_estimate`, `council_recommend`, `council_doctor`,
    `council_list_modes`, `council_last_transcript`, `council_models`,
-   `council_stats`)
+   `council_stats`, `council_query_transcripts`)
 
 Both flow through the same pipeline:
 
@@ -131,7 +131,17 @@ Key modules:
   `false_blocker_rate`, `citation_accuracy`, `evidence_density`,
   `signal_to_noise_ratio`), `runner.py` (`load_fixture`, `run_suite`,
   `to_json`, `check_promotion_gate`), bundled minimal `fixtures/`.
-  CLI: `llm-council eval run`.
+  CLI: `llm-council eval run`. `check_promotion_gate` accepts optional
+  `cross_rank_correlation_floor` (v0.9.0) for future eval-driven flip
+  of `--cross-rank` defaults.
+- `query.py` (v0.9.0) — `SimilarMatch`, `search_similar()`. Jaccard
+  token-overlap search over `.llm-council/runs/*.json` for prior
+  council questions. Reuses `convergence.tokenize`,
+  `deliberation.recommendation_label`, and
+  `stats.load_transcript_files`. Surface is MCP only
+  (`council_query_transcripts`); no CLI subcommand. No new
+  dependencies — sentence-transformers deferred until Jaccard proves
+  insufficient.
 
 ## Invariants worth preserving
 
@@ -249,6 +259,37 @@ Key modules:
   is NEVER fed back to peers during round-2 deliberation — MAD
   literature (arxiv 2402.18272) warns that in-round convergence
   forcing depresses signal-to-noise.
+- **Cross-ranking is a flag, not a mode, and ranking-round outputs
+  never enter deliberation.** `--cross-rank` (CLI) / `cross_rank: true`
+  (MCP) is composable with any existing mode. After round 1, the
+  orchestrator builds an anonymization map (`peer → "Response A|B|…"`,
+  Excel-column style for >26 peers), constructs per-peer ranking
+  prompts with OTHER peers' outputs relabeled, runs the ranking pass
+  via `run_participants`, parses `FINAL RANKING:` numbered lists, and
+  aggregates per-peer `rank_position_mean`. Surfaced top-level on the
+  transcript JSON (`cross_rank_scores`, `anonymization_map`,
+  `anonymization_map_reverse`, `cross_rank_rankings`), MCP
+  `structured_results`, and `stats.aggregate_reliability`. Ranking-
+  round results carry `is_ranking_round=True` on `ParticipantResult`,
+  are persisted and cached, and are EXCLUDED from the round-2
+  deliberation prompt builder (`transcript.py:470`) — same MAD-
+  literature invariant as the finding matrix. Promotion gate keeps an
+  optional `cross_rank_correlation_floor` slot for the eventual
+  default flip.
+- **Tool-call voting is opt-in even within `review-with-tools`.**
+  `tool_call_voting: false` by default on the `review-with-tools` mode
+  (`defaults.py:397`). When flipped to `true`, the orchestrator
+  appends a `record_recommendation(verdict, blockers, evidence)` tool
+  schema to the per-peer directive and runs a unified
+  `_extract_tool_call_recommendation` parser; regex
+  `RECOMMENDATION:` parsing remains the fallback. `tool_call_status`
+  on `ParticipantResult` (`absent` / `ok` / `malformed` / `None`)
+  makes parser behavior operator-visible — serialized in transcripts
+  and MCP `structured_results` (Phase 5b fix). Promotion to default
+  requires eval-harness lift on the same gate that governs
+  `review-with-tools` itself; no family-specific extraction code is
+  added until concrete CLI tool-call payloads exist to validate
+  against.
 - **Per-mode model overrides.**
   `modes.<name>.model_overrides: {peer: model_id}` in
   `.llm-council.yaml`. Resolution order: base

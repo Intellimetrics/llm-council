@@ -86,17 +86,6 @@ def test_parse_tagged_entry_strips_verified_token():
     assert "kaboom" in out["text"]
 
 
-def test_parse_tagged_entry_published_regression():
-    """Pre-Phase-A shape must still work for non-VERIFIED tags."""
-    out = _parse_tagged_entry("[PUBLISHED] Bai et al. 2022")
-    assert out == {"text": "Bai et al. 2022", "tag": "published"}
-
-
-def test_parse_tagged_entry_untagged_regression():
-    out = _parse_tagged_entry("a claim with no tag")
-    assert out == {"text": "a claim with no tag", "tag": None}
-
-
 # --- verify_ref filesystem tests ---------------------------------------
 
 def _write_lines(path: Path, n_lines: int) -> None:

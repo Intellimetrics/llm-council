@@ -159,6 +159,8 @@ def build_payload(
     section_repair_attempted: bool = False,
     evidence_verification_failures: list[str] | None = None,
     continue_debate: str | None = None,
+    tool_call_status: str | None = None,
+    is_ranking_round: bool = False,
 ) -> dict[str, Any]:
     preview = prompt[:PROMPT_PREVIEW_CHARS]
     payload: dict[str, Any] = {
@@ -206,6 +208,22 @@ def build_payload(
     # the default is None (no behavioral change for old payloads).
     if continue_debate is not None:
         payload["continue_debate"] = str(continue_debate)
+    # v0.9.0 Feature 3: persist the tool-call telemetry distinction so cache
+    # hits still surface the absent/ok/malformed bucket in stats. Only
+    # written when not None — `None` means "extraction did not run for
+    # this peer", which is the default state and is semantically
+    # identical to absence. Schema version is NOT bumped because the
+    # default-on-missing read is None (no behavioral change for old
+    # payloads).
+    if tool_call_status is not None:
+        payload["tool_call_status"] = str(tool_call_status)
+    # v0.9.0 Feature 2: persist the ranking-round flag so cache hits still
+    # surface as ranking-round and stay filtered from the deliberation
+    # round-2 prompt builder. Only written when True (default False);
+    # readers default-on-missing to False, so absence is semantically
+    # identical to "primary response, not a ranking pass".
+    if is_ranking_round:
+        payload["is_ranking_round"] = True
     return payload
 
 

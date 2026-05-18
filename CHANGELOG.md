@@ -1,5 +1,110 @@
 # Changelog
 
+## 0.9.0 - 2026-05-18
+
+v0.9.0 ships four items driven by the post-v0.8 competitor-comparison
+pass (karpathy/llm-council, massgen/MassGen, blueman82/ai-counsel —
+clones at `/development/projects/reference/`): an MCP transcript-search
+tool, opt-in tool-call voting, a one-line Phase-5b serialization fix the
+dogfood pass caught, and an anonymized cross-ranking flag composable
+with any mode. 935 → 1017 passing tests (+82 net: +91 added across
+three new test files, -9 from a conservative cleanup pass); same 3
+pre-existing environmental failures unchanged. Cache schema v3
+unchanged.
+
+**`council_query_transcripts` MCP tool.** Semantic search over
+`.llm-council/runs/*.json`. New module `llm_council/query.py` with
+`SimilarMatch` dataclass and `search_similar()`
+(`query.py:30-38,99-161`). Reuses `stats.load_transcript_files`,
+`convergence.tokenize`/`jaccard_similarity`, and the fence-aware
+`deliberation.recommendation_label`. Returns top-k matches with
+`(run_id, similarity, question_excerpt, recommendation_label,
+timestamp)`; timestamp parsed from the run-id `YYYYMMDD_HHMMSS` prefix.
+Wired into MCP at `mcp_server.py:1351,1366,1460,1496` — canonical
+surface is MCP only; no CLI subcommand. NO new dependencies (Jaccard
+MVP — sentence-transformers deferred until Jaccard demonstrably
+insufficient). Scope-cut: `find_contradictions` and `trace_evolution`
+deferred to v0.9.x. Dogfood-verified: 5 matches returned for a
+"v0.8 closed-loop measurement pipeline" query
+(`.llm-council/runs/20260518_044924_*`). New test file
+`tests/test_query_transcripts.py`. Inspired by ai-counsel's
+`query_decisions` MCP tool.
+
+**Tool-call voting (opt-in).** Strictly opt-in via `tool_call_voting:
+true` on the `review-with-tools` mode (default `false`,
+`defaults.py:397`). When enabled, the
+`record_recommendation(verdict, blockers, evidence)` tool-call schema
+is appended to the per-peer directive; the orchestrator runs a unified
+`_extract_tool_call_recommendation` parser and falls back to the
+existing regex `RECOMMENDATION:` parsing when no structured payload is
+present. No family-specific extraction code yet — no real CLI
+tool-call payloads to validate against, deferred until concrete shapes
+appear. New `tool_call_status` field on `ParticipantResult`
+distinguishes `absent` / `ok` / `malformed` / `None` so parser bugs
+become operator-visible instead of silently masking. Cache round-trip
+preserved (the new field rehydrates to `None` on absence; schema
+version unchanged). Orchestrator wiring at
+`orchestrator.py:416-418,434,593`. Dogfood-verified: with the flag
+flipped via a temp yaml override, all three CLI peers reported
+`tool_call_status: "absent"` (extraction ran, found no tool call,
+regex fallback succeeded) — confirms the no-op safety path end-to-end
+(`.llm-council/runs/20260518_052232_*`). New test file
+`tests/test_tool_call_voting.py`.
+
+**Phase 5b (dogfood-caught fix).** Phase 5 set `tool_call_status`
+internally but never serialized it — same class of latent bug as
+v0.8.1's Phase 1b verified-tag schema gap. `result_to_dict`
+(`transcript.py:367-370`) and `council_run_output_schema`
+(`mcp_server.py:344,1109`) did not include the field, so the operator
+couldn't see whether extraction ran. Two-line fix on each surface;
+caught precisely because the v0.8.1 lesson ("dogfood the new surface
+through MCP immediately after restart") was followed.
+
+**Anonymized cross-ranking (flag, not mode).** New `--cross-rank` CLI
+flag (`cli.py:244-249,2644`) and `cross_rank: true` MCP arg
+(`mcp_server.py:204-212,1042`); composable with any existing mode (NOT
+a new mode — avoids mode proliferation). After round 1, builds a stable
+anonymization map `{peer: "Response A|B|C…"}` (Excel-column style for
+>26 peers), constructs per-peer ranking prompts with the OTHER peers'
+outputs relabeled, runs the ranking pass via existing
+`run_participants`, parses `FINAL RANKING:` numbered lists, aggregates
+per-peer `rank_position_mean`. Orchestrator wiring at
+`orchestrator.py:310,510-632`. Surfaces in transcript JSON top-level
+(`cross_rank_scores` + `anonymization_map` + reverse map +
+`cross_rank_rankings`; `transcript.py:918-977`), transcript markdown
+(`transcript.py:856-877`), MCP `structured_results`
+(`mcp_server.py:518,1188-1204`), and `stats.aggregate_reliability` as
+a new per-peer counter (`stats.py:630-632`). New `is_ranking_round`
+field on `ParticipantResult`; ranking-round results are persisted and
+cached but explicitly EXCLUDED from the round-2 deliberation prompt
+builder (`transcript.py:470`) — mirrors the v0.8 finding-matrix
+invariant (MAD literature, arxiv 2402.18272). Promotion gate in
+`eval/runner.py:402-484` accepts an optional
+`cross_rank_correlation_floor` for future eval-data-driven default
+flip. Dogfood-verified: a `consensus + cross_rank: true` run produced
+`cross_rank_scores: {claude: 1.0, codex: 1.5, gemini: 2.0}` with the
+anonymization map persisted to metadata
+(`.llm-council/runs/20260518_044924_*`). New test file
+`tests/test_cross_rank.py`.
+
+**Test cleanup pass.** 9 tests deleted across 8 files (tautologies,
+type-system-checks-dressed-as-tests, byte-identical duplicates,
+default-value-only checks). Conservative scope — `test_llm_council.py`
+(357K, 437 tests) intentionally untouched; a deeper consolidation pass
+is deferred. Flagged but did NOT change:
+`llm_council/eval/runner.py:392` — `PromotionResult.to_dict()` is just
+`return asdict(self)` and adds no value over calling `asdict` directly;
+defer to v0.9.x. Test surface: 935 (v0.8.1) → 1017 (v0.9.0) = +82 net.
+
+**Operational gotcha (carry forward).** The v0.7.1 MCP-server-
+restart-after-install warning still applies. All four v0.9.0 surfaces
+(`council_query_transcripts`, tool-call voting, Phase 5b
+serialization, cross-rank) require an MCP-server restart before
+MCP-mediated councils pick them up. Phase 5b was caught precisely
+because the post-Phase-5 restart was the first moment the MCP server
+emitted `tool_call_status` over the wire; dogfood through MCP
+immediately after restart to catch this class of issue.
+
 ## 0.8.1 - 2026-05-17
 
 v0.8.1 ships three items: hash-aware chunking for `context_files`

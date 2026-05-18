@@ -240,6 +240,20 @@ def build_parser() -> argparse.ArgumentParser:
             "model so a tier can swap a subset."
         ),
     )
+    run.add_argument(
+        "--cross-rank",
+        dest="cross_rank",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt-in anonymized cross-ranking pass (v0.9.0, experimental). "
+            "After round 1, each peer ranks the OTHER peers' responses "
+            "blindly via a stable anonymization map. Aggregates as "
+            "per-peer mean rank position in transcripts + stats. Composes "
+            "with any existing mode; ranking outputs are NEVER fed back "
+            "into round-2 deliberation."
+        ),
+    )
 
     sub.add_parser("list", help="List participants and modes")
     init = sub.add_parser("init", help="Write an example project config")
@@ -2627,6 +2641,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         synthesize=bool(getattr(args, "synthesize", False)),
         current=current,
         question=question,
+        cross_rank=bool(getattr(args, "cross_rank", False)),
     )
     # Record the secret-scan result in metadata for transcript-based
     # audit tooling. The stderr warning above is for the live terminal;

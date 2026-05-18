@@ -383,6 +383,18 @@ DEFAULT_CONFIG: dict = {
             "include_current": True,
             "experimental": True,
             "timeout_multiplier": 1.8,
+            # v0.9.0 Feature 3 — strictly opt-in tool-call voting. When
+            # True, CLI peers (claude/codex/gemini) additionally receive a
+            # directive describing a `record_recommendation(verdict,
+            # blockers, evidence)` tool they can invoke. The adapter then
+            # tries to parse a structured tool-call payload from each
+            # peer's stdout and, on success, populates the envelope from
+            # that payload instead of (or alongside) the regex
+            # `RECOMMENDATION:` label. Default `false`: promotion to
+            # default-on requires eval-harness lift on blocker_recall /
+            # SNR vs the regex-only baseline. Operators flip per their
+            # verified CLI schema.
+            "tool_call_voting": False,
             "description": (
                 "EXPERIMENTAL — Claude/Codex/Gemini directed to use their "
                 "file-read / grep / glob tools to verify diff claims before "

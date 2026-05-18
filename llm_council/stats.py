@@ -538,6 +538,16 @@ def _empty_reliability_bucket() -> dict[str, Any]:
         # public payload divides them when rendering.
         "_verified_total": 0,
         "_verified_ok": 0,
+        # v0.9.0 Feature 2: accumulators for the per-peer mean rank
+        # position from `--cross-rank` runs. Each contribution comes
+        # from a transcript's `cross_rank_scores[peer]` (already a
+        # per-run mean position). The aggregate is the mean across
+        # those per-run means. Stays at zero scoring when the peer
+        # never participated in a `--cross-rank` run — surfaced as
+        # `None` in the public row to mirror `verified_citation_rate`'s
+        # "no data" semantic.
+        "_rank_position_sum": 0.0,
+        "_rank_position_count": 0,
     }
 
 
@@ -599,7 +609,10 @@ def aggregate_reliability(
     for transcript in by_run_id.values():
         for result in transcript.get("results") or []:
             raw_name = result.get("name") or ""
-            name = raw_name.split(":round")[0] or "unknown"
+            # Strip both `:round\d+` (deliberation) and `:rank`
+            # (v0.9.0 cross-rank pass) suffixes so the bucket merges
+            # by primary peer identity.
+            name = raw_name.split(":round")[0].split(":rank")[0] or "unknown"
             if not name:
                 continue
             bucket = peers.setdefault(name, _empty_reliability_bucket())
@@ -611,6 +624,21 @@ def aggregate_reliability(
                 bucket["_verified_total"] += 1
                 if entry.get("verified") is True:
                     bucket["_verified_ok"] += 1
+        # v0.9.0 Feature 2: accumulate per-peer rank-position mean from
+        # transcripts that ran `--cross-rank`. Each per-run mean is one
+        # observation; the aggregate is the mean across observations.
+        cross_rank_scores = transcript.get("cross_rank_scores") or {}
+        if isinstance(cross_rank_scores, dict):
+            for peer_name, score in cross_rank_scores.items():
+                if not isinstance(peer_name, str) or not peer_name:
+                    continue
+                try:
+                    score_f = float(score)
+                except (TypeError, ValueError):
+                    continue
+                bucket = peers.setdefault(peer_name, _empty_reliability_bucket())
+                bucket["_rank_position_sum"] += score_f
+                bucket["_rank_position_count"] += 1
 
     # Second pass: operator-marked outcome counters. Cross-reference the
     # outcome's run_id to the transcript to find which peers
@@ -665,14 +693,22 @@ def aggregate_reliability(
             verified_rate = verified_ok / verified_total
         else:
             verified_rate = None
+        rank_count = bucket["_rank_position_count"]
+        rank_position_mean: float | None
+        if rank_count > 0:
+            rank_position_mean = bucket["_rank_position_sum"] / rank_count
+        else:
+            rank_position_mean = None
         # A peer that has neither outcomes nor VERIFIED evidence
-        # contributes no signal — drop it from the rendered output to
-        # avoid swamping the table with zero rows. Callers that want
-        # "this peer exists but has nothing yet" can use
-        # `llm-council stats --participant <peer>` (separate code path).
+        # nor rank-position data contributes no signal — drop it
+        # from the rendered output to avoid swamping the table
+        # with zero rows. Callers that want "this peer exists but
+        # has nothing yet" can use `llm-council stats --participant
+        # <peer>` (separate code path).
         if (
             bucket["outcomes_marked"] == 0
             and verified_total == 0
+            and rank_count == 0
         ):
             continue
         rows.append(
@@ -684,6 +720,8 @@ def aggregate_reliability(
                 "unique_blocker_catch_count": bucket["unique_blocker_catch_count"],
                 "verified_citation_rate": verified_rate,
                 "verified_total": verified_total,
+                "rank_position_mean": rank_position_mean,
+                "rank_position_count": rank_count,
             }
         )
 
@@ -717,18 +755,22 @@ def format_reliability_text(reliability: dict[str, Any]) -> str:
     lines.append("")
     lines.append(
         f"{'participant':14} {'marked':>7} {'useful':>7} "
-        f"{'falseB':>7} {'uniqCatch':>10} {'verifCite':>10}"
+        f"{'falseB':>7} {'uniqCatch':>10} {'verifCite':>10} "
+        f"{'rankPos':>8}"
     )
     for row in rows:
         rate = row.get("verified_citation_rate")
         rate_str = "—" if rate is None else f"{rate * 100:.0f}%"
+        rank_mean = row.get("rank_position_mean")
+        rank_str = "—" if rank_mean is None else f"{rank_mean:.2f}"
         lines.append(
             f"{row['name'][:14]:14} "
             f"{row['outcomes_marked']:>7} "
             f"{row['useful_count']:>7} "
             f"{row['false_blocker_count']:>7} "
             f"{row['unique_blocker_catch_count']:>10} "
-            f"{rate_str:>10}"
+            f"{rate_str:>10} "
+            f"{rank_str:>8}"
         )
     return "\n".join(lines)
 

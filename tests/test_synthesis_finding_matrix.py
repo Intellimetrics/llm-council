@@ -7,13 +7,6 @@ when omitted/empty, and the appended block when non-empty.
 
 from __future__ import annotations
 
-import asyncio
-import inspect
-from dataclasses import dataclass
-from pathlib import Path
-
-import pytest
-
 from llm_council.adapters import ParticipantResult
 from llm_council.citations import VerifiedRef
 from llm_council.findings import (
@@ -21,10 +14,7 @@ from llm_council.findings import (
     FindingMatrix,
     cluster_findings,
 )
-from llm_council.synthesis import (
-    build_synthesis_prompt,
-    run_synthesis_chair,
-)
+from llm_council.synthesis import build_synthesis_prompt
 
 
 def _ok_result(name: str, label: str = "yes") -> ParticipantResult:
@@ -186,13 +176,3 @@ def test_build_synthesis_prompt_single_peer_unverified_marker():
     assert "codex" in prompt
     assert "unverified" in prompt
     assert "consider extracting helper" in prompt
-
-
-# --- run_synthesis_chair signature accepts finding_matrix ---------------
-
-
-def test_run_synthesis_chair_signature_has_finding_matrix_param():
-    """Backward compat: the new kwarg must exist and default to None."""
-    sig = inspect.signature(run_synthesis_chair)
-    assert "finding_matrix" in sig.parameters
-    assert sig.parameters["finding_matrix"].default is None

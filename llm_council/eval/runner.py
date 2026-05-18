@@ -399,6 +399,8 @@ def check_promotion_gate(
     *,
     recall_lift: float = 0.05,
     snr_floor_ratio: float = 0.85,
+    cross_rank_correlation_floor: float | None = None,
+    cross_rank_correlation: float | None = None,
 ) -> PromotionResult:
     """Compare a baseline scorecard against a candidate scorecard.
 
@@ -464,8 +466,39 @@ def check_promotion_gate(
             f"(baseline={a_snr:.4f}, candidate={b_snr:.4f})"
         )
 
+    # v0.9.0 Feature 2 (experimental): optional cross-rank correlation
+    # gate. When `cross_rank_correlation_floor` is supplied, the caller
+    # asserts that the candidate's per-peer `rank_position_mean` must
+    # correlate at >= floor with per-peer `useful_count` from outcome
+    # data. Failing the gate blocks promotion. The default `None` keeps
+    # the gate untouched for callers that didn't opt in. The
+    # `cross_rank_correlation` is supplied directly by the caller
+    # (computed from `stats.aggregate_reliability` output) rather than
+    # re-derived here, to keep this runner pure and side-effect-free.
+    cross_rank_ok = True
+    if cross_rank_correlation_floor is not None:
+        if cross_rank_correlation is None:
+            cross_rank_ok = False
+            reasons.append(
+                "cross_rank_correlation_missing: no correlation supplied "
+                f"with floor={cross_rank_correlation_floor:.4f}"
+            )
+        elif cross_rank_correlation >= cross_rank_correlation_floor:
+            reasons.append(
+                f"cross_rank_correlation_met: "
+                f"r={cross_rank_correlation:.4f} >= "
+                f"{cross_rank_correlation_floor:.4f}"
+            )
+        else:
+            cross_rank_ok = False
+            reasons.append(
+                f"cross_rank_correlation_low: "
+                f"r={cross_rank_correlation:.4f} < "
+                f"{cross_rank_correlation_floor:.4f}"
+            )
+
     return PromotionResult(
-        promoted=recall_ok and snr_ok,
+        promoted=recall_ok and snr_ok and cross_rank_ok,
         reasons=reasons,
         recall_delta=recall_delta,
         snr_ratio=snr_ratio,

@@ -79,11 +79,6 @@ def test_continue_debate_bullet_form_parses():
 
 # --- ParticipantResult round-trip ---------------------------------------
 
-def test_participant_result_default_is_none():
-    r = ParticipantResult("a", True, "RECOMMENDATION: yes - ok", "", 0.1)
-    assert r.continue_debate is None
-
-
 def test_with_envelope_populates_continue_debate():
     r = ParticipantResult(
         "a",

@@ -201,6 +201,19 @@ def council_run_schema() -> dict[str, Any]:
                     "tier map keep their default model."
                 ),
             },
+            "cross_rank": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Opt-in anonymized cross-ranking pass (v0.9.0, "
+                    "experimental). After round 1, each peer ranks the "
+                    "OTHER peers' responses blindly via a stable "
+                    "anonymization map. Aggregates as per-peer mean rank "
+                    "position in `cross_rank_scores`. Composes with any "
+                    "existing mode; ranking outputs are NEVER fed back "
+                    "into round-2 deliberation."
+                ),
+            },
         },
         "required": ["question"],
         "additionalProperties": False,
@@ -326,6 +339,24 @@ def council_run_output_schema() -> dict[str, Any]:
                                 "(launch failure) and `repair_retry_recovered` "
                                 "(missing label) so stats can attribute recovery "
                                 "to the right mechanism."
+                            ),
+                        },
+                        "tool_call_status": {
+                            "type": ["string", "null"],
+                            "enum": ["absent", "ok", "malformed", None],
+                            "description": (
+                                "v0.9.0 tool-call voting telemetry. `null` when "
+                                "the mode does not enable `tool_call_voting`; "
+                                "`absent` when extraction ran and found no "
+                                "`record_recommendation` payload (regex "
+                                "fallback canonical); `ok` when a structured "
+                                "tool call was parsed and used for the "
+                                "envelope; `malformed` when a tool-call shape "
+                                "was detected but the payload was unparseable "
+                                "(regex fallback still ran). Distinct telemetry "
+                                "for `absent` vs `malformed` so parser bugs "
+                                "are visible instead of silently masked as "
+                                "'fallback succeeded'."
                             ),
                         },
                         "prompt_chars": {
@@ -483,6 +514,30 @@ def council_run_output_schema() -> dict[str, Any]:
                     },
                     "required": ["peer", "severity", "claim"],
                 },
+            },
+            "cross_rank_scores": {
+                "type": "object",
+                "description": (
+                    "v0.9.0 Feature 2 (experimental). Per-peer mean rank "
+                    "position from the opt-in anonymized cross-ranking "
+                    "pass. Keys are peer names; values are floats where "
+                    "1.0 = unanimously ranked first (lower is better). "
+                    "Omitted entirely when `--cross-rank` was not set or "
+                    "fewer than 2 peers produced labeled responses."
+                ),
+                "additionalProperties": {"type": "number"},
+            },
+            "anonymization_map": {
+                "type": "object",
+                "description": (
+                    "v0.9.0 Feature 2 (experimental). Stable map from "
+                    "peer name to anonymization label (`Response A`, "
+                    "`Response B`, ...) used by the cross-ranking pass. "
+                    "Persisted so operators reading the transcript can "
+                    "de-anonymize the rank-position scores. Omitted when "
+                    "`--cross-rank` was not set."
+                ),
+                "additionalProperties": {"type": "string"},
             },
             "metadata": {"type": "object"},
             "summary_markdown": {
@@ -662,6 +717,24 @@ def models_schema() -> dict[str, Any]:
             "limit": {"type": "integer", "minimum": 1, "maximum": 100},
             "no_cache": {"type": "boolean", "default": False},
         },
+        "additionalProperties": False,
+    }
+
+
+def query_transcripts_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "minLength": 1},
+            "top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "default": 5,
+            },
+            "working_directory": {"type": "string"},
+        },
+        "required": ["query"],
         "additionalProperties": False,
     }
 
@@ -966,6 +1039,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         synthesize=synthesize,
         current=current,
         question=question,
+        cross_rank=bool(arguments.get("cross_rank")),
     )
     if image_manifest:
         metadata["images"] = [
@@ -1032,6 +1106,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "repair_retry_recovered": bool(result.repair_retry_recovered),
                 "recovered_after_timeout": bool(result.recovered_after_timeout),
+                "tool_call_status": getattr(result, "tool_call_status", None),
                 "prompt_chars": result.prompt_chars,
                 "effort": result.effort,
                 "confidence": result.confidence,
@@ -1106,6 +1181,29 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
     if consensus_blockers or single_peer_concerns:
         payload["consensus_blockers"] = consensus_blockers
         payload["single_peer_concerns"] = single_peer_concerns
+    # v0.9.0 Feature 2: lift cross-rank fields to the top-level payload
+    # mirroring finding_matrix. Strip them from metadata to avoid
+    # double-serialization (same data appearing under metadata.* AND
+    # top-level keys).
+    if isinstance(metadata, dict) and "cross_rank_scores" in metadata:
+        metadata = dict(metadata)
+        cross_rank_scores_out = metadata.pop("cross_rank_scores") or {}
+    else:
+        cross_rank_scores_out = {}
+    if isinstance(metadata, dict) and "anonymization_map" in metadata:
+        metadata = dict(metadata)
+        anonymization_map_out = metadata.pop("anonymization_map") or {}
+    else:
+        anonymization_map_out = {}
+    # Re-anchor the payload's metadata reference if we just mutated it
+    # in this block — without this the popped keys still appear in
+    # `payload["metadata"]` (the original reference).
+    if cross_rank_scores_out or anonymization_map_out:
+        payload["metadata"] = metadata
+    if cross_rank_scores_out:
+        payload["cross_rank_scores"] = cross_rank_scores_out
+    if anonymization_map_out:
+        payload["anonymization_map"] = anonymization_map_out
     return payload
 
 
@@ -1243,6 +1341,43 @@ def list_modes(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def query_transcripts(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Semantic search over recorded transcripts (Jaccard MVP).
+
+    Mirrors the read-only / project-rooted resolution used by every other
+    transcript-reading tool. Returns ``{matches: [...]}`` even when empty
+    so the consumer can rely on the shape.
+    """
+    from llm_council.query import search_similar
+
+    cwd = _resolve_working_directory(arguments)
+    load_project_env(cwd)
+    config = load_config(find_config(cwd), search=False)
+    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
+    if not out_dir.is_absolute():
+        out_dir = cwd / out_dir
+    query_text = arguments.get("query")
+    if not isinstance(query_text, str) or not query_text.strip():
+        raise ValueError("query must be a non-empty string")
+    top_k_raw = arguments.get("top_k")
+    top_k = 5 if top_k_raw is None else int(top_k_raw)
+    if top_k < 1 or top_k > 50:
+        raise ValueError("top_k must be between 1 and 50")
+    matches = search_similar(query_text, top_k=top_k, runs_dir=out_dir)
+    return {
+        "matches": [
+            {
+                "run_id": match.run_id,
+                "similarity": match.similarity,
+                "question_excerpt": match.question_excerpt,
+                "recommendation_label": match.recommendation_label,
+                "timestamp": match.timestamp,
+            }
+            for match in matches
+        ]
+    }
+
+
 async def _serve() -> None:
     try:
         from mcp.server import Server
@@ -1321,6 +1456,17 @@ async def _serve() -> None:
                 ),
                 inputSchema=stats_schema(),
             ),
+            Tool(
+                name="council_query_transcripts",
+                description=(
+                    "Semantic search across recorded council transcripts. "
+                    "Returns the top-k prior runs whose questions overlap "
+                    "with the query (Jaccard token similarity). Lets an "
+                    "agent check whether council already weighed in on a "
+                    "topic before launching a fresh consultation."
+                ),
+                inputSchema=query_transcripts_schema(),
+            ),
         ]
 
     @app.call_tool()
@@ -1347,6 +1493,8 @@ async def _serve() -> None:
             result = list_models(arguments)
         elif name == "council_stats":
             result = run_stats(arguments)
+        elif name == "council_query_transcripts":
+            result = query_transcripts(arguments)
         else:
             raise ValueError(f"Unknown tool: {name}")
         text_blocks = [TextContent(type="text", text=json.dumps(result, indent=2))]

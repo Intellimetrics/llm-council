@@ -307,6 +307,7 @@ async def execute_council(
     synthesize: bool | None = None,
     current: str | None = None,
     question: str | None = None,
+    cross_rank: bool = False,
 ) -> tuple[list[ParticipantResult], dict[str, Any]]:
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
     convergence_thresholds = _resolve_convergence_thresholds(config, mode)
@@ -407,6 +408,15 @@ async def execute_council(
         and mode_cfg_for_timeout.get("timeout_multiplier") is not None
         else None
     )
+    # v0.9.0 Feature 3: opt-in tool-call voting flag, scoped to whichever
+    # mode the operator enables it on (today only `review-with-tools`
+    # ships the key; default `False`). Resolution mirrors
+    # `timeout_multiplier` — peer-level config does NOT override the mode
+    # flag.
+    tool_call_voting = bool(
+        isinstance(mode_cfg_for_timeout, dict)
+        and mode_cfg_for_timeout.get("tool_call_voting")
+    )
 
     if run_targets:
         run_results = await run_participants(
@@ -421,6 +431,7 @@ async def execute_council(
             cache_ctx=cache_ctx_round1,
             mode_multiplier=mode_multiplier,
             mode=mode,
+            tool_call_voting=tool_call_voting,
         )
         verify_evidence_citations(run_results, cwd)
     else:
@@ -434,7 +445,13 @@ async def execute_council(
             name, error, model=cfg.get("model")
         )
     results = [by_name[name] for name in participants if name in by_name]
-    round_results = results
+    # `round_results` is a separate list from `results` so the v0.9.0
+    # cross-rank pass (which appends ranking-round entries to `results`
+    # via `results.extend(ranking_results)`) does NOT pollute the
+    # round-1 view used by `has_disagreement` / `build_deliberation_prompt`.
+    # Before v0.9.0 these were aliases; the cross-rank pass is the
+    # only mutation site that requires the split.
+    round_results = list(results)
     round_number = 1
     initial_disagreement = has_disagreement(round_results)
     metadata = {
@@ -486,6 +503,136 @@ async def execute_council(
                 "abdicated_peers": _early_abdication["abdicated_peers"],
             }
         )
+
+    # v0.9.0 Feature 2 — Anonymized cross-ranking. Opt-in flag composable
+    # with any mode. After round 1, peers with usable RECOMMENDATION
+    # labels rank each other's anonymized outputs. The ranking outputs
+    # are tagged `is_ranking_round=True` and intentionally NOT fed back
+    # to round-2 deliberation (MAD literature risk — see
+    # `deliberation.build_deliberation_prompt`). Skipped when:
+    #   - the flag is off (default),
+    #   - fewer than `CROSS_RANK_MIN_PEERS` peers produced usable labels
+    #     (you cannot rank one response against itself),
+    #   - the universal-abdication short-circuit fired (no signal to rank).
+    if (
+        cross_rank
+        and not metadata.get("universal_abdication")
+    ):
+        from llm_council.context import (
+            CROSS_RANK_MIN_PEERS,
+            build_anonymization_map,
+            build_ranking_prompt,
+            compute_rank_position_means,
+            parse_final_ranking,
+        )
+
+        labeled_results = [
+            r for r in round_results
+            if r.ok and recommendation_label(r.output) in {"yes", "no", "tradeoff"}
+        ]
+        if len(labeled_results) >= CROSS_RANK_MIN_PEERS:
+            labeled_names = [r.name for r in labeled_results]
+            anonymization_map = build_anonymization_map(labeled_names)
+            metadata["anonymization_map"] = dict(anonymization_map)
+            # Reverse map for de-anonymization: "A" -> "claude".
+            metadata["anonymization_map_reverse"] = {
+                full_label.replace("Response ", "").strip(): name
+                for name, full_label in anonymization_map.items()
+            }
+            valid_label_set = {
+                full_label.replace("Response ", "").strip()
+                for full_label in anonymization_map.values()
+            }
+            response_by_peer = {r.name: r.output for r in labeled_results}
+            ranking_question = question or prompt
+            emit(
+                {
+                    "event": "cross_rank_start",
+                    "round": round_number,
+                    "peer_count": len(labeled_names),
+                }
+            )
+
+            async def _rank_one(peer_name: str) -> ParticipantResult:
+                ranking_prompt = build_ranking_prompt(
+                    peer_name=peer_name,
+                    own_response=response_by_peer.get(peer_name, ""),
+                    other_peers={
+                        name: text
+                        for name, text in response_by_peer.items()
+                        if name != peer_name
+                    },
+                    anonymization_map=anonymization_map,
+                    question=ranking_question,
+                )
+                from llm_council.adapters import run_participant
+
+                # Ranking pass intentionally bypasses tool-call voting:
+                # the response shape is `FINAL RANKING:`, not a
+                # `record_recommendation` tool call. We also turn off
+                # cache writes for ranking-round results (cache_ctx
+                # mirrors `cache_ctx_deliberation`) to avoid cross-run
+                # bleed when the operator re-runs without --cross-rank.
+                cfg_for_peer = participant_cfg.get(peer_name) or {}
+                # Disable label/section/strict-evidence validation for
+                # the ranking pass: the response is intentionally a
+                # one-line FINAL RANKING with no RECOMMENDATION envelope.
+                ranking_cfg = dict(cfg_for_peer)
+                ranking_cfg["require_recommendation"] = False
+                ranking_cfg["require_sections"] = False
+                ranking_cfg["strict_evidence"] = False
+                rank_result = await run_participant(
+                    peer_name,
+                    ranking_cfg,
+                    ranking_prompt,
+                    cwd,
+                    image_manifest=None,
+                    cache_ctx=cache_ctx_deliberation,
+                    mode_multiplier=mode_multiplier,
+                    mode=mode,
+                    tool_call_voting=False,
+                )
+                return replace(
+                    rank_result,
+                    name=f"{peer_name}:rank",
+                    is_ranking_round=True,
+                )
+
+            ranking_results = await asyncio.gather(
+                *[_rank_one(name) for name in labeled_names]
+            )
+            results.extend(ranking_results)
+
+            rankings_by_peer: dict[str, list[str]] = {}
+            for r in ranking_results:
+                base = r.name.split(":rank", 1)[0]
+                if not r.ok:
+                    continue
+                # Each peer's valid labels = ALL bare labels MINUS its own.
+                own_label = (
+                    anonymization_map.get(base, "")
+                    .replace("Response ", "")
+                    .strip()
+                )
+                peer_valid = {lbl for lbl in valid_label_set if lbl != own_label}
+                parsed = parse_final_ranking(r.output, peer_valid)
+                if parsed is not None:
+                    rankings_by_peer[base] = parsed
+
+            cross_rank_scores = compute_rank_position_means(
+                anonymization_map, rankings_by_peer
+            )
+            if cross_rank_scores:
+                metadata["cross_rank_scores"] = cross_rank_scores
+            metadata["cross_rank_rankings"] = rankings_by_peer
+            emit(
+                {
+                    "event": "cross_rank_complete",
+                    "round": round_number,
+                    "scores": cross_rank_scores,
+                    "ranker_count": len(rankings_by_peer),
+                }
+            )
 
     # v0.8.1 CONTINUE_DEBATE unanimity short-circuit. After round 1, if
     # every label-producing peer voted ``CONTINUE_DEBATE: no``, skip the
@@ -581,6 +728,7 @@ async def execute_council(
             cache_ctx=cache_ctx_deliberation,
             mode_multiplier=mode_multiplier,
             mode=mode,
+            tool_call_voting=tool_call_voting,
         )
         verify_evidence_citations(next_results, cwd)
         prior_round_results = list(round_results)
