@@ -4885,6 +4885,10 @@ def test_tri_cli_setup_loaded_config_does_not_restore_defaults(tmp_path: Path):
         "us-only",
         "consensus",
         "opus-versions",
+        # Experimental `review-with-tools` (v0.8 Phase E) — CLI-peers-only,
+        # so it survives tri-cli pruning. Still ships flagged
+        # `experimental: true` until the eval harness gate promotes it.
+        "review-with-tools",
     }
 
 
@@ -4937,7 +4941,16 @@ def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path):
         "claude_4_6",
         "claude_4_7",
     }
-    assert set(config["modes"]) == {"quick", "peer-only", "consensus", "opus-versions"}
+    # `review-with-tools` (v0.8 Phase E, experimental) routes only to CLI
+    # peers, so tri-cli setup retains it alongside the other CLI-only modes.
+    # `us-only` is dropped by the `us_only_default=True` branch above.
+    assert set(config["modes"]) == {
+        "quick",
+        "peer-only",
+        "consensus",
+        "opus-versions",
+        "review-with-tools",
+    }
     assert config["defaults"]["origin_policy"] == "us"
     assert not (tmp_path / ".mcp.json").exists()
     assert not (tmp_path / ".llm-council" / "instructions").exists()
@@ -4970,6 +4983,9 @@ def test_setup_yes_auto_selects_tri_cli_when_native_clis_exist(
         "us-only",
         "consensus",
         "opus-versions",
+        # `review-with-tools` (v0.8 Phase E, experimental) is CLI-only and
+        # therefore retained in tri-cli setups.
+        "review-with-tools",
     }
     assert "Auto preset selected: tri-cli" in capsys.readouterr().out
 
@@ -7891,6 +7907,15 @@ def test_build_prompt_hash_aware_drops_unrelated_files(tmp_path: Path):
         },
     )
     events: list[dict] = []
+    # 9_000 char budget gives ~1_000 chars of headroom over the framing
+    # block (~1_900 chars on pytest's long /tmp/pytest-of-clindell/...
+    # working-directory path) so the budget can absorb the natural
+    # one-line growth that occasionally lands in the envelope-bullet
+    # block (e.g. CONTINUE_DEBATE in v0.8.1) without flipping this
+    # specific test from "hash-aware preserved the named file" to "no
+    # file fits the budget at all". The intent under test is the
+    # hash-aware scoring preferring `gamma.py` over alpha/beta — NOT
+    # the absolute byte cost of the framing.
     prompt = build_prompt(
         "review the bug in gamma.py please",
         mode="quick",
@@ -7898,11 +7923,11 @@ def test_build_prompt_hash_aware_drops_unrelated_files(tmp_path: Path):
         context_paths=[],
         include_diff=True,
         stdin_text=None,
-        max_prompt_chars=8_000,
+        max_prompt_chars=9_000,
         chunk_strategy="hash-aware",
         chunk_progress=events.append,
     )
-    assert len(prompt) <= 8_000
+    assert len(prompt) <= 9_000
     assert "gamma.py" in prompt
     assert events
     last = events[-1]

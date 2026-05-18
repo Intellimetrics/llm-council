@@ -9,27 +9,43 @@ from llm_council.context import build_prompt
 from llm_council.defaults import DEFAULT_CONFIG
 
 
-def test_long_context_overflow_fails_fast_instead_of_truncating(
+def test_long_context_overflow_chunks_instead_of_truncating_silently(
     tmp_path: Path,
 ) -> None:
+    """v0.8.1: context_files exceeding the cap now auto-chunk via the
+    hash-aware strategy instead of either silently truncating OR
+    fail-fasting. The fail-fast invariant in this test's old name was
+    inverted in Fix A — the new invariant is that overflow is loudly
+    surfaced via a `chunk_progress` event and never silent.
+    """
     first = tmp_path / "first.txt"
     second = tmp_path / "second.txt"
     first.write_text("a" * 120_000)
     second.write_text("b" * 120_000)
 
-    with pytest.raises(ValueError) as excinfo:
-        build_prompt(
-            "Should we make this change?",
-            mode="review",
-            cwd=tmp_path,
-            context_paths=[str(first), str(second)],
-            include_diff=False,
-            stdin_text=None,
-        )
+    events: list[dict] = []
+    prompt = build_prompt(
+        "Should we make this change?",
+        mode="review",
+        cwd=tmp_path,
+        context_paths=[str(first), str(second)],
+        include_diff=False,
+        stdin_text=None,
+        chunk_progress=events.append,
+    )
 
-    message = str(excinfo.value)
-    assert "max_prompt_chars" in message
-    assert "chunk-strategy" in message
+    # Prompt now fits under the default cap.
+    assert len(prompt) <= 200_000
+    # And the operator sees what happened — no silent truncation.
+    chunk_events = [
+        e for e in events if e.get("event") == "context_files_chunked"
+    ]
+    assert chunk_events, (
+        "expected a context_files_chunked event; overflow must not be silent"
+    )
+    last = chunk_events[-1]
+    assert last["strategy"] == "hash-aware"
+    assert last["dropped_files"]
 
 
 def test_build_prompt_honors_configured_prompt_limit(tmp_path: Path) -> None:

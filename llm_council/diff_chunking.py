@@ -1,4 +1,11 @@
-"""Opt-in diff chunking strategies for oversized review prompts."""
+"""Opt-in diff chunking strategies for oversized review prompts.
+
+The same hash-aware scoring (filename mentions + extension affinity) is
+reused for `context_files` chunking via :func:`chunk_context_files`, so
+multi-file context payloads that would otherwise trip the per-participant
+`max_prompt_chars` cap can be auto-trimmed without requiring callers to
+opt into a diff strategy.
+"""
 
 from __future__ import annotations
 
@@ -317,3 +324,167 @@ def _question_extension_hints(question: str) -> set[str]:
         if keyword in lowered:
             hits.update(exts)
     return hits
+
+
+@dataclass
+class ContextChunkResult:
+    """Outcome of applying hash-aware chunking to pre-rendered context-file
+    sections.
+
+    Returned by :func:`chunk_context_files`. Fields mirror :class:`ChunkResult`
+    where the meaning carries over, plus :attr:`oversize_files` to distinguish
+    files dropped because they alone exceed the budget (operator-actionable —
+    raise `max_prompt_chars` or shorten the file) from files dropped because
+    the budget filled up with higher-priority files (expected behavior on
+    very-large multi-file context payloads).
+    """
+
+    sections: list[str] = field(default_factory=list)
+    original_chars: int = 0
+    chunked_chars: int = 0
+    dropped_chars: int = 0
+    dropped_files: list[str] = field(default_factory=list)
+    oversize_files: list[str] = field(default_factory=list)
+    triggered: bool = False
+
+
+def chunk_context_files(
+    files: list[tuple[str, str]],
+    *,
+    budget: int,
+    question: str,
+) -> ContextChunkResult:
+    """Trim a list of rendered context-file sections to fit ``budget`` chars.
+
+    ``files`` is a list of ``(path_label, rendered_text)`` pairs where
+    ``rendered_text`` already contains the `## File: <label>\\n\\n```...```'
+    wrapper produced by :func:`llm_council.context.read_context_file`. The
+    function applies the same hash-aware scoring as the diff path (filename
+    mentions in the question, extension affinity, smaller-first tiebreak)
+    so files explicitly named in the user question survive truncation.
+
+    Behavior:
+
+    - If the joined sections fit under ``budget``, returns all files in
+      original order with ``triggered=False``.
+    - If a single file's rendered text alone exceeds ``budget``, that file
+      is dropped entirely and recorded in :attr:`ContextChunkResult.oversize_files`
+      AND :attr:`ContextChunkResult.dropped_files`. Operator-actionable
+      warning surface.
+    - Otherwise greedily admits sections in priority order until the budget
+      fills, surfacing every dropped path in :attr:`dropped_files`.
+
+    Sections are joined with ``\\n`` to match how the surrounding prompt
+    assembles its context block; the caller is responsible for splicing the
+    returned ``sections`` back into the prompt in place of the original
+    list.
+    """
+
+    items = list(files)
+    if not items:
+        return ContextChunkResult()
+
+    sep = "\n"
+    # Original char count: sum of section lengths + separators between them
+    # (matches how `assemble` joins context sections in build_prompt).
+    original_chars = sum(len(text) for _path, text in items) + max(
+        0, (len(items) - 1) * len(sep)
+    )
+
+    if budget <= 0:
+        # Defensive — caller should have raised before this; return everything
+        # dropped so the operator sees the budget exhaustion.
+        return ContextChunkResult(
+            sections=[],
+            original_chars=original_chars,
+            chunked_chars=0,
+            dropped_chars=original_chars,
+            dropped_files=[path or "<unknown>" for path, _ in items],
+            oversize_files=[],
+            triggered=original_chars > 0,
+        )
+
+    # Split into "fits-individually" and "oversize" buckets first. Oversize
+    # files are dropped entirely up front so they neither steal budget from
+    # other files nor degrade gracefully into head-truncated stubs (per spec:
+    # operator-actionable warning naming the file path + size).
+    oversize_files: list[str] = []
+    candidates: list[tuple[str, str, int]] = []  # (path, text, original_index)
+    for index, (path, text) in enumerate(items):
+        if len(text) > budget:
+            oversize_files.append(path or "<unknown>")
+            continue
+        candidates.append((path, text, index))
+
+    if not candidates:
+        # Every file alone exceeded the budget.
+        return ContextChunkResult(
+            sections=[],
+            original_chars=original_chars,
+            chunked_chars=0,
+            dropped_chars=original_chars,
+            dropped_files=list(oversize_files),
+            oversize_files=oversize_files,
+            triggered=True,
+        )
+
+    # Cheap exit: if all surviving candidates fit AND nothing was dropped as
+    # oversize, no change required.
+    naive_chars = sum(len(text) for _p, text, _i in candidates) + max(
+        0, (len(candidates) - 1) * len(sep)
+    )
+    if naive_chars <= budget and not oversize_files:
+        return ContextChunkResult(
+            sections=[text for _p, text, _i in candidates],
+            original_chars=original_chars,
+            chunked_chars=naive_chars,
+            dropped_chars=0,
+            dropped_files=[],
+            oversize_files=[],
+            triggered=False,
+        )
+
+    # Score and greedily admit, mirroring `_chunk_hash_aware`.
+    mentioned_paths = _filename_tokens(question)
+    extension_hits = {token.rsplit(".", 1)[-1].lower() for token in mentioned_paths}
+    keyword_extensions = _question_extension_hints(question)
+
+    scored: list[tuple[int, int, int, str, str]] = []
+    for path, text, original_index in candidates:
+        path_lower = (path or "").lower()
+        priority = 0
+        if path and any(token.lower() in path_lower for token in mentioned_paths):
+            priority -= 100
+        if path:
+            ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            if ext and ext in extension_hits:
+                priority -= 25
+            if ext and ext in keyword_extensions:
+                priority -= 10
+        scored.append((priority, len(text), original_index, path, text))
+
+    scored.sort(key=lambda row: (row[0], row[1], row[2]))
+
+    accepted: list[tuple[int, str, str]] = []  # (original_index, path, text)
+    used = 0
+    dropped_files: list[str] = list(oversize_files)
+    for _priority, length, original_index, path, text in scored:
+        addition = length + (len(sep) if accepted else 0)
+        if used + addition > budget:
+            dropped_files.append(path or "<unknown>")
+            continue
+        accepted.append((original_index, path, text))
+        used += addition
+
+    accepted.sort(key=lambda row: row[0])
+    sections = [text for _idx, _path, text in accepted]
+    chunked_chars = used
+    return ContextChunkResult(
+        sections=sections,
+        original_chars=original_chars,
+        chunked_chars=chunked_chars,
+        dropped_chars=max(0, original_chars - chunked_chars),
+        dropped_files=dropped_files,
+        oversize_files=oversize_files,
+        triggered=bool(dropped_files),
+    )

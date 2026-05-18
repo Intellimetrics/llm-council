@@ -240,6 +240,20 @@ def build_parser() -> argparse.ArgumentParser:
             "model so a tier can swap a subset."
         ),
     )
+    run.add_argument(
+        "--cross-rank",
+        dest="cross_rank",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt-in anonymized cross-ranking pass (v0.9.0, experimental). "
+            "After round 1, each peer ranks the OTHER peers' responses "
+            "blindly via a stable anonymization map. Aggregates as "
+            "per-peer mean rank position in transcripts + stats. Composes "
+            "with any existing mode; ranking outputs are NEVER fed back "
+            "into round-2 deliberation."
+        ),
+    )
 
     sub.add_parser("list", help="List participants and modes")
     init = sub.add_parser("init", help="Write an example project config")
@@ -498,6 +512,182 @@ def build_parser() -> argparse.ArgumentParser:
         help="Filter the per-participant table to one peer",
     )
     stats.add_argument("--json", action="store_true", help="Print JSON")
+    stats.add_argument(
+        "--eval",
+        action="store_true",
+        help=(
+            "Aggregate the per-mode and per-peer trend across the most recent "
+            "eval scorecards under `.llm-council/eval-runs/` instead of the "
+            "transcript-derived stats. Use with --last to widen the window."
+        ),
+    )
+    stats.add_argument(
+        "--last",
+        type=int,
+        default=10,
+        help="Window size for --eval trend deltas (default: 10)",
+    )
+    stats.add_argument(
+        "--reliability",
+        action="store_true",
+        help=(
+            "Print per-peer reliability counters derived from "
+            "`.llm-council/outcomes/`: useful_count, false_blocker_count, "
+            "unique_blocker_catch_count, and the mechanical "
+            "verified_citation_rate. Combine with --participant to filter."
+        ),
+    )
+    stats.add_argument(
+        "--peer",
+        dest="reliability_peer",
+        default=None,
+        help="Alias of --participant for --reliability; filters to one peer.",
+    )
+
+    outcome = sub.add_parser(
+        "outcome",
+        help=(
+            "Mark or list user-tagged outcomes for council runs "
+            "(shipped/reverted/rejected/unknown + optional bug-found and "
+            "winning-peer). Persists to `.llm-council/outcomes/<run-id>.json`."
+        ),
+    )
+    outcome_sub = outcome.add_subparsers(dest="outcome_command")
+    outcome_mark = outcome_sub.add_parser(
+        "mark", help="Mark a finished run with an outcome label"
+    )
+    outcome_mark.add_argument(
+        "run_id",
+        help=(
+            "Run id (timestamp prefix or full filename) of the council "
+            "transcript to mark. Prefix matching mirrors `--continue`."
+        ),
+    )
+    outcome_mark.add_argument(
+        "--decision",
+        required=True,
+        choices=["shipped", "reverted", "rejected", "unknown"],
+        help="Operator decision after reviewing the council's recommendation.",
+    )
+    outcome_mark.add_argument(
+        "--bug-found",
+        dest="bug_found",
+        choices=["yes", "no"],
+        default=None,
+        help=(
+            "Did the change require a follow-up bug fix? Leave unset when "
+            "unknown; the reliability counters only count outcomes where "
+            "this is explicitly answered."
+        ),
+    )
+    outcome_mark.add_argument(
+        "--winning-peer",
+        dest="winning_peer",
+        default=None,
+        help=(
+            "Optional peer name credited with the decisive analysis. Used "
+            "by stats to compute `unique_blocker_catch_count`."
+        ),
+    )
+    outcome_mark.add_argument(
+        "--note",
+        default=None,
+        help="Free-text annotation, surfaced in `outcome list`.",
+    )
+    outcome_mark.add_argument(
+        "--cwd",
+        default=".",
+        help="Working directory (default: cwd)",
+    )
+    outcome_list = outcome_sub.add_parser(
+        "list", help="List recent outcomes (newest first)"
+    )
+    outcome_list.add_argument(
+        "--peer",
+        default=None,
+        help="Filter to outcomes where winning_peer == this peer.",
+    )
+    outcome_list.add_argument(
+        "--last", type=int, default=20, help="Max records to display (default: 20)"
+    )
+    outcome_list.add_argument(
+        "--json", action="store_true", help="Print JSON array instead of TSV"
+    )
+    outcome_list.add_argument(
+        "--cwd",
+        default=".",
+        help="Working directory (default: cwd)",
+    )
+
+    eval_parser = sub.add_parser(
+        "eval", help="Run the council against fixture prompts and score answers"
+    )
+    eval_sub = eval_parser.add_subparsers(dest="eval_command")
+    eval_run = eval_sub.add_parser("run", help="Run an eval suite and emit a scorecard")
+    eval_run.add_argument(
+        "--mode",
+        default="review",
+        help="Council mode used for every fixture (default: review)",
+    )
+    eval_run.add_argument(
+        "--fixtures",
+        default=None,
+        help=(
+            "Path to fixture directory. Default: bundled `llm_council/eval/fixtures/`."
+        ),
+    )
+    eval_run.add_argument(
+        "--out",
+        default=None,
+        help="Write the JSON scorecard to this path. Default: stdout.",
+    )
+    eval_run.add_argument(
+        "--cwd",
+        default=".",
+        help="Working directory used to resolve config + cache (default: cwd)",
+    )
+    eval_run.add_argument(
+        "--require-cached",
+        action="store_true",
+        dest="require_cached",
+        help=(
+            "Detect-after-call: peers still execute, but the run exits "
+            "nonzero (exit code 2) if any peer's result did NOT come from "
+            "cache. Use this in CI to flag when a fixture has not been "
+            "warmed yet — NOT as a budget hard-stop, because the calls "
+            "still happen. Pre-warm the cache with a separate run first."
+        ),
+    )
+    eval_run.add_argument(
+        "--compare-against",
+        default=None,
+        help=(
+            "Path to a baseline scorecard JSON (typically produced by "
+            "`llm-council eval run --mode review --out <path>`). When set, "
+            "the candidate suite's aggregates are checked against the "
+            "baseline using the v0.8 promotion gate (>=5pp blocker_recall "
+            "lift AND <=15%% SNR collapse). Result is embedded in the "
+            "output JSON under `promotion_check`."
+        ),
+    )
+    eval_run.add_argument(
+        "--promotion-recall-lift",
+        type=float,
+        default=0.05,
+        help=(
+            "Custom blocker_recall absolute lift threshold for "
+            "--compare-against (default: 0.05 = 5pp)."
+        ),
+    )
+    eval_run.add_argument(
+        "--promotion-snr-floor-ratio",
+        type=float,
+        default=0.85,
+        help=(
+            "Custom signal_to_noise_ratio floor ratio for --compare-against "
+            "(candidate SNR must be >= baseline SNR * floor; default: 0.85)."
+        ),
+    )
 
     sub.add_parser("mcp-server", help="Run llm-council MCP server over stdio")
 
@@ -666,7 +856,8 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(f"  {name:20} {cfg.get('type'):10} {model}")
     print("\nModes:")
     for name, cfg in config.get("modes", {}).items():
-        print(f"  {name:20} {cfg.get('description', '')}")
+        flag = " [EXPERIMENTAL]" if cfg.get("experimental") else ""
+        print(f"  {name:20}{flag} {cfg.get('description', '')}")
     return 0
 
 
@@ -1425,6 +1616,44 @@ def cmd_stats(args: argparse.Namespace) -> int:
     out_dir = _transcript_dir(cwd, config)
     if args.since is not None and args.since <= 0:
         raise SystemExit("--since must be a positive integer or ISO date in the past")
+    # `--eval` switches to the eval-scorecard trend aggregator. The
+    # transcript-derived per-participant stats live elsewhere; the two
+    # views answer different questions (per-run reliability vs. per-mode
+    # regression delta) and intentionally don't share a row format.
+    if getattr(args, "eval", False):
+        from llm_council.stats import aggregate_eval_runs
+
+        last_n = int(getattr(args, "last", 10) or 10)
+        if last_n <= 0:
+            raise SystemExit("--last must be a positive integer")
+        scorecards_dir = cwd / ".llm-council" / "eval-runs"
+        eval_stats = aggregate_eval_runs(scorecards_dir, last_n=last_n)
+        # `--json` is shared across all stats subviews, but `--eval` does
+        # not have a text formatter yet — the JSON shape (mode → delta
+        # blocks) is the only consumer surface today. Emit it
+        # unconditionally rather than maintain two identical branches.
+        print(json.dumps(eval_stats, indent=2))
+        return 0
+    # `--reliability` is the v0.8 per-peer outcome-derived view; it lives
+    # alongside the existing per-run telemetry rather than replacing it
+    # (the two answer different operator questions).
+    if getattr(args, "reliability", False):
+        from llm_council.stats import (
+            aggregate_reliability,
+            format_reliability_text,
+        )
+
+        peer_filter = args.reliability_peer or args.participant
+        reliability = aggregate_reliability(
+            cwd,
+            transcripts_dir=out_dir,
+            peer=peer_filter,
+        )
+        if args.json:
+            print(json.dumps(reliability, indent=2))
+        else:
+            print(format_reliability_text(reliability))
+        return 0
     stats = compute_stats(
         out_dir,
         participant=args.participant,
@@ -1435,6 +1664,270 @@ def cmd_stats(args: argparse.Namespace) -> int:
     else:
         print(format_stats_text(stats))
     return 0
+
+
+def _default_fixtures_dir() -> Path:
+    """Return the bundled fixtures directory (resolved via package path)."""
+    return Path(__file__).parent / "eval" / "fixtures"
+
+
+def _eval_council_caller(
+    *,
+    cwd: Path,
+    config: dict[str, Any],
+) -> Any:
+    """Build the `execute_council_fn` the runner injects per fixture.
+
+    Closes over the config + cwd so each fixture prompt feeds the same
+    council shape. Mode is supplied per-call by the runner so a single
+    invocation could (in future) compare review vs. review-with-tools
+    from one Suite run.
+    """
+    from llm_council.orchestrator import execute_council
+    from llm_council.context import build_prompt
+
+    def _call(prompt_text: str, mode: str) -> list[Any]:
+        # Resolve participants for THIS mode.
+        try:
+            participants = select_participants(
+                config,
+                mode,
+                detect_current_agent(),
+                explicit=[],
+                include=[],
+                origin_policy=None,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        participant_cfg = config.get("participants", {}) or {}
+        mode_cfg = config.get("modes", {}).get(mode, {}) or {}
+        # The runner-supplied `prompt_text` is the FULL prompt (the
+        # fixture authored it). We do not re-wrap with build_prompt's
+        # mode templates — the fixture IS the prompt under test.
+        cache_mode = "on"
+        results, _metadata = asyncio.run(
+            execute_council(
+                participants,
+                participant_cfg,
+                prompt_text,
+                cwd,
+                config,
+                deliberate=bool(mode_cfg.get("deliberate")),
+                max_rounds=int(mode_cfg.get("max_rounds") or 2),
+                progress=None,
+                image_manifest=None,
+                min_quorum=None,
+                mode=mode,
+                cache_mode=cache_mode,
+                stances=None,
+                synthesize=False,
+                current=None,
+                question=None,
+            )
+        )
+        return list(results)
+
+    return _call
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    if not getattr(args, "eval_command", None):
+        raise SystemExit("eval subcommand is required (try `llm-council eval run`)")
+    if args.eval_command != "run":
+        raise SystemExit(f"Unknown eval subcommand: {args.eval_command}")
+
+    from llm_council.eval.runner import (
+        SuiteScorecard,
+        check_promotion_gate,
+        run_suite,
+        to_json,
+    )
+
+    cwd = Path(args.cwd).resolve()
+    load_project_env(cwd)
+    fixtures_dir = (
+        Path(args.fixtures).resolve() if args.fixtures else _default_fixtures_dir()
+    )
+    if not fixtures_dir.is_dir():
+        raise SystemExit(f"fixtures directory not found: {fixtures_dir}")
+
+    try:
+        config = load_config(args.config if hasattr(args, "config") else None, search=False)
+    except (OSError, ValueError) as exc:
+        # When no explicit config is supplied, fall back to find_config(cwd).
+        try:
+            config = load_config(find_config(cwd), search=False)
+        except (OSError, ValueError) as inner:
+            raise SystemExit(str(inner)) from inner
+    except TypeError:
+        # Older signature compatibility — load_config currently accepts a
+        # path or None, but guard against future churn so the eval CLI
+        # never blows up on signature shifts.
+        config = load_config(find_config(cwd), search=False)
+
+    require_cached = bool(getattr(args, "require_cached", False))
+
+    caller = _eval_council_caller(cwd=cwd, config=config)
+
+    suite = run_suite(
+        fixtures_dir,
+        mode=args.mode,
+        execute_council_fn=caller,
+        cache_only=require_cached,
+    )
+
+    # Optional promotion-gate comparison against a saved baseline scorecard.
+    # Used to gate `review-with-tools` (Phase E) but generic: any pair of
+    # mode scorecards run against the same fixture set can be compared.
+    promotion_check: dict[str, Any] | None = None
+    compare_path = getattr(args, "compare_against", None)
+    if compare_path:
+        baseline_path = Path(compare_path).resolve()
+        if not baseline_path.is_file():
+            raise SystemExit(
+                f"--compare-against baseline scorecard not found: {baseline_path}"
+            )
+        try:
+            baseline_payload = json.loads(baseline_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise SystemExit(
+                f"--compare-against baseline scorecard malformed: {exc}"
+            ) from exc
+        # Reconstruct a minimal SuiteScorecard-like object — we only need
+        # aggregate_metrics for the gate, so a thin shim avoids depending
+        # on the full FixtureScorecard rehydration path.
+        baseline_suite = SuiteScorecard(
+            mode=str(baseline_payload.get("mode") or "unknown"),
+            council_version=str(baseline_payload.get("council_version") or ""),
+            timestamp=str(baseline_payload.get("timestamp") or ""),
+            aggregate_metrics=dict(baseline_payload.get("aggregate_metrics") or {}),
+        )
+        promotion = check_promotion_gate(
+            baseline_suite,
+            suite,
+            recall_lift=float(getattr(args, "promotion_recall_lift", 0.05)),
+            snr_floor_ratio=float(getattr(args, "promotion_snr_floor_ratio", 0.85)),
+        )
+        promotion_check = {
+            "baseline_mode": baseline_suite.mode,
+            "candidate_mode": suite.mode,
+            "recall_lift_threshold": float(
+                getattr(args, "promotion_recall_lift", 0.05)
+            ),
+            "snr_floor_ratio_threshold": float(
+                getattr(args, "promotion_snr_floor_ratio", 0.85)
+            ),
+            **promotion.to_dict(),
+        }
+
+    if promotion_check is not None:
+        suite_dict = suite.to_dict()
+        suite_dict["promotion_check"] = promotion_check
+        output = json.dumps(suite_dict, indent=2, sort_keys=False, default=str)
+    else:
+        output = to_json(suite)
+
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(output + "\n", encoding="utf-8")
+        print(f"wrote {out_path}")
+    else:
+        print(output)
+
+    # Exit nonzero on --require-cached misses so CI can gate on "all
+    # fixtures cached" without an extra JSON pass. Otherwise — the brief
+    # says don't gate on quality thresholds in v0.8; just surface metrics.
+    if suite.cache_only and suite.cache_misses:
+        return 2
+    return 0
+
+
+def cmd_outcome(args: argparse.Namespace) -> int:
+    """Dispatch `llm-council outcome mark|list`."""
+    sub_cmd = getattr(args, "outcome_command", None)
+    if not sub_cmd:
+        raise SystemExit(
+            "outcome subcommand is required (try `llm-council outcome mark` "
+            "or `llm-council outcome list`)"
+        )
+
+    from llm_council.outcomes import (
+        OutcomeRecord,
+        iter_outcomes,
+        resolve_run_id,
+        write_outcome,
+    )
+
+    cwd = Path(args.cwd).resolve()
+
+    if sub_cmd == "mark":
+        run_id = resolve_run_id(cwd, args.run_id)
+        if run_id is None:
+            print(
+                f"error: could not resolve run id '{args.run_id}' to a single "
+                f"transcript under {cwd}/.llm-council/runs/",
+                file=sys.stderr,
+            )
+            return 1
+        bug_found: bool | None
+        if args.bug_found is None:
+            bug_found = None
+        else:
+            bug_found = args.bug_found == "yes"
+        record = OutcomeRecord(
+            run_id=run_id,
+            decision=args.decision,
+            bug_found=bug_found,
+            winning_peer=args.winning_peer,
+            note=args.note,
+        )
+        path = write_outcome(cwd, record)
+        print(f"marked {run_id} -> {path}")
+        return 0
+
+    if sub_cmd == "list":
+        records: list = list(iter_outcomes(cwd))
+        if args.peer:
+            records = [r for r in records if r.winning_peer == args.peer]
+        last_n = max(0, int(args.last or 0))
+        if last_n:
+            records = records[:last_n]
+        if args.json:
+            print(
+                json.dumps(
+                    [r.to_payload() for r in records],
+                    indent=2,
+                )
+            )
+            return 0
+        # TSV-ish, single-line per record. Note excerpts cap at 60 chars
+        # so wide terminals do not wrap weirdly.
+        if not records:
+            print("(no outcomes recorded)")
+            return 0
+        header = "\t".join(
+            ("marked_at", "run_id", "decision", "bug_found", "winning_peer", "note")
+        )
+        print(header)
+        for r in records:
+            note_excerpt = (r.note or "")[:60].replace("\t", " ").replace("\n", " ")
+            bug = "" if r.bug_found is None else ("yes" if r.bug_found else "no")
+            print(
+                "\t".join(
+                    (
+                        r.marked_at.isoformat(),
+                        r.run_id,
+                        r.decision,
+                        bug,
+                        r.winning_peer or "",
+                        note_excerpt,
+                    )
+                )
+            )
+        return 0
+
+    raise SystemExit(f"Unknown outcome subcommand: {sub_cmd}")
 
 
 def cmd_transcripts(args: argparse.Namespace) -> int:
@@ -1594,135 +2087,167 @@ def _fmt_usd(value: float | None) -> str:
     return f"${value:.4f}"
 
 
-def _print_progress_event(event: dict) -> None:
-    kind = event.get("event")
-    participant = event.get("participant")
-    round_label = f"round {event.get('round')}" if event.get("round") else "round ?"
-    color = display.wants_color(sys.stderr)
-    if kind == "participant_start":
-        print(
-            display.format_gutter(
-                participant or "peer",
-                f"start {round_label}",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "participant_slow":
-        elapsed = float(event.get("elapsed_seconds") or 0)
-        timeout = float(event.get("timeout_seconds") or 0)
-        slow = display.colorize_status("slow", color=color)
-        print(
-            display.format_gutter(
-                participant or "peer",
-                f"{slow} after {elapsed:.1f}s (hard timeout at {timeout:.0f}s)",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "participant_finish":
-        status = event.get("status") or ("ok" if event.get("ok") else "error")
-        details = [f"{float(event.get('elapsed_seconds') or 0):.1f}s"]
-        if event.get("total_tokens") is not None:
-            details.append(f"{event['total_tokens']} tokens")
-        if event.get("cost_usd") is not None:
-            details.append(f"${float(event['cost_usd']):.6f}")
-        if event.get("from_cache"):
-            details.append("cached")
-        colored_status = display.colorize_status(status, color=color)
-        print(
-            display.format_gutter(
-                participant or "peer",
-                f"{colored_status} {round_label} ({'; '.join(details)})",
-                color=color,
-            ),
-            flush=True,
-        )
-        if event.get("error"):
+def _make_progress_printer(ordered_peers: list[str] | tuple[str, ...] | None = None):
+    """Build a `_print_progress_event`-shaped callback with a peer roster
+    closure for per-peer color accents.
+
+    Closure exists so `execute_council`'s sync `progress` callback contract
+    stays single-argument while still giving us deterministic per-peer
+    color rotation. Falls back to the bold-cyan gutter for peers that
+    aren't in the roster (e.g., custom CLIs registered late, future peer
+    types).
+    """
+    peers = list(ordered_peers or [])
+
+    def _accent_for(name: str | None) -> str | None:
+        if not name or not peers:
+            return None
+        return display.peer_accent(name, peers)
+
+    def _emit(event: dict) -> None:
+        kind = event.get("event")
+        participant = event.get("participant")
+        round_label = f"round {event.get('round')}" if event.get("round") else "round ?"
+        # `wants_quiet()` suppresses color (layout stays); NO_COLOR / non-TTY
+        # is already handled by `wants_color`.
+        color = display.wants_color(sys.stderr) and not display.wants_quiet()
+        peer_color = _accent_for(participant) if color else None
+        if kind == "participant_start":
             print(
-                display.format_gutter("", event["error"], color=color),
+                display.format_gutter(
+                    participant or "peer",
+                    f"start {round_label}",
+                    color=color,
+                    token_color=peer_color,
+                ),
                 flush=True,
             )
-        return
-    if kind == "deliberation_skip_participants":
-        skipped = ", ".join(event.get("skipped") or [])
-        print(
-            display.format_gutter(
-                display.VERB_DELIBERATING,
-                f"skipping {skipped} from round {event.get('round')} "
-                f"({event.get('reason')})",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "deliberation_pending":
-        print(
-            display.format_gutter(
-                display.VERB_DELIBERATING,
-                f"disagreement detected; starting round {event.get('round')}",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "deliberation_round_start":
-        print(
-            display.format_gutter(
-                display.VERB_ROUND,
-                f"{event.get('round')} (deliberation)",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "deliberation_skip":
-        print(
-            display.format_gutter(
-                display.VERB_DELIBERATING,
-                f"skipped ({event.get('reason')})",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "deliberation_finish":
-        status = event.get("status") or "done"
-        colored_status = display.colorize_status(status, color=color)
-        print(
-            display.format_gutter(
-                display.VERB_DELIBERATING,
-                f"{colored_status} after {event.get('rounds')} rounds",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "degraded_consensus":
-        labeled = event.get("labeled_quorum")
-        threshold = event.get("min_quorum")
-        degraded = display.colorize_status("DEGRADED", color=color)
-        print(
-            display.format_gutter(
-                "Quorum",
-                f"{labeled} of {threshold} required peers labeled — {degraded}",
-                color=color,
-            ),
-            flush=True,
-        )
-        return
-    if kind == "images_skipped":
-        print(
-            display.format_gutter(
-                participant or "peer",
-                f"image attachments skipped ({event.get('reason')}; "
-                f"{event.get('image_count')} image(s) referenced as text only)",
-                color=color,
-            ),
-            flush=True,
-        )
+            return
+        if kind == "participant_slow":
+            elapsed = float(event.get("elapsed_seconds") or 0)
+            timeout = float(event.get("timeout_seconds") or 0)
+            slow = display.colorize_status("slow", color=color)
+            print(
+                display.format_gutter(
+                    participant or "peer",
+                    f"{slow} after {elapsed:.1f}s (hard timeout at {timeout:.0f}s)",
+                    color=color,
+                    token_color=peer_color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "participant_finish":
+            status = event.get("status") or ("ok" if event.get("ok") else "error")
+            details = [f"{float(event.get('elapsed_seconds') or 0):.1f}s"]
+            if event.get("total_tokens") is not None:
+                details.append(f"{event['total_tokens']} tokens")
+            if event.get("cost_usd") is not None:
+                details.append(f"${float(event['cost_usd']):.6f}")
+            if event.get("from_cache"):
+                details.append("cached")
+            colored_status = display.colorize_status(status, color=color)
+            print(
+                display.format_gutter(
+                    participant or "peer",
+                    f"{colored_status} {round_label} ({'; '.join(details)})",
+                    color=color,
+                    token_color=peer_color,
+                ),
+                flush=True,
+            )
+            if event.get("error"):
+                print(
+                    display.format_gutter("", event["error"], color=color),
+                    flush=True,
+                )
+            return
+        if kind == "deliberation_skip_participants":
+            skipped = ", ".join(event.get("skipped") or [])
+            print(
+                display.format_gutter(
+                    display.VERB_DELIBERATING,
+                    f"skipping {skipped} from round {event.get('round')} "
+                    f"({event.get('reason')})",
+                    color=color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "deliberation_pending":
+            print(
+                display.format_gutter(
+                    display.VERB_DELIBERATING,
+                    f"disagreement detected; starting round {event.get('round')}",
+                    color=color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "deliberation_round_start":
+            print(
+                display.format_gutter(
+                    display.VERB_ROUND,
+                    f"{event.get('round')} (deliberation)",
+                    color=color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "deliberation_skip":
+            print(
+                display.format_gutter(
+                    display.VERB_DELIBERATING,
+                    f"skipped ({event.get('reason')})",
+                    color=color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "deliberation_finish":
+            status = event.get("status") or "done"
+            colored_status = display.colorize_status(status, color=color)
+            print(
+                display.format_gutter(
+                    display.VERB_DELIBERATING,
+                    f"{colored_status} after {event.get('rounds')} rounds",
+                    color=color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "degraded_consensus":
+            labeled = event.get("labeled_quorum")
+            threshold = event.get("min_quorum")
+            degraded = display.colorize_status("DEGRADED", color=color)
+            print(
+                display.format_gutter(
+                    "Quorum",
+                    f"{labeled} of {threshold} required peers labeled — {degraded}",
+                    color=color,
+                ),
+                flush=True,
+            )
+            return
+        if kind == "images_skipped":
+            print(
+                display.format_gutter(
+                    participant or "peer",
+                    f"image attachments skipped ({event.get('reason')}; "
+                    f"{event.get('image_count')} image(s) referenced as text only)",
+                    color=color,
+                    token_color=peer_color,
+                ),
+                flush=True,
+            )
+
+    return _emit
+
+
+# Back-compat: the previous module-level callback kept for tests/imports
+# that call it directly. Built without a peer roster, so the per-peer
+# accent rotation degrades to the default gutter.
+_print_progress_event = _make_progress_printer()
 
 
 def cmd_models(args: argparse.Namespace) -> int:
@@ -2139,7 +2664,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         config,
         deliberate=deliberate,
         max_rounds=max_rounds,
-        progress=None if args.json else _print_progress_event,
+        progress=None if args.json else _make_progress_printer(participants),
         image_manifest=image_manifest or None,
         min_quorum=min_quorum_value,
         mode=mode,
@@ -2148,6 +2673,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         synthesize=bool(getattr(args, "synthesize", False)),
         current=current,
         question=question,
+        cross_rank=bool(getattr(args, "cross_rank", False)),
     )
     # Record the secret-scan result in metadata for transcript-based
     # audit tooling. The stderr warning above is for the live terminal;
@@ -2358,6 +2884,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_stats(args)
     if args.command == "models":
         return cmd_models(args)
+    if args.command == "eval":
+        return cmd_eval(args)
+    if args.command == "outcome":
+        return cmd_outcome(args)
     if args.command == "mcp-server":
         from llm_council.mcp_server import main as mcp_main
 

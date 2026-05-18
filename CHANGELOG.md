@@ -1,6 +1,455 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 - 2026-05-18
+
+v0.10.0 ships two coupled visibility features: MCP progress
+notifications so host agents see mid-run progress on the existing
+`council_run` tool call, and a brand-identity layer that makes council
+output unambiguous in a stream of regular agent chatter. Comes out of
+the Symphony-research pass — three candidates were shelved (stall
+detection, `PROMPT.md` overlay, `council_active_runs` sidecar), and
+this is the one that landed cheaply by extending `display.py`'s
+existing brand affordances rather than introducing new state. 1035 →
+1053 passing tests (+18 net new); same 3 pre-existing environmental
+failures unchanged. Cache schema v3 unchanged. No new dependencies.
+
+**MCP progress notifications.** New `_build_mcp_progress_callback` in
+`mcp_server.py:744-799` bridges the orchestrator's sync `emit` callback
+to async `session.send_progress_notification` via
+`asyncio.create_task` — fire-and-forget so a slow client cannot wedge
+the council run; transport errors swallowed for the same reason. In
+`call_tool`, `app.request_context.meta.progressToken` is captured and
+threaded into `run_council` (`mcp_server.py:1493-1517`); silent no-op
+when the client did not set a token. Progress fraction:
+`completed_peer_runs / (peers * effective_rounds + 1)`, the `+1`
+reserving headroom for synthesis or cross-rank; clamps to total on
+`council_finish`. Replaces the rejected `council_active_runs` sidecar
+design (one MCP call now surfaces mid-run progress; no second call,
+no on-disk state, no GC, no CLI subcommand).
+
+**Event-to-notification mapping.** Only "interesting" events emit
+notifications (`display.format_progress_message`); `participant_start`
+is suppressed (per-peer noise multiplier when N peers fire
+concurrently; `participant_finish` is the visible signal), along with
+`images_skipped`, `truncated_for_deliberation`,
+`deliberation_skip_participants`, `convergence`, and
+`context_files_chunked`. 12–14 notifications per 4-peer 2-round run.
+The `PROGRESS_ADVANCING_EVENTS` frozenset enumerates the three events
+that advance the counter: `participant_finish`, `cross_rank_complete`,
+`synthesis_finish`.
+
+**Brand identity token.** `display.BRAND_TOKEN = "LLM Council"` plus
+`BRAND_SEP = " · "`. Every progress message is plain-text prefixed
+`LLM Council · …` — no ANSI (hosts strip), no emoji (font-fallback
+risk on macOS Terminal default + CI logs), no markdown bold (some
+hosts render `**` as literal in progress messages). Matches the
+existing `**LLM Council**` header in `render_summary_markdown`
+(`display.py:205`) so CLI and MCP say the same word. Plain ASCII is
+greppable and survives every rendering path.
+
+**Per-peer color accent (CLI).** New `PEER_ACCENT_PALETTE`
+(cyan/magenta/yellow/green/blue/red) rotated deterministically by
+roster index in `display.peer_accent()`. CLI `_print_progress_event`
+becomes `_make_progress_printer(participants)` — a factory that
+closes over the roster so the sync `progress` callback contract stays
+single-argument while still giving deterministic per-peer color.
+Custom CLIs defined in `.llm-council.yaml` slot into the cycle by
+roster position. `format_gutter` gains an optional `token_color`
+parameter (`display.py:113-138`); default bold-cyan gutter applies
+when no override is provided or when the peer is not in the roster
+(stranger peer fallback). MCP `message` field stays plain text — per-
+peer color isn't expressible in one-line notifications.
+
+**`LLM_COUNCIL_QUIET=1` opt-out.** Single env switch suppresses (a)
+all MCP progress notifications (treated as if no `progressToken` was
+sent) and (b) all CLI gutter colorization. Layout still prints under
+QUIET — accessibility and pipe-friendliness are the goals, not
+silence. Env-only because MCP servers have no per-call CLI flags;
+parity with the existing `NO_COLOR` honoring in `display.wants_color`.
+
+**Honest gaps.** Claude Code's exact rendering of
+`notifications/progress.message` is unverified; the plain-text-only
+design is the safe-under-uncertainty choice and works under
+worst-case "strip everything but text" rendering. If Claude Code
+turns out to render markdown in progress messages, future patches can
+add bold under the same token without breaking older renderers.
+
+**Test surface.** New `tests/test_display_branding.py` (+18 tests):
+peer-accent determinism + palette wrap-around, `wants_quiet` truthy
+/ falsy parsing, message prefix on every interesting event,
+suppression of `participant_start` + noise events, no-token /
+no-session / quiet-env no-op, monotonic progress + clamp-to-total,
+transport-error swallowing, CLI quiet-mode strips ANSI but preserves
+gutter layout, CLI per-peer accent matches palette, stranger peers
+fall back to `ANSI_GUTTER`.
+
+## 0.9.0 - 2026-05-18
+
+v0.9.0 ships four items driven by the post-v0.8 competitor-comparison
+pass (karpathy/llm-council, massgen/MassGen, blueman82/ai-counsel —
+clones at `/development/projects/reference/`): an MCP transcript-search
+tool, opt-in tool-call voting, a one-line Phase-5b serialization fix the
+dogfood pass caught, and an anonymized cross-ranking flag composable
+with any mode. 935 → 1017 passing tests (+82 net: +91 added across
+three new test files, -9 from a conservative cleanup pass); same 3
+pre-existing environmental failures unchanged. Cache schema v3
+unchanged.
+
+**`council_query_transcripts` MCP tool.** Semantic search over
+`.llm-council/runs/*.json`. New module `llm_council/query.py` with
+`SimilarMatch` dataclass and `search_similar()`
+(`query.py:30-38,99-161`). Reuses `stats.load_transcript_files`,
+`convergence.tokenize`/`jaccard_similarity`, and the fence-aware
+`deliberation.recommendation_label`. Returns top-k matches with
+`(run_id, similarity, question_excerpt, recommendation_label,
+timestamp)`; timestamp parsed from the run-id `YYYYMMDD_HHMMSS` prefix.
+Wired into MCP at `mcp_server.py:1351,1366,1460,1496` — canonical
+surface is MCP only; no CLI subcommand. NO new dependencies (Jaccard
+MVP — sentence-transformers deferred until Jaccard demonstrably
+insufficient). Scope-cut: `find_contradictions` and `trace_evolution`
+deferred to v0.9.x. Dogfood-verified: 5 matches returned for a
+"v0.8 closed-loop measurement pipeline" query
+(`.llm-council/runs/20260518_044924_*`). New test file
+`tests/test_query_transcripts.py`. Inspired by ai-counsel's
+`query_decisions` MCP tool.
+
+**Tool-call voting (opt-in).** Strictly opt-in via `tool_call_voting:
+true` on the `review-with-tools` mode (default `false`,
+`defaults.py:397`). When enabled, the
+`record_recommendation(verdict, blockers, evidence)` tool-call schema
+is appended to the per-peer directive; the orchestrator runs a unified
+`_extract_tool_call_recommendation` parser and falls back to the
+existing regex `RECOMMENDATION:` parsing when no structured payload is
+present. No family-specific extraction code yet — no real CLI
+tool-call payloads to validate against, deferred until concrete shapes
+appear. New `tool_call_status` field on `ParticipantResult`
+distinguishes `absent` / `ok` / `malformed` / `None` so parser bugs
+become operator-visible instead of silently masking. Cache round-trip
+preserved (the new field rehydrates to `None` on absence; schema
+version unchanged). Orchestrator wiring at
+`orchestrator.py:416-418,434,593`. Dogfood-verified: with the flag
+flipped via a temp yaml override, all three CLI peers reported
+`tool_call_status: "absent"` (extraction ran, found no tool call,
+regex fallback succeeded) — confirms the no-op safety path end-to-end
+(`.llm-council/runs/20260518_052232_*`). New test file
+`tests/test_tool_call_voting.py`.
+
+**Phase 5b (dogfood-caught fix).** Phase 5 set `tool_call_status`
+internally but never serialized it — same class of latent bug as
+v0.8.1's Phase 1b verified-tag schema gap. `result_to_dict`
+(`transcript.py:367-370`) and `council_run_output_schema`
+(`mcp_server.py:344,1109`) did not include the field, so the operator
+couldn't see whether extraction ran. Two-line fix on each surface;
+caught precisely because the v0.8.1 lesson ("dogfood the new surface
+through MCP immediately after restart") was followed.
+
+**Anonymized cross-ranking (flag, not mode).** New `--cross-rank` CLI
+flag (`cli.py:244-249,2644`) and `cross_rank: true` MCP arg
+(`mcp_server.py:204-212,1042`); composable with any existing mode (NOT
+a new mode — avoids mode proliferation). After round 1, builds a stable
+anonymization map `{peer: "Response A|B|C…"}` (Excel-column style for
+>26 peers), constructs per-peer ranking prompts with the OTHER peers'
+outputs relabeled, runs the ranking pass via existing
+`run_participants`, parses `FINAL RANKING:` numbered lists, aggregates
+per-peer `rank_position_mean`. Orchestrator wiring at
+`orchestrator.py:310,510-632`. Surfaces in transcript JSON top-level
+(`cross_rank_scores` + `anonymization_map` + reverse map +
+`cross_rank_rankings`; `transcript.py:918-977`), transcript markdown
+(`transcript.py:856-877`), MCP `structured_results`
+(`mcp_server.py:518,1188-1204`), and `stats.aggregate_reliability` as
+a new per-peer counter (`stats.py:630-632`). New `is_ranking_round`
+field on `ParticipantResult`; ranking-round results are persisted and
+cached but explicitly EXCLUDED from the round-2 deliberation prompt
+builder (`transcript.py:470`) — mirrors the v0.8 finding-matrix
+invariant (MAD literature, arxiv 2402.18272). Promotion gate in
+`eval/runner.py:402-484` accepts an optional
+`cross_rank_correlation_floor` for future eval-data-driven default
+flip. Dogfood-verified: a `consensus + cross_rank: true` run produced
+`cross_rank_scores: {claude: 1.0, codex: 1.5, gemini: 2.0}` with the
+anonymization map persisted to metadata
+(`.llm-council/runs/20260518_044924_*`). New test file
+`tests/test_cross_rank.py`.
+
+**Test cleanup pass.** 9 tests deleted across 8 files (tautologies,
+type-system-checks-dressed-as-tests, byte-identical duplicates,
+default-value-only checks). Conservative scope — `test_llm_council.py`
+(357K, 437 tests) intentionally untouched; a deeper consolidation pass
+is deferred. Flagged but did NOT change:
+`llm_council/eval/runner.py:392` — `PromotionResult.to_dict()` is just
+`return asdict(self)` and adds no value over calling `asdict` directly;
+defer to v0.9.x. Test surface: 935 (v0.8.1) → 1017 (v0.9.0) = +82 net.
+
+**Operational gotcha (carry forward).** The v0.7.1 MCP-server-
+restart-after-install warning still applies. All four v0.9.0 surfaces
+(`council_query_transcripts`, tool-call voting, Phase 5b
+serialization, cross-rank) require an MCP-server restart before
+MCP-mediated councils pick them up. Phase 5b was caught precisely
+because the post-Phase-5 restart was the first moment the MCP server
+emitted `tool_call_status` over the wire; dogfood through MCP
+immediately after restart to catch this class of issue.
+
+## 0.8.1 - 2026-05-17
+
+v0.8.1 ships three items: hash-aware chunking for `context_files`
+(matching `--diff`'s existing pattern); a latent v0.8.0 MCP-schema bug
+fix (the new `[VERIFIED:...]` tag was not in the schema's tag enum, so
+any MCP-mediated council where a peer emitted a verified citation
+failed output validation); and a new optional
+`CONTINUE_DEBATE: yes|no` envelope tag that lets peers vote to skip
+round-2 deliberation. 906 → 935 passing tests (+29 across two new test
+files); same 3 pre-existing environmental failures unchanged.
+
+**`context_files` chunking.** Today's planning-pass dogfood surfaced
+that passing many real files trips the 120K per-participant prompt cap
+(the original failure was
+`Prompt exceeds max_prompt_chars: 375023 > 120000` with 9 context
+files). `--diff` already handles this via hash-aware chunking in
+`llm_council/diff_chunking.py`; `context_files` did not. v0.8.1 routes
+them through the same chunker. New public function
+`chunk_context_files()` reuses the existing scoring helpers (filename
+mentions, extension affinity, smaller-first tiebreak). Oversize-alone
+files — a single file larger than `max_prompt_chars - framing` — are
+dropped entirely with a `context_files_chunked` progress event listing
+`oversize_files`. Dogfood-verified: the original 375K-char payload
+chunks to ~104K and runs cleanly
+(`.llm-council/runs/20260517_170455_dogfood-test-1-*`). The behavior
+change inverts an old fail-fast test
+(`test_long_context_overflow_fails_fast_instead_of_truncating` renamed
+and rewritten to assert loud chunking events, not silent truncation).
+The chunker-budget test
+`test_build_prompt_hash_aware_drops_unrelated_files` was bumped 8K → 9K
+chars to leave headroom for natural envelope growth. New test file
+`tests/test_context_chunking.py` (14 tests).
+
+**MCP schema accepts `verified` tag.** v0.8.0's Phase A
+`[VERIFIED:path:start-end]` citation parsing produces evidence entries
+with `tag="verified"` and accompanying `path`/`start_line`/`end_line`/
+`verified` fields, but `council_run_output_schema` in `mcp_server.py`
+(around line 385) did not include `"verified"` in the evidence-tag
+enum. Any MCP-mediated council where a peer emitted a verified
+citation crashed with
+`'verified' is not one of ['published', 'observable', 'inferred', 'speculative', None]`.
+The bug was latent during v0.8 development because the MCP server was
+still on v0.7.1 code; it surfaced the first moment the operator
+restarted into v0.8 (dogfood test 1). Fixed by adding `"verified"` to
+the tag enum and the four accompanying optional structured properties
+(`path`, `start_line`, `end_line`, `verified`); description string
+updated to document the new shape. Carry-forward to v0.9.0: continue
+to test new envelope features through the actual MCP path during
+dogfood, not only via pytest.
+
+**`CONTINUE_DEBATE: yes|no` envelope tag (Feature 4 from the
+post-v0.8 competitor-comparison pass).** A new optional envelope field
+peers may emit alongside `EFFORT`/`CONFIDENCE`/`RISK`. New regex in
+`_ENVELOPE_SINGLE_RE` (`adapters.py:2316`); new field on
+`ParticipantResult` (`adapters.py:160-169`); unanimity gate in
+`orchestrator.py:489-525`; one-line envelope-doc addition in
+`context.py:395`. When **all** label-producing peers in round 1 emit
+`CONTINUE_DEBATE: no`, the orchestrator skips the optional round-2
+deliberation and stamps
+`deliberation_status: skipped_continue_debate_unanimous` plus a
+`deliberation_skipped` progress event carrying `no_votes` +
+`denominator` counts. Denominator mirrors the existing label-producing
+semantics: abdicated peers, `error_kind=invalid_response`, and peers
+without a usable `RECOMMENDATION` label are excluded. The unanimity
+threshold (not 66%) is deliberately conservative — relaxation
+deferred to v0.9.x once a transcript corpus exists to audit gaming
+risk. Cache round-trip preserved (the new field on `ParticipantResult`
+is persisted; schema version unchanged because absence rehydrates to
+None). Dogfood-verified: a deliberate-mode council with all three
+peers emitting `CONTINUE_DEBATE: no` triggers
+`deliberation_status: "skipped_continue_debate_unanimous"` +
+`deliberation_skipped` event with `no_votes: 3, denominator: 3`
+(`.llm-council/runs/20260517_170522_dogfood-test-2-*`). New test file
+`tests/test_continue_debate.py` (15 tests). Inspired by ai-counsel's
+`continue_debate: bool` per-vote field; full competitor-comparison
+context lives in `reference_council_projects.md` in the auto-memory.
+
+**Operational gotcha (carry forward).** The v0.7.1 MCP-server-
+restart-after-install warning still applies. Both v0.8.1 surfaces
+(chunking, `CONTINUE_DEBATE`) require a restart before MCP-mediated
+councils pick them up. The Fix B bug above was caught precisely
+because the restart-after-v0.8.0 was the first moment the MCP server
+saw verified citations; dogfood the new surface through MCP
+immediately after restart to catch this class of issue.
+
+## 0.8.0 - 2026-05-17
+
+v0.8.0 ships a closed-loop measurement pipeline. The keystone is the new
+`[VERIFIED:path:start-end]` evidence tag with mechanical verification;
+it generates the signal that powers both an eval harness with
+Signal-to-Noise Ratio (SNR) tracking and a minimal per-peer reliability
+layer. Architecture direction set by a council-on-itself
+meta-consultation (transcript
+`20260517_072537_meta-consultation-llm-council-product-roadmap-you-are-being.md`)
+plus a 2024–2026 literature review (citations below). 745 → 906 passing
+tests (+161); same 3 pre-existing environmental failures unchanged.
+Cache schema stays at v3 — the new `evidence_verification_failures`
+field defaults gracefully via `payload.get(...) or []` on rehydrate.
+
+**Closed-loop pipeline (Parts 1, 4, 7).** Three features that only
+deliver as a bundle:
+
+- *Verified citations.* `[VERIFIED:path:start-end]` joins the existing
+  `[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]` tag set. New
+  module `llm_council/citations.py` (`VerifiedRef`,
+  `parse_verified_tag`, `verify_ref`, `verify_evidence_citations`);
+  `adapters._parse_tagged_entry` extended to recognize the new tag;
+  `orchestrator.execute_council` calls `verify_evidence_citations`
+  after every round (`orchestrator.py:424,547`). Failed refs are
+  recorded on `ParticipantResult.evidence_verification_failures` but
+  the entry is NOT dropped — coverage > filtering, per Anthropic Claude
+  4 prompting guidance. Prompt directive added in `context.py`
+  envelope block asks peers to prefer the tag and explicitly states
+  unverifiable cites are kept, not dropped.
+
+- *Eval harness.* New `llm_council/eval/` package — `metrics.py`
+  (`blocker_recall`, `false_blocker_rate`, `citation_accuracy`,
+  `evidence_density`, `signal_to_noise_ratio`), `runner.py`
+  (`load_fixture`, `run_suite`, `to_json`, `check_promotion_gate`),
+  bundled minimal `fixtures/` directory. New CLI surface:
+  `llm-council eval run [--mode <m>] [--fixtures <path>] [--out <path>]
+  [--require-cached] [--compare-against <baseline.json>]`. SNR metric
+  matches the CR-Bench convention (true-positive findings / total
+  findings emitted). The seed fixture set is intentionally minimal —
+  building a real eval suite is a separate ongoing effort. Scorecards
+  land under `.llm-council/eval-runs/` for trend aggregation via
+  `llm-council stats --eval`.
+
+- *Outcome tracking + per-peer reliability.* New module
+  `llm_council/outcomes.py` — `OutcomeRecord` persisted as sidecar
+  `.llm-council/outcomes/<run-id>.json` so transcript JSON shape stays
+  immutable. New CLI:
+  `llm-council outcome mark <run-id-or-prefix> --decision
+  shipped|reverted|rejected|unknown [--bug-found yes|no]
+  [--winning-peer X] [--note "..."]` and `llm-council outcome list`.
+  New `llm-council stats --reliability [--peer <name>]` surfaces
+  per-peer counters from `stats.aggregate_reliability`:
+  `outcomes_marked`, `useful_count` (peer voted `yes|tradeoff` AND
+  outcome was shipped+no-bug), `false_blocker_count` (peer voted `no`
+  AND outcome was shipped+no-bug — mutually exclusive with the useful
+  bucket), `unique_blocker_catch_count`, `verified_citation_rate`
+  (mechanical; no user label required). NO IRT-style scoring yet —
+  revisit at ≥200 marked outcomes per the council deliberation.
+
+**CLI-tool-use mode (experimental, Phase E).** New `review-with-tools`
+mode in `DEFAULT_CONFIG["modes"]` (`defaults.py:381`). CLI peers only
+(`other_cli_peers` strategy; hosted peers do not participate).
+`experimental: true` surfaced as `[EXPERIMENTAL]` in `llm-council list`
+and included in MCP `council_list_modes` output.
+`timeout_multiplier: 1.8` (≈432s against the 240s baseline). The
+per-peer tool-use directive is applied in `adapters.run_one`
+(`adapters.py:2029`), NOT `context.build_prompt` — family info is
+per-peer, so hosted peers do not receive the directive even when
+explicitly routed to this mode. *Promotion gate*:
+`eval/runner.py:check_promotion_gate` requires
+`blocker_recall(review-with-tools) ≥ blocker_recall(review) + 0.05`
+AND `signal_to_noise_ratio(review-with-tools) ≥
+0.85 × signal_to_noise_ratio(review)` before the mode can graduate
+from `experimental: true`. CLI flags: `--compare-against`,
+`--promotion-recall-lift`, `--promotion-snr-floor-ratio`. SWE-PRBench
+(arxiv 2603.26130) finding that more context monotonically degrades
+review quality motivates the gate: don't ship a regression.
+
+**Per-finding agreement matrix (Phase F, synthesis aid only).** New
+module `llm_council/findings.py` — `Finding`, `FindingCluster`,
+`FindingMatrix`, `extract_findings`, `cluster_findings`,
+`build_matrix_from_results`, `matrix_to_dict`. Peers may emit an
+optional `FINDINGS:` envelope block (`id`, `severity`, `claim`,
+`evidence` as a `[VERIFIED:...]` tag). `cluster_findings` mechanically
+clusters across peers by overlapping verified line ranges + severity
+class; consensus = ≥2 distinct peers with overlapping verified refs.
+The matrix is computed ONCE post-deliberation on the final round's
+results (`orchestrator.py:666`) — explicitly NOT fed back to peers
+during round-2 deliberation, because the MAD literature
+(arxiv 2402.18272) warns that in-round convergence forcing depresses
+signal-to-noise. Surfaced in transcript markdown (`## Finding
+Matrix`), transcript JSON top-level (`finding_matrix`), and MCP
+`structured_results` (`consensus_blockers` + `single_peer_concerns`,
+omitted entirely when no peer emitted findings — gated to match
+transcript JSON precedent). `synthesis.run_synthesis_chair` accepts
+`finding_matrix: FindingMatrix | None = None`; non-empty renders
+"CONSENSUS BLOCKERS" / "SINGLE-PEER CONCERNS" sections so the chair
+weights agreement properly. `None` produces the v0.7.x prompt
+unchanged.
+
+**Per-mode model overrides (Phase D, persona-routing replacement).**
+New optional `modes.<name>.model_overrides: {peer_name: model_id}` in
+`.llm-council.yaml`. Resolution chain:
+`participants.<peer>.model` (base) → `tiers.<tier>.<peer>` (existing
+`--tier` swap) → `modes.<name>.model_overrides` (highest priority
+within a mode). Validated at config-load (`config.py:251`); honored
+during participant selection (`config.py:904`). No built-in modes ship
+overrides — operators add their own once eval harness signal supports
+the affinity. *Cuts*: persona auto-routing (Plan Phase 5) and cascade
+routing (Plan Phase 3) were deliberately dropped. PRISM
+(arxiv 2603.18507) finds persona prompting is net-negative for
+accuracy on knowledge/coding tasks on GPT-4-class+ models; the useful
+sub-feature (model affinity per task) is captured by `model_overrides`
+without the persona-theatre risk. Published cascade-routing gains are
+on code GENERATION, zero on code REVIEW, and the user dropped cost as
+a constraint so the headline benefit no longer applies.
+
+**Cleanup pass + breadcrumb fixes.** Renamed `--cache-only` →
+`--require-cached` (honest naming — peers still execute; the flag
+detects cache misses post-hoc and exits non-zero so CI can gate on
+"all fixtures pre-warmed"). Dropped redundant runtime type checks in
+`config.select_participants` (`validate_config` already enforces shape
+at config-load). Reverted cache schema bump (v3 stays valid; the new
+`evidence_verification_failures` field defaults to `[]` on rehydrate
+— see `cache.py:24` rationale comment). Fixed
+`useful_count`/`false_blocker_count` mutual-exclusivity in
+`stats.aggregate_reliability` (`stats.py:636`) — a peer voting `no` on
+a shipped+no-bug PR is a false blocker, not useful. Dropped unused
+`PeerScore.error` / `.ok` / `.from_cache` fields and
+`blocker_recall_mean` from fixture scorecards (populated but never
+consumed by aggregators; `from_cache` is now read off raw results in
+`_aggregate_fixture`). Gated MCP `consensus_blockers` /
+`single_peer_concerns` arrays — omitted from the payload entirely
+when no peer emitted findings, matching transcript JSON precedent
+(`mcp_server.py:1089`).
+
+**Second cleanup pass (post-council-review).** A critical code-review
+pass (transcript `20260517_125529_critical-code-review-...`) surfaced
+4 real bugs and 9 dead-code items missed by the first cleanup. Fixed:
+`PromotionResult.snr_ratio` infinity sentinel (was conflating
+"trivially passed over zero baseline" with "candidate has zero
+signal" — now serializes as `None`); duplicate `finding_matrix`
+serialization in transcripts and MCP (now top-level only, removed
+from `metadata`); a duplicate-branch JSON print in `cli.py`; ambiguous
+metric naming between `_aggregate_fixture` and `_aggregate_suite`
+documented via docstrings on `SuiteScorecard` / `_aggregate_suite`
+enumerating per-key aggregation rules. Deletions: `FindingMatrix.by_peer`
+(write-only), `FindingCluster.consensus` (always True), unused
+`verify_ref` import in `findings.py`, `Fixture.to_dict` and
+`Fixture.path` (no callers), unused `Awaitable` import, two
+function-local imports in `adapters.py` hoisted, duplicate
+`final_round_results(results)` call collapsed, `check_promotion_gate`
+parameters renamed `scorecards_a/b` → `baseline/candidate`,
+`_result_field` getattr-shim inlined at its four call sites.
+
+**Known operational gotcha (carries forward from v0.7.1).** The MCP
+server is a long-running stdio process. After `pip install -e .`
+brings these changes in, the MCP server must be restarted before the
+new `eval run` / `outcome` / `review-with-tools` surface is reachable
+from MCP-mediated runs. Editable installs do not auto-reload long-
+running child processes.
+
+**Key papers cited.** Verify accessibility before relying on:
+- arxiv 2402.18272 — Rethinking the Bounds of LLM Reasoning
+  (multi-agent debate often hurts vs strong single-agent on objective
+  benchmarks).
+- arxiv 2603.26130 — SWE-PRBench (no frontier model detects >31% of
+  human-flagged PR issues; more context monotonically degrades review
+  quality).
+- arxiv 2512.12117 — Citation-Grounded Code Comprehension (92%
+  accuracy with verified file:line citations vs 14–18pp worse
+  uncited).
+- arxiv 2603.18507 — PRISM (persona prompting net-negative for
+  knowledge/coding accuracy).
+- CR-Bench — Signal-to-Noise Ratio for code review (Reflexion-style
+  agents collapse SNR 5.11 → 1.95).
+- Anthropic Claude 4 prompting best-practices — coverage > filtering.
 
 ## 0.7.1 - 2026-05-17
 

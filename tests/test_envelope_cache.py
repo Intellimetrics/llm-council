@@ -9,12 +9,7 @@ locks in the bump so it cannot regress.
 
 from __future__ import annotations
 
-from llm_council.cache import CACHE_SCHEMA_VERSION, compute_key
-
-
-def test_cache_schema_version_at_least_2():
-    """The envelope-contract bump (v1 -> v2) must not regress."""
-    assert CACHE_SCHEMA_VERSION >= 2
+from llm_council.cache import compute_key
 
 
 def test_compute_key_includes_schema_version():

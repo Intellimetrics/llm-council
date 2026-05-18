@@ -21,7 +21,7 @@ from typing import Any
 CACHE_SUBDIR = ".llm-council/cache"
 DEFAULT_TTL_SECONDS = 24 * 3600
 PROMPT_PREVIEW_CHARS = 200
-CACHE_SCHEMA_VERSION = 3  # v3 = structured evidence shape (list[{text, tag}]), prompt_chars, recovered_after_timeout, section_repair_attempted
+CACHE_SCHEMA_VERSION = 3  # v3 = structured evidence shape (list[{text, tag}]), prompt_chars, recovered_after_timeout, section_repair_attempted. evidence_verification_failures is optional with a `[]` default on rehydrate, so we deliberately do NOT bump for it — keeps old v3 caches readable.
 
 _MODES_THAT_SKIP_CACHE = frozenset({"consensus"})
 
@@ -157,9 +157,13 @@ def build_payload(
     recovered_after_timeout: bool = False,
     prompt_chars: int | None = None,
     section_repair_attempted: bool = False,
+    evidence_verification_failures: list[str] | None = None,
+    continue_debate: str | None = None,
+    tool_call_status: str | None = None,
+    is_ranking_round: bool = False,
 ) -> dict[str, Any]:
     preview = prompt[:PROMPT_PREVIEW_CHARS]
-    return {
+    payload: dict[str, Any] = {
         "participant_name": participant_name,
         "prompt_sha256": key,
         "prompt_preview": preview,
@@ -191,6 +195,36 @@ def build_payload(
         # strict-evidence wrapper's guard correct across cache hits.
         "section_repair_attempted": bool(section_repair_attempted),
     }
+    # v4: only include the key when there's something to record so payloads
+    # stay tight for the overwhelming majority of runs (no VERIFIED tags
+    # cited, or all VERIFIED refs verified). Readers default to `[]` on
+    # missing, so the absence is semantically identical to an empty list.
+    if evidence_verification_failures:
+        payload["evidence_verification_failures"] = list(evidence_verification_failures)
+    # v0.8.1: persist the peer's CONTINUE_DEBATE vote so cached rehydrates
+    # still drive the unanimity gate. Only stored when present — readers
+    # default to None on absence, so absence is semantically identical to
+    # "peer did not emit the tag". Schema version is NOT bumped because
+    # the default is None (no behavioral change for old payloads).
+    if continue_debate is not None:
+        payload["continue_debate"] = str(continue_debate)
+    # v0.9.0 Feature 3: persist the tool-call telemetry distinction so cache
+    # hits still surface the absent/ok/malformed bucket in stats. Only
+    # written when not None — `None` means "extraction did not run for
+    # this peer", which is the default state and is semantically
+    # identical to absence. Schema version is NOT bumped because the
+    # default-on-missing read is None (no behavioral change for old
+    # payloads).
+    if tool_call_status is not None:
+        payload["tool_call_status"] = str(tool_call_status)
+    # v0.9.0 Feature 2: persist the ranking-round flag so cache hits still
+    # surface as ranking-round and stay filtered from the deliberation
+    # round-2 prompt builder. Only written when True (default False);
+    # readers default-on-missing to False, so absence is semantically
+    # identical to "primary response, not a ranking pass".
+    if is_ranking_round:
+        payload["is_ranking_round"] = True
+    return payload
 
 
 def resolve_ttl_seconds(

@@ -37,6 +37,17 @@ llm-council run --current codex --mode review --diff "Review this change"
 
 # Run as MCP server over stdio (what `.mcp.json` invokes)
 llm-council mcp-server
+
+# Eval harness (v0.8+)
+llm-council eval run --mode review --out scorecard.json
+llm-council eval run --mode review-with-tools --compare-against scorecard.json
+
+# Outcome tracking (v0.8+)
+llm-council outcome mark <run-id-or-prefix> --decision shipped|reverted|rejected|unknown [--bug-found yes|no] [--winning-peer X] [--note "..."]
+llm-council outcome list
+
+# Per-peer reliability counters from outcomes (v0.8+)
+llm-council stats --reliability [--peer claude]
 ```
 
 CI (`.github/workflows/test.yml`) runs `pytest -q` on Python 3.11 and 3.12.
@@ -51,7 +62,7 @@ the same core:
 2. `mcp_server.py` (`llm-council mcp-server`, exposing `council_run`,
    `council_estimate`, `council_recommend`, `council_doctor`,
    `council_list_modes`, `council_last_transcript`, `council_models`,
-   `council_stats`)
+   `council_stats`, `council_query_transcripts`)
 
 Both flow through the same pipeline:
 
@@ -101,6 +112,36 @@ Key modules:
 - `transcript.py` — paired markdown + JSON transcripts under
   `.llm-council/runs/`. `latest_transcript` and `transcript_records` back the
   `last` and `transcripts` subcommands.
+- `citations.py` — `VerifiedRef`, `parse_verified_tag`, `verify_ref`,
+  `verify_evidence_citations`. Run by the orchestrator after every
+  round; mutates each result's evidence list to stamp `verified` on
+  `[VERIFIED:...]` entries and appends failed refs to
+  `ParticipantResult.evidence_verification_failures`.
+- `outcomes.py` — `OutcomeRecord` sidecar persistence under
+  `.llm-council/outcomes/<run-id>.json`. Read via `read_outcome` /
+  `iter_outcomes`; powers the per-peer reliability layer in
+  `stats.aggregate_reliability`.
+- `findings.py` — `Finding`, `FindingCluster`, `FindingMatrix`,
+  `extract_findings`, `cluster_findings`, `build_matrix_from_results`,
+  `matrix_to_dict`. Parses the optional `FINDINGS:` envelope block and
+  clusters across peers by overlapping verified line ranges + severity.
+  Computed post-deliberation in `orchestrator.execute_council`; never
+  fed back to peers in-round.
+- `eval/` package — `metrics.py` (`blocker_recall`,
+  `false_blocker_rate`, `citation_accuracy`, `evidence_density`,
+  `signal_to_noise_ratio`), `runner.py` (`load_fixture`, `run_suite`,
+  `to_json`, `check_promotion_gate`), bundled minimal `fixtures/`.
+  CLI: `llm-council eval run`. `check_promotion_gate` accepts optional
+  `cross_rank_correlation_floor` (v0.9.0) for future eval-driven flip
+  of `--cross-rank` defaults.
+- `query.py` (v0.9.0) — `SimilarMatch`, `search_similar()`. Jaccard
+  token-overlap search over `.llm-council/runs/*.json` for prior
+  council questions. Reuses `convergence.tokenize`,
+  `deliberation.recommendation_label`, and
+  `stats.load_transcript_files`. Surface is MCP only
+  (`council_query_transcripts`); no CLI subcommand. No new
+  dependencies — sentence-transformers deferred until Jaccard proves
+  insufficient.
 
 ## Invariants worth preserving
 
@@ -119,8 +160,8 @@ Key modules:
   string `(no RECOMMENDATION label emitted)` for round-2 prompt summaries
   rather than falling back to arbitrary prose.
 - **Optional response envelope.** Peers may emit `EFFORT:`, `CONFIDENCE:`,
-  `RISK:`, `BLOCKERS:`, `EVIDENCE:`, `TESTS_TO_RUN:`, `ASSUMPTIONS:` lines
-  alongside the `RECOMMENDATION:` label. Parsed by
+  `RISK:`, `BLOCKERS:`, `EVIDENCE:`, `TESTS_TO_RUN:`, `ASSUMPTIONS:`,
+  `CONTINUE_DEBATE:` lines alongside the `RECOMMENDATION:` label. Parsed by
   `adapters._extract_response_envelope`, stored on `ParticipantResult`, and
   emitted in transcripts / MCP `structured_results`. All fields are optional
   in the current schema (v2). A peer that says `EFFORT: blocked` with no
@@ -129,7 +170,16 @@ Key modules:
   repair retry. Naming concrete missing artifacts in either list is
   treated as honest information, not abdication. Track presence via the
   new `envelope_field_present` bucket in `stats.aggregate` before any
-  future flip from optional to required.
+  future flip from optional to required. `CONTINUE_DEBATE: yes|no`
+  (v0.8.1) is a per-peer vote on whether round-2 deliberation is worth
+  running; when ALL label-producing peers emit `no` in round 1
+  (denominator excludes abdicated / `invalid_response` / unlabeled),
+  the orchestrator skips round-2 and stamps
+  `deliberation_status: skipped_continue_debate_unanimous` plus a
+  `deliberation_skipped` progress event with `no_votes` + `denominator`
+  counts. Unanimity (not 66%) is conservative-until-measured — revisit
+  once a transcript corpus exists to audit gaming risk
+  (`orchestrator.py:489-525`).
 - **Config migration is silent.** `migrate_known_cli_defaults` rewrites old
   `OLD_CLAUDE_PLAN_ARGS` / `OLD_CODEX_APPROVAL_ARGS` and back-fills
   `peer-only` mode and `include_current` for built-in `other_cli_peers`
@@ -137,7 +187,15 @@ Key modules:
   constants too.
 - **Prompt-size guard.** `max_prompt_chars` is enforced both globally and
   per-participant before any subprocess launches; preserve this so oversized
-  prompts fail fast rather than after a long hosted/CLI timeout.
+  prompts fail fast rather than after a long hosted/CLI timeout. Both
+  `--diff` payloads AND `context_files` (v0.8.1+) route through
+  `llm_council/diff_chunking.py`'s hash-aware chunker before assembly so
+  large multi-file context drops don't trip the cap. New entry point
+  `diff_chunking.chunk_context_files()` reuses the existing scoring
+  helpers (filename mentions, extension affinity, smaller-first
+  tiebreak). A single file larger than `max_prompt_chars - framing` is
+  dropped entirely with a `context_files_chunked` progress event listing
+  `oversize_files` — operator-visible rather than silently truncated.
 - **Mode-aware timeouts.** `defaults.py:DEFAULT_CONFIG["modes"]` may carry
   an optional `timeout_multiplier: float`. Resolution:
   `effective = per_participant_timeout * mode_multiplier`. The
@@ -167,15 +225,102 @@ Key modules:
   `defaults.require_sections: false` or `--no-require-sections`.
 - **Strict evidence-tag enforcement (optional, default off).** Each
   EVIDENCE bullet is parsed for a leading/trailing/inline
-  `[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]` tag and stored as
-  `list[{text, tag}]` on `ParticipantResult`. When
-  `defaults.strict_evidence: true` (or `--strict-evidence`), entries
-  without a tag fail validation with `error_kind=untagged_evidence` and
-  trigger the repair-retry path. Empty evidence list passes — the gate
-  is FORMAT of entries that exist, not PRESENCE. Watch
+  `[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]/[VERIFIED:path:start-end]`
+  tag and stored as `list[{text, tag, ...}]` on `ParticipantResult`.
+  When `defaults.strict_evidence: true` (or `--strict-evidence`),
+  entries without a tag fail validation with
+  `error_kind=untagged_evidence` and trigger the repair-retry path.
+  Empty evidence list passes — the gate is FORMAT of entries that
+  exist, not PRESENCE. Strict-evidence treats `[VERIFIED:...]` as
+  tagged whether mechanical verification passed or failed — the tag is
+  present; verification is a separate axis surfaced via
+  `evidence_verification_failures`. Watch
   `evidence_tag_distribution["untagged"]` in stats before flipping the
   default. Tag parsing only applies to `evidence` — blockers/assumptions/
   tests_to_run stay `list[str]`.
+- **`[VERIFIED:path:start-end]` is a fifth optional evidence tag.**
+  Joins `[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]`. The
+  orchestrator runs `citations.verify_evidence_citations` after every
+  round (`orchestrator.py:424,547`); failed refs land on
+  `ParticipantResult.evidence_verification_failures` as
+  `path:start-end` strings but the entry is NOT dropped — coverage >
+  filtering. The prompt directive in `context.py`'s envelope block
+  asks peers to surface low-confidence findings and explicitly states
+  unverifiable cites are kept as-is, not dropped. Cache schema v3
+  stays valid; the new field defaults to `[]` on rehydrate via
+  `payload.get(...) or []`.
+- **Finding matrix is post-deliberation only.**
+  `findings.build_matrix_from_results` runs ONCE on the final round's
+  results inside `orchestrator.execute_council`. The matrix is
+  consumed by `synthesis.build_synthesis_prompt` (rendered as
+  "CONSENSUS BLOCKERS" / "SINGLE-PEER CONCERNS") and surfaced in
+  transcripts and MCP `structured_results` (`consensus_blockers` +
+  `single_peer_concerns`, omitted when no peer emitted findings). It
+  is NEVER fed back to peers during round-2 deliberation — MAD
+  literature (arxiv 2402.18272) warns that in-round convergence
+  forcing depresses signal-to-noise.
+- **Cross-ranking is a flag, not a mode, and ranking-round outputs
+  never enter deliberation.** `--cross-rank` (CLI) / `cross_rank: true`
+  (MCP) is composable with any existing mode. After round 1, the
+  orchestrator builds an anonymization map (`peer → "Response A|B|…"`,
+  Excel-column style for >26 peers), constructs per-peer ranking
+  prompts with OTHER peers' outputs relabeled, runs the ranking pass
+  via `run_participants`, parses `FINAL RANKING:` numbered lists, and
+  aggregates per-peer `rank_position_mean`. Surfaced top-level on the
+  transcript JSON (`cross_rank_scores`, `anonymization_map`,
+  `anonymization_map_reverse`, `cross_rank_rankings`), MCP
+  `structured_results`, and `stats.aggregate_reliability`. Ranking-
+  round results carry `is_ranking_round=True` on `ParticipantResult`,
+  are persisted and cached, and are EXCLUDED from the round-2
+  deliberation prompt builder (`transcript.py:470`) — same MAD-
+  literature invariant as the finding matrix. Promotion gate keeps an
+  optional `cross_rank_correlation_floor` slot for the eventual
+  default flip.
+- **Tool-call voting is opt-in even within `review-with-tools`.**
+  `tool_call_voting: false` by default on the `review-with-tools` mode
+  (`defaults.py:397`). When flipped to `true`, the orchestrator
+  appends a `record_recommendation(verdict, blockers, evidence)` tool
+  schema to the per-peer directive and runs a unified
+  `_extract_tool_call_recommendation` parser; regex
+  `RECOMMENDATION:` parsing remains the fallback. `tool_call_status`
+  on `ParticipantResult` (`absent` / `ok` / `malformed` / `None`)
+  makes parser behavior operator-visible — serialized in transcripts
+  and MCP `structured_results` (Phase 5b fix). Promotion to default
+  requires eval-harness lift on the same gate that governs
+  `review-with-tools` itself; no family-specific extraction code is
+  added until concrete CLI tool-call payloads exist to validate
+  against.
+- **Per-mode model overrides.**
+  `modes.<name>.model_overrides: {peer: model_id}` in
+  `.llm-council.yaml`. Resolution order: base
+  `participants.<peer>.model` → `--tier` swap → mode override
+  (highest priority within a mode). Validated at config-load; honored
+  in `config.select_participants`. Built-in modes ship NO overrides —
+  operators add their own once eval-harness signal supports the
+  affinity. This replaces the cut auto-routed-persona feature (PRISM
+  evidence: persona prompting net-negative for knowledge/coding
+  accuracy).
+- **Experimental mode promotion gate.** A mode marked
+  `experimental: true` in `DEFAULT_CONFIG["modes"]` stays experimental
+  until the eval harness shows on a canonical fixture set: ≥5pp
+  `blocker_recall` lift AND ≤15% SNR collapse vs the baseline mode.
+  `eval/runner.py:check_promotion_gate` is the computational gate;
+  flipping the flag in `defaults.py` is a manual operator decision
+  pinned to scorecard evidence. `review-with-tools` is the first mode
+  that ships under this discipline. CLI flags:
+  `--compare-against <baseline.json>`, `--promotion-recall-lift`,
+  `--promotion-snr-floor-ratio`. The `[EXPERIMENTAL]` marker is
+  surfaced in `llm-council list` (`cli.py:845`) and visible via MCP
+  `council_list_modes` (the raw `modes` dict carries the flag).
+- **Outcome tracking is sidecar.**
+  `.llm-council/outcomes/<run-id>.json` is persisted separately from
+  transcripts so transcript JSON shape stays immutable. Reliability
+  counters in `stats.aggregate_reliability` are mutually exclusive: a
+  peer voting `yes`/`tradeoff` on a shipped+no-bug outcome →
+  `useful_count`; voting `no` → `false_blocker_count`; no usable
+  label → neither. `verified_citation_rate` is the only counter that
+  does NOT require user outcome labels — it's mechanical from
+  `evidence_verification_failures`.
 - **Timeout-by-prompt-size telemetry.** `stats.aggregate` buckets
   timed-out runs into `timeout_by_prompt_size` (small / medium / large /
   xlarge, char cutoffs at 4K / 20K / 60K) and tracks `timeout_recoveries`
@@ -271,3 +416,17 @@ known `cost_usd` per participant from the OpenRouter catalog; free/local
 peers count as $0 and unknown-cost peers (catalog miss) cannot be
 enforced — those raise no error but are visible in the estimate. Use
 `llm-council estimate ...` for a per-peer breakdown when a cap fails.
+
+## Per-peer model selection: tiers and per-mode overrides
+
+`defaults.tiers.<name>: {peer: model_id}` defines a named swap applied
+globally via `--tier <name>` (CLI) before participant selection. For a
+mode-scoped pin, `modes.<name>.model_overrides: {peer: model_id}` in
+`.llm-council.yaml` overrides a peer's model only when that mode is
+active. Resolution chain: base `participants.<peer>.model` -> `--tier`
+swap (when set) -> `modes.<name>.model_overrides` (highest priority).
+Overrides naming a peer absent from the resolved roster are silent
+no-ops, and only the `model` field is touched (args, timeout, type,
+family, origin are untouched). Built-in modes ship without
+`model_overrides` on purpose — do NOT add vendor-affinity defaults until
+the eval harness shows real lift on the relevant fixture set.

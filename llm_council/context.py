@@ -13,7 +13,11 @@ from llm_council.defaults import (
     STANCE_INVARIANT_SUFFIX,
     VALID_STANCES,
 )
-from llm_council.diff_chunking import VALID_STRATEGIES, chunk_diff
+from llm_council.diff_chunking import (
+    VALID_STRATEGIES,
+    chunk_context_files,
+    chunk_diff,
+)
 
 
 MAX_CONTEXT_FILE_CHARS = 120_000
@@ -383,9 +387,12 @@ def build_prompt(
             "- `RISK: low|medium|high|critical`",
             "- `BLOCKERS:` then bullet lines for each concrete missing artifact",
             "  (file, command output, policy doc) that prevented full analysis.",
-            "- `EVIDENCE:` then bullet lines of `path:line` or `section` references.",
+            "- `EVIDENCE:` bullet lines, each tagged `[PUBLISHED]`/`[OBSERVABLE]`/`[INFERRED]`/`[SPECULATIVE]`,",
+            "  or `[VERIFIED:path:start-end]` for code claims (orchestrator mechanically verifies file/range). Report findings broadly; a downstream step filters.",
+            "- `FINDINGS:` optional bullets (`id`, `severity`, `claim`, `evidence`) for cross-peer dedup; not fed to round 2.",
             "- `TESTS_TO_RUN:` then bullet lines of verification commands.",
             "- `ASSUMPTIONS:` then bullet lines of stated assumptions.",
+            "- `CONTINUE_DEBATE: yes|no` — unanimous `no` skips round-2.",
             "If you cannot evaluate, emit `EFFORT: blocked` AND a non-empty",
             "`BLOCKERS:` list naming what is missing. `EFFORT: blocked`",
             "without `BLOCKERS:` is treated as abdication and dropped from quorum.",
@@ -415,6 +422,10 @@ def build_prompt(
     diff_section_index: int | None = None
     diff_raw: str = ""
     diff_default_section: str = ""
+    # Track context-file sections so we can route them through the hash-aware
+    # chunker on overflow. `context_file_indices` maps section index ->
+    # path label (the same label rendered into the section header).
+    context_file_indices: dict[int, str] = {}
     manifest_for_render = image_manifest
     if manifest_for_render is None and image_paths:
         manifest_for_render = build_image_manifest(
@@ -428,9 +439,20 @@ def build_prompt(
         diff_section_index = len(context_sections)
         context_sections.append(diff_default_section)
     for item in context_paths:
-        context_sections.append(
-            read_context_file(item, cwd=cwd, allow_outside_cwd=allow_outside_cwd)
+        rendered = read_context_file(
+            item, cwd=cwd, allow_outside_cwd=allow_outside_cwd
         )
+        # Derive the label the same way read_context_file did so the chunker
+        # can match path-mentions in the question.
+        source = Path(item)
+        if not source.is_absolute():
+            source = cwd / source
+        try:
+            label = str(source.resolve().relative_to(cwd.resolve()))
+        except ValueError:
+            label = str(source)
+        context_file_indices[len(context_sections)] = label
+        context_sections.append(rendered)
     if stdin_text:
         context_sections.append("## Stdin Context\n\n```\n" + stdin_text + "\n```")
 
@@ -455,6 +477,83 @@ def build_prompt(
 
     prompt = assemble(context_sections)
     if max_prompt_chars is not None and len(prompt) > max_prompt_chars:
+        # Context-files chunking is automatic (no `chunk_strategy` opt-in
+        # required) because context_files are explicitly-requested attachments
+        # — the user's intent is "include as much of this as fits", not "fail
+        # if it doesn't". Hash-aware scoring preserves files mentioned by name
+        # in the question; files larger than the available budget on their
+        # own are dropped entirely with a `config_warning`-shaped progress
+        # event so the operator can see what was lost.
+        if context_file_indices:
+            file_items: list[tuple[str, str]] = [
+                (path_label, context_sections[idx])
+                for idx, path_label in sorted(context_file_indices.items())
+            ]
+            # Compute framing exactly: assemble the prompt with each
+            # context-file slot replaced by an empty string, then subtract
+            # from `max_prompt_chars`. This accounts for the separators
+            # added by `assemble`'s "\n".join — empty slots still take 1
+            # char (the separator) each, which exactly matches the chunker's
+            # accounting where M surviving sections contribute (M-1)
+            # internal separators.
+            scratch = list(context_sections)
+            for idx in context_file_indices:
+                scratch[idx] = ""
+            framing_chars = len(assemble(scratch))
+            file_budget = max_prompt_chars - framing_chars
+            chunked = chunk_context_files(
+                file_items, budget=file_budget, question=question
+            )
+            if chunked.triggered:
+                # Rebuild context_sections with the surviving file sections
+                # in their original positions. Files dropped entirely are
+                # removed; other sections (images/diff/stdin) stay put.
+                # Map original path_label -> surviving section text using
+                # exact text equality (rendered sections are unique per file
+                # since they contain the file's path in the header).
+                text_to_label = {text: label for label, text in file_items}
+                surviving_label_to_text: dict[str, str] = {}
+                for section_text in chunked.sections:
+                    label = text_to_label.get(section_text, "<unknown>")
+                    surviving_label_to_text[label] = section_text
+                rebuilt: list[str] = []
+                for idx, section in enumerate(context_sections):
+                    label = context_file_indices.get(idx)
+                    if label is None:
+                        rebuilt.append(section)
+                        continue
+                    if label in surviving_label_to_text:
+                        rebuilt.append(surviving_label_to_text[label])
+                    # else: file was dropped — omit entirely
+                rebuilt_prompt = assemble(rebuilt)
+                if chunk_progress is not None:
+                    chunk_progress(
+                        {
+                            "event": "context_files_chunked",
+                            "strategy": "hash-aware",
+                            "original_chars": chunked.original_chars,
+                            "chunked_chars": chunked.chunked_chars,
+                            "dropped_chars": chunked.dropped_chars,
+                            "dropped_files": list(chunked.dropped_files),
+                            "oversize_files": list(chunked.oversize_files),
+                        }
+                    )
+                # If the rebuilt prompt now fits, return immediately. If not,
+                # fall through to diff-chunking / fail-fast paths below with
+                # the updated context list.
+                if len(rebuilt_prompt) <= max_prompt_chars:
+                    return rebuilt_prompt
+                context_sections = rebuilt
+                # Recompute diff_section_index against the rebuilt list since
+                # files may have been removed before the diff section.
+                if diff_section_index is not None and diff_default_section:
+                    try:
+                        diff_section_index = context_sections.index(
+                            diff_default_section
+                        )
+                    except ValueError:
+                        diff_section_index = None
+                prompt = rebuilt_prompt
         if (
             chunk_strategy != "fail"
             and include_diff
@@ -515,3 +614,358 @@ def build_prompt(
             "budget. Raise max_prompt_chars or drop --context/--diff."
         )
     return prompt
+
+
+# Families that ship with file-read / grep / glob tools enabled by the
+# read-only sandbox flags baked into their CLI baseline args
+# (`defaults.py:DEFAULT_CONFIG["participants"]`). Hosted families
+# (openrouter / openai_compatible) and local Ollama peers never see tool
+# access at the council layer, even if they're forcibly routed into a
+# tool-mode run via `--include`.
+_TOOL_CAPABLE_CLI_FAMILIES = frozenset({"claude", "codex", "gemini"})
+
+REVIEW_WITH_TOOLS_DIRECTIVE = (
+    "You have file-read, grep, and glob tools available via your CLI "
+    "sandbox. Use them when the diff alone is insufficient to verify a "
+    "claim — open the cited files, search for related callers, check "
+    "surrounding context. Cite specific findings with "
+    "`[VERIFIED:path:start-end]` so the orchestrator can mechanically "
+    "validate them. Keep tool use proportional: investigate suspected "
+    "issues, do not enumerate the entire repo. Hosted/local peers do "
+    "not see this instruction."
+)
+
+# v0.9.0 Feature 3 — additional directive appended on top of
+# REVIEW_WITH_TOOLS_DIRECTIVE when `modes.review-with-tools.tool_call_voting`
+# is true AND the peer is a tool-capable CLI family. `record_recommendation`
+# is NOT a real MCP tool the orchestrator hosts; we rely on the CLI peer's
+# own tool-calling machinery to emit a structured artifact in stdout
+# (claude `tool_use` content blocks, codex JSON function-calls, gemini
+# Vertex-AI flavored). `adapters._extract_tool_call_recommendation`
+# detects + parses after the fact, falling back to regex
+# `RECOMMENDATION:` parsing when the tool call is absent or malformed.
+TOOL_CALL_VOTING_DIRECTIVE = (
+    "You may additionally invoke a `record_recommendation` tool to "
+    "submit your verdict as a structured payload instead of (or in "
+    "addition to) the `RECOMMENDATION:` label. Schema:\n\n"
+    "  record_recommendation({\n"
+    '    "verdict": "yes" | "no" | "tradeoff",\n'
+    '    "blockers": ["concrete missing artifact or hard requirement", ...],\n'
+    '    "evidence": [{"text": "...", "tag": '
+    '"verified|published|observable|inferred|speculative", '
+    '"path": "...", "start_line": 0, "end_line": 0}, ...]\n'
+    "  })\n\n"
+    "If you emit this tool call, the orchestrator parses your "
+    "recommendation from the structured payload rather than from the "
+    "`RECOMMENDATION:` label. The label is still accepted as a "
+    "fallback when no tool call is emitted or the payload is malformed."
+)
+
+
+def apply_per_peer_directives(
+    prompt: str,
+    *,
+    mode: str | None,
+    family: str | None,
+    tool_call_voting: bool = False,
+) -> str:
+    """Append per-peer prompt directives based on mode + peer family.
+
+    Returns the prompt unchanged when no directive applies (the default
+    path for `mode=None`, hosted/local peers, and every mode except
+    `review-with-tools`). Backward-compatible by design — callers that
+    do not need per-peer variation can ignore this function.
+
+    Currently the only directive is the `review-with-tools` tool-use
+    block, appended when:
+    - `mode == "review-with-tools"`, AND
+    - `family` is one of `_TOOL_CAPABLE_CLI_FAMILIES`.
+
+    Hosted/local participants get the unchanged base prompt even when
+    routed into a `review-with-tools` run (defensive — the mode SHOULD
+    only route to CLI peers per the mode config, but `--include` can
+    override).
+
+    When `tool_call_voting=True` (mode config opt-in, v0.9.0 Feature 3),
+    the additional `TOOL_CALL_VOTING_DIRECTIVE` describing the
+    `record_recommendation` schema is appended after the tool-use
+    directive. Same gate: only fires for `review-with-tools` + a
+    tool-capable CLI family.
+    """
+    if mode != "review-with-tools":
+        return prompt
+    if family is None or family not in _TOOL_CAPABLE_CLI_FAMILIES:
+        return prompt
+    result = prompt + "\n\n" + REVIEW_WITH_TOOLS_DIRECTIVE
+    if tool_call_voting:
+        result = result + "\n\n" + TOOL_CALL_VOTING_DIRECTIVE
+    return result
+
+
+# --- v0.9.0 Feature 2: Anonymized cross-ranking helpers --------------------
+#
+# Opt-in `--cross-rank` flag (composable with ANY existing mode) runs an
+# extra stage between round 1 and the optional deliberation. Each peer
+# receives the OTHER peers' round-1 responses relabeled per a stable
+# anonymization map ("Response A" / "Response B" / ...) and is asked to
+# emit a `FINAL RANKING:` line ordering the labels from best to worst.
+#
+# Critical MAD-literature constraint (council risk #2): the ranking-round
+# outputs MUST NOT leak into round-2 deliberation. Each ranking-round
+# `ParticipantResult` is tagged `is_ranking_round=True`; the round-2
+# deliberation builder filters those out. We DO NOT feed ranking
+# results back to peers in-round — they are post-deliberation telemetry
+# only, mirroring how the v0.8 finding-matrix is handled.
+
+import re as _re_cross_rank
+
+
+CROSS_RANK_MIN_PEERS = 2
+
+
+def build_anonymization_map(peer_names: list[str]) -> dict[str, str]:
+    """Build a stable name -> "Response A|B|C|..." map.
+
+    Sort the peer names alphabetically before assigning letters so the
+    map is deterministic across runs; persisting it into transcript
+    metadata makes the ranking replayable / de-anonymizable by the
+    operator. Labels go A, B, ..., Z, AA, AB, ... (zero peers returns
+    `{}`; the orchestrator guard prevents the >26-peer case from
+    arising in practice but the helper degrades gracefully).
+    """
+    sorted_names = sorted({n for n in peer_names if isinstance(n, str) and n})
+    out: dict[str, str] = {}
+    for idx, name in enumerate(sorted_names):
+        out[name] = f"Response {_anonymization_label(idx)}"
+    return out
+
+
+def _anonymization_label(idx: int) -> str:
+    # 0 -> A, 1 -> B, ..., 25 -> Z, 26 -> AA, ... (excel-column style).
+    out = ""
+    n = idx
+    while True:
+        out = chr(ord("A") + (n % 26)) + out
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return out
+
+
+def build_ranking_prompt(
+    peer_name: str,
+    own_response: str,
+    other_peers: dict[str, str],
+    anonymization_map: dict[str, str],
+    question: str,
+) -> str:
+    """Build the stage-2 ranking prompt sent to `peer_name`.
+
+    Shows each OTHER peer's round-1 output relabeled per the
+    `anonymization_map` (the peer's own response is excluded — no
+    self-rank). Asks for a single `FINAL RANKING:` line followed by
+    labels from best to worst. `own_response` is currently unused
+    (peers do not self-rank) but accepted for API symmetry so future
+    variants can inject the peer's prior position for context if
+    needed.
+
+    The prompt is intentionally terse: ranking is a small structural
+    task, not a re-review. Long preambles risk the peer re-arguing the
+    underlying question instead of ranking. We also explicitly forbid
+    chain-of-thought spillage into the response body — only the
+    `FINAL RANKING:` line is needed.
+    """
+    del own_response  # reserved for future variants; see docstring.
+    if not other_peers:
+        # Defensive: orchestrator already gates on `>= 2 labeled peers`,
+        # but be permissive at the helper boundary.
+        other_peers = {}
+
+    lines: list[str] = [
+        "You are participating in a council ranking pass.",
+        "",
+        "The original question was:",
+        question.strip() if isinstance(question, str) else "",
+        "",
+        "Below are the other council members' anonymized responses.",
+        "Read each one, then emit a single `FINAL RANKING:` line ranking",
+        "them from best (most accurate and insightful) to worst.",
+        "",
+    ]
+    for original_name, label in sorted(
+        anonymization_map.items(), key=lambda kv: kv[1]
+    ):
+        if original_name == peer_name:
+            continue
+        body = other_peers.get(original_name, "")
+        bare_label = label.replace("Response ", "")
+        lines.append(f"{label}:")
+        lines.append("```")
+        lines.append(body.strip() or "(empty response)")
+        lines.append("```")
+        lines.append("")
+        del bare_label
+    lines.extend(
+        [
+            "Respond with exactly one line in this format (no preamble,",
+            "no analysis, no closing remarks):",
+            "",
+            "FINAL RANKING: <best> <next> ... <worst>",
+            "",
+            "Example: `FINAL RANKING: B A C` (best is B, worst is C).",
+            "Use only the response letters (the part after `Response `).",
+            "Keep your reply short — a single line is sufficient.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+_FINAL_RANKING_LINE_RE = _re_cross_rank.compile(
+    r"(?im)^[ \t]*[*_]*[ \t]*final\s+ranking[*_]*[ \t]*:[ \t]*(.+?)[ \t]*$"
+)
+# Inline / colon variants — captures "FINAL RANKING: B A C" or "FINAL RANKING: B, A, C"
+_FINAL_RANKING_BLOCK_HEAD_RE = _re_cross_rank.compile(
+    r"(?im)^[ \t]*[*_]*[ \t]*final\s+ranking[*_]*[ \t]*:[ \t]*$"
+)
+_NUMBERED_TOKEN_RE = _re_cross_rank.compile(
+    r"^\s*(?:\d+[\.\)]\s*)?\*?\*?([A-Za-z]{1,4})\*?\*?\s*$"
+)
+
+
+def parse_final_ranking(
+    output: str, valid_labels: set[str]
+) -> list[str] | None:
+    """Parse a `FINAL RANKING:` line from a peer's stage-2 output.
+
+    Accepts (tolerant of markdown bold + bullets + commas + numbered):
+    - ``FINAL RANKING: B A C``
+    - ``FINAL RANKING: B, A, C``
+    - ``**FINAL RANKING:** B A C``
+    - ``FINAL RANKING:\n1. B\n2. A\n3. C``
+
+    `valid_labels` is the set of bare letter labels ("A", "B", ...)
+    derived from the anonymization map MINUS the responding peer's
+    own label (the ranking prompt asks for n-1 entries). Returns the
+    ordered list of labels (best first) or ``None`` when:
+    - No `FINAL RANKING:` line is found, or
+    - Extracted tokens contain duplicates, OR
+    - Extracted tokens are not a permutation/subset of `valid_labels`
+    """
+    if not isinstance(output, str) or not output.strip():
+        return None
+    if not valid_labels:
+        return None
+
+    candidate_tokens: list[str] = []
+    text = output
+
+    inline_match = _FINAL_RANKING_LINE_RE.search(text)
+    if inline_match:
+        payload = inline_match.group(1)
+        # Strip trailing markdown / punctuation noise.
+        payload = payload.strip().strip("*_`")
+        candidate_tokens = _split_ranking_tokens(payload)
+
+    if not candidate_tokens:
+        # Try the numbered-block form: "FINAL RANKING:\n1. B\n2. A\n3. C"
+        head = _FINAL_RANKING_BLOCK_HEAD_RE.search(text)
+        if head is not None:
+            tail = text[head.end():].splitlines()
+            for raw_line in tail:
+                stripped = raw_line.strip()
+                if not stripped:
+                    if candidate_tokens:
+                        break
+                    continue
+                m = _NUMBERED_TOKEN_RE.match(stripped)
+                if not m:
+                    if candidate_tokens:
+                        break
+                    continue
+                candidate_tokens.append(m.group(1).upper())
+
+    if not candidate_tokens:
+        return None
+
+    # Reject duplicates — a coherent ranking has no repeats.
+    if len(set(candidate_tokens)) != len(candidate_tokens):
+        return None
+    # Subset/permutation check: every emitted token must be in
+    # valid_labels. Missing entries are NOT auto-filled — we surface
+    # the partial-rank decision up to the caller.
+    upper_valid = {label.upper() for label in valid_labels}
+    if not set(candidate_tokens).issubset(upper_valid):
+        return None
+    return candidate_tokens
+
+
+def _split_ranking_tokens(payload: str) -> list[str]:
+    """Tokenize a `FINAL RANKING:` payload tolerantly.
+
+    Accepts space-separated, comma-separated, ``>`` / ``→`` separated,
+    or numbered (``1. B  2. A``) forms. Returns uppercase labels with
+    markdown noise stripped.
+    """
+    # Normalize separators to whitespace.
+    normalized = payload
+    for sep in (",", "→", "->", "->", ">", ";"):
+        normalized = normalized.replace(sep, " ")
+    raw_parts = [p for p in normalized.split() if p]
+    out: list[str] = []
+    for part in raw_parts:
+        # Strip leading numbering ("1.", "2)") and markdown noise.
+        stripped = part.strip().lstrip("0123456789.()").strip()
+        stripped = stripped.strip("*_`").strip()
+        if not stripped:
+            continue
+        # A valid ranking token is 1-4 ASCII letters.
+        if not stripped.isalpha() or len(stripped) > 4:
+            return []
+        out.append(stripped.upper())
+    return out
+
+
+def compute_rank_position_means(
+    anonymization_map: dict[str, str],
+    rankings_by_peer: dict[str, list[str]],
+) -> dict[str, float]:
+    """Aggregate per-peer mean rank position from individual rankings.
+
+    `rankings_by_peer[name]` is the ordered list of labels returned by
+    that peer (best first). Position 1 = best. Each peer's score is
+    the average rank position assigned to them across all OTHER peers'
+    rankings. Lower is better (1.0 = unanimously ranked first).
+
+    Returns `{peer_name: mean_position}` for every peer the anonymization
+    map names that received at least one ranking from another peer. Peers
+    that received zero rankings (every other peer failed to emit a parsable
+    `FINAL RANKING:` line) are omitted — they have no signal to score.
+    """
+    # Build the reverse map ("Response A" -> "claude") and the bare-label
+    # lookup ("A" -> "claude") used to translate token sequences back.
+    bare_to_name: dict[str, str] = {}
+    for name, full_label in anonymization_map.items():
+        bare = full_label.replace("Response ", "").strip()
+        if bare:
+            bare_to_name[bare.upper()] = name
+
+    accumulators: dict[str, list[int]] = {name: [] for name in anonymization_map}
+    for ranker, ordered_labels in rankings_by_peer.items():
+        if not isinstance(ordered_labels, list):
+            continue
+        for position, label in enumerate(ordered_labels, start=1):
+            target_name = bare_to_name.get(str(label).upper())
+            if target_name is None:
+                continue
+            if target_name == ranker:
+                # Self-rank should not happen (prompt excludes own
+                # response), but guard against malformed peer output.
+                continue
+            accumulators[target_name].append(position)
+
+    means: dict[str, float] = {}
+    for name, positions in accumulators.items():
+        if not positions:
+            continue
+        means[name] = round(sum(positions) / len(positions), 4)
+    return means

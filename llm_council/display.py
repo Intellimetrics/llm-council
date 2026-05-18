@@ -34,6 +34,25 @@ ANSI_FAIL = "\x1b[31m"  # red
 ANSI_WARN = "\x1b[33m"  # yellow
 ANSI_DIM = "\x1b[2m"
 
+# Identity token shared by CLI and MCP surfaces. Plain ASCII so it
+# survives any host's rendering (markdown / plain / ANSI-stripped) and
+# matches the `**LLM Council**` header in `render_summary_markdown`.
+BRAND_TOKEN = "LLM Council"
+BRAND_SEP = " · "
+
+# Per-peer color rotation for the CLI gutter. Indexed by the peer's
+# position in the active roster (deterministic via `select_participants`).
+# Custom CLI peers defined in `.llm-council.yaml` slot into the cycle by
+# their roster index — no per-name registry needed.
+PEER_ACCENT_PALETTE = (
+    "\x1b[36m",  # cyan
+    "\x1b[35m",  # magenta
+    "\x1b[33m",  # yellow
+    "\x1b[32m",  # green
+    "\x1b[34m",  # blue
+    "\x1b[31m",  # red
+)
+
 # Verbs reserved for the gutter on orchestrator-level lines. Peer-name
 # lines use the peer name as the gutter token directly.
 VERB_CONVENING = "Convening"
@@ -75,6 +94,30 @@ def wants_color(stream: IO | None = None) -> bool:
         return False
 
 
+def wants_quiet() -> bool:
+    """True iff `LLM_COUNCIL_QUIET=1` opt-out is set.
+
+    Single env switch suppresses MCP progress notifications and CLI color
+    (layout still prints). MCP servers have no per-call CLI flags, so an
+    env-only switch is the only shape that works on both surfaces.
+    """
+    value = os.environ.get("LLM_COUNCIL_QUIET", "").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
+def peer_accent(name: str, ordered_peers: list[str] | tuple[str, ...]) -> str | None:
+    """Return ANSI color for `name` from `PEER_ACCENT_PALETTE`.
+
+    Deterministic via roster index. Returns `None` when the peer is not in
+    the roster (caller should fall back to the default `ANSI_GUTTER`).
+    """
+    try:
+        idx = list(ordered_peers).index(name)
+    except ValueError:
+        return None
+    return PEER_ACCENT_PALETTE[idx % len(PEER_ACCENT_PALETTE)]
+
+
 def wants_unicode_rule(stream: IO | None = None) -> bool:
     """True iff U+2500 box-drawing is safe on this stream's encoding.
 
@@ -94,18 +137,24 @@ def format_gutter(
     *,
     color: bool = True,
     width: int = GUTTER_WIDTH,
+    token_color: str | None = None,
 ) -> str:
     """Format a gutter line: right-aligned token, single space, content.
 
     `token` is right-aligned to `width` columns; longer tokens are
     truncated rather than widening the gutter. The right-alignment is the
     visual signature, so we preserve it even when color is off.
+
+    `token_color` overrides the default bold-cyan gutter — used by callers
+    that want per-peer accent rotation (see `peer_accent`). Ignored when
+    `color=False`.
     """
     if len(token) > width:
         token = token[:width]
     aligned = token.rjust(width)
     if color:
-        aligned = f"{ANSI_GUTTER}{aligned}{ANSI_RESET}"
+        code = token_color if token_color is not None else ANSI_GUTTER
+        aligned = f"{code}{aligned}{ANSI_RESET}"
     return f"{aligned} {content}"
 
 
@@ -179,3 +228,99 @@ def render_summary_markdown(
     if transcript_path:
         lines.extend(["", f"> Transcript: `{transcript_path}`"])
     return "\n".join(lines)
+
+
+# Events that should advance the progress counter (i.e. represent
+# completed work units). All other "interesting" events emit messages
+# with delta=0. Events not listed in `format_progress_message` are
+# suppressed entirely (noise vs signal — see plan §3 table).
+PROGRESS_ADVANCING_EVENTS = frozenset(
+    {"participant_finish", "cross_rank_complete", "synthesis_finish"}
+)
+
+
+def format_progress_message(event: dict) -> str | None:
+    """Map an orchestrator `progress_events` entry to an MCP message.
+
+    Returns the `message` field for `notifications/progress` (always
+    prefixed with the brand token), or `None` to suppress.
+
+    Plain text only. No ANSI (hosts strip), no emoji (font risk), no
+    markdown bold (some hosts render `**` as literal in progress
+    messages). The literal prefix `LLM Council · ` is the identity
+    signal that survives every rendering path.
+    """
+    kind = event.get("event")
+    peer = event.get("participant") or "peer"
+    round_no = event.get("round")
+    body: str | None = None
+
+    if kind == "council_start":
+        n = len(event.get("participants") or [])
+        mode = event.get("mode")
+        # `mode` is not on the orchestrator's council_start event today
+        # (only `participants`, `round`, `max_rounds`, `deliberate`,
+        # `image_count`); we accept it if present and degrade gracefully.
+        if mode:
+            body = f"convening {n} peers · mode={mode}"
+        else:
+            body = f"convening {n} peers"
+    elif kind == "preflight_failed":
+        body = f"preflight failed: {peer}"
+    elif kind == "participant_slow":
+        elapsed = float(event.get("elapsed_seconds") or 0)
+        timeout = float(event.get("timeout_seconds") or 0)
+        body = f"{peer} slow ({elapsed:.0f}s / {timeout:.0f}s timeout)"
+    elif kind == "participant_finish":
+        status = event.get("status") or ("ok" if event.get("ok") else "error")
+        elapsed = float(event.get("elapsed_seconds") or 0)
+        body = f"{peer} {status} ({elapsed:.1f}s)"
+    elif kind == "deliberation_pending":
+        body = f"disagreement detected, deliberation round {round_no} starting"
+    elif kind == "deliberation_skip":
+        reason = event.get("reason") or "unspecified"
+        body = f"deliberation skipped ({reason})"
+    elif kind == "deliberation_skipped":
+        reason = event.get("reason") or "unspecified"
+        body = f"deliberation skipped ({reason})"
+    elif kind == "deliberation_round_start":
+        body = f"round {round_no} deliberation"
+    elif kind == "deliberation_finish":
+        rounds_ = event.get("rounds")
+        body = f"deliberation finished after {rounds_} rounds"
+    elif kind == "cross_rank_start":
+        count = event.get("peer_count") or "?"
+        body = f"cross-ranking {count} peers"
+    elif kind == "cross_rank_complete":
+        ranker = event.get("ranker_count")
+        body = (
+            f"cross-ranking complete ({ranker} rankers)"
+            if ranker is not None
+            else "cross-ranking complete"
+        )
+    elif kind == "synthesis_start":
+        chair = event.get("chair") or "?"
+        body = f"synthesis chair: {chair}"
+    elif kind == "synthesis_finish":
+        label = event.get("decision_label") or "done"
+        body = f"synthesis done ({label})"
+    elif kind == "synthesis_error":
+        body = f"synthesis error: {event.get('error') or 'unknown'}"
+    elif kind == "universal_abdication":
+        body = "universal abdication (all peers blocked)"
+    elif kind == "degraded_consensus":
+        labeled = event.get("labeled_quorum")
+        threshold = event.get("min_quorum")
+        body = f"degraded consensus: {labeled}/{threshold} peers labeled"
+    elif kind == "council_finish":
+        ok = event.get("ok")
+        total = event.get("total")
+        body = f"concluded: {ok}/{total} ok"
+    # Suppressed by design: participant_start (per-peer noise multiplier
+    # when N peers fire concurrently — participant_finish is the visible
+    # signal), images_skipped, truncated_for_deliberation,
+    # deliberation_skip_participants, convergence, context_files_chunked.
+
+    if body is None:
+        return None
+    return f"{BRAND_TOKEN}{BRAND_SEP}{body}"

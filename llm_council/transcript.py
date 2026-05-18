@@ -364,6 +364,10 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
         payload["terse_retry_attempted"] = True
     if result.section_repair_attempted:
         payload["section_repair_attempted"] = True
+    if getattr(result, "is_ranking_round", False):
+        payload["is_ranking_round"] = True
+    if getattr(result, "tool_call_status", None) is not None:
+        payload["tool_call_status"] = result.tool_call_status
     if result.prompt_chars is not None:
         payload["prompt_chars"] = result.prompt_chars
     if result.from_cache:
@@ -455,8 +459,20 @@ def result_round(name: str) -> int:
 def final_round_results(results: list[ParticipantResult]) -> list[ParticipantResult]:
     if not results:
         return []
-    final_round = max(result_round(result.name) for result in results)
-    return [result for result in results if result_round(result.name) == final_round]
+    # v0.9.0 Feature 2: ranking-round results (`peer:rank`) are
+    # post-deliberation telemetry only; they are NOT part of the
+    # peer-vote final-round view consumed by synthesis, recommendation
+    # counts, and the headline label aggregation. Filter them out
+    # before computing the final round so a `--cross-rank` run cannot
+    # accidentally have the ranking responses double-counted as
+    # primary votes.
+    primary = [
+        r for r in results if not getattr(r, "is_ranking_round", False)
+    ]
+    if not primary:
+        return []
+    final_round = max(result_round(result.name) for result in primary)
+    return [result for result in primary if result_round(result.name) == final_round]
 
 
 _RECOMMENDATION_PREFIX_RE = re.compile(
@@ -788,6 +804,79 @@ def write_transcript(
             )
             lines.append("")
 
+    finding_matrix_md = metadata.get("finding_matrix")
+    if isinstance(finding_matrix_md, dict) and (
+        finding_matrix_md.get("consensus_blockers")
+        or finding_matrix_md.get("single_peer_concerns")
+    ):
+        lines.extend(["## Finding Matrix", ""])
+        consensus = finding_matrix_md.get("consensus_blockers") or []
+        if consensus:
+            lines.append("**Consensus blockers** (>=2 peers, overlapping verified ranges):")
+            lines.append("")
+            for entry in consensus:
+                peers = ", ".join(entry.get("peers") or [])
+                location = ""
+                path = entry.get("path")
+                if path:
+                    lo = entry.get("start_line")
+                    hi = entry.get("end_line")
+                    location = f" at `{path}:{lo}-{hi}`"
+                lines.append(
+                    f"- {entry.get('id')} [{entry.get('severity')}]{location} — {peers}"
+                )
+                claim = (entry.get("claim") or "").strip()
+                if claim:
+                    lines.append(f"  - {claim}")
+            lines.append("")
+        singles = finding_matrix_md.get("single_peer_concerns") or []
+        if singles:
+            lines.append("**Single-peer concerns:**")
+            lines.append("")
+            for entry in singles:
+                peer = entry.get("peer") or "?"
+                location = ""
+                path = entry.get("path")
+                if path:
+                    lo = entry.get("start_line")
+                    hi = entry.get("end_line")
+                    location = f" at `{path}:{lo}-{hi}`"
+                    if entry.get("unverified"):
+                        location += " (unverified)"
+                elif entry.get("unverified"):
+                    location = " (unverified)"
+                lines.append(
+                    f"- {peer} [{entry.get('severity')}]{location}"
+                )
+                claim = (entry.get("claim") or "").strip()
+                if claim:
+                    lines.append(f"  - {claim}")
+            lines.append("")
+
+    cross_rank_scores_md = metadata.get("cross_rank_scores")
+    anonymization_map_md = metadata.get("anonymization_map")
+    if isinstance(cross_rank_scores_md, dict) and cross_rank_scores_md:
+        lines.extend(["## Cross-Rank Scores", ""])
+        lines.append(
+            "Lower mean rank position = ranked higher by peers (1.0 = "
+            "unanimously first). Anonymization map persisted below for "
+            "de-anonymization."
+        )
+        lines.append("")
+        lines.append("| Peer | Mean Rank Position |")
+        lines.append("| --- | --- |")
+        for name, score in sorted(
+            cross_rank_scores_md.items(), key=lambda kv: kv[1]
+        ):
+            lines.append(f"| {name} | {score:.2f} |")
+        lines.append("")
+        if isinstance(anonymization_map_md, dict) and anonymization_map_md:
+            lines.append("Anonymization map:")
+            lines.append("")
+            for name, label in sorted(anonymization_map_md.items()):
+                lines.append(f"- {name} → {label}")
+            lines.append("")
+
     fence = markdown_fence(prompt)
     lines.extend(["## Prompt Sent", "", f"{fence}text", prompt, fence, ""])
 
@@ -810,6 +899,39 @@ def write_transcript(
             )
     markdown_path.write_text("\n".join(lines), encoding="utf-8")
 
+    # `finding_matrix` lives at the TOP level of the JSON payload for
+    # downstream consumers (eval harness, dashboards). We extract it
+    # from `metadata` and remove it there to avoid double-serialization
+    # (the same dict appearing under both `metadata.finding_matrix` and
+    # `json_payload.finding_matrix`).
+    finding_matrix_payload = None
+    if isinstance(metadata, dict) and "finding_matrix" in metadata:
+        # Shallow copy so the in-memory `metadata` mutation does not
+        # surprise the caller (orchestrator continues to use its own
+        # reference after `write_transcript` returns).
+        metadata = dict(metadata)
+        finding_matrix_payload = metadata.pop("finding_matrix")
+    # v0.9.0 Feature 2: cross-rank scores and the anonymization map
+    # are lifted to the top level (mirroring finding_matrix). Omitted
+    # entirely when no `--cross-rank` pass ran. Both fields are
+    # popped from metadata to avoid double-serialization.
+    cross_rank_scores_payload = None
+    anonymization_map_payload = None
+    anonymization_map_reverse_payload = None
+    cross_rank_rankings_payload = None
+    if isinstance(metadata, dict) and "cross_rank_scores" in metadata:
+        metadata = dict(metadata)
+        cross_rank_scores_payload = metadata.pop("cross_rank_scores")
+    if isinstance(metadata, dict) and "anonymization_map" in metadata:
+        metadata = dict(metadata)
+        anonymization_map_payload = metadata.pop("anonymization_map")
+    if isinstance(metadata, dict) and "anonymization_map_reverse" in metadata:
+        metadata = dict(metadata)
+        anonymization_map_reverse_payload = metadata.pop("anonymization_map_reverse")
+    if isinstance(metadata, dict) and "cross_rank_rankings" in metadata:
+        metadata = dict(metadata)
+        cross_rank_rankings_payload = metadata.pop("cross_rank_rankings")
+
     json_payload: dict[str, Any] = {
         "question": question,
         "mode": mode,
@@ -828,6 +950,31 @@ def write_transcript(
     overflow_records = context_overflow_records(results)
     if overflow_records:
         json_payload["context_overflow_excluded"] = overflow_records
+    if isinstance(finding_matrix_payload, dict) and (
+        finding_matrix_payload.get("consensus_blockers")
+        or finding_matrix_payload.get("single_peer_concerns")
+    ):
+        # Mirrors the shape used in MCP `structured_results`.
+        json_payload["finding_matrix"] = finding_matrix_payload
+    if isinstance(cross_rank_scores_payload, dict) and cross_rank_scores_payload:
+        json_payload["cross_rank_scores"] = cross_rank_scores_payload
+    if (
+        isinstance(anonymization_map_payload, dict)
+        and anonymization_map_payload
+    ):
+        json_payload["anonymization_map"] = anonymization_map_payload
+    if (
+        isinstance(anonymization_map_reverse_payload, dict)
+        and anonymization_map_reverse_payload
+    ):
+        json_payload["anonymization_map_reverse"] = (
+            anonymization_map_reverse_payload
+        )
+    if (
+        isinstance(cross_rank_rankings_payload, dict)
+        and cross_rank_rankings_payload
+    ):
+        json_payload["cross_rank_rankings"] = cross_rank_rankings_payload
     json_path.write_text(
         json.dumps(json_payload, indent=2) + "\n",
         encoding="utf-8",

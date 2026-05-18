@@ -23,7 +23,8 @@ from llm_council.cache import (
     read_cache as cache_read,
     write_cache as cache_write,
 )
-from llm_council.context import IMAGE_MIME_ALLOWLIST
+from llm_council.citations import parse_verified_tag, strip_verified_tag
+from llm_council.context import IMAGE_MIME_ALLOWLIST, apply_per_peer_directives
 
 
 OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
@@ -155,6 +156,15 @@ class ParticipantResult:
     evidence: list[Any] = field(default_factory=list)
     tests_to_run: list[str] = field(default_factory=list)
     assumptions: list[str] = field(default_factory=list)
+    # v0.8.1: peer-emitted vote on whether to deliberate further. Values
+    # are "yes" / "no" / None. The orchestrator gates round-2 deliberation
+    # on a unanimous-"no" from the label-producing peers (denominator
+    # excludes abdicated / invalid-response / unlabeled peers). The
+    # threshold is unanimity (not 66%) in v0.8.1 — conservative until
+    # corpus data can audit gaming risk. None means the peer did not
+    # emit the tag and is treated as "no vote to skip" (round 2 still
+    # runs).
+    continue_debate: str | None = None
     # Set True when the original call timed out and the terse-retry
     # recovered with a valid response. Separate from
     # `recovered_after_launch_retry` (launch-fail retry) and
@@ -198,6 +208,36 @@ class ParticipantResult:
     # case where sections recovered but the now-visible evidence is
     # untagged (handled by the new third merge branch).
     section_repair_attempted: bool = False
+    # Failed [VERIFIED:path:start-end] citations recorded by
+    # citations.verify_evidence_citations after the orchestrator returns
+    # participant results. Each entry is a `path:start-end` string. Empty
+    # by default — VERIFIED tags are optional. Surfaced in transcripts +
+    # MCP structured_results so operators can see when a peer cited code
+    # that does not exist at the claimed range.
+    evidence_verification_failures: list[str] = field(default_factory=list)
+    # v0.9.0 Feature 3 — telemetry for opt-in tool-call voting in
+    # `review-with-tools` mode. Values:
+    #   "absent"    — tool-call extraction ran but found no payload
+    #   "ok"        — payload parsed; envelope populated from structured args
+    #   "malformed" — `record_recommendation` token detected but JSON
+    #                 args unparseable; regex parsing took over as fallback
+    #   None        — tool-call extraction did NOT run (mode disabled,
+    #                 family unsupported, or `tool_call_voting=False`)
+    # The "malformed" state is the critical distinction (council risk #3):
+    # silently masking parser failures as "fallback succeeded" would hide
+    # parser bugs. Surface this in stats so eval can audit.
+    tool_call_status: str | None = None
+    # v0.9.0 Feature 2 — Anonymized cross-ranking flag. True when this
+    # ParticipantResult was produced by the stage-2 ranking pass (peer
+    # was asked to rank the OTHER peers' round-1 outputs). False for
+    # the primary round-1 / round-2 deliberation responses. The
+    # `deliberation.build_deliberation_prompt` builder filters these
+    # out so ranking-round outputs CANNOT leak into round-2
+    # deliberation prompts (MAD-literature risk #2: in-round
+    # convergence forcing depresses signal-to-noise). Persisted
+    # through the cache only when True so payloads stay tight for the
+    # overwhelming majority of runs that do not enable `--cross-rank`.
+    is_ranking_round: bool = False
 
 
 @dataclass
@@ -225,6 +265,170 @@ class CacheContext:
             not self.cache_disabled
             and self.cache_mode in ("on", "refresh")
         )
+
+
+_TOOL_CAPABLE_CLI_FAMILIES_ADAPTER = frozenset({"claude", "codex", "gemini"})
+
+# v0.9.0 Feature 3 — `record_recommendation(...)` tool-call extraction.
+#
+# Per-family parsing approach: the brief describes three distinct
+# stdout surfaces (claude `tool_use` content blocks, codex JSON function
+# calls, gemini Vertex-flavored tool calls). Implementing three
+# fully-distinct parsers right now risks getting them all wrong without
+# real CLI tool-call payloads to validate against — none of the three
+# CLIs currently emit `record_recommendation` calls in dogfood
+# transcripts, and the eval harness is what gates promotion-to-default.
+# We ship a single forgiving "find `record_recommendation` token +
+# nearest balanced JSON object" parser instead. Family-specific
+# wrappers can be layered on later as the v0.9.x eval corpus surfaces
+# concrete payload shapes. Hosted/local families are explicitly
+# unsupported (the council layer never gives them tool access).
+_TOOL_CALL_TOKEN = "record_recommendation"
+_VALID_VERDICTS = frozenset({"yes", "no", "tradeoff"})
+
+
+@dataclass
+class RecommendationFromToolCall:
+    """Structured payload extracted from a peer's `record_recommendation` call.
+
+    `raw_payload` carries the unmodified parsed JSON dict for downstream
+    diagnostics and stats. `verdict` is lowercased before storage.
+    """
+
+    verdict: str
+    blockers: list[str] = field(default_factory=list)
+    evidence: list[Any] = field(default_factory=list)
+    raw_payload: dict[str, Any] = field(default_factory=dict)
+
+
+class _ToolCallMalformed:
+    """Sentinel returned when a `record_recommendation` token was found
+    but the args could not be parsed/validated. Callers should set
+    `tool_call_status="malformed"` and fall back to regex parsing."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug only
+        return "_TOOL_CALL_MALFORMED"
+
+
+_TOOL_CALL_MALFORMED = _ToolCallMalformed()
+
+
+def _find_balanced_json_object(text: str, start: int) -> str | None:
+    """Scan `text` from `start` for the first `{` and return the
+    substring through its matching `}` accounting for nested braces +
+    string literals. Returns None if no balanced object is found."""
+    n = len(text)
+    i = start
+    while i < n and text[i] != "{":
+        i += 1
+    if i >= n:
+        return None
+    obj_start = i
+    depth = 0
+    in_string = False
+    escape = False
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[obj_start : i + 1]
+        i += 1
+    return None
+
+
+def _extract_tool_call_recommendation(
+    output: str,
+    family: str | None,
+) -> RecommendationFromToolCall | _ToolCallMalformed | None:
+    """Parse a `record_recommendation(...)` tool call from peer stdout.
+
+    Returns:
+    - `RecommendationFromToolCall` when a token + balanced JSON object
+      was found AND the payload schema validated (verdict in
+      {yes,no,tradeoff}, blockers is list[str] or absent, evidence is
+      list[dict|str] or absent).
+    - `_TOOL_CALL_MALFORMED` sentinel when the token is present but
+      either no balanced JSON object follows, the JSON is not parseable,
+      or the payload schema fails validation. Callers distinguish
+      `absent` (None) from `malformed` for telemetry.
+    - None when the token does not appear in the output OR the family
+      is not a tool-capable CLI family.
+
+    Family-specific surface (for future per-family parsers):
+    - claude: `tool_use` content blocks in JSON streams
+    - codex: JSON function-call blocks
+    - gemini: Vertex-AI flavored tool-call format
+    Today the unified parser locates the token + nearest balanced
+    JSON object, which is forgiving enough to absorb all three
+    surfaces in practice; family-specific wrappers can be added when
+    real dogfood payloads surface a parsing gap.
+    """
+    if not output:
+        return None
+    if family is None or family not in _TOOL_CAPABLE_CLI_FAMILIES_ADAPTER:
+        return None
+    if _TOOL_CALL_TOKEN not in output:
+        return None
+    # Locate the token; scan forward for the nearest `{...}` JSON object.
+    idx = output.find(_TOOL_CALL_TOKEN)
+    if idx < 0:
+        return None
+    obj_text = _find_balanced_json_object(output, idx + len(_TOOL_CALL_TOKEN))
+    if obj_text is None:
+        return _TOOL_CALL_MALFORMED
+    import json as _json
+
+    try:
+        payload = _json.loads(obj_text)
+    except (ValueError, TypeError):
+        return _TOOL_CALL_MALFORMED
+    if not isinstance(payload, dict):
+        return _TOOL_CALL_MALFORMED
+    verdict_raw = payload.get("verdict")
+    if not isinstance(verdict_raw, str):
+        return _TOOL_CALL_MALFORMED
+    verdict = verdict_raw.strip().lower()
+    if verdict not in _VALID_VERDICTS:
+        return _TOOL_CALL_MALFORMED
+    blockers_raw = payload.get("blockers", [])
+    if blockers_raw is None:
+        blockers: list[str] = []
+    elif isinstance(blockers_raw, list) and all(
+        isinstance(b, str) for b in blockers_raw
+    ):
+        blockers = list(blockers_raw)
+    else:
+        return _TOOL_CALL_MALFORMED
+    evidence_raw = payload.get("evidence", [])
+    if evidence_raw is None:
+        evidence: list[Any] = []
+    elif isinstance(evidence_raw, list) and all(
+        isinstance(e, (dict, str)) for e in evidence_raw
+    ):
+        evidence = list(evidence_raw)
+    else:
+        return _TOOL_CALL_MALFORMED
+    return RecommendationFromToolCall(
+        verdict=verdict,
+        blockers=blockers,
+        evidence=evidence,
+        raw_payload=payload,
+    )
 
 
 def _participant_recommendation_label(output: str) -> str | None:
@@ -261,6 +465,12 @@ def _result_from_cache_payload(
         section_repair_attempted=bool(
             payload.get("section_repair_attempted", False)
         ),
+        evidence_verification_failures=list(
+            payload.get("evidence_verification_failures") or []
+        ),
+        continue_debate=payload.get("continue_debate"),
+        tool_call_status=payload.get("tool_call_status"),
+        is_ranking_round=bool(payload.get("is_ranking_round", False)),
     )
 
 
@@ -326,6 +536,10 @@ def _maybe_persist_cache(
         recovered_after_timeout=result.recovered_after_timeout,
         prompt_chars=result.prompt_chars,
         section_repair_attempted=result.section_repair_attempted,
+        evidence_verification_failures=result.evidence_verification_failures or None,
+        continue_debate=result.continue_debate,
+        tool_call_status=result.tool_call_status,
+        is_ranking_round=result.is_ranking_round,
     )
     try:
         cache_write(
@@ -1925,6 +2139,7 @@ async def run_participant(
     cache_ctx: CacheContext | None = None,
     mode_multiplier: float | None = None,
     mode: str | None = None,
+    tool_call_voting: bool = False,
 ) -> ParticipantResult:
     ptype = cfg.get("type")
     if ptype == "cli":
@@ -1957,7 +2172,11 @@ async def run_participant(
             elapsed_seconds=0,
             model=cfg.get("model"),
         )
-    return _with_envelope(result)
+    return _with_envelope(
+        result,
+        tool_call_voting=tool_call_voting,
+        family=cfg.get("family"),
+    )
 
 
 async def _request_with_retries(
@@ -2008,12 +2227,24 @@ async def run_participants(
     cache_ctx: CacheContext | None = None,
     mode_multiplier: float | None = None,
     mode: str | None = None,
+    tool_call_voting: bool = False,
 ) -> list[ParticipantResult]:
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
     async def run_one(name: str) -> ParticipantResult:
         async with semaphore:
             cfg = participant_cfg[name]
+            # Apply per-peer prompt directives (e.g. the review-with-tools
+            # tool-use block, scoped to CLI families with tool flags). The
+            # helper returns `prompt` unchanged for every other mode +
+            # peer combination, so hosted/local peers and non-tool modes
+            # remain backward-compatible.
+            peer_prompt = apply_per_peer_directives(
+                prompt,
+                mode=mode,
+                family=cfg.get("family"),
+                tool_call_voting=tool_call_voting,
+            )
             timeout = _resolve_effective_timeout(cfg, mode_multiplier)
             override = cfg.get("slow_warn_after_seconds")
             if override is not None:
@@ -2045,12 +2276,13 @@ async def run_participants(
                 result = await run_participant(
                     name,
                     cfg,
-                    prompt,
+                    peer_prompt,
                     cwd,
                     image_manifest=image_manifest,
                     cache_ctx=cache_ctx,
                     mode_multiplier=mode_multiplier,
                     mode=mode,
+                    tool_call_voting=tool_call_voting,
                 )
             finally:
                 if slow_task is not None and not slow_task.done():
@@ -2296,7 +2528,7 @@ def _format_retry_transcript(
 _ENVELOPE_SINGLE_RE = re.compile(
     r"""
     ^\s*(?:>\s*)?(?:[-*]\s+)?(?:\*\*)?
-    (?P<key>EFFORT|CONFIDENCE|RISK)
+    (?P<key>EFFORT|CONFIDENCE|RISK|CONTINUE_DEBATE)
     (?:\*\*)?\s*:\s*(?:\*\*)?
     (?P<value>[A-Za-z][A-Za-z\-_]*)
     """,
@@ -2368,14 +2600,26 @@ TAG_PARSED_LIST_FIELDS = frozenset({"evidence"})
 
 
 def _parse_tagged_entry(raw: str) -> dict[str, Any]:
-    """Extract a tag from an evidence bullet; structure as `{text, tag}`.
+    """Extract a tag from an evidence bullet; structure as `{text, tag, ...}`.
 
-    Tag-less entries return `{"text": raw, "tag": None}` so the parsed
-    shape is uniform and downstream consumers (stats, transcripts) can
-    treat untagged entries as a distinct category.
+    Three shapes returned:
+    - `[VERIFIED:path:start-end]` → `{text, tag: "verified", path, start_line, end_line, verified: None}`
+      (`verified` is set later by `citations.verify_evidence_citations`)
+    - `[PUBLISHED|OBSERVABLE|INFERRED|SPECULATIVE]` → `{text, tag: <lowercase>}`
+    - untagged → `{text, tag: None}`
     """
     if not raw:
         return {"text": raw, "tag": None}
+    verified = parse_verified_tag(raw)
+    if verified is not None:
+        return {
+            "text": strip_verified_tag(raw) or raw.strip(),
+            "tag": "verified",
+            "path": verified.path,
+            "start_line": verified.start_line,
+            "end_line": verified.end_line,
+            "verified": None,
+        }
     match = EVIDENCE_TAG_RE.search(raw)
     if not match:
         return {"text": raw, "tag": None}
@@ -2400,6 +2644,7 @@ def _extract_response_envelope(output: str) -> dict[str, Any]:
         "evidence": [],
         "tests_to_run": [],
         "assumptions": [],
+        "continue_debate": None,
     }
     if not output:
         return envelope
@@ -2469,7 +2714,12 @@ def _is_abdication(envelope: dict[str, Any], output: str) -> bool:
     return _has_recommendation_label(output)
 
 
-def _with_envelope(result: ParticipantResult) -> ParticipantResult:
+def _with_envelope(
+    result: ParticipantResult,
+    *,
+    tool_call_voting: bool = False,
+    family: str | None = None,
+) -> ParticipantResult:
     """Populate envelope fields on a result; mark abdications as terminal failures.
 
     Abdication detection runs once here so quorum math (in the orchestrator)
@@ -2483,12 +2733,53 @@ def _with_envelope(result: ParticipantResult) -> ParticipantResult:
     is the lone correctness mechanism — do not gate the abdication check
     on `repair_retry_recovered` here, because that would let a legitimately
     abdicating *repaired* response slip through as ok=True.
+
+    v0.9.0 Feature 3 — when `tool_call_voting=True` AND `family` is a
+    tool-capable CLI family, `_extract_tool_call_recommendation` runs
+    BEFORE the regex envelope parse. Three outcomes:
+
+    - `ok`: a synthetic `RECOMMENDATION: <verdict>` (plus `BLOCKERS:` /
+      `EVIDENCE:` shadow lines from the structured payload) is
+      prepended to the parse source, then envelope parsing proceeds
+      against that augmented source. The original output is preserved
+      verbatim on the result; only the envelope-parse view is
+      augmented. `tool_call_status` is set to `"ok"`.
+    - `malformed`: regex parsing takes over as fallback;
+      `tool_call_status="malformed"` records that a parser bug or
+      schema violation was masked by the fallback (council risk #3 —
+      surface this so eval can audit).
+    - `absent`: extraction ran and found no `record_recommendation`
+      token. `tool_call_status="absent"`; regex parsing is canonical.
+
+    When `tool_call_voting=False` or the family is unsupported,
+    `tool_call_status` stays None (extraction did not run) and the
+    code path is identical to v0.8.1 — bit-for-bit backward compat.
     """
     from dataclasses import replace
 
     parse_source = _envelope_parse_source(result.output)
+    tool_call_status: str | None = None
+    if tool_call_voting and family is not None:
+        extraction = _extract_tool_call_recommendation(result.output, family)
+        if extraction is None:
+            # Either family is unsupported (returns None) OR the
+            # `record_recommendation` token did not appear. The
+            # `_extract_tool_call_recommendation` family gate matches
+            # the same `_TOOL_CAPABLE_CLI_FAMILIES_ADAPTER` set used
+            # here, so when the caller asserts the family is tool-
+            # capable the None response unambiguously means "token
+            # absent" — record it for telemetry.
+            if family in _TOOL_CAPABLE_CLI_FAMILIES_ADAPTER:
+                tool_call_status = "absent"
+        elif isinstance(extraction, _ToolCallMalformed):
+            tool_call_status = "malformed"
+        else:
+            tool_call_status = "ok"
+            parse_source = _augment_parse_source_from_tool_call(
+                parse_source, extraction
+            )
     envelope = _extract_response_envelope(parse_source)
-    updated = replace(result, **envelope)
+    updated = replace(result, tool_call_status=tool_call_status, **envelope)
     if updated.ok and _is_abdication(envelope, parse_source):
         return replace(
             updated,
@@ -2501,6 +2792,57 @@ def _with_envelope(result: ParticipantResult) -> ParticipantResult:
             ),
         )
     return updated
+
+
+def _augment_parse_source_from_tool_call(
+    parse_source: str,
+    extraction: RecommendationFromToolCall,
+) -> str:
+    """Prepend a synthetic envelope block built from the tool-call payload.
+
+    The existing regex envelope parser is the single canonical reader of
+    `RECOMMENDATION:` / `BLOCKERS:` / `EVIDENCE:` lines. Rather than
+    duplicating that logic in `_with_envelope`, we render the
+    structured payload into the same line-based grammar and prepend it
+    to the parse source. The original output is unchanged on the
+    result — only the envelope-parse view is augmented. Prepending (not
+    appending) means the tool-call verdict wins any conflict with a
+    later regex `RECOMMENDATION:` line, because the existing parser
+    picks the first match.
+    """
+    lines = [f"RECOMMENDATION: {extraction.verdict} - via record_recommendation"]
+    if extraction.blockers:
+        lines.append("BLOCKERS:")
+        for item in extraction.blockers:
+            lines.append(f"- {item}")
+    if extraction.evidence:
+        lines.append("EVIDENCE:")
+        for item in extraction.evidence:
+            if isinstance(item, dict):
+                text = str(item.get("text") or "").strip()
+                tag = str(item.get("tag") or "").strip().lower()
+                path = item.get("path")
+                start_line = item.get("start_line")
+                end_line = item.get("end_line")
+                if tag == "verified" and path and start_line and end_line:
+                    bullet = (
+                        f"- [VERIFIED:{path}:{start_line}-{end_line}] {text}"
+                        if text
+                        else f"- [VERIFIED:{path}:{start_line}-{end_line}]"
+                    )
+                elif tag in {"published", "observable", "inferred", "speculative"}:
+                    bullet = (
+                        f"- [{tag.upper()}] {text}" if text else f"- [{tag.upper()}]"
+                    )
+                else:
+                    bullet = f"- {text}" if text else "-"
+            else:
+                bullet = f"- {str(item).strip()}"
+            lines.append(bullet)
+    synthesized = "\n".join(lines)
+    if parse_source:
+        return synthesized + "\n\n" + parse_source
+    return synthesized
 
 
 def _envelope_parse_source(output: str) -> str:

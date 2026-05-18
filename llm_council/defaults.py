@@ -319,6 +319,30 @@ DEFAULT_CONFIG: dict = {
             "read_only": True,
         },
     },
+    # Mode shape (recognized optional keys per entry):
+    #   strategy: "other_cli_peers" | "local_only_peers"     — selection rule
+    #   participants: list[str]                              — explicit roster
+    #   include_current: bool                                — keep host CLI
+    #   add: list[str]                                       — extra peers
+    #   origin_policy: "any" | "us"
+    #   stances: dict[peer, "for"|"against"|"neutral"]       — debate roles
+    #   deliberate: bool                                     — force round 2
+    #   max_rounds: int                                      — round cap
+    #   min_quorum: int                                      — quorum floor
+    #   timeout_multiplier: float                            — per-mode * base
+    #   experimental: bool                                   — surfaces a
+    #       warning in list-modes / council_list_modes that the mode is
+    #       gated behind eval-harness promotion criteria and may change
+    #       or be cut. Mode still runs normally.
+    #   model_overrides: dict[peer_name, model_id]           — pin per-peer
+    #       model for THIS mode only. Resolution order:
+    #       participants.<peer>.model (base) -> tiers.<tier>.<peer>
+    #       (--tier <name>) -> modes.<name>.model_overrides.<peer>
+    #       (highest priority). Override is silent: a stale entry naming
+    #       a peer not in the resolved roster is a no-op. Built-in modes
+    #       intentionally ship without model_overrides — users add their
+    #       own once eval-harness data supports the pin.
+    #   description: str                                     — human note
     "modes": {
         "quick": {
             "strategy": "other_cli_peers",
@@ -341,6 +365,41 @@ DEFAULT_CONFIG: dict = {
             "include_current": True,
             "add": ["qwen_coder_plus"],
             "description": "Claude/Codex/Gemini plus Qwen coding model.",
+        },
+        # Experimental: CLI peers only, with explicit directive to use their
+        # file-read / grep / glob tools before voting. The CLIs already have
+        # tool access via their sandbox flags (claude `--permission-mode
+        # default` + `--tools Read,Grep,Glob,LS`; codex `--sandbox read-only`;
+        # gemini `--approval-mode plan`), but the standard prompt never asks
+        # them to use them. This mode activates that latent autonomy.
+        #
+        # Stays `experimental: true` until the eval harness shows on the
+        # canonical fixture set:
+        #   blocker_recall(review-with-tools) >= blocker_recall(review) + 0.05
+        #   signal_to_noise_ratio(review-with-tools) >= 0.85 * signal_to_noise_ratio(review)
+        # Promotion is the release gate's call, not this mode's defaults.
+        "review-with-tools": {
+            "strategy": "other_cli_peers",
+            "include_current": True,
+            "experimental": True,
+            "timeout_multiplier": 1.8,
+            # v0.9.0 Feature 3 — strictly opt-in tool-call voting. When
+            # True, CLI peers (claude/codex/gemini) additionally receive a
+            # directive describing a `record_recommendation(verdict,
+            # blockers, evidence)` tool they can invoke. The adapter then
+            # tries to parse a structured tool-call payload from each
+            # peer's stdout and, on success, populates the envelope from
+            # that payload instead of (or alongside) the regex
+            # `RECOMMENDATION:` label. Default `false`: promotion to
+            # default-on requires eval-harness lift on blocker_recall /
+            # SNR vs the regex-only baseline. Operators flip per their
+            # verified CLI schema.
+            "tool_call_voting": False,
+            "description": (
+                "EXPERIMENTAL — Claude/Codex/Gemini directed to use their "
+                "file-read / grep / glob tools to verify diff claims before "
+                "voting. CLI peers only; hosted peers do not participate."
+            ),
         },
         "review-cheap": {
             "participants": [

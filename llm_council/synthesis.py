@@ -20,6 +20,7 @@ from llm_council.deliberation import (
     has_disagreement,
     recommendation_label,
 )
+from llm_council.findings import FindingMatrix
 
 
 MAX_SYNTHESIS_PROMPT_CHARS_DEFAULT = 60_000
@@ -204,12 +205,82 @@ def _summary_rationale(output: str) -> str:
     return text
 
 
+def _format_finding_matrix_block(matrix: FindingMatrix) -> list[str]:
+    """Render the FindingMatrix as appended lines for the chair prompt.
+
+    Returns an empty list when the matrix has no clusters and no
+    single-peer concerns — preserves the pre-Phase-F prompt shape when
+    no peer emitted a structured FINDINGS block.
+
+    The block is purely informational for the chair: it surfaces which
+    findings ≥2 peers anchored to overlapping verified ranges vs which
+    findings only one peer named. It must NEVER be fed back to peers
+    during deliberation — see the module docstring in findings.py.
+    """
+    if matrix.is_empty():
+        return []
+
+    lines: list[str] = [
+        "",
+        "## Finding matrix (post-deliberation; synthesis-input only)",
+        "",
+        "Weight CONSENSUS BLOCKERS more heavily — these are findings >=2 peers",
+        "anchored to overlapping verified line ranges. SINGLE-PEER CONCERNS",
+        "are worth surfacing but should not block on their own.",
+        "",
+    ]
+
+    if matrix.clusters:
+        lines.append("CONSENSUS BLOCKERS (>=2 peers, overlapping verified ranges):")
+        for cluster in matrix.clusters:
+            location = ""
+            if cluster.verified_path and cluster.verified_range is not None:
+                lo, hi = cluster.verified_range
+                location = f" at {cluster.verified_path}:{lo}-{hi}"
+            peers = ", ".join(cluster.peers)
+            lines.append(
+                f"  {cluster.id} [{cluster.severity}]{location} — {peers}"
+            )
+            # Use the first contributing finding's claim as the
+            # representative; do not paraphrase across peers.
+            if cluster.findings:
+                claim = cluster.findings[0].claim.strip()
+                if claim:
+                    lines.append(f'    "{claim}"')
+        lines.append("")
+    else:
+        lines.append("CONSENSUS BLOCKERS: (none)")
+        lines.append("")
+
+    if matrix.single_peer_concerns:
+        lines.append("SINGLE-PEER CONCERNS:")
+        for finding in matrix.single_peer_concerns:
+            location = ""
+            if finding.verified_ref is not None:
+                ref = finding.verified_ref
+                location = f" at {ref.path}:{ref.start_line}-{ref.end_line}"
+                if finding.verified is False:
+                    location += " (unverified)"
+            else:
+                location = " (unverified)"
+            lines.append(
+                f"  {finding.peer} [{finding.severity}]{location}"
+            )
+            claim = (finding.claim or "").strip()
+            if claim:
+                lines.append(f'    "{claim}"')
+        lines.append("")
+
+    return lines
+
+
 def build_synthesis_prompt(
     question: str,
     results: list[ParticipantResult],
     convergence: dict[str, Any] | None,
     *,
     max_chars: int = MAX_SYNTHESIS_PROMPT_CHARS_DEFAULT,
+    finding_matrix: FindingMatrix | None = None,
 ) -> str:
     """Compact chair prompt. Cites peers by name; consumes pre-computed
     convergence metadata rather than re-deriving Jaccard drift on
@@ -291,6 +362,12 @@ def build_synthesis_prompt(
                         f" similarity={record.get('similarity')}"
                     )
             lines.append("")
+    # Append the FindingMatrix block last so the chair has the
+    # already-rendered envelope context (BLOCKERS/EVIDENCE/etc) above when
+    # it reads the cross-peer cluster summary. When the matrix is None or
+    # empty the prompt shape is unchanged from v0.7.x.
+    if finding_matrix is not None:
+        lines.extend(_format_finding_matrix_block(finding_matrix))
     prompt = "\n".join(lines)
     if len(prompt) > max_chars:
         prompt = prompt[: max_chars - 80].rstrip() + (
@@ -308,6 +385,7 @@ async def run_synthesis_chair(
     cwd: Path,
     chair_name: str,
     max_chars: int = MAX_SYNTHESIS_PROMPT_CHARS_DEFAULT,
+    finding_matrix: FindingMatrix | None = None,
 ) -> dict[str, Any]:
     """Invoke the chair once, return a metadata-only synthesis payload.
 
@@ -315,7 +393,13 @@ async def run_synthesis_chair(
     appended to ``results`` — quorum and agreement_count must stay derived
     from peer votes only.
     """
-    prompt = build_synthesis_prompt(question, results, convergence, max_chars=max_chars)
+    prompt = build_synthesis_prompt(
+        question,
+        results,
+        convergence,
+        max_chars=max_chars,
+        finding_matrix=finding_matrix,
+    )
     cfg = dict(participant_cfg.get(chair_name) or {})
     # Chair output is a decision memo, not a vote. Override
     # require_recommendation so the standard label-validation path does NOT

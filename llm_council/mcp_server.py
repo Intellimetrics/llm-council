@@ -31,6 +31,7 @@ from llm_council.config import (
     select_participants,
 )
 from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_prompt
+from llm_council import display
 from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env
 from llm_council.estimate import estimate_council
@@ -201,6 +202,19 @@ def council_run_schema() -> dict[str, Any]:
                     "tier map keep their default model."
                 ),
             },
+            "cross_rank": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Opt-in anonymized cross-ranking pass (v0.9.0, "
+                    "experimental). After round 1, each peer ranks the "
+                    "OTHER peers' responses blindly via a stable "
+                    "anonymization map. Aggregates as per-peer mean rank "
+                    "position in `cross_rank_scores`. Composes with any "
+                    "existing mode; ranking outputs are NEVER fed back "
+                    "into round-2 deliberation."
+                ),
+            },
         },
         "required": ["question"],
         "additionalProperties": False,
@@ -328,6 +342,24 @@ def council_run_output_schema() -> dict[str, Any]:
                                 "to the right mechanism."
                             ),
                         },
+                        "tool_call_status": {
+                            "type": ["string", "null"],
+                            "enum": ["absent", "ok", "malformed", None],
+                            "description": (
+                                "v0.9.0 tool-call voting telemetry. `null` when "
+                                "the mode does not enable `tool_call_voting`; "
+                                "`absent` when extraction ran and found no "
+                                "`record_recommendation` payload (regex "
+                                "fallback canonical); `ok` when a structured "
+                                "tool call was parsed and used for the "
+                                "envelope; `malformed` when a tool-call shape "
+                                "was detected but the payload was unparseable "
+                                "(regex fallback still ran). Distinct telemetry "
+                                "for `absent` vs `malformed` so parser bugs "
+                                "are visible instead of silently masked as "
+                                "'fallback succeeded'."
+                            ),
+                        },
                         "prompt_chars": {
                             "type": ["integer", "null"],
                             "description": (
@@ -386,9 +418,14 @@ def council_run_output_schema() -> dict[str, Any]:
                                                     "observable",
                                                     "inferred",
                                                     "speculative",
+                                                    "verified",
                                                     None,
                                                 ],
                                             },
+                                            "path": {"type": "string"},
+                                            "start_line": {"type": "integer"},
+                                            "end_line": {"type": "integer"},
+                                            "verified": {"type": ["boolean", "null"]},
                                         },
                                         "required": ["text"],
                                     },
@@ -398,10 +435,14 @@ def council_run_output_schema() -> dict[str, Any]:
                             "description": (
                                 "Structured evidence entries (schema v3). "
                                 "Each item is `{text, tag}` where `tag` is one "
-                                "of `published|observable|inferred|speculative` "
-                                "or `null` for untagged entries. Plain strings "
-                                "are also accepted for legacy/external producers. "
-                                "`text` carries the path:line or section reference."
+                                "of `published|observable|inferred|speculative|"
+                                "verified` or `null` for untagged entries. When "
+                                "`tag` is `verified` (from a `[VERIFIED:path:start-end]` "
+                                "citation), the item also carries `path`, `start_line`, "
+                                "`end_line`, and `verified` (mechanical-check result, "
+                                "may be null pre-verification). Plain strings are also "
+                                "accepted for legacy/external producers. `text` carries "
+                                "the path:line or section reference."
                             ),
                         },
                         "tests_to_run": {
@@ -417,6 +458,87 @@ def council_run_output_schema() -> dict[str, Any]:
                     },
                     "required": ["name", "ok", "label"],
                 },
+            },
+            "consensus_blockers": {
+                "type": "array",
+                "description": (
+                    "Per-finding agreement matrix (Phase F). Findings >=2 peers "
+                    "anchored to overlapping `[VERIFIED:path:start-end]` ranges. "
+                    "Omitted entirely (along with `single_peer_concerns`) when "
+                    "no peer emitted FINDINGS or no cluster met the consensus "
+                    "threshold. Mechanical clustering only — no fuzzy prose "
+                    "match. Surfaces for synthesis input only; peers in round "
+                    "2 never see this."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "severity": {
+                            "type": "string",
+                            "enum": ["blocker", "medium", "nit"],
+                        },
+                        "peers": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "claim": {"type": "string"},
+                        "path": {"type": "string"},
+                        "start_line": {"type": "integer"},
+                        "end_line": {"type": "integer"},
+                    },
+                    "required": ["id", "severity", "peers", "claim"],
+                },
+            },
+            "single_peer_concerns": {
+                "type": "array",
+                "description": (
+                    "Findings only one peer raised — either no verified ref "
+                    "or no overlapping peer ref. Worth surfacing but not "
+                    "consensus-grade. Omitted entirely (along with "
+                    "`consensus_blockers`) when no peer emitted FINDINGS."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "peer": {"type": "string"},
+                        "id": {"type": "string"},
+                        "severity": {
+                            "type": "string",
+                            "enum": ["blocker", "medium", "nit"],
+                        },
+                        "claim": {"type": "string"},
+                        "path": {"type": ["string", "null"]},
+                        "start_line": {"type": ["integer", "null"]},
+                        "end_line": {"type": ["integer", "null"]},
+                        "unverified": {"type": "boolean"},
+                    },
+                    "required": ["peer", "severity", "claim"],
+                },
+            },
+            "cross_rank_scores": {
+                "type": "object",
+                "description": (
+                    "v0.9.0 Feature 2 (experimental). Per-peer mean rank "
+                    "position from the opt-in anonymized cross-ranking "
+                    "pass. Keys are peer names; values are floats where "
+                    "1.0 = unanimously ranked first (lower is better). "
+                    "Omitted entirely when `--cross-rank` was not set or "
+                    "fewer than 2 peers produced labeled responses."
+                ),
+                "additionalProperties": {"type": "number"},
+            },
+            "anonymization_map": {
+                "type": "object",
+                "description": (
+                    "v0.9.0 Feature 2 (experimental). Stable map from "
+                    "peer name to anonymization label (`Response A`, "
+                    "`Response B`, ...) used by the cross-ranking pass. "
+                    "Persisted so operators reading the transcript can "
+                    "de-anonymize the rank-position scores. Omitted when "
+                    "`--cross-rank` was not set."
+                ),
+                "additionalProperties": {"type": "string"},
             },
             "metadata": {"type": "object"},
             "summary_markdown": {
@@ -600,7 +722,87 @@ def models_schema() -> dict[str, Any]:
     }
 
 
-async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
+def query_transcripts_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "minLength": 1},
+            "top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "default": 5,
+            },
+            "working_directory": {"type": "string"},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+
+
+def _build_mcp_progress_callback(
+    session: Any,
+    progress_token: Any,
+    *,
+    planned_total: float,
+):
+    """Build a sync `progress` callback that emits MCP progress notifications.
+
+    The orchestrator's `emit` is sync; `session.send_progress_notification`
+    is async. We bridge via `asyncio.create_task(...)` so we never block
+    round progression on a slow client, and we swallow transport errors so
+    a wedged client cannot fail the council run.
+
+    Returns a callable suitable for `execute_council(..., progress=cb)`,
+    or `None` when no token is set / quiet mode is active (caller falls
+    back to no progress callback).
+    """
+    if progress_token is None or session is None:
+        return None
+    if display.wants_quiet():
+        return None
+
+    counter = {"value": 0.0}
+
+    async def _send(progress: float, message: str) -> None:
+        try:
+            await session.send_progress_notification(
+                progress_token,
+                progress,
+                total=planned_total,
+                message=message,
+            )
+        except Exception:
+            # Transport errors must never break the council run. The
+            # final tool-result envelope still ships every event in
+            # metadata.progress_events, so nothing is permanently lost.
+            pass
+
+    def callback(event: dict[str, Any]) -> None:
+        message = display.format_progress_message(event)
+        if message is None:
+            return
+        kind = event.get("event")
+        if kind in display.PROGRESS_ADVANCING_EVENTS:
+            counter["value"] += 1
+        elif kind == "council_finish":
+            counter["value"] = planned_total
+        try:
+            asyncio.create_task(_send(counter["value"], message))
+        except RuntimeError:
+            # No running loop (sync test contexts). Drop silently —
+            # progress notifications are advisory.
+            pass
+
+    return callback
+
+
+async def run_council(
+    arguments: dict[str, Any],
+    *,
+    mcp_session: Any | None = None,
+    progress_token: Any | None = None,
+) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
     config = load_config(find_config(cwd), search=False)
@@ -885,6 +1087,15 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
     # populate the metadata field once execute_council has returned its
     # own dict, but hold the list locally so it doesn't fall out of scope.
     _pending_config_warnings = warnings
+    # Plan §5 progress semantics: `total = peers * effective_rounds + 1`
+    # (the +1 reserves headroom for synthesis or cross-rank). Clamps
+    # apply on `council_finish`. Skipped entirely when no progressToken
+    # was set by the client (silent no-op fallback).
+    _effective_rounds = max_rounds if deliberate else 1
+    _planned_total = float(len(participants) * _effective_rounds + 1)
+    _progress_cb = _build_mcp_progress_callback(
+        mcp_session, progress_token, planned_total=_planned_total
+    )
     results, metadata = await execute_council(
         participants,
         cfg,
@@ -893,6 +1104,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         config,
         deliberate=deliberate,
         max_rounds=max_rounds,
+        progress=_progress_cb,
         image_manifest=image_manifest or None,
         min_quorum=min_quorum_value,
         mode=mode,
@@ -900,6 +1112,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         synthesize=synthesize,
         current=current,
         question=question,
+        cross_rank=bool(arguments.get("cross_rank")),
     )
     if image_manifest:
         metadata["images"] = [
@@ -966,6 +1179,7 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "repair_retry_recovered": bool(result.repair_retry_recovered),
                 "recovered_after_timeout": bool(result.recovered_after_timeout),
+                "tool_call_status": getattr(result, "tool_call_status", None),
                 "prompt_chars": result.prompt_chars,
                 "effort": result.effort,
                 "confidence": result.confidence,
@@ -1005,7 +1219,18 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         deliberated=bool(metadata.get("deliberated")),
         rounds=int(metadata.get("rounds") or 1),
     )
-    return {
+    # `finding_matrix` is lifted to the top-level `consensus_blockers` /
+    # `single_peer_concerns` keys below. Strip it from `metadata` before
+    # surfacing the payload so the same data is not serialized in two
+    # places (metadata.finding_matrix AND the top-level lists).
+    if isinstance(metadata, dict) and "finding_matrix" in metadata:
+        metadata = dict(metadata)
+        finding_matrix_payload = metadata.pop("finding_matrix") or {}
+    else:
+        finding_matrix_payload = {}
+    consensus_blockers = list(finding_matrix_payload.get("consensus_blockers") or [])
+    single_peer_concerns = list(finding_matrix_payload.get("single_peer_concerns") or [])
+    payload: dict[str, Any] = {
         "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
         "recommendation": recommendation,
         "agreement_count": agreement,
@@ -1022,6 +1247,37 @@ async def run_council(arguments: dict[str, Any]) -> dict[str, Any]:
         "results": structured_results,
         "summary_markdown": summary_markdown,
     }
+    # Mirror the transcript JSON precedent: only emit the per-finding
+    # matrix keys when at least one of them has content. Runs without a
+    # FINDINGS envelope leave the keys absent rather than emitting empty
+    # arrays.
+    if consensus_blockers or single_peer_concerns:
+        payload["consensus_blockers"] = consensus_blockers
+        payload["single_peer_concerns"] = single_peer_concerns
+    # v0.9.0 Feature 2: lift cross-rank fields to the top-level payload
+    # mirroring finding_matrix. Strip them from metadata to avoid
+    # double-serialization (same data appearing under metadata.* AND
+    # top-level keys).
+    if isinstance(metadata, dict) and "cross_rank_scores" in metadata:
+        metadata = dict(metadata)
+        cross_rank_scores_out = metadata.pop("cross_rank_scores") or {}
+    else:
+        cross_rank_scores_out = {}
+    if isinstance(metadata, dict) and "anonymization_map" in metadata:
+        metadata = dict(metadata)
+        anonymization_map_out = metadata.pop("anonymization_map") or {}
+    else:
+        anonymization_map_out = {}
+    # Re-anchor the payload's metadata reference if we just mutated it
+    # in this block — without this the popped keys still appear in
+    # `payload["metadata"]` (the original reference).
+    if cross_rank_scores_out or anonymization_map_out:
+        payload["metadata"] = metadata
+    if cross_rank_scores_out:
+        payload["cross_rank_scores"] = cross_rank_scores_out
+    if anonymization_map_out:
+        payload["anonymization_map"] = anonymization_map_out
+    return payload
 
 
 def last_transcript(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1158,6 +1414,43 @@ def list_modes(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def query_transcripts(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Semantic search over recorded transcripts (Jaccard MVP).
+
+    Mirrors the read-only / project-rooted resolution used by every other
+    transcript-reading tool. Returns ``{matches: [...]}`` even when empty
+    so the consumer can rely on the shape.
+    """
+    from llm_council.query import search_similar
+
+    cwd = _resolve_working_directory(arguments)
+    load_project_env(cwd)
+    config = load_config(find_config(cwd), search=False)
+    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
+    if not out_dir.is_absolute():
+        out_dir = cwd / out_dir
+    query_text = arguments.get("query")
+    if not isinstance(query_text, str) or not query_text.strip():
+        raise ValueError("query must be a non-empty string")
+    top_k_raw = arguments.get("top_k")
+    top_k = 5 if top_k_raw is None else int(top_k_raw)
+    if top_k < 1 or top_k > 50:
+        raise ValueError("top_k must be between 1 and 50")
+    matches = search_similar(query_text, top_k=top_k, runs_dir=out_dir)
+    return {
+        "matches": [
+            {
+                "run_id": match.run_id,
+                "similarity": match.similarity,
+                "question_excerpt": match.question_excerpt,
+                "recommendation_label": match.recommendation_label,
+                "timestamp": match.timestamp,
+            }
+            for match in matches
+        ]
+    }
+
+
 async def _serve() -> None:
     try:
         from mcp.server import Server
@@ -1236,12 +1529,43 @@ async def _serve() -> None:
                 ),
                 inputSchema=stats_schema(),
             ),
+            Tool(
+                name="council_query_transcripts",
+                description=(
+                    "Semantic search across recorded council transcripts. "
+                    "Returns the top-k prior runs whose questions overlap "
+                    "with the query (Jaccard token similarity). Lets an "
+                    "agent check whether council already weighed in on a "
+                    "topic before launching a fresh consultation."
+                ),
+                inputSchema=query_transcripts_schema(),
+            ),
         ]
 
     @app.call_tool()
     async def call_tool(name: str, arguments: dict):
         if name == "council_run":
-            result = await run_council(arguments)
+            # Grab the per-call MCP context to enable mid-run progress
+            # notifications. Both fields are None-safe: a client that
+            # didn't set `_meta.progressToken` (the on-the-wire shape)
+            # gets the silent no-op fallback documented in
+            # `_build_mcp_progress_callback`.
+            session: Any = None
+            progress_token: Any = None
+            try:
+                rc = app.request_context
+                session = getattr(rc, "session", None)
+                meta = getattr(rc, "meta", None)
+                progress_token = (
+                    getattr(meta, "progressToken", None) if meta is not None else None
+                )
+            except (LookupError, AttributeError):
+                pass
+            result = await run_council(
+                arguments,
+                mcp_session=session,
+                progress_token=progress_token,
+            )
         elif name == "council_recommend":
             use, mode, reason = should_use_council(
                 arguments["task"],
@@ -1262,6 +1586,8 @@ async def _serve() -> None:
             result = list_models(arguments)
         elif name == "council_stats":
             result = run_stats(arguments)
+        elif name == "council_query_transcripts":
+            result = query_transcripts(arguments)
         else:
             raise ValueError(f"Unknown tool: {name}")
         text_blocks = [TextContent(type="text", text=json.dumps(result, indent=2))]

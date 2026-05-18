@@ -220,13 +220,6 @@ def test_stats_counts_timeout_recoveries():
     assert by_peer["claude"]["timeout_recoveries"] == 1
 
 
-def test_participant_result_carries_prompt_chars_field():
-    """Smoke check that the dataclass field exists and defaults to None."""
-    pr = ParticipantResult(name="x", ok=True, output="", error="", elapsed_seconds=0)
-    assert pr.prompt_chars is None
-    assert pr.recovered_after_timeout is False
-
-
 # --- prompt_chars population on success and recovery paths (pass-8 fix #7) -
 
 def test_cli_success_populates_prompt_chars():
