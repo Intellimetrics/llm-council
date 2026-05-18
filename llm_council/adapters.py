@@ -2525,12 +2525,35 @@ def _format_retry_transcript(
     )
 
 
-_ENVELOPE_SINGLE_RE = re.compile(
+# Enum-style envelope fields: single-word values from a closed vocabulary
+# (e.g., `EFFORT: high`, `CONFIDENCE: medium`, `CONTINUE_DEBATE: yes`). The
+# single-word value pattern is intentional — these are categorical, not
+# free-form. RISK was originally lumped here but is contractually a
+# sentence ("RISK: <one sentence — the single biggest risk you see>" in
+# context.py), so it has its own pattern below.
+_ENVELOPE_ENUM_RE = re.compile(
     r"""
     ^\s*(?:>\s*)?(?:[-*]\s+)?(?:\*\*)?
-    (?P<key>EFFORT|CONFIDENCE|RISK|CONTINUE_DEBATE)
+    (?P<key>EFFORT|CONFIDENCE|CONTINUE_DEBATE)
     (?:\*\*)?\s*:\s*(?:\*\*)?
     (?P<value>[A-Za-z][A-Za-z\-_]*)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Free-form sentence for RISK. Captures rest-of-line preserving case so
+# something like `RISK: The single biggest risk is X.` is stored whole
+# instead of being truncated to "the" — the v0.10.1 bug surfaced when
+# the council reviewed itself and the parsed `risk` field showed only
+# the first word of every peer's sentence. Trailing `**` markdown
+# emphasis is tolerated.
+_ENVELOPE_RISK_RE = re.compile(
+    r"""
+    ^\s*(?:>\s*)?(?:[-*]\s+)?(?:\*\*)?
+    RISK
+    (?:\*\*)?\s*:\s*(?:\*\*)?
+    (?P<value>\S.*?)
+    \s*(?:\*\*)?\s*$
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -2571,6 +2594,14 @@ _ENVELOPE_LIST_INLINE_RE = re.compile(
 )
 
 _ENVELOPE_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?P<item>.+?)\s*$")
+
+# Sentinels a peer uses to mean "no entries" for a list field. Normalized
+# to an empty list rather than a list containing the literal token.
+# Matters for abdication detection: `EFFORT: blocked` + `BLOCKERS: none` +
+# `ASSUMPTIONS: none` should classify as abdication (no concrete missing
+# artifact named), but if "none" is stored as a list entry the
+# truthiness check in _is_abdication would treat it as a real blocker.
+_LIST_NONE_SENTINELS = frozenset({"none", "n/a", "na", "-", "—"})
 
 # Evidence-tag parser. Pass-7's R3 rule defined four tags for grading the
 # epistemic status of each EVIDENCE bullet. Tags may appear at the start
@@ -2676,23 +2707,42 @@ def _extract_response_envelope(output: str) -> dict[str, Any]:
             active_list = None
         inline = _ENVELOPE_LIST_INLINE_RE.match(line)
         if inline:
-            # `EVIDENCE: <content>` (and the BLOCKERS / TESTS_TO_RUN /
-            # ASSUMPTIONS analogues) as a single-line entry. Treat each
-            # such line as one item under the named list, and set
-            # active_list so any following `- bullet` lines accrue too.
+            # `EVIDENCE: <content>` (and BLOCKERS / TESTS_TO_RUN /
+            # ASSUMPTIONS analogues) on a single line. The prompt
+            # contract in context.py documents these as comma-separated
+            # (`EVIDENCE: <comma-separated bullets, each tagged ...>`),
+            # so split on commas — otherwise multi-cite lines like
+            # `EVIDENCE: [VERIFIED:a:1-2], [VERIFIED:b:3-4]` collapse
+            # into one mangled entry (v0.10.1 self-review bug).
+            # Sentinels like "none" normalize to no entries. Each line
+            # also sets active_list so following `- bullet` lines accrue
+            # under the same field.
             target = _ENVELOPE_LIST_HEADERS[inline.group("key").upper()]
-            item = inline.group("item")
-            if target in TAG_PARSED_LIST_FIELDS:
-                envelope[target].append(_parse_tagged_entry(item))
-            else:
-                envelope[target].append(item)
+            raw_item = inline.group("item")
+            pieces = [
+                piece.strip()
+                for piece in raw_item.split(",")
+                if piece.strip()
+                and piece.strip().lower() not in _LIST_NONE_SENTINELS
+            ]
+            for item in pieces:
+                if target in TAG_PARSED_LIST_FIELDS:
+                    envelope[target].append(_parse_tagged_entry(item))
+                else:
+                    envelope[target].append(item)
             active_list = target
             continue
-        single = _ENVELOPE_SINGLE_RE.match(line)
+        single = _ENVELOPE_ENUM_RE.match(line)
         if single:
             key = single.group("key").lower()
             if envelope.get(key) is None:
                 envelope[key] = single.group("value").lower()
+            continue
+        risk = _ENVELOPE_RISK_RE.match(line)
+        if risk and envelope.get("risk") is None:
+            value = risk.group("value").strip().rstrip("*").strip()
+            if value:
+                envelope["risk"] = value
     return envelope
 
 
