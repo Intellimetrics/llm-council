@@ -180,9 +180,11 @@ Modes are named ways to assemble the council.
 | `peer-only` | Outside voices only; excludes the current host CLI. |
 | `plan` | Architecture and approach questions before code changes. |
 | `review` | Diff review before merge or release. |
+| `review-with-tools` | Diff review where peers verify claims with their own file-read / grep tools before voting. Experimental. |
 | `review-cheap` | Budget hosted review when you want a first pass before spending more. |
 | `diverse` | A wider spread across Claude, Codex, Gemini, and OpenRouter. |
 | `private-local` | Ollama only. Use when the prompt must stay on your machine. |
+| `local-only` | Every configured local peer (Ollama plus any loopback `openai_compatible`). Stricter than `private-local`, which pins one peer. |
 | `us-only` | Filters to US-origin participants. |
 | `deliberate` | Forces a second round even if the first answers mostly agree. |
 | `consensus` | Makes peers argue from different sides, then gives them a chance to revise. |
@@ -263,6 +265,7 @@ It provides these tools:
 | `council_doctor` | Check whether setup is healthy. |
 | `council_list_modes` | See configured modes and participants. |
 | `council_last_transcript` | Fetch the latest transcript path or content. |
+| `council_query_transcripts` | Search past transcripts by similarity to a new question. |
 | `council_models` | Inspect configured or hosted model choices. |
 | `council_stats` | Summarize past transcript usage. |
 
