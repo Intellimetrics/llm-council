@@ -318,6 +318,24 @@ DEFAULT_CONFIG: dict = {
             "timeout": 180,
             "read_only": True,
         },
+        "antigravity": {
+            "type": "cli",
+            "family": "antigravity",
+            "origin": "US / Google",
+            "command": "agy",
+            "args": [
+                "--print",
+                "--sandbox",
+                "--dangerously-skip-permissions",
+                "-",
+            ],
+            "model": None,
+            "timeout": 240,
+            "max_prompt_chars": 120_000,
+            "read_only": True,
+            "stdin_prompt": True,
+            "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTIGRAVITY_API_KEY"],
+        },
     },
     # Mode shape (recognized optional keys per entry):
     #   strategy: "other_cli_peers" | "local_only_peers"     — selection rule
@@ -451,6 +469,7 @@ DEFAULT_CONFIG: dict = {
                 "claude": "for",
                 "codex": "against",
                 "gemini": "neutral",
+                "antigravity": "neutral",
             },
             "timeout_multiplier": 2.0,
             "description": (

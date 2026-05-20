@@ -103,20 +103,24 @@ from llm_council.convergence import (
 def test_builtin_quick_selects_full_native_triad():
     config = load_config(None)
     selected = select_participants(config, "quick", "codex")
-    assert selected == ["claude", "codex", "gemini"]
+    assert selected == ["claude", "codex", "gemini", "antigravity"]
 
 
 def test_peer_only_excludes_current():
     config = load_config(None)
     selected = select_participants(config, "peer-only", "codex")
-    assert selected == ["claude", "gemini"]
+    assert selected == ["claude", "gemini", "antigravity"]
+    # When current is antigravity, gemini is also excluded:
+    assert select_participants(config, "peer-only", "antigravity") == ["claude", "codex"]
+    # When current is gemini, antigravity is also excluded:
+    assert select_participants(config, "peer-only", "gemini") == ["claude", "codex"]
 
 
 def test_custom_other_cli_peers_stays_peer_only_by_default():
     config = load_config(None)
     config["modes"]["custom-peer"] = {"strategy": "other_cli_peers"}
     selected = select_participants(config, "custom-peer", "codex")
-    assert selected == ["claude", "gemini"]
+    assert selected == ["claude", "gemini", "antigravity"]
 
 
 def test_claude_prompt_goes_to_stdin():
@@ -687,13 +691,13 @@ def test_prompt_arg_is_redacted_and_literal_braces_are_safe(tmp_path: Path):
 def test_plan_mode_adds_deepseek():
     config = load_config(None)
     selected = select_participants(config, "plan", "claude")
-    assert selected == ["claude", "codex", "gemini", "deepseek_v4_pro"]
+    assert selected == ["claude", "codex", "gemini", "antigravity", "deepseek_v4_pro"]
 
 
 def test_deliberate_mode_adds_deepseek_and_marks_expensive():
     config = load_config(None)
     selected = select_participants(config, "deliberate", "claude")
-    assert selected == ["claude", "codex", "gemini", "deepseek_v4_pro"]
+    assert selected == ["claude", "codex", "gemini", "antigravity", "deepseek_v4_pro"]
     assert config["modes"]["deliberate"]["deliberate"] is True
 
 
@@ -1194,7 +1198,7 @@ def test_explicit_participants_respect_origin_policy_with_clear_error():
 def test_us_origin_policy_filters_non_us_additions():
     config = load_config(None)
     selected = select_participants(config, "diverse", "codex", origin_policy="us")
-    assert selected == ["claude", "codex", "gemini"]
+    assert selected == ["claude", "codex", "gemini", "antigravity"]
 
 
 def test_origin_policy_empty_selection_is_clear():
@@ -1227,13 +1231,14 @@ def test_consensus_mode_default_assigns_for_against_neutral():
         "claude": "for",
         "codex": "against",
         "gemini": "neutral",
+        "antigravity": "neutral",
     }
 
 
 def test_consensus_mode_select_participants_returns_full_triad():
-    config = load_config(None, search=False)
+    config = load_config(None)
     selected = select_participants(config, "consensus", "claude")
-    assert selected == ["claude", "codex", "gemini"]
+    assert selected == ["claude", "codex", "gemini", "antigravity"]
 
 
 def test_consensus_mode_validates_stance_keys(tmp_path: Path):
@@ -4890,6 +4895,7 @@ def test_tri_cli_setup_loaded_config_does_not_restore_defaults(tmp_path: Path):
         "claude",
         "codex",
         "gemini",
+        "antigravity",
         "claude_4_6",
         "claude_4_7",
     }
@@ -4936,6 +4942,7 @@ def test_setup_interactive_uses_preset_and_suppression_flags(
         "claude",
         "codex",
         "gemini",
+        "antigravity",
         "claude_4_6",
         "claude_4_7",
     }
@@ -4968,6 +4975,7 @@ def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path, monkeypatch
         "claude",
         "codex",
         "gemini",
+        "antigravity",
         "claude_4_6",
         "claude_4_7",
     }
@@ -5004,6 +5012,7 @@ def test_setup_yes_auto_selects_tri_cli_when_native_clis_exist(
         "claude",
         "codex",
         "gemini",
+        "antigravity",
         "claude_4_6",
         "claude_4_7",
     }

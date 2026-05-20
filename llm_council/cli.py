@@ -82,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--config", help="Path to config YAML")
     run.add_argument("--mode", default=None, help="Council mode")
-    run.add_argument("--current", choices=["claude", "codex", "gemini"])
+    run.add_argument("--current", choices=["claude", "codex", "gemini", "antigravity"])
     run.add_argument("--participants", help="Comma-separated explicit participants")
     run.add_argument("--include", help="Comma-separated extra participants")
     run.add_argument(
@@ -362,7 +362,7 @@ def build_parser() -> argparse.ArgumentParser:
     estimate.add_argument("question", nargs="*", help="Question or prompt")
     estimate.add_argument("--config", help="Path to config YAML")
     estimate.add_argument("--mode", default=None, help="Council mode")
-    estimate.add_argument("--current", choices=["claude", "codex", "gemini"])
+    estimate.add_argument("--current", choices=["claude", "codex", "gemini", "antigravity"])
     estimate.add_argument("--participants", help="Comma-separated explicit participants")
     estimate.add_argument("--include", help="Comma-separated extra participants")
     estimate.add_argument(
@@ -1051,8 +1051,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print("LLM Council setup")
         print(f"Project root: {root}")
         print("\nDetected CLIs:")
-        for name in ("claude", "codex", "gemini", "ollama"):
-            print(f"  {name:8} {shutil.which(name) or 'not found'}")
+        for name in ("claude", "codex", "gemini", "antigravity", "ollama"):
+            cmd = "agy" if name == "antigravity" else name
+            print(f"  {name:12} {shutil.which(cmd) or 'not found'}")
         include_openrouter = _confirm(
             "Include OpenRouter participant presets?", include_openrouter
         )
@@ -1114,17 +1115,17 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 
 def _auto_setup_preset() -> str:
-    native_names = ("claude", "codex", "gemini")
-    native_count = sum(1 for name in native_names if shutil.which(name))
+    native_names = ("claude", "codex", "gemini", "antigravity")
+    native_count = sum(1 for name in native_names if shutil.which("agy" if name == "antigravity" else name))
     if native_count >= 2:
         return "tri-cli"
     if os.environ.get("OPENROUTER_API_KEY"):
         return "openrouter"
-    found = ", ".join(name for name in native_names if shutil.which(name)) or "none"
+    found = ", ".join(name for name in native_names if shutil.which("agy" if name == "antigravity" else name)) or "none"
     raise SystemExit(
         "Auto setup could not find a usable default council route. "
         f"Found native CLIs: {found}. "
-        "Install at least two of claude/codex/gemini, or set OPENROUTER_API_KEY "
+        "Install at least two of claude/codex/gemini/antigravity, or set OPENROUTER_API_KEY "
         "in your shell, .env, .env.local, or .llm-council.env and rerun setup. "
         "Advanced users who intentionally want to stage an incomplete config "
         "can choose an explicit preset with --allow-incomplete."
@@ -1132,8 +1133,8 @@ def _auto_setup_preset() -> str:
 
 
 def _detect_setup_routes() -> dict[str, object]:
-    native_names = ("claude", "codex", "gemini")
-    native_paths = {name: shutil.which(name) for name in native_names}
+    native_names = ("claude", "codex", "gemini", "antigravity")
+    native_paths = {name: shutil.which("agy" if name == "antigravity" else name) for name in native_names}
     native_count = sum(1 for path in native_paths.values() if path)
     has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
     ollama_path = shutil.which("ollama")
@@ -1164,8 +1165,8 @@ def _preset_status(preset: str, routes: dict[str, object]) -> tuple[str, str]:
         return "blocked", "needs at least two native CLIs or OPENROUTER_API_KEY"
     if preset == "tri-cli":
         if native_count >= 2:
-            return "available", "uses installed Claude/Codex/Gemini CLI accounts"
-        return "blocked", "needs at least two of claude/codex/gemini"
+            return "available", "uses installed Claude/Codex/Gemini/Antigravity CLI accounts"
+        return "blocked", "needs at least two of claude/codex/gemini/antigravity"
     if preset == "openrouter":
         if has_openrouter:
             return "available", "uses hosted OpenRouter reviewers"
@@ -1229,8 +1230,8 @@ def _print_setup_plan(root: Path) -> None:
     print(f"Project root: {root}")
     print()
     print("Detected:")
-    for name in ("claude", "codex", "gemini"):
-        print(f"  {name:8} {native_paths.get(name) or 'not found'}")
+    for name in ("claude", "codex", "gemini", "antigravity"):
+        print(f"  {name:12} {native_paths.get(name) or 'not found'}")
     print(f"  openrouter {'OPENROUTER_API_KEY set' if routes['has_openrouter'] else 'OPENROUTER_API_KEY not set'}")
     print(f"  ollama   {routes['ollama_path'] or 'not found'}")
     print()
@@ -1300,6 +1301,10 @@ def _print_setup_next_steps(
             "     Append the full contents of "
             f"{root / '.llm-council/instructions/gemini.md'} to GEMINI.md."
         )
+        print(
+            "     Append the full contents of "
+            f"{root / '.llm-council/instructions/antigravity.md'} to GEMINI.md."
+        )
     else:
         print("  1. Add council instructions to CLAUDE.md, AGENTS.md, and GEMINI.md.")
     if write_mcp:
@@ -1323,8 +1328,9 @@ def _print_setup_next_steps(
 
     warnings: list[str] = []
     if include_native:
-        for name in ("claude", "codex", "gemini"):
-            if shutil.which(name) is None:
+        for name in ("claude", "codex", "gemini", "antigravity"):
+            cmd = "agy" if name == "antigravity" else name
+            if shutil.which(cmd) is None:
                 warnings.append(f"{name} was not found on PATH; native CLI modes need it.")
     if include_openrouter and not os.environ.get("OPENROUTER_API_KEY"):
         warnings.append(

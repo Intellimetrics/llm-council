@@ -17,7 +17,7 @@ import yaml
 from llm_council.defaults import DEFAULT_CONFIG, KNOWN_ORIGIN_STRINGS, VALID_STANCES
 
 
-BASELINE_CLIS = ("claude", "codex", "gemini")
+BASELINE_CLIS = ("claude", "codex", "gemini", "antigravity")
 OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 PARTICIPANT_TYPES = frozenset({"cli", "openrouter", "openai_compatible", "ollama"})
 OPENAI_COMPATIBLE_TYPES = frozenset({"openrouter", "openai_compatible"})
@@ -569,7 +569,7 @@ def migrate_known_cli_defaults(config: dict[str, Any]) -> None:
         return
     if (
         isinstance(participants, dict)
-        and all(name in participants for name in BASELINE_CLIS)
+        and all(name in participants for name in ("claude", "codex", "gemini"))
         and "peer-only" not in modes
     ):
         modes["peer-only"] = copy.deepcopy(DEFAULT_CONFIG["modes"]["peer-only"])
@@ -658,6 +658,8 @@ def detect_current_agent() -> str | None:
     )
     if explicit:
         normalized = explicit.strip().lower()
+        if normalized == "agy":
+            normalized = "antigravity"
         return normalized if normalized in BASELINE_CLIS else None
 
     # Linux-specific parent process walk. If it fails, caller can use all peers.
@@ -675,6 +677,12 @@ def detect_current_agent() -> str | None:
             for name in BASELINE_CLIS:
                 if f"/{name}" in lowered or lowered.startswith(name):
                     return name
+                if name == "antigravity" and (
+                    "/agy" in lowered
+                    or "/_agy" in lowered
+                    or lowered.startswith("agy")
+                ):
+                    return "antigravity"
             stat = stat_path.read_text(errors="ignore")
             pid = int(stat.split()[3])
     except Exception:
@@ -828,7 +836,11 @@ def select_participants(
             if mode_cfg.get("include_current", False):
                 selected = list(BASELINE_CLIS)
             else:
-                selected = [name for name in BASELINE_CLIS if name != current]
+                exclusions = {current} if current else set()
+                if "gemini" in exclusions or "antigravity" in exclusions:
+                    exclusions.add("gemini")
+                    exclusions.add("antigravity")
+                selected = [name for name in BASELINE_CLIS if name not in exclusions]
                 if not current:
                     selected = list(BASELINE_CLIS)
             selected.extend(mode_cfg.get("add", []))

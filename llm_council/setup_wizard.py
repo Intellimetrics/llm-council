@@ -123,7 +123,7 @@ def project_config(
     extra_local_participants = extra_local_participants or {}
     participant_names: set[str] = set()
     if include_native:
-        participant_names.update({"claude", "codex", "gemini"})
+        participant_names.update({"claude", "codex", "gemini", "antigravity"})
         # Temporary: ship pinned-version Claude variants so `opus-versions`
         # mode is reachable without manual config edits. Remove when version
         # drift no longer warrants direct comparison.
@@ -161,7 +161,7 @@ def project_config(
         config["defaults"]["origin_policy"] = "us"
         modes.pop("us-only", None)
     if include_native:
-        for name in ("claude", "codex", "gemini", "claude_4_6", "claude_4_7"):
+        for name in ("claude", "codex", "gemini", "antigravity", "claude_4_6", "claude_4_7"):
             config["participants"][name] = DEFAULT_CONFIG["participants"][name]
     if include_openrouter:
         for name in OPENROUTER_PARTICIPANTS:
@@ -308,7 +308,7 @@ def write_setup_files(
     if write_instructions:
         instructions_dir = root / ".llm-council" / "instructions"
         instructions_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("claude", "codex", "gemini"):
+        for name in ("claude", "codex", "gemini", "antigravity"):
             path = instructions_dir / f"{name}.md"
             if force or not path.exists():
                 path.write_text(
@@ -407,6 +407,9 @@ def _generate_host_skill_files(skills_dir: Path) -> list[tuple[Path, str]]:
     files.append(
         (skills_dir / "gemini-cli" / "GEMINI.md", _GEMINI_CLI_GEMINI_MD)
     )
+    files.append(
+        (skills_dir / "antigravity" / "GEMINI.md", _ANTIGRAVITY_SKILL_MD)
+    )
     return files
 
 
@@ -449,6 +452,15 @@ cat .llm-council/skills/gemini-cli/GEMINI.md >> ~/.gemini/GEMINI.md
 ```
 
 Gemini CLI reads `~/.gemini/GEMINI.md` as global instructions.
+
+## Antigravity CLI
+
+```bash
+mkdir -p ~/.gemini
+cat .llm-council/skills/antigravity/GEMINI.md >> ~/.gemini/GEMINI.md
+```
+
+Antigravity CLI reads global instructions from `~/.gemini/GEMINI.md`.
 
 After installing on any host, the prerequisite is that `llm-council` is on
 PATH (via `uv tool install` or `pipx install`) and that an MCP transport is
@@ -520,4 +532,11 @@ _GEMINI_CLI_GEMINI_MD = (
     "# LLM Council (global Gemini CLI instructions)\n"
     "\n"
     + _HOST_SKILL_BODY.format(current="gemini")
+)
+
+
+_ANTIGRAVITY_SKILL_MD = (
+    "# LLM Council (global Antigravity instructions)\n"
+    "\n"
+    + _HOST_SKILL_BODY.format(current="antigravity")
 )

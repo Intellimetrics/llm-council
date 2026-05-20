@@ -62,6 +62,7 @@ def test_review_with_tools_routes_to_cli_peers_only():
             "claude": {"type": "cli", "family": "claude"},
             "codex": {"type": "cli", "family": "codex"},
             "gemini": {"type": "cli", "family": "gemini"},
+            "antigravity": {"type": "cli", "family": "antigravity"},
             "qwen_coder_plus": {"type": "openrouter", "family": "qwen"},
         },
         "modes": DEFAULT_CONFIG["modes"],
@@ -71,10 +72,11 @@ def test_review_with_tools_routes_to_cli_peers_only():
     assert "claude" in selected
     assert "codex" in selected
     assert "gemini" in selected
+    assert "antigravity" in selected
     # No hosted peers in the default roster — the mode is CLI-only.
     assert "qwen_coder_plus" not in selected
-    # Sanity: only the three CLI peers.
-    assert set(selected) == {"claude", "codex", "gemini"}
+    # Sanity: only the CLI peers.
+    assert set(selected) == {"claude", "codex", "gemini", "antigravity"}
 
 
 def test_review_with_tools_does_not_add_hosted_peers():

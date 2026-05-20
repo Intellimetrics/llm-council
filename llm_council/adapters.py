@@ -267,7 +267,7 @@ class CacheContext:
         )
 
 
-_TOOL_CAPABLE_CLI_FAMILIES_ADAPTER = frozenset({"claude", "codex", "gemini"})
+_TOOL_CAPABLE_CLI_FAMILIES_ADAPTER = frozenset({"claude", "codex", "gemini", "antigravity"})
 
 # v0.9.0 Feature 3 — `record_recommendation(...)` tool-call extraction.
 #
