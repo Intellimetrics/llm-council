@@ -3,68 +3,58 @@
 [![Tests](https://github.com/Intellimetrics/llm-council/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/Intellimetrics/llm-council/actions/workflows/test.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776ab?logo=python&logoColor=white)](pyproject.toml)
 [![MCP](https://img.shields.io/badge/MCP-ready-2f855a)](docs/llm-council.md)
-[![Read-only](https://img.shields.io/badge/default-read--only-6b7280)](#read-only-means-read-only)
+[![Read-only](https://img.shields.io/badge/default-read--only-6b7280)](#read-only-safety)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/Intellimetrics/llm-council?style=flat&color=yellow)](https://github.com/Intellimetrics/llm-council/stargazers)
 [![Version](https://img.shields.io/badge/version-0.11.2-111827)](CHANGELOG.md)
 
-Your coding agent is confident.
+Your coding agent is incredibly fast, capable, and confident. 
 
-That is useful right up until it confidently ships a bad migration, hides the real bug behind a nicer-looking patch, or refactors the one file nobody should have touched.
+That is highly valuable—until it confidently overwrites a critical database migration, introduces a subtle security vulnerability, or refactors a complex module it wasn't supposed to touch.
 
-**LLM Council** gives that agent a way to ask other models for read-only second opinions before it does something expensive.
+**LLM Council** is a lightweight, read-only multi-agent orchestration harness designed to give your primary coding agent a fast, independent second opinion before committing to risky changes or expensive edits. It runs as a Python 3.11+ MCP server and command-line tool.
 
-It is a Python 3.11+ MCP server and CLI. It works with the tools developers already use:
-- **Claude Code**
-- **Codex CLI**
-- **Antigravity CLI** (using [google-antigravity/antigravity-cli](https://github.com/google-antigravity/antigravity-cli) and powered by [google-antigravity/antigravity-sdk-python](https://github.com/google-antigravity/antigravity-sdk-python))
-- **Gemini CLI**
-- Hosted models through **OpenRouter**
-- Local models through **Ollama**
+---
 
-The console command is `llm-council`. The MCP server name is also `llm-council`.
+## Why Use LLM Council?
 
-MIT licensed. Current version: `0.11.2`.
+Coding agents move fast. To prevent single-model blind spots from becoming production incidents, LLM Council lets you pause and request a peer review:
 
-GitHub: <https://github.com/Intellimetrics/llm-council>
+> *"This diff looks plausible, but I want other models to try to break it."*
 
-## Why this exists
-
-A coding agent can move fast enough to be dangerous.
-
-That is the point. You want the speed. You do not want a single model's blind spot to become your production incident.
-
-LLM Council is for the moment when you pause and think:
-
-> This looks plausible, but I want another model to try to break it.
-
-Ask council. The peers read the same prompt or diff. They answer independently. They cannot edit your files. Each answer must end with one of three plain labels:
+When you ask the council, peers read the same context (e.g., prompt, codebase, or git diff) and independently evaluate it. To ensure actionable feedback, every peer response is strictly parsed and must resolve to one of three consensus labels:
 
 ```text
-RECOMMENDATION: yes
-RECOMMENDATION: no
-RECOMMENDATION: tradeoff
+RECOMMENDATION: yes       # Safe to proceed
+RECOMMENDATION: no        # Stop; major issues detected
+RECOMMENDATION: tradeoff  # Plausible, but note critical trade-offs
 ```
 
-That label matters. It means your coding agent does not have to guess whether a long answer was approval, rejection, or "this depends." If a peer forgets the label, LLM Council treats that answer as failed instead of quietly pretending it was fine.
+If a peer fails to supply one of these labels, the response is rejected as a failure. Vague essays are not permitted.
 
-## Install
+---
 
-Use `uv tool install` for a real install:
+## Installation
 
+Install `llm-council` globally on your system.
+
+### Option A: Using `uv` (Recommended)
 ```bash
 uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
 ```
 
-Or use `pipx`:
-
+### Option B: Using `pipx`
 ```bash
 pipx install --force git+https://github.com/Intellimetrics/llm-council.git
 ```
 
-Do not use `uvx` for the install. `uvx` is good for a one-shot trial, but it does not give your project a stable tool install.
+> [!WARNING]
+> Do not use `uvx` for your primary installation. While convenient for one-off trials, `uvx` does not configure a stable MCP environment or keep the tool persistently available on your path.
 
-Now move into the project where your coding agent works:
+---
+
+## Quickstart
+
+Once installed, navigate to your active project repository and run the setup wizard:
 
 ```bash
 cd /path/to/your/project
@@ -73,349 +63,174 @@ llm-council setup --yes --preset auto
 llm-council doctor
 ```
 
-Then restart your coding agent so it reloads MCP config and project instructions.
+> [!IMPORTANT]
+> After running setup, restart your active terminal session or reload your developer agent so it detects the newly configured MCP server and project-specific instructions.
 
-## The thirty-second version
+### The 30-Second Example
+Once configured, you can talk to your primary developer agent (e.g., Claude Code, Codex, Antigravity CLI) directly in natural language:
 
-Once installed, talk to your coding agent like this:
+*   *"Ask the council to review my current changes before we commit."*
+*   *"Take this failing test to council. I need theory and review, not another patch."*
+*   *"Run a local-only council on this code. It cannot leave this machine."*
 
-```text
-Ask council to review the current diff before we ship it.
-```
+---
 
-Or:
+## CLI Reference
 
-```text
-Take this bug to council. I want independent theories, not another patch yet.
-```
-
-Or:
-
-```text
-Use private-local council. This code cannot leave my machine.
-```
-
-LLM Council is not another chat UI. It is a way for your existing agent to slow down at the right moment and ask peers to look for the thing it missed.
-
-## What gets asked
-
-You can ask a direct question:
+While most interaction happens transparently via the MCP server inside your agent, you can invoke the CLI directly:
 
 ```bash
+# Get a fast second opinion on a question
 llm-council run --mode quick "Why is this test flaky?"
+
+# Review the current git diff
+llm-council run --mode review --diff "Is this migration safe to run?"
+
+# Force a detailed debate with assigned stances
+llm-council run --mode consensus --diff "Should we merge this auth rewrite?"
+
+# Estimate token sizes and costs before running a council
+llm-council estimate --mode consensus --diff "Should we merge this?"
+
+# Inspect the last run's raw transcripts
+llm-council last
 ```
 
-You can ask about the current diff:
+---
 
-```bash
-llm-council run --mode review --diff "Is this safe to merge?"
-```
+## Presets & Configuration
 
-You can make the council argue harder:
+The setup wizard (`llm-council setup --plan`) automatically probes your environment to find available tools and recommends the best preset:
 
-```bash
-llm-council run --mode consensus --diff "Should we ship this migration?"
-```
+| Preset | Description / Use Case |
+| :--- | :--- |
+| `auto` | Automatically selects the best mix of local CLIs, hosted keys, and local models. |
+| `tri-cli` | Resolves a local 3-member triad (Claude Code, Codex CLI, and Antigravity CLI or Gemini CLI). |
+| `openrouter` | Uses hosted API models through a single OpenRouter key. |
+| `tri-cli-openrouter` | Runs local CLIs with hosted fallback or additional variety. |
+| `local-private` | Strict offline-only review using local Ollama instances. |
+| `all` | Configures every discovered route on the host machine. |
 
-And you can ask for the cost first:
+---
 
-```bash
-llm-council estimate --mode consensus --diff "Should we ship this migration?"
-```
+## Peers & Agent Integration
 
-Most day-to-day use should happen through MCP, from your coding agent. The CLI is there for setup, diagnosis, transcripts, and the occasional manual run.
+LLM Council supports three classes of peer participants:
 
-## Pick a setup
+1.  **Native CLIs**: Uses existing command-line interfaces installed on your machine (`claude`, `codex`, `agy`, or `gemini`).
+2.  **Hosted Models**: Integrates with remote APIs via **OpenRouter**.
+3.  **Local Models**: Communicates with local instances via **Ollama**.
 
-`llm-council setup --plan` looks at what is already available on your machine and tells you which routes can work.
+### Dynamic Triad Resolution & Family Exclusions
+*   **The 3-CLI Triad**: The `tri-cli` preset dynamically selects exactly three active local CLIs. If both `antigravity` (`agy`) and `gemini` are installed, `llm-council` prioritizes `antigravity` as the active Gemini-family peer.
+*   **Family Exclusions**: If the primary driver running your session is a Gemini-family agent (e.g., Antigravity CLI or Gemini CLI), `llm-council` automatically excludes other Gemini-family peers from the voting pool to avoid redundant reviews. It instead recruits independent peers (such as Claude Code and Codex CLI) for a balanced triad.
 
-Then choose one preset:
+---
 
-| Preset | Use it when |
-|---|---|
-| `auto` | You want LLM Council to use the best working mix it can find. |
-| `tri-cli` | You have Claude Code, Codex CLI, and Antigravity CLI (or Gemini CLI) installed. Selects exactly 3 active peers. |
-| `openrouter` | You want hosted peers through one OpenRouter key. |
-| `tri-cli-openrouter` | You want native CLIs plus hosted fallback or variety. |
-| `local-private` | You want local Ollama peers only. |
-| `all` | You want every available route configured. |
+## Read-Only Safety
 
-The setup flow is intentionally boring:
+Peers act strictly as advisors, not co-authors:
+*   **No File Modifications**: Every native CLI peer is invoked with read-only or strict approval-only flags (e.g., `agy --sandbox --dangerously-skip-permissions -` or `claude --read-only`). They cannot modify your files.
+*   **Isolated Environments**: Peers inspect the codebase or diff via standard input, protecting your repository from accidental writes.
 
-```bash
-llm-council setup --plan
-llm-council setup --yes --preset <name>
-llm-council doctor
-```
+---
 
-If setup cannot find enough working peers, add another native CLI, configure OpenRouter, or set up Ollama.
+## Configured Modes
 
-## Peers
+Modes determine the composition and behaviors of the council. You can customize them in `.llm-council.yaml`:
 
-LLM Council can ask three kinds of peers.
+| Mode | Purpose |
+| :--- | :--- |
+| `quick` | Fast, lightweight review. Perfect default for general troubleshooting. |
+| `peer-only` | Excludes the active driver CLI to hear solely from external peers. |
+| `plan` | Structural/architecture questions *before* starting implementation. |
+| `review` | Thorough diff evaluation before a merge or release. |
+| `review-with-tools` | Experimental mode where peers run file-read/grep tools before voting. |
+| `review-cheap` | Budget hosted review using smaller, cheaper models. |
+| `diverse` | Broad coverage across different companies and host architectures. |
+| `private-local` | Strict offline review pinned to local Ollama models. |
+| `consensus` | Multi-round structured debate with assigned stances (Pro, Con, Neutral). |
+| `deliberate` | Forces a secondary round of discussion even if peers initially agree. |
 
-### Native CLI Peers
-Use the tools you may already have installed locally:
-- **Claude Code** (`claude`)
-- **Codex CLI** (`codex`)
-- **Antigravity CLI** (`agy`) — A fast terminal wrapper for Google's agentic platform (see [antigravity-cli](https://github.com/google-antigravity/antigravity-cli) and [antigravity-sdk-python](https://github.com/google-antigravity/antigravity-sdk-python)).
-- **Gemini CLI** (`gemini`)
+### The Consensus Mode
+The `consensus` mode is designed for critical decisions (e.g., database schema changes, authentication logic). 
+1.  **Assigned Stances**: One peer is assigned to argue in favor of the proposal, one against, and one to remain neutral.
+2.  **Refutation Round**: If there is disagreement, a second round is run where peers receive the strongest opposing arguments and are given the opportunity to revise their stance.
+3.  **No Forced Unanimity**: If the peers still disagree, the final report outlines the conflicting arguments clearly.
 
-#### Dynamic Triad & Family Exclusions
-* **Dynamic Triad**: The `tri-cli` preset resolves to a 3-member native council (Claude, Codex, and either Antigravity or Gemini). If both Antigravity and Gemini CLIs are installed on your path, LLM Council dynamically chooses **Antigravity CLI** as the active triad peer.
-* **Claude Model Support in Antigravity**: Does Antigravity itself support Claude models? **Yes!** Google Antigravity supports native execution of Anthropic's Claude models (such as Claude Sonnet and Claude Opus) in its model selector.
-* **Family Exclusions**: If you run LLM Council *from* Antigravity CLI (or Gemini CLI) as your primary driver, the council detects this. To ensure diverse opinions and avoid redundant model-family votes, the council automatically excludes other Gemini-family peers (e.g., Gemini CLI) and recruits independent peers (Claude Code and Codex CLI) instead.
+---
 
-### Hosted Peers
-Go through **OpenRouter**.
+## Cost Controls & Data Boundaries
 
-### Local Peers
-Go through **Ollama**.
-
-This lets you choose the shape of the review: keep everything local, use accounts you already pay for, or add hosted models for a broader spread.
-
-## Read-only means read-only
-
-Council peers are reviewers, not co-authors.
-
-Every native CLI peer is launched under that host's read-only or approval-only flags. The council process asks for opinions; it does not hand peers permission to edit your project.
-
-LLM Council also rejects peer replies that do not include a `RECOMMENDATION: yes|no|tradeoff` line. A vague essay is not enough. Your agent gets an answer it can act on, or it gets a failure.
-
-This is the whole bargain: let other models inspect the work without giving them the keys.
-
-## Modes
-
-Modes are named ways to assemble the council.
-
-| Mode | What it is for |
-|---|---|
-| `quick` | A fast second opinion. Good default when your agent seems stuck. |
-| `peer-only` | Outside voices only; excludes the current host CLI. |
-| `plan` | Architecture and approach questions before code changes. |
-| `review` | Diff review before merge or release. |
-| `review-with-tools` | Diff review where peers verify claims with their own file-read / grep tools before voting. Experimental. |
-| `review-cheap` | Budget hosted review when you want a first pass before spending more. |
-| `diverse` | A wider spread across Claude, Codex, Gemini, and OpenRouter. |
-| `private-local` | Ollama only. Use when the prompt must stay on your machine. |
-| `local-only` | Every configured local peer (Ollama plus any loopback `openai_compatible`). Stricter than `private-local`, which pins one peer. |
-| `us-only` | Filters to US-origin participants. |
-| `deliberate` | Forces a second round even if the first answers mostly agree. |
-| `consensus` | Makes peers argue from different sides, then gives them a chance to revise. |
-
-You can define your own modes in `.llm-council.yaml`. The full schema is in the [operator reference](docs/llm-council.md).
-
-## Consensus
-
-`consensus` is the mode to use when "looks fine" is not enough.
-
-It gives peers different jobs: one looks for the case to proceed, one looks for the case against, and one tries to stay neutral. If they disagree, LLM Council runs another round where they can respond to the strongest opposing points.
-
-That is useful for questions like:
-
-```text
-Is this migration safe to run during business hours?
-```
-
-```text
-Does this auth change fix the bug, or does it just move the hole?
-```
-
-```text
-Is this refactor actually equivalent?
-```
-
-A peer is never forced to defend something unsafe just because it was assigned a side. If the honest answer is "do not ship this," it can say so.
-
-If the peers still disagree at the end, the transcript says that clearly. No fake unanimity.
-
-## Costs, data boundaries, safety
-
-LLM Council may call native CLIs, hosted models, or local models depending on your setup.
-
-Native CLI peers use your installed Claude Code, Codex CLI, Gemini CLI, or Antigravity CLI accounts. Their billing and rate limits belong to those tools.
-
-OpenRouter peers are hosted API calls and may cost money by token.
-
-Ollama peers run locally.
-
-Use cost caps when you want a hard stop before anything runs:
-
-```bash
-llm-council run --mode consensus --diff \
-  --max-cost-usd 0.50 \
-  --max-tokens 200000 \
-  "Is this migration safe to ship?"
-```
-
-Use an estimate when you just want to see the shape of the run:
-
-```bash
-llm-council estimate --mode consensus --diff \
-  "Is this migration safe to ship?"
-```
-
-Secrets are not written into `.mcp.json`. Put API keys in `.env`, `.env.local`, or `.llm-council.env`.
-
-Oversized prompts are refused before peers launch. Hosted peers without known pricing do not get to sneak past a cost cap.
+*   **Cost Caps**: Enforce limits to prevent unexpected hosted API charges:
+    ```bash
+    llm-council run --mode consensus --diff --max-cost-usd 0.50 "Is this migration safe?"
+    ```
+*   **Pre-flight Estimation**: Run `llm-council estimate` to calculate prompt tokens and project costs before making API calls.
+*   **API Credentials**: Put keys in `.env`, `.env.local`, or `.llm-council.env`. Keys are never written directly into the shared `.mcp.json`.
 
 > [!CAUTION]
-> Do not use council for classified, CUI, regulated, customer, production,
-> credential, or `DEPLOY_MODE=secret` content unless every configured
-> participant is approved for that data. US-origin model/company origin is
-> not the same as GovCloud, FedRAMP, or enterprise data-handling approval.
+> Do not use hosted council modes for classified, regulated, or credentialed codebases unless all configured models/providers are compliant with your security standards. For restricted codebases, use `local-private` or `private-local`.
 
-## MCP tools
+---
 
-Setup exposes an MCP server named `llm-council`.
+## MCP Server Integration
 
-It provides these tools:
+The `llm-council` server exposes the following tools to your developer agents:
 
-| Tool | What your agent uses it for |
-|---|---|
-| `council_run` | Ask the council a question. |
-| `council_estimate` | Estimate size and cost before asking. |
-| `council_recommend` | Ask whether council is worth using for the current task. |
-| `council_doctor` | Check whether setup is healthy. |
-| `council_list_modes` | See configured modes and participants. |
-| `council_last_transcript` | Fetch the latest transcript path or content. |
-| `council_query_transcripts` | Search past transcripts by similarity to a new question. |
-| `council_models` | Inspect configured or hosted model choices. |
-| `council_stats` | Summarize past transcript usage. |
+*   `council_run`: Run a council query with custom modes and optional diffs.
+*   `council_estimate`: Check sizes and estimated costs.
+*   `council_recommend`: Ask whether a council review is recommended for a given task.
+*   `council_doctor`: Diagnoses connection issues and CLI path status.
+*   `council_list_modes`: Lists configured presets, modes, and active peers.
+*   `council_last_transcript`: Returns the path/contents of the last run.
+*   `council_query_transcripts`: Searches past transcript history for similar reviews.
 
-The important one is `council_run`. Your agent sends the prompt, mode, and optional diff context. LLM Council returns the peer answers, recommendation labels, and transcript path.
+---
 
-## Agent-driven install
+## Manual Driver Configuration
 
-The easiest way to install LLM Council into a project is to ask your coding agent to do it.
+To integrate the council with your active terminal developer agents, append the appropriate config snippet to their global/project instruction files:
 
-Paste this into Claude Code, Codex CLI, Gemini CLI, or Antigravity CLI from the project root:
-
-```text
-Install LLM Council into this project from
-https://github.com/Intellimetrics/llm-council.
-
-Use the stable install path:
-1. Check for `uv` with `command -v uv`. If present, run:
-   `uv tool install --force git+https://github.com/Intellimetrics/llm-council.git`
-2. If `uv` is not installed, check for `pipx`. If present, run:
-   `pipx install --force git+https://github.com/Intellimetrics/llm-council.git`
-3. Do not use `uvx`; that is only for a one-shot trial.
-4. From this project root, run `llm-council setup --plan`.
-5. Show me the detected routes and ask which preset I want:
-   `auto`, `tri-cli`, `openrouter`, `tri-cli-openrouter`,
-   `local-private`, or `all`.
-6. Run `llm-council setup --yes --preset <my-choice>`.
-7. If setup reports no usable council route, stop and ask me whether to
-   set `OPENROUTER_API_KEY`, install another native CLI, or configure Ollama.
-8. After setup, append the matching snippet from `.llm-council/instructions/`
-   to the project instruction file without overwriting it:
-   - Claude Code: `.llm-council/instructions/claude.md` -> `CLAUDE.md`
-   - Codex CLI: `.llm-council/instructions/codex.md` -> `AGENTS.md`
-   - Gemini CLI: `.llm-council/instructions/gemini.md` -> `GEMINI.md`
-   - Antigravity CLI: `.llm-council/instructions/antigravity.md` -> `GEMINI.md`
-9. Confirm the destination file now contains the LLM Council routing rules.
-10. Run `llm-council doctor` and show me the result.
-11. Tell me to restart this CLI session so MCP and project instructions reload.
-```
-
-That last restart matters. Without it, your agent may not see the new MCP server or the new routing instructions.
-
-## Manual use
-
-These commands are useful when you are setting up, debugging, or reading old runs:
-
+### Claude Code
+Append to `CLAUDE.md`:
 ```bash
-llm-council setup --plan
-llm-council doctor
-llm-council doctor --probe-openrouter
-llm-council doctor --probe-ollama
-llm-council doctor --check-update
+cp .llm-council/skills/claude-code/SKILL.md ~/.claude/skills/llm-council/SKILL.md
 ```
 
-Run council directly:
-
+### Codex CLI
+Append to `~/.codex/AGENTS.md`:
 ```bash
-llm-council run --mode quick "What is the likely cause of this failing test?"
-llm-council run --mode review --diff "Review the current diff."
-llm-council run --mode consensus --diff "Should this ship?"
+cat .llm-council/skills/codex-cli/AGENTS.md >> ~/.codex/AGENTS.md
 ```
 
-Inspect transcripts:
-
+### Antigravity CLI / Gemini CLI
+Append to `~/.gemini/GEMINI.md`:
 ```bash
-llm-council last
-llm-council transcripts list
-llm-council transcripts summary
-llm-council transcripts prune --keep-since 2026-04-01 --apply
+cat .llm-council/skills/antigravity/GEMINI.md >> ~/.gemini/GEMINI.md
 ```
 
-Refresh hosted model data:
+---
 
-```bash
-llm-council models refresh
-```
+## Updates & Maintenance
 
-More options, including conversation continuation and prompt chunking, are in the [operator reference](docs/llm-council.md).
-
-## Try it once with uvx
-
-Use `uvx` only when you want to try the CLI without installing it:
-
-```bash
-uvx --from git+https://github.com/Intellimetrics/llm-council.git llm-council \
-  run --mode quick "Explain the tradeoff in this design."
-```
-
-That does not install the tool for your project. It also does not give your coding agent MCP access.
-
-For real use, install with `uv tool install` or `pipx`.
-
-## Smithery
-
-This repo includes `smithery.yaml` for registering `llm-council mcp-server` as a stdio MCP server.
-
-Install through the Smithery marketplace UI if that is how you manage MCP servers. The manifest exposes configuration for:
-
-- `OPENROUTER_API_KEY`
-- `OLLAMA_HOST`
-- `LLM_COUNCIL_MCP_ROOT`
-
-Native CLI peers still need to be installed on the host.
-
-## Update
-
-Check your version:
-
+Check current version:
 ```bash
 llm-council --version
 ```
 
-Check for a newer release:
-
+Check for updates:
 ```bash
 llm-council check-update
 ```
 
-Update with the same install command:
-
+Update to latest release:
 ```bash
 uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
 ```
 
-Or with `pipx`:
-
-```bash
-pipx install --force git+https://github.com/Intellimetrics/llm-council.git
-```
-
-Releases are tagged as `vX.Y.Z` and recorded in [CHANGELOG.md](CHANGELOG.md).
-
-## More
-
-- [Operator reference](docs/llm-council.md)
-- [Changelog](CHANGELOG.md)
+All releases and changes are logged in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
-<sub>MIT licensed. Built for coding agents that should ask before they ship.</sub>
+<sub>MIT Licensed. Built to help coding agents ask before they ship.</sub>
