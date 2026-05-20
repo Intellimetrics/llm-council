@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.2 - 2026-05-20
+
+v0.11.2 rewrites the README.md to feature Google Antigravity CLI and SDK as first-class citizens.
+*   Documented integration points linking to the official [antigravity-cli](https://github.com/google-antigravity/antigravity-cli) and [antigravity-sdk-python](https://github.com/google-antigravity/antigravity-sdk-python) repositories.
+*   Clarified the dynamic triad selection behavior (exactly 3 active CLIs) and the fallback/prioritization rules.
+*   Documented Antigravity CLI's native support for Claude models (Claude Sonnet & Claude Opus) and how `llm-council` family exclusions prevent redundant voting when using Antigravity CLI as the primary driver.
+
 ## 0.11.1 - 2026-05-20
 
 v0.11.1 refines participant logic to dynamically select exactly 3 CLI peers for the quick-select triad (`tri-cli`).

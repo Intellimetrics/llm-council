@@ -6,7 +6,7 @@
 [![Read-only](https://img.shields.io/badge/default-read--only-6b7280)](#read-only-means-read-only)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/Intellimetrics/llm-council?style=flat&color=yellow)](https://github.com/Intellimetrics/llm-council/stargazers)
-[![Version](https://img.shields.io/badge/version-0.11.1-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.11.2-111827)](CHANGELOG.md)
 
 Your coding agent is confident.
 
@@ -14,11 +14,17 @@ That is useful right up until it confidently ships a bad migration, hides the re
 
 **LLM Council** gives that agent a way to ask other models for read-only second opinions before it does something expensive.
 
-It is a Python 3.11+ MCP server and CLI. It works with the tools developers already use: Claude Code, Codex CLI, Gemini CLI, Antigravity CLI, hosted models through OpenRouter, and local models through Ollama.
+It is a Python 3.11+ MCP server and CLI. It works with the tools developers already use:
+- **Claude Code**
+- **Codex CLI**
+- **Antigravity CLI** (using [google-antigravity/antigravity-cli](https://github.com/google-antigravity/antigravity-cli) and powered by [google-antigravity/antigravity-sdk-python](https://github.com/google-antigravity/antigravity-sdk-python))
+- **Gemini CLI**
+- Hosted models through **OpenRouter**
+- Local models through **Ollama**
 
 The console command is `llm-council`. The MCP server name is also `llm-council`.
 
-MIT licensed. Current version: `0.11.1`.
+MIT licensed. Current version: `0.11.2`.
 
 GitHub: <https://github.com/Intellimetrics/llm-council>
 
@@ -128,7 +134,7 @@ Then choose one preset:
 | Preset | Use it when |
 |---|---|
 | `auto` | You want LLM Council to use the best working mix it can find. |
-| `tri-cli` | You have Claude Code, Codex CLI, Gemini CLI, and Antigravity CLI installed. |
+| `tri-cli` | You have Claude Code, Codex CLI, and Antigravity CLI (or Gemini CLI) installed. Selects exactly 3 active peers. |
 | `openrouter` | You want hosted peers through one OpenRouter key. |
 | `tri-cli-openrouter` | You want native CLIs plus hosted fallback or variety. |
 | `local-private` | You want local Ollama peers only. |
@@ -148,18 +154,25 @@ If setup cannot find enough working peers, add another native CLI, configure Ope
 
 LLM Council can ask three kinds of peers.
 
-Native CLI peers use the tools you may already have installed:
+### Native CLI Peers
+Use the tools you may already have installed locally:
+- **Claude Code** (`claude`)
+- **Codex CLI** (`codex`)
+- **Antigravity CLI** (`agy`) — A fast terminal wrapper for Google's agentic platform (see [antigravity-cli](https://github.com/google-antigravity/antigravity-cli) and [antigravity-sdk-python](https://github.com/google-antigravity/antigravity-sdk-python)).
+- **Gemini CLI** (`gemini`)
 
-- Claude Code
-- Codex CLI
-- Gemini CLI
-- Antigravity CLI
+#### Dynamic Triad & Family Exclusions
+* **Dynamic Triad**: The `tri-cli` preset resolves to a 3-member native council (Claude, Codex, and either Antigravity or Gemini). If both Antigravity and Gemini CLIs are installed on your path, LLM Council dynamically chooses **Antigravity CLI** as the active triad peer.
+* **Claude Model Support in Antigravity**: Does Antigravity itself support Claude models? **Yes!** Google Antigravity supports native execution of Anthropic's Claude models (such as Claude Sonnet and Claude Opus) in its model selector.
+* **Family Exclusions**: If you run LLM Council *from* Antigravity CLI (or Gemini CLI) as your primary driver, the council detects this. To ensure diverse opinions and avoid redundant model-family votes, the council automatically excludes other Gemini-family peers (e.g., Gemini CLI) and recruits independent peers (Claude Code and Codex CLI) instead.
 
-Hosted peers go through OpenRouter.
+### Hosted Peers
+Go through **OpenRouter**.
 
-Local peers go through Ollama.
+### Local Peers
+Go through **Ollama**.
 
-That lets you choose the shape of the review. You can keep everything local, use accounts you already pay for, or add hosted models when you want a broader spread.
+This lets you choose the shape of the review: keep everything local, use accounts you already pay for, or add hosted models for a broader spread.
 
 ## Read-only means read-only
 
