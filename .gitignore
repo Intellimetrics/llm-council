@@ -26,8 +26,9 @@ htmlcov/
 *.log
 *.tmp
 
-# Per-CLI runtime artifacts (created by Gemini CLI in cwd)
+# Per-CLI runtime artifacts (created by Gemini CLI and Antigravity in cwd)
 .gemini/
+.antigravitycli/
 GEMINI.md
 
 # Local strategy / planning notes — kept in the working tree but not shipped.

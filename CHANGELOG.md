@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.1 - 2026-05-20
+
+v0.11.1 refines participant logic to dynamically select exactly 3 CLI peers for the quick-select triad (`tri-cli`).
+*   Configured the `other_cli_peers` strategy to dynamically choose between `antigravity` and `gemini` based on PATH, resolving to `antigravity` if both are installed.
+*   Updated setup verification, auto-preset routing, and next-steps logic to treat `antigravity` and `gemini` as a single slot in the triad.
+*   Added friendly warning/recommendation in diagnostics (`doctor`) and setup to prompt users to upgrade to `antigravity` if only `gemini` is installed.
+
 ## 0.11.0 - 2026-05-20
 
 v0.11.0 integrates the Antigravity CLI (`agy`) as a native participant and primary driver.

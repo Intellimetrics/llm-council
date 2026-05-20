@@ -800,6 +800,12 @@ def config_warnings(config: dict[str, Any]) -> list[str]:
             f"so this typo silently breaks US-only filtering. "
             f"Did you mean {suggestion!r}?"
         )
+    import shutil
+    if shutil.which("gemini") and not shutil.which("agy"):
+        warnings.append(
+            "Gemini CLI is installed but Antigravity CLI is replacing it. "
+            "Please install/upgrade to Antigravity CLI (agy) for the best experience."
+        )
     return warnings
 
 
@@ -833,16 +839,20 @@ def select_participants(
         if "participants" in mode_cfg:
             selected = list(mode_cfg["participants"])
         elif mode_cfg.get("strategy") == "other_cli_peers":
+            import shutil
+            neutral_peer = "antigravity" if (shutil.which("agy") or not shutil.which("gemini")) else "gemini"
+            triad = ["claude", "codex", neutral_peer]
+
             if mode_cfg.get("include_current", False):
-                selected = list(BASELINE_CLIS)
+                selected = list(triad)
             else:
                 exclusions = {current} if current else set()
                 if "gemini" in exclusions or "antigravity" in exclusions:
                     exclusions.add("gemini")
                     exclusions.add("antigravity")
-                selected = [name for name in BASELINE_CLIS if name not in exclusions]
+                selected = [name for name in triad if name not in exclusions]
                 if not current:
-                    selected = list(BASELINE_CLIS)
+                    selected = list(triad)
             selected.extend(mode_cfg.get("add", []))
         elif mode_cfg.get("strategy") == "local_only_peers":
             selected = [

@@ -50,13 +50,8 @@ def test_review_with_tools_timeout_multiplier_is_1_8():
     )
 
 
-def test_review_with_tools_routes_to_cli_peers_only():
-    """Default participant list (via select_participants) is CLI-only.
-
-    `other_cli_peers` + `include_current: True` resolves to the three
-    BASELINE_CLIS (claude, codex, gemini). No `add` field on the mode
-    means no hosted peers join by default.
-    """
+def test_review_with_tools_routes_to_cli_peers_only(monkeypatch):
+    """Default participant list (via select_participants) is CLI-only."""
     config = {
         "participants": {
             "claude": {"type": "cli", "family": "claude"},
@@ -68,15 +63,25 @@ def test_review_with_tools_routes_to_cli_peers_only():
         "modes": DEFAULT_CONFIG["modes"],
         "defaults": {},
     }
+    # Case A: agy only
+    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "agy" else None)
+    selected = select_participants(config, mode="review-with-tools", current="claude")
+    assert "claude" in selected
+    assert "codex" in selected
+    assert "antigravity" in selected
+    assert "gemini" not in selected
+    assert "qwen_coder_plus" not in selected
+    assert set(selected) == {"claude", "codex", "antigravity"}
+
+    # Case B: gemini only
+    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "gemini" else None)
     selected = select_participants(config, mode="review-with-tools", current="claude")
     assert "claude" in selected
     assert "codex" in selected
     assert "gemini" in selected
-    assert "antigravity" in selected
-    # No hosted peers in the default roster — the mode is CLI-only.
+    assert "antigravity" not in selected
     assert "qwen_coder_plus" not in selected
-    # Sanity: only the CLI peers.
-    assert set(selected) == {"claude", "codex", "gemini", "antigravity"}
+    assert set(selected) == {"claude", "codex", "gemini"}
 
 
 def test_review_with_tools_does_not_add_hosted_peers():

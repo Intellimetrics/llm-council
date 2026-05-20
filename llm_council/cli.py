@@ -1115,27 +1115,39 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 
 def _auto_setup_preset() -> str:
-    native_names = ("claude", "codex", "gemini", "antigravity")
-    native_count = sum(1 for name in native_names if shutil.which("agy" if name == "antigravity" else name))
-    if native_count >= 2:
+    has_claude = bool(shutil.which("claude"))
+    has_codex = bool(shutil.which("codex"))
+    has_neutral = bool(shutil.which("agy") or shutil.which("gemini"))
+    native_role_count = sum([has_claude, has_codex, has_neutral])
+    if native_role_count >= 2:
         return "tri-cli"
     if os.environ.get("OPENROUTER_API_KEY"):
         return "openrouter"
-    found = ", ".join(name for name in native_names if shutil.which("agy" if name == "antigravity" else name)) or "none"
+    
+    found_list = []
+    if has_claude: found_list.append("claude")
+    if has_codex: found_list.append("codex")
+    if shutil.which("agy"): found_list.append("antigravity")
+    elif shutil.which("gemini"): found_list.append("gemini")
+    found = ", ".join(found_list) or "none"
+    
     raise SystemExit(
         "Auto setup could not find a usable default council route. "
         f"Found native CLIs: {found}. "
-        "Install at least two of claude/codex/gemini/antigravity, or set OPENROUTER_API_KEY "
-        "in your shell, .env, .env.local, or .llm-council.env and rerun setup. "
-        "Advanced users who intentionally want to stage an incomplete config "
-        "can choose an explicit preset with --allow-incomplete."
+        "Install at least two of claude, codex, and antigravity (or gemini), or set "
+        "OPENROUTER_API_KEY in your shell, .env, .env.local, or .llm-council.env "
+        "and rerun setup. Advanced users who intentionally want to stage an "
+        "incomplete config can choose an explicit preset with --allow-incomplete."
     )
 
 
 def _detect_setup_routes() -> dict[str, object]:
     native_names = ("claude", "codex", "gemini", "antigravity")
     native_paths = {name: shutil.which("agy" if name == "antigravity" else name) for name in native_names}
-    native_count = sum(1 for path in native_paths.values() if path)
+    has_claude = bool(native_paths.get("claude"))
+    has_codex = bool(native_paths.get("codex"))
+    has_neutral = bool(native_paths.get("antigravity") or native_paths.get("gemini"))
+    native_count = sum([has_claude, has_codex, has_neutral])
     has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
     ollama_path = shutil.which("ollama")
     return {
@@ -1166,7 +1178,7 @@ def _preset_status(preset: str, routes: dict[str, object]) -> tuple[str, str]:
     if preset == "tri-cli":
         if native_count >= 2:
             return "available", "uses installed Claude/Codex/Gemini/Antigravity CLI accounts"
-        return "blocked", "needs at least two of claude/codex/gemini/antigravity"
+        return "blocked", "needs at least two of claude, codex, and antigravity (or gemini)"
     if preset == "openrouter":
         if has_openrouter:
             return "available", "uses hosted OpenRouter reviewers"
@@ -1328,10 +1340,15 @@ def _print_setup_next_steps(
 
     warnings: list[str] = []
     if include_native:
-        for name in ("claude", "codex", "gemini", "antigravity"):
-            cmd = "agy" if name == "antigravity" else name
-            if shutil.which(cmd) is None:
+        for name in ("claude", "codex"):
+            if shutil.which(name) is None:
                 warnings.append(f"{name} was not found on PATH; native CLI modes need it.")
+        has_agy = bool(shutil.which("agy"))
+        has_gemini = bool(shutil.which("gemini"))
+        if not has_agy and not has_gemini:
+            warnings.append("antigravity was not found on PATH; native CLI modes need it.")
+        elif has_gemini and not has_agy:
+            warnings.append("antigravity was not found on PATH (found gemini). We recommend installing/upgrading to antigravity.")
     if include_openrouter and not os.environ.get("OPENROUTER_API_KEY"):
         warnings.append(
             "OPENROUTER_API_KEY is not exported; hosted OpenRouter modes need it."
