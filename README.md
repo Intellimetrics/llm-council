@@ -6,7 +6,7 @@
 [![Read-only](https://img.shields.io/badge/default-read--only-6b7280)](#read-only-means-read-only)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/Intellimetrics/llm-council?style=flat&color=yellow)](https://github.com/Intellimetrics/llm-council/stargazers)
-[![Version](https://img.shields.io/badge/version-0.10.2-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.11.0-111827)](CHANGELOG.md)
 
 Your coding agent is confident.
 
@@ -14,11 +14,11 @@ That is useful right up until it confidently ships a bad migration, hides the re
 
 **LLM Council** gives that agent a way to ask other models for read-only second opinions before it does something expensive.
 
-It is a Python 3.11+ MCP server and CLI. It works with the tools developers already use: Claude Code, Codex CLI, Gemini CLI, hosted models through OpenRouter, and local models through Ollama.
+It is a Python 3.11+ MCP server and CLI. It works with the tools developers already use: Claude Code, Codex CLI, Gemini CLI, Antigravity CLI, hosted models through OpenRouter, and local models through Ollama.
 
 The console command is `llm-council`. The MCP server name is also `llm-council`.
 
-MIT licensed. Current version: `0.10.2`.
+MIT licensed. Current version: `0.11.0`.
 
 GitHub: <https://github.com/Intellimetrics/llm-council>
 
@@ -128,7 +128,7 @@ Then choose one preset:
 | Preset | Use it when |
 |---|---|
 | `auto` | You want LLM Council to use the best working mix it can find. |
-| `tri-cli` | You have Claude Code, Codex CLI, and Gemini CLI installed. |
+| `tri-cli` | You have Claude Code, Codex CLI, Gemini CLI, and Antigravity CLI installed. |
 | `openrouter` | You want hosted peers through one OpenRouter key. |
 | `tri-cli-openrouter` | You want native CLIs plus hosted fallback or variety. |
 | `local-private` | You want local Ollama peers only. |
@@ -153,6 +153,7 @@ Native CLI peers use the tools you may already have installed:
 - Claude Code
 - Codex CLI
 - Gemini CLI
+- Antigravity CLI
 
 Hosted peers go through OpenRouter.
 
@@ -219,7 +220,7 @@ If the peers still disagree at the end, the transcript says that clearly. No fak
 
 LLM Council may call native CLIs, hosted models, or local models depending on your setup.
 
-Native CLI peers use your installed Claude Code, Codex CLI, or Gemini CLI accounts. Their billing and rate limits belong to those tools.
+Native CLI peers use your installed Claude Code, Codex CLI, Gemini CLI, or Antigravity CLI accounts. Their billing and rate limits belong to those tools.
 
 OpenRouter peers are hosted API calls and may cost money by token.
 
@@ -275,7 +276,7 @@ The important one is `council_run`. Your agent sends the prompt, mode, and optio
 
 The easiest way to install LLM Council into a project is to ask your coding agent to do it.
 
-Paste this into Claude Code, Codex CLI, or Gemini CLI from the project root:
+Paste this into Claude Code, Codex CLI, Gemini CLI, or Antigravity CLI from the project root:
 
 ```text
 Install LLM Council into this project from
@@ -299,6 +300,7 @@ Use the stable install path:
    - Claude Code: `.llm-council/instructions/claude.md` -> `CLAUDE.md`
    - Codex CLI: `.llm-council/instructions/codex.md` -> `AGENTS.md`
    - Gemini CLI: `.llm-council/instructions/gemini.md` -> `GEMINI.md`
+   - Antigravity CLI: `.llm-council/instructions/antigravity.md` -> `GEMINI.md`
 9. Confirm the destination file now contains the LLM Council routing rules.
 10. Run `llm-council doctor` and show me the result.
 11. Tell me to restart this CLI session so MCP and project instructions reload.

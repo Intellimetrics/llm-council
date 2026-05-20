@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.0 - 2026-05-20
+
+v0.11.0 integrates the Antigravity CLI (`agy`) as a native participant and primary driver.
+*   Added `antigravity` to baseline CLIs and registered default participant configs.
+*   Updated `detect_current_agent` process detection and environment variable parsing.
+*   Implemented model-family selection exclusion rules (excluding `gemini` if driver is `antigravity`, and vice versa).
+*   Updated the setup wizard, diagnostics (`doctor`), and README guidelines.
+
 ## 0.10.2 - 2026-05-18
 
 v0.10.2 fixes three envelope-parser bugs surfaced when the council
