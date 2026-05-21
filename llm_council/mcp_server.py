@@ -906,6 +906,8 @@ async def run_council(
                 continue
             base[peer] = stance.lower()
         mode_stances = base
+    from llm_council.config import balance_stances
+    mode_stances = balance_stances(participants, mode_stances)
     default_max = (
         config.get("defaults", {}).get("max_prompt_chars") or MAX_PROMPT_CHARS
     )

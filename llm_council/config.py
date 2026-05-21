@@ -840,7 +840,15 @@ def select_participants(
             selected = list(mode_cfg["participants"])
         elif mode_cfg.get("strategy") == "other_cli_peers":
             import shutil
-            neutral_peer = "antigravity" if (shutil.which("agy") or not shutil.which("gemini")) else "gemini"
+            has_agy = bool(shutil.which("agy"))
+            has_gemini = bool(shutil.which("gemini"))
+            if not has_agy and not has_gemini:
+                raise ValueError(
+                    "Neither Antigravity CLI (agy) nor Gemini CLI (gemini) "
+                    "was found on your PATH. The quick triad mode requires "
+                    "at least one Gemini-family CLI. Please install Antigravity CLI."
+                )
+            neutral_peer = "antigravity" if (has_agy or not has_gemini) else "gemini"
             triad = ["claude", "codex", neutral_peer]
 
             if mode_cfg.get("include_current", False):
@@ -933,3 +941,52 @@ def select_participants(
                 participant_entry["model"] = model_id
 
     return deduped
+
+
+def balance_stances(active_participants: list[str], mode_stances: dict[str, str] | None) -> dict[str, str] | None:
+    """Dynamically balance assigned stances when a stance role is missing.
+
+    If mode_stances contains stance assignments, we filter them to the active
+    participants and ensure that the 'for', 'against', and 'neutral' stances
+    are assigned as evenly as possible (e.g. exactly 1 of each if N=3, or 1 'for'
+    and 1 'against' if N=2). Original stance preferences are preserved where
+    possible.
+    """
+    if mode_stances is None:
+        return None
+
+    if not active_participants:
+        return {}
+
+    n = len(active_participants)
+
+    # Target counts:
+    target_counts = {
+        "for": n // 3 + (1 if n % 3 >= 1 else 0),
+        "against": n // 3 + (1 if n % 3 >= 2 else 0),
+        "neutral": n // 3
+    }
+
+    assigned: dict[str, str] = {}
+    remaining_targets = dict(target_counts)
+
+    # First pass: assign to those whose original stance is still available under remaining_targets.
+    unassigned = []
+    for p in active_participants:
+        orig = mode_stances.get(p, "neutral")
+        if remaining_targets.get(orig, 0) > 0:
+            assigned[p] = orig
+            remaining_targets[orig] -= 1
+        else:
+            unassigned.append(p)
+
+    # Second pass: assign the unassigned participants to whatever target stances are still remaining.
+    for p in unassigned:
+        for stance, count in remaining_targets.items():
+            if count > 0:
+                assigned[p] = stance
+                remaining_targets[stance] -= 1
+                break
+
+    return assigned
+

@@ -110,6 +110,12 @@ def test_builtin_quick_selects_full_native_triad(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "gemini" else None)
     assert select_participants(config, "quick", "codex") == ["claude", "codex", "gemini"]
 
+    # Case C: neither installed -> raises ValueError
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    import pytest
+    with pytest.raises(ValueError, match="Neither Antigravity CLI.*nor Gemini CLI"):
+        select_participants(config, "quick", "codex")
+
 
 def test_peer_only_excludes_current(monkeypatch):
     config = load_config(None)
@@ -1308,6 +1314,58 @@ def test_consensus_mode_rejects_non_dict_stances(tmp_path: Path):
     )
     with pytest.raises(ValueError, match="stances must be a mapping"):
         load_config(path)
+
+
+def test_balance_stances_various_scenarios():
+    from llm_council.config import balance_stances
+
+    # Scenario 1: None inputs
+    assert balance_stances(["claude"], None) is None
+
+    # Scenario 2: Empty active participants
+    assert balance_stances([], {"claude": "for"}) == {}
+
+    # Scenario 3: Original mode stances doesn't have active participants
+    assert balance_stances(["claude"], {"codex": "against"}) == {"claude": "for"}
+
+    # Scenario 4: N=3 (claude, codex, antigravity), stances has all 3
+    # Target: 1 for, 1 against, 1 neutral
+    stances = {
+        "claude": "for",
+        "codex": "against",
+        "antigravity": "neutral"
+    }
+    assert balance_stances(["claude", "codex", "antigravity"], stances) == {
+        "claude": "for",
+        "codex": "against",
+        "antigravity": "neutral"
+    }
+
+    # Scenario 5: N=2 (claude, codex), when one is excluded
+    # Target: 1 for, 1 against, 0 neutral
+    # claude is for, codex is against (both preserved)
+    assert balance_stances(["claude", "codex"], stances) == {
+        "claude": "for",
+        "codex": "against"
+    }
+
+    # Scenario 6: N=2 (claude, antigravity), when codex is excluded
+    # Target: 1 for, 1 against, 0 neutral
+    # claude is for, antigravity is neutral -> neutral is not allowed, so antigravity becomes against
+    res = balance_stances(["claude", "antigravity"], stances)
+    assert res == {
+        "claude": "for",
+        "antigravity": "against"
+    }
+
+    # Scenario 7: N=2 (codex, antigravity), when claude is excluded
+    # Target: 1 for, 1 against, 0 neutral
+    # codex is against, antigravity is neutral -> neutral is not allowed, so antigravity becomes for
+    res2 = balance_stances(["codex", "antigravity"], stances)
+    assert res2 == {
+        "codex": "against",
+        "antigravity": "for"
+    }
 
 
 def test_participant_stance_field_validates(tmp_path: Path):
@@ -10639,9 +10697,9 @@ def test_cli_stance_flag_overrides_mode_stance(monkeypatch, tmp_path: Path):
     )
     rc = cli_module.cmd_run(args)
     assert rc == 0
-    # Mode stance for codex preserved; CLI override for claude wins.
+    # Mode stance for codex is balanced; CLI override for claude wins.
     assert captured["build_prompt_stances"]["claude"] == "for"
-    assert captured["build_prompt_stances"]["codex"] == "neutral"
+    assert captured["build_prompt_stances"]["codex"] == "against"
     assert captured["execute_stances"]["claude"] == "for"
 
 

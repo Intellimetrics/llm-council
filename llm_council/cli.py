@@ -2456,6 +2456,8 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             base = dict(mode_stances) if isinstance(mode_stances, dict) else {}
             base.update(cli_stance_overrides)
             mode_stances = base
+        from llm_council.config import balance_stances
+        mode_stances = balance_stances(participants, mode_stances)
         default_max = (
             config.get("defaults", {}).get("max_prompt_chars") or MAX_PROMPT_CHARS
         )

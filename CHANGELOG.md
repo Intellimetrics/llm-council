@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.3 - 2026-05-21
+
+v0.11.3 introduces dynamic stance balancing and robust diagnostics for missing tools.
+*   Implemented dynamic stance balancing in consensus mode so that debate roles (for, against, neutral) remain evenly distributed when participants are filtered or excluded.
+*   Added unit test suite verifying stance balancing across multiple participant count scenarios (N=2, N=3, etc.).
+*   Added a clean startup error when neither `antigravity` nor `gemini` CLI is present on PATH when running quick triad modes.
+
 ## 0.11.2 - 2026-05-20
 
 v0.11.2 rewrites the README.md to feature Google Antigravity CLI and SDK as first-class citizens.
