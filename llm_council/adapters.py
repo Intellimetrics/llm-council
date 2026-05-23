@@ -616,31 +616,45 @@ def _format_arg(value: str, *, prompt: str, cwd: Path) -> str:
     return value.replace("{prompt}", prompt).replace("{cwd}", str(cwd))
 
 
+QUOTA_FALLBACK_MAX_STEPS = 3
+
+
 def _pick_quota_fallback_model(cfg: dict[str, Any]) -> str | None:
-    """Return the next-in-chain model to try after a quota error.
+    """Return the FIRST next-in-chain model to try after a quota error.
+
+    Single-step helper kept for back-compat with callers / tests that
+    want just the first candidate. The multi-step walker
+    (:func:`_quota_fallback_walk`) is the new primary path used by
+    :func:`run_cli_participant`.
+    """
+    walk = _quota_fallback_walk(cfg)
+    return walk[0] if walk else None
+
+
+def _quota_fallback_walk(cfg: dict[str, Any]) -> list[str]:
+    """Return the ordered list of models to attempt on quota errors.
 
     Resolution:
-    * `cfg.model` is in `cfg.fallback_chain` → return the entry AFTER it
-      (or None if it's already the last in the chain).
-    * `cfg.model` is None or not in the chain → return `chain[0]`.
-    * Empty chain → None.
+    * `cfg.model` is in `cfg.fallback_chain` → walk the entries AFTER it.
+    * `cfg.model` is None or not in the chain → walk from `chain[0]`.
+    * Empty chain → `[]`.
 
-    For Phase 2 the adapter performs at most ONE quota-fallback retry per
-    call, so we never walk past chain[0] on a single quota error. A
-    multi-step walk would be cost-unbounded; the chain's later entries
-    are reachable only across separate council runs as the operator
-    overrides `cfg.model` to the previous fallback target.
+    Capped at ``QUOTA_FALLBACK_MAX_STEPS`` to bound wall-clock cost when
+    multiple chain entries are all throttled. v0.12.1+ multi-step
+    walking replaces v0.11.6's "one extra call per quota incident"
+    rule: the adapter now retries up to MAX_STEPS times within a single
+    call, stopping at the first success OR the first non-quota failure
+    OR the chain's end OR the cap.
     """
     chain = cfg.get("fallback_chain") or []
     if not chain:
-        return None
+        return []
     current = cfg.get("model")
     if current and current in chain:
-        idx = chain.index(current)
-        if idx + 1 < len(chain):
-            return chain[idx + 1]
-        return None
-    return chain[0]
+        idx = chain.index(current) + 1
+    else:
+        idx = 0
+    return chain[idx : idx + QUOTA_FALLBACK_MAX_STEPS]
 
 
 def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -> list[str]:
@@ -757,50 +771,63 @@ async def run_cli_participant(
             result = _annotate_timeout_retry_failure(
                 result, terse_result, name, budget=retry_budget
             )
-    # Quota-fallback retry. Fires when a CLI peer exits with a known
-    # quota / rate-limit signal AND `cfg.fallback_chain` has a
-    # candidate model. Skipped for the Claude family because the
-    # CLI's own `--fallback-model` flag (wired in `_build_cli_command`)
-    # already handles overload internally — adding our own retry on
-    # top would double-pay the peer. Mutually exclusive with terse-
-    # retry by precondition (quota_exhausted error vs. timeout), so
-    # the "one extra call per peer per round" wall-clock ceiling
-    # stays bounded.
+    # Quota-fallback walk (v0.12.1+ multi-step). Fires when a CLI peer
+    # exits with a known quota / rate-limit signal AND
+    # `cfg.fallback_chain` has candidate models. Skipped for the Claude
+    # family because the CLI's own `--fallback-model` flag (wired in
+    # `_build_cli_command`) already handles overload internally.
+    # Walks the chain up to ``QUOTA_FALLBACK_MAX_STEPS`` entries,
+    # stopping at the first success OR the first non-quota failure OR
+    # chain exhaustion. The walk replaces v0.11.6's single-step retry
+    # so a fallback chain of [pro, mini, nano] can step through all
+    # three within one council call when each in turn is throttled.
+    # ALL exit paths return early — downstream branches (launch-retry,
+    # label-repair, section-repair, strict-evidence) MUST NOT fire
+    # after a quota walk, or they'd re-attack the original (throttled)
+    # model and violate the wall-clock cost ceiling.
     if (
         not result.ok
         and is_quota_exhausted_error(result.error)
         and cfg.get("family") != "claude"
     ):
-        fallback_model = _pick_quota_fallback_model(cfg)
-        if fallback_model:
-            fallback_cfg = dict(cfg)
-            fallback_cfg["model"] = fallback_model
-            fallback_result, _fallback_meta = await _run_cli_once(
-                name, fallback_cfg, prompt, cwd, start=start,
-                mode_multiplier=mode_multiplier, mode=mode,
-            )
+        walk_models = _quota_fallback_walk(cfg)
+        if walk_models:
             from dataclasses import replace as _replace
-            if fallback_result.ok:
-                merged = _replace(
-                    fallback_result,
-                    model_fallback_used=fallback_model,
-                    recovered_after_quota=True,
+            last_attempt_model: str | None = None
+            last_attempt_result: ParticipantResult | None = None
+            for fallback_model in walk_models:
+                fallback_cfg = dict(cfg)
+                fallback_cfg["model"] = fallback_model
+                fallback_result, _fallback_meta = await _run_cli_once(
+                    name, fallback_cfg, prompt, cwd, start=start,
+                    mode_multiplier=mode_multiplier, mode=mode,
                 )
-                _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
-                return merged
-            # Retry also failed. Stamp `model_fallback_used` and RETURN
-            # EARLY — the quota retry IS the "one extra call per peer
-            # per round" budget; downstream branches (launch-retry,
-            # label-repair, section-repair, strict-evidence) would
-            # otherwise fire AGAIN with the ORIGINAL `cfg` (pointing
-            # at the overloaded model), violating the cost ceiling
-            # AND silently re-routing traffic to the throttled model.
-            # `recovered_after_quota` stays False so the result still
-            # drops from quorum if the retry's error keeps the
-            # quota_exhausted classification.
+                last_attempt_model = fallback_model
+                last_attempt_result = fallback_result
+                if fallback_result.ok:
+                    merged = _replace(
+                        fallback_result,
+                        model_fallback_used=fallback_model,
+                        recovered_after_quota=True,
+                    )
+                    _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
+                    return merged
+                # Stop walking on a non-quota failure. The fallback model
+                # didn't hit a quota wall — it failed for some other
+                # reason (timeout, missing label, downstream error).
+                # Continuing the walk would spam more models with the
+                # same prompt; the operator should see what went wrong.
+                if not is_quota_exhausted_error(fallback_result.error):
+                    break
+            # Chain exhausted (or walk stopped early on non-quota
+            # failure). Stamp `model_fallback_used` with the LAST model
+            # attempted so the transcript shows where we stopped, and
+            # return the last attempt's result. `recovered_after_quota`
+            # stays False — the call did not recover.
+            assert last_attempt_result is not None  # walk_models was non-empty
             failed = _replace(
-                fallback_result,
-                model_fallback_used=fallback_model,
+                last_attempt_result,
+                model_fallback_used=last_attempt_model,
             )
             return failed
     if _should_launch_retry(meta, cfg):

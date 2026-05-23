@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.12.1 - 2026-05-23
+
+v0.12.1 reshapes fallback chains for capability-graceful step-down and adds multi-step walking.
+*   **Better default fallback chains** for built-in CLI peers:
+    *   `claude`: `["claude-opus-4-6", "claude-sonnet-4-6"]` (was `["claude-sonnet-4-6"]`) — same-tier one-version-back before dropping to sonnet.
+    *   `claude_4_7`: same shape (`opus-4-6` first, then `sonnet-4-6`).
+    *   `claude_4_6`: `["claude-sonnet-4-6", "claude-haiku-4-5"]` — sonnet (next tier) then haiku.
+    *   `codex`: `["gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"]` (was `["gpt-5-mini"]`) — minor version back, codex-tuned variant, then small final.
+    *   `gemini`: `["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"]` (was `["gemini-2.5-flash"]`) — pro is more capable than flash within Google's tiering, so a flash→pro fallback is often an *upgrade* that also sidesteps the throttled flash quota.
+    *   `antigravity`: still `[]` (no `--model` flag; confirmed via binary probe — agy stores model selection in `~/.gemini/antigravity/antigravity_state.pbtxt` as opaque `MODEL_PLACEHOLDER_M<N>` enums with no external override mechanism).
+*   **Multi-step walking** (`_quota_fallback_walk` + `QUOTA_FALLBACK_MAX_STEPS=3`). On quota error the adapter now walks the chain up to MAX_STEPS entries instead of stopping after one retry — a chain of `[pro, mini, nano]` can step through all three within a single council call. Walker stops at: first success, first non-quota failure (continuing would spam more models with an unrelated problem), or chain exhaustion. Claude family still uses CLI-native `--fallback-model` and is excluded from the walker.
+*   On walker failure, `model_fallback_used` is stamped with the LAST attempted model so the transcript shows where the walk stopped. `recovered_after_quota` stays False.
+*   `_pick_quota_fallback_model` kept as a back-compat helper that returns walk[0]; primary path uses the walker.
+
 ## 0.12.0 - 2026-05-23
 
 v0.12.0 lands four timeout-resilience improvements surfaced by the v0.11.7 dogfood (claude timed out at 240s on a 4KB prompt; codex timed out at 240s on a 26KB prompt; the 60s terse-retry on a 240s timeout was structurally doomed).

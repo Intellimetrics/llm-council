@@ -10168,6 +10168,168 @@ def test_quota_fallback_retry_also_fails_keeps_quota_classification(
     assert classify_error(result.error) == ERROR_KIND_QUOTA_EXHAUSTED
 
 
+def test_quota_fallback_walk_helper():
+    """`_quota_fallback_walk` returns the ordered list of chain entries
+    to try, sliced by current model position and capped at MAX_STEPS."""
+    from llm_council.adapters import (
+        QUOTA_FALLBACK_MAX_STEPS,
+        _quota_fallback_walk,
+    )
+
+    chain = ["a", "b", "c", "d", "e"]
+    # cfg.model=None → walk from chain[0], capped at MAX_STEPS.
+    assert _quota_fallback_walk({"model": None, "fallback_chain": chain}) == chain[:QUOTA_FALLBACK_MAX_STEPS]
+    # cfg.model in chain → walk after it.
+    assert _quota_fallback_walk({"model": "b", "fallback_chain": chain}) == ["c", "d", "e"][:QUOTA_FALLBACK_MAX_STEPS]
+    # cfg.model is the LAST entry → empty walk.
+    assert _quota_fallback_walk({"model": "e", "fallback_chain": chain}) == []
+    # cfg.model not in chain → start from chain[0].
+    assert _quota_fallback_walk({"model": "z", "fallback_chain": chain}) == chain[:QUOTA_FALLBACK_MAX_STEPS]
+    # Empty chain → empty walk.
+    assert _quota_fallback_walk({"model": None, "fallback_chain": []}) == []
+
+
+def test_quota_fallback_walks_to_next_chain_entry_on_recovery(
+    monkeypatch, tmp_path: Path
+):
+    """v0.12.1 multi-step: chain[0] also fails quota, chain[1] succeeds —
+    the walker keeps stepping rather than giving up after one retry."""
+    import llm_council.adapters as adapters_module
+
+    cfgs_seen: list[dict[str, Any]] = []
+
+    async def fake_run_cli_once(name, cfg, prompt, cwd, *, start, mode_multiplier, mode):
+        cfgs_seen.append(dict(cfg))
+        # First two calls (initial + chain[0]) hit quota; chain[1] succeeds.
+        if len(cfgs_seen) <= 2:
+            return (
+                ParticipantResult(
+                    name, False, "", "Error: rate_limit_exceeded", 1.0,
+                    model=cfg.get("model"),
+                ),
+                {"nonzero_exit": True, "stderr": "rate_limit_exceeded", "exited": True},
+            )
+        return (
+            ParticipantResult(
+                name, True, "RECOMMENDATION: yes - ok", "", 0.5,
+                model=cfg.get("model"),
+            ),
+            {"nonzero_exit": False, "stderr": "", "exited": True},
+        )
+
+    monkeypatch.setattr(adapters_module, "_run_cli_once", fake_run_cli_once)
+
+    cfg = {
+        "type": "cli",
+        "family": "codex",
+        "command": "codex",
+        "args": ["exec"],
+        "model": None,
+        "fallback_chain": ["gpt-5-mid", "gpt-5-small"],
+    }
+    result = asyncio.run(
+        adapters_module.run_cli_participant("codex", cfg, "prompt", tmp_path)
+    )
+    # 1 initial + 2 walk steps = 3 total calls.
+    assert len(cfgs_seen) == 3
+    assert cfgs_seen[1]["model"] == "gpt-5-mid"
+    assert cfgs_seen[2]["model"] == "gpt-5-small"
+    assert result.ok is True
+    assert result.recovered_after_quota is True
+    assert result.model_fallback_used == "gpt-5-small"
+
+
+def test_quota_fallback_walk_stops_on_non_quota_failure(
+    monkeypatch, tmp_path: Path
+):
+    """If chain[0] returns a non-quota error (e.g. missing label), the
+    walker stops — continuing would spam more models with the same
+    prompt for a problem unrelated to quota."""
+    import llm_council.adapters as adapters_module
+
+    cfgs_seen: list[dict[str, Any]] = []
+
+    async def fake_run_cli_once(name, cfg, prompt, cwd, *, start, mode_multiplier, mode):
+        cfgs_seen.append(dict(cfg))
+        if len(cfgs_seen) == 1:
+            # Initial: quota.
+            return (
+                ParticipantResult(
+                    name, False, "", "Error: rate_limit_exceeded", 1.0,
+                    model=cfg.get("model"),
+                ),
+                {"nonzero_exit": True, "stderr": "rate_limit_exceeded", "exited": True},
+            )
+        # chain[0]: NON-quota failure (label-missing). Walk must stop.
+        return (
+            ParticipantResult(
+                name, False, "no label here",
+                "InvalidParticipantResponse: missing required RECOMMENDATION label",
+                0.5,
+                model=cfg.get("model"),
+            ),
+            {"nonzero_exit": False, "stderr": "", "exited": True},
+        )
+
+    monkeypatch.setattr(adapters_module, "_run_cli_once", fake_run_cli_once)
+
+    cfg = {
+        "type": "cli",
+        "family": "codex",
+        "command": "codex",
+        "args": ["exec"],
+        "model": None,
+        "fallback_chain": ["gpt-5-mid", "gpt-5-small", "gpt-5-tiny"],
+    }
+    result = asyncio.run(
+        adapters_module.run_cli_participant("codex", cfg, "prompt", tmp_path)
+    )
+    # Walk stops after chain[0] returns non-quota — chain[1] and [2] NOT tried.
+    assert len(cfgs_seen) == 2
+    assert cfgs_seen[1]["model"] == "gpt-5-mid"
+    assert result.ok is False
+    assert result.model_fallback_used == "gpt-5-mid"
+    assert "InvalidParticipantResponse" in result.error
+
+
+def test_quota_fallback_walk_caps_at_max_steps(monkeypatch, tmp_path: Path):
+    """A chain longer than QUOTA_FALLBACK_MAX_STEPS is walked only that
+    many entries — bounded wall-clock cost when many entries are
+    throttled."""
+    import llm_council.adapters as adapters_module
+    from llm_council.adapters import QUOTA_FALLBACK_MAX_STEPS
+
+    cfgs_seen: list[dict[str, Any]] = []
+
+    async def fake_run_cli_once(name, cfg, prompt, cwd, *, start, mode_multiplier, mode):
+        cfgs_seen.append(dict(cfg))
+        return (
+            ParticipantResult(
+                name, False, "", "Error: rate_limit_exceeded", 1.0,
+                model=cfg.get("model"),
+            ),
+            {"nonzero_exit": True, "stderr": "rate_limit_exceeded", "exited": True},
+        )
+
+    monkeypatch.setattr(adapters_module, "_run_cli_once", fake_run_cli_once)
+
+    long_chain = [f"step-{i}" for i in range(QUOTA_FALLBACK_MAX_STEPS + 5)]
+    cfg = {
+        "type": "cli",
+        "family": "codex",
+        "command": "codex",
+        "args": ["exec"],
+        "model": None,
+        "fallback_chain": long_chain,
+    }
+    result = asyncio.run(
+        adapters_module.run_cli_participant("codex", cfg, "prompt", tmp_path)
+    )
+    # Initial call + MAX_STEPS walk attempts = MAX_STEPS + 1 total.
+    assert len(cfgs_seen) == QUOTA_FALLBACK_MAX_STEPS + 1
+    assert result.model_fallback_used == long_chain[QUOTA_FALLBACK_MAX_STEPS - 1]
+
+
 def test_quota_fallback_failed_retry_does_not_chain_label_repair(
     monkeypatch, tmp_path: Path
 ):

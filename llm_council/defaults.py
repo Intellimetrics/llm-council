@@ -145,12 +145,16 @@ DEFAULT_CONFIG: dict = {
             "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["ANTHROPIC_API_KEY"],
-            # Quota / overload fallback chain. For Claude family this is
-            # consumed natively via the CLI's `--fallback-model` flag (only
-            # the first entry is used — the CLI handles the retry itself).
-            # For other families llm-council retries one step down the chain
-            # on quota detection. Empty chain disables fallback.
-            "fallback_chain": ["claude-sonnet-4-6"],
+            # Quota / overload fallback chain — capability-graceful step-down.
+            # For Claude family this is consumed natively via the CLI's
+            # `--fallback-model` flag (only chain[0] is used; the CLI
+            # handles the retry itself). For other families llm-council
+            # walks the chain on quota detection, capped at
+            # QUOTA_FALLBACK_MAX_STEPS (v0.12.1+ multi-step walking).
+            # Empty chain disables fallback. Chain[0] is a same-tier
+            # one-version-back step (opus→opus); subsequent entries
+            # progressively step down (opus→sonnet→haiku).
+            "fallback_chain": ["claude-opus-4-6", "claude-sonnet-4-6"],
         },
         # Temporary: pinned-version Claude participants for opt-in head-to-head
         # review when the user wants a specific Opus version's perspective.
@@ -176,7 +180,9 @@ DEFAULT_CONFIG: dict = {
             "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["ANTHROPIC_API_KEY"],
-            "fallback_chain": ["claude-sonnet-4-6"],
+            # claude_4_6 IS opus-4-6 — chain[0] is the natural next-tier
+            # step-down (sonnet-4-6, same version).
+            "fallback_chain": ["claude-sonnet-4-6", "claude-haiku-4-5"],
         },
         "claude_4_7": {
             "type": "cli",
@@ -197,7 +203,9 @@ DEFAULT_CONFIG: dict = {
             "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["ANTHROPIC_API_KEY"],
-            "fallback_chain": ["claude-sonnet-4-6"],
+            # claude_4_7 IS opus-4-7 — step down to opus-4-6 first (same
+            # tier, one version back), then sonnet-4-6 if 4-6 also overload.
+            "fallback_chain": ["claude-opus-4-6", "claude-sonnet-4-6"],
         },
         "codex": {
             "type": "cli",
@@ -219,11 +227,13 @@ DEFAULT_CONFIG: dict = {
             "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["OPENAI_API_KEY"],
-            # Best-effort step-down on quota. Users on a different account
-            # tier or with custom routing should override in
-            # .llm-council.yaml; an unknown model id just makes the
-            # fallback retry fail and the peer drops normally.
-            "fallback_chain": ["gpt-5-mini"],
+            # Capability-graceful step-down: same-tier minor version back
+            # (gpt-5.4 from gpt-5.5), then codex-tuned variant (still
+            # capable for coding), then a small final fallback. Users on
+            # a different account tier should override in .llm-council.yaml;
+            # an unknown model id just makes that step fail and the walk
+            # continues (or the peer drops if chain is exhausted).
+            "fallback_chain": ["gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"],
         },
         "gemini": {
             "type": "cli",
@@ -240,7 +250,15 @@ DEFAULT_CONFIG: dict = {
             "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-            "fallback_chain": ["gemini-2.5-flash"],
+            # Within Google's tiering, Pro > Flash for capability — so
+            # falling from 3.5-flash to 3.1-pro is actually an UPGRADE
+            # in many tasks while sidestepping the throttled flash quota.
+            # Then progressively step down through older flash variants.
+            "fallback_chain": [
+                "gemini-3.1-pro-preview",
+                "gemini-3-flash-preview",
+                "gemini-2.5-flash",
+            ],
         },
         "deepseek_v4_pro": {
             "type": "openrouter",

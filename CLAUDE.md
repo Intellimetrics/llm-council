@@ -329,28 +329,32 @@ Key modules:
   signal for raising `defaults.timeout` or a mode's `timeout_multiplier`
   rather than chunking. Bucket cutoffs are tuned to
   `MAX_PROMPT_CHARS=200_000`; revisit if the global cap changes.
-- **Quota-fallback chain semantics.** Each CLI participant carries an
-  optional `fallback_chain: list[str]` — ordered list of model IDs to
-  step down to on a `quota_exhausted` failure. Resolution: if `cfg.model`
-  is in the chain, pick the entry AFTER it; if it's None or absent from
-  the chain, pick `chain[0]`; if there's no next entry, no retry. The
-  retry walks AT MOST ONE step per call to bound wall-clock cost — a
-  multi-step walk happens only across separate council runs as the
-  operator overrides `cfg.model`. The Claude family is special-cased:
-  `_build_cli_command` auto-injects `--fallback-model <chain[0]>` so the
-  CLI itself handles overload internally, and the llm-council-level
-  retry is SKIPPED for Claude to avoid double-paying the peer.
-  Antigravity ships with `fallback_chain: []` because `agy` has no
-  `--model` flag — the peer drops with `quota_throttled_peers` (Phase 1
-  signal) and never enters the fallback path. Codex/Gemini ship best-
-  effort defaults (`gpt-5-mini`, `gemini-2.5-flash`); a wrong model id
-  just makes the retry fail and the peer drops normally, so being out of
-  date is degraded behavior, not a crash. Successful recoveries stamp
-  `recovered_after_quota=True` + `model_fallback_used=<id>` on the
-  result, emit a `peer_quota_recovered` progress event, and surface in
-  top-level `quota_recoveries: [{peer, family, fallback_model, model}]`
-  (disjoint from `quota_throttled_peers` — a peer is in exactly one
-  list per run, keyed on its final state).
+- **Quota-fallback chain semantics (multi-step walking).** Each CLI
+  participant carries an optional `fallback_chain: list[str]` — ordered
+  list of model IDs to step down to on a `quota_exhausted` failure.
+  Resolution: if `cfg.model` is in the chain, walk the entries AFTER
+  it; if it's None or absent from the chain, walk from `chain[0]`.
+  The walker (`_quota_fallback_walk`) is capped at
+  `QUOTA_FALLBACK_MAX_STEPS` (currently 3) to bound wall-clock cost
+  when multiple chain entries are all throttled. Stops at the first
+  success, the first non-quota failure (continuing would spam more
+  models with a problem unrelated to quota), or chain exhaustion.
+  v0.12.1+ multi-step replaces the v0.11.6 single-step rule. The
+  Claude family is special-cased: `_build_cli_command` auto-injects
+  `--fallback-model <chain[0]>` so the CLI itself handles overload
+  internally; the llm-council-level walker is SKIPPED for Claude to
+  avoid double-paying the peer. Antigravity ships with
+  `fallback_chain: []` because `agy` has no `--model` flag (the peer
+  drops with `quota_throttled_peers` signal). Default chains shipped
+  in `DEFAULT_CONFIG` are capability-graceful (same-tier minor version
+  back → next-tier-smaller → smallest); wrong model ids just make
+  that step fail and the walker proceeds (or the peer drops if chain
+  exhausts). Successful recoveries stamp `recovered_after_quota=True`
+  + `model_fallback_used=<id>` on the result, emit a
+  `peer_quota_recovered` progress event, and surface in top-level
+  `quota_recoveries`. On failure, `model_fallback_used` is stamped
+  with the LAST attempted model so the transcript shows where the
+  walker stopped.
 - **Per-CLI token usage is not observable.** CLI participants
   (claude, codex, gemini, antigravity) authenticate as the user and
   burn the user's own account quota. llm-council has no metering hook
