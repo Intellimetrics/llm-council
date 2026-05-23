@@ -180,6 +180,77 @@ def test_drop_missing_key_participants_uses_default_env_name():
     assert dropped[0]["api_key_env"] == "OPENROUTER_API_KEY"
 
 
+def test_drop_missing_key_participants_drops_openai_compatible_with_explicit_env(
+    monkeypatch,
+):
+    """v0.12.2 fix: openai_compatible peers WITH an explicit api_key_env
+    are pre-dropped when that env var is unset — same as openrouter peers.
+    The user told us which env var to check; honor that intent."""
+    import os as _os
+    from llm_council.orchestrator import _drop_missing_key_participants
+
+    _os.environ.pop("EXPLICIT_OPENAI_COMPAT_KEY", None)
+    cfg = {
+        "vllm_remote": {
+            "type": "openai_compatible",
+            "base_url": "https://my-vllm.example.com/v1",
+            "api_key_env": "EXPLICIT_OPENAI_COMPAT_KEY",
+        }
+    }
+    active, dropped = _drop_missing_key_participants(["vllm_remote"], cfg)
+    assert active == []
+    assert len(dropped) == 1
+    assert dropped[0]["peer"] == "vllm_remote"
+    assert dropped[0]["api_key_env"] == "EXPLICIT_OPENAI_COMPAT_KEY"
+
+
+def test_drop_missing_key_participants_skips_openai_compatible_without_explicit_env(
+    monkeypatch,
+):
+    """v0.12.2 fix: openai_compatible peers WITHOUT api_key_env must NOT be
+    pre-dropped — the OPENROUTER_API_KEY default would falsely-drop a
+    local server (e.g. vLLM on loopback) that legitimately doesn't need
+    auth. Defer to the adapter, which surfaces its own `Missing X` error
+    if a key was actually required."""
+    import os as _os
+    from llm_council.orchestrator import _drop_missing_key_participants
+
+    # Ensure even the legacy OPENROUTER_API_KEY default is unset — the
+    # peer must stay active regardless.
+    _os.environ.pop("OPENROUTER_API_KEY", None)
+    cfg = {
+        "local_vllm": {
+            "type": "openai_compatible",
+            "base_url": "http://127.0.0.1:8000/v1",
+            # No api_key_env: this is a local server, no auth expected.
+        },
+    }
+    active, dropped = _drop_missing_key_participants(["local_vllm"], cfg)
+    assert active == ["local_vllm"]
+    assert dropped == []
+
+
+def test_drop_missing_key_participants_keeps_openai_compatible_with_env_set(
+    monkeypatch,
+):
+    """openai_compatible peer with explicit api_key_env that IS set stays
+    active — same as the openrouter happy path, but exercising the new
+    branch."""
+    from llm_council.orchestrator import _drop_missing_key_participants
+
+    monkeypatch.setenv("PRESENT_OPENAI_COMPAT_KEY", "dummy")
+    cfg = {
+        "remote_openai": {
+            "type": "openai_compatible",
+            "base_url": "https://api.openai.com/v1",
+            "api_key_env": "PRESENT_OPENAI_COMPAT_KEY",
+        }
+    }
+    active, dropped = _drop_missing_key_participants(["remote_openai"], cfg)
+    assert active == ["remote_openai"]
+    assert dropped == []
+
+
 def test_execute_council_missing_key_peer_does_not_degrade_run(
     monkeypatch, tmp_path: Path
 ):

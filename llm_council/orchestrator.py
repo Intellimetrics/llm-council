@@ -363,7 +363,27 @@ def _drop_missing_key_participants(
         if ptype not in {"openrouter", "openai_compatible"}:
             active.append(name)
             continue
-        key_env = cfg.get("api_key_env") or "OPENROUTER_API_KEY"
+        key_env_raw = cfg.get("api_key_env")
+        if ptype == "openrouter":
+            # OpenRouter peers always need a key, and the well-known env
+            # name is OPENROUTER_API_KEY — safe to assume that default
+            # when api_key_env is omitted.
+            key_env = key_env_raw or "OPENROUTER_API_KEY"
+        else:
+            # `openai_compatible` covers a wide spectrum: hosted OpenAI,
+            # OpenRouter via openai_compatible shim, vLLM / llama.cpp /
+            # LM Studio with no auth, local TGI behind tailnet… A peer
+            # WITHOUT an explicit `api_key_env` declaration leaves us
+            # unable to reliably predict whether it needs auth at all,
+            # so we DEFER to the adapter and skip pre-drop. The adapter
+            # path surfaces its own `Missing X` error if a key really
+            # was required. With an explicit `api_key_env`, the user
+            # has told us the env var to check; treat its absence as a
+            # configuration gap and pre-drop normally.
+            if not key_env_raw:
+                active.append(name)
+                continue
+            key_env = key_env_raw
         if _os.environ.get(key_env):
             active.append(name)
             continue

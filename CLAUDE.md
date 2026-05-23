@@ -405,7 +405,14 @@ Key modules:
   run that ends with one hosted peer missing its key looks
   identical (for `degraded` / `min_quorum` purposes) to a run that
   never listed that peer at all — a missing key is an operator
-  configuration gap, not a council failure.
+  configuration gap, not a council failure. Asymmetry between the
+  two hosted types: `openrouter` peers without explicit
+  `api_key_env` default to `OPENROUTER_API_KEY` (well-known
+  convention); `openai_compatible` peers without explicit
+  `api_key_env` are NOT pre-dropped (the type covers everything
+  from hosted OpenAI to no-auth local vLLM — we defer to the
+  adapter rather than guess). With explicit `api_key_env` set, both
+  types pre-drop normally.
 - **`.mcp.json` stays local.** Setup adds it to `.gitignore`. It contains
   absolute paths and must not be committed.
 - **Version bumps.** `__version__` in `llm_council/__init__.py` and the

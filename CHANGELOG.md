@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.2 - 2026-05-23
+
+v0.12.2 fixes a council-flagged false-drop in `_drop_missing_key_participants`.
+*   `openai_compatible` peers without an explicit `api_key_env` are NO LONGER pre-dropped. The previous code defaulted to `OPENROUTER_API_KEY` for both `openrouter` AND `openai_compatible` types, which would falsely drop a local vLLM / llama.cpp / LM Studio peer that legitimately doesn't need auth. New behavior: defer to the adapter, which surfaces its own `Missing X` error if a key was actually required.
+*   `openrouter` peers keep the `OPENROUTER_API_KEY` default (well-known convention; OpenRouter peers always need a key).
+*   `openai_compatible` peers WITH an explicit `api_key_env` still pre-drop normally — explicit declaration is treated as explicit expectation.
+*   New tests: 3 (`drops_openai_compatible_with_explicit_env`, `skips_openai_compatible_without_explicit_env`, `keeps_openai_compatible_with_env_set`).
+
 ## 0.12.1 - 2026-05-23
 
 v0.12.1 reshapes fallback chains for capability-graceful step-down and adds multi-step walking.
