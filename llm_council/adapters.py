@@ -770,15 +770,21 @@ async def run_cli_participant(
                 )
                 _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
                 return merged
-            # Retry also failed. Stamp `model_fallback_used` so the
-            # transcript reflects that fallback was attempted, but keep
-            # the retry's own error (which may itself be quota-exhausted
-            # on a different model — the chain only gets one step per
-            # call). `recovered_after_quota` stays False.
-            result = _replace(
+            # Retry also failed. Stamp `model_fallback_used` and RETURN
+            # EARLY — the quota retry IS the "one extra call per peer
+            # per round" budget; downstream branches (launch-retry,
+            # label-repair, section-repair, strict-evidence) would
+            # otherwise fire AGAIN with the ORIGINAL `cfg` (pointing
+            # at the overloaded model), violating the cost ceiling
+            # AND silently re-routing traffic to the throttled model.
+            # `recovered_after_quota` stays False so the result still
+            # drops from quorum if the retry's error keeps the
+            # quota_exhausted classification.
+            failed = _replace(
                 fallback_result,
                 model_fallback_used=fallback_model,
             )
+            return failed
     if _should_launch_retry(meta, cfg):
         await asyncio.sleep(_launch_retry_backoff(0))
         retry_result, retry_meta = await _run_cli_once(
@@ -3170,18 +3176,40 @@ UNTAGGED_EVIDENCE_PREFIX = "UntaggedEvidence:"
 # contextual words ("Too Many", "quota", etc.) to avoid catching e.g.
 # port numbers or row counts.
 QUOTA_EXHAUSTED_PATTERNS = (
-    re.compile(r"RESOURCE_EXHAUSTED"),                       # Google/Gemini/Antigravity
-    re.compile(r"quota\s+exceeded", re.IGNORECASE),
-    re.compile(r"quota_exceeded"),                            # Anthropic-style
-    re.compile(r"rate_limit_exceeded"),                       # OpenAI/Codex
-    re.compile(r"insufficient_quota"),                        # OpenAI
-    re.compile(r"insufficient\s+credits", re.IGNORECASE),     # OpenRouter
-    re.compile(r"usage\s+limit", re.IGNORECASE),              # Claude
-    re.compile(r"\d+-hour\s+limit", re.IGNORECASE),           # Claude 5-hour limit
-    re.compile(r"Too\s+Many\s+Requests", re.IGNORECASE),      # HTTP 429 text
-    re.compile(r"HTTP\s+status\s+429\b", re.IGNORECASE),      # httpx Retryable…
+    # Google / Gemini / Antigravity. `RESOURCE_EXHAUSTED` (gRPC code,
+    # uppercase) AND the Python SDK's `ResourceExhausted` (PascalCase
+    # exception class) AND the natural-language "resource has been
+    # exhausted" / "resource exhausted" form are all real shapes. All
+    # case-insensitive — operators report both lower- and
+    # upper-cased stderr depending on which layer emits it.
+    re.compile(r"resource[_\s]?exhausted", re.IGNORECASE),
+    re.compile(r"resource\s+has\s+been\s+exhausted", re.IGNORECASE),
+    # Anthropic / Claude
+    re.compile(r"quota[_\s]+exceeded", re.IGNORECASE),
+    re.compile(r"exceeded\s+your\s+(?:current\s+)?quota", re.IGNORECASE),
+    re.compile(r"usage\s+limit", re.IGNORECASE),
+    re.compile(r"\d+-hour\s+limit", re.IGNORECASE),
+    # OpenAI / Codex. Snake-case and space form are both observed
+    # depending on whether the error came from the Python SDK or
+    # straight from the HTTP body.
+    re.compile(r"rate[_\s]?limit[_\s]?exceeded", re.IGNORECASE),
+    re.compile(r"insufficient[_\s]?quota", re.IGNORECASE),
+    # OpenRouter / generic
+    re.compile(r"insufficient\s+credits", re.IGNORECASE),
+    re.compile(r"too\s+many\s+requests", re.IGNORECASE),
+    # HTTP 429 with a status-line context. Bounded to ~60 chars from
+    # the bare `429` token AND requires a quota-adjacent neighbor word
+    # (`limit`, `retry`, `quota`, `rate`, `exhausted`, `too many`) so a
+    # random "429" in unrelated text (port numbers, row counts) doesn't
+    # trigger. 60-char window covers shapes like
+    # `429 Resource has been exhausted (e.g. queries per minute limit was exceeded)`
+    # where `limit` is ~44 chars in (the previous 40-char window missed it).
+    re.compile(r"http\s+status\s+429\b", re.IGNORECASE),
     re.compile(r"status\s+code\s+429\b", re.IGNORECASE),
-    re.compile(r"\b429\b.{0,40}(Too Many|quota|rate|limit|retry)", re.IGNORECASE),
+    re.compile(
+        r"\b429\b.{0,60}?(too\s+many|quota|rate|limit|retry|exhausted)",
+        re.IGNORECASE | re.DOTALL,
+    ),
 )
 
 

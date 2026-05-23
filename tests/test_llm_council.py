@@ -10168,6 +10168,206 @@ def test_quota_fallback_retry_also_fails_keeps_quota_classification(
     assert classify_error(result.error) == ERROR_KIND_QUOTA_EXHAUSTED
 
 
+def test_quota_fallback_failed_retry_does_not_chain_label_repair(
+    monkeypatch, tmp_path: Path
+):
+    """Regression for council finding: when quota fallback fires and the
+    retry returns an InvalidParticipantResponse (missing-label) error,
+    the label-repair branch must NOT fire a 3rd call against the
+    overloaded ORIGINAL cfg. The quota retry is THE extra call; the
+    downstream chain is gated off."""
+    import llm_council.adapters as adapters_module
+
+    call_count = 0
+    cfgs_seen: list[dict[str, Any]] = []
+
+    async def fake_run_cli_once(name, cfg, prompt, cwd, *, start, mode_multiplier, mode):
+        nonlocal call_count
+        call_count += 1
+        cfgs_seen.append(dict(cfg))
+        if call_count == 1:
+            # Initial call: quota error.
+            return (
+                ParticipantResult(
+                    name, False, "", "Error: rate_limit_exceeded", 1.0,
+                    model=cfg.get("model"),
+                ),
+                {"nonzero_exit": True, "stderr": "rate_limit_exceeded", "exited": True},
+            )
+        # Fallback retry: returns text WITHOUT the RECOMMENDATION label,
+        # which would normally trigger label-repair against the ORIGINAL
+        # cfg (the council-flagged bug).
+        return (
+            ParticipantResult(
+                name, False, "I think the answer is yes but no label here.",
+                "InvalidParticipantResponse: missing required RECOMMENDATION label",
+                0.5,
+                model=cfg.get("model"),
+            ),
+            {"nonzero_exit": False, "stderr": "", "exited": True},
+        )
+
+    monkeypatch.setattr(adapters_module, "_run_cli_once", fake_run_cli_once)
+
+    cfg = {
+        "type": "cli",
+        "family": "codex",
+        "command": "codex",
+        "args": ["exec"],
+        "model": None,
+        "fallback_chain": ["gpt-5-mini"],
+    }
+    result = asyncio.run(
+        adapters_module.run_cli_participant("codex", cfg, "prompt", tmp_path)
+    )
+    # Exactly 2 calls: the initial (quota) + the fallback retry. No 3rd
+    # call against the original cfg via label-repair.
+    assert call_count == 2
+    # The fallback retry used the fallback model.
+    assert cfgs_seen[1]["model"] == "gpt-5-mini"
+    # Final state: failed with the retry's error, model_fallback_used stamped.
+    assert result.ok is False
+    assert result.model_fallback_used == "gpt-5-mini"
+
+
+def test_quota_fallback_failed_retry_does_not_chain_section_repair(
+    monkeypatch, tmp_path: Path
+):
+    """Same chaining guard for the section-repair path."""
+    import llm_council.adapters as adapters_module
+
+    call_count = 0
+
+    async def fake_run_cli_once(name, cfg, prompt, cwd, *, start, mode_multiplier, mode):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return (
+                ParticipantResult(
+                    name, False, "", "Error: rate_limit_exceeded", 1.0,
+                    model=cfg.get("model"),
+                ),
+                {"nonzero_exit": True, "stderr": "rate_limit_exceeded", "exited": True},
+            )
+        # Fallback retry: section-coverage failure (different prefix than
+        # label-repair; checks `_should_section_repair`).
+        return (
+            ParticipantResult(
+                name, False, "RECOMMENDATION: yes - ok",
+                "IncompleteResponse: response had the RECOMMENDATION label but missed sections",
+                0.5,
+                model=cfg.get("model"),
+            ),
+            {"nonzero_exit": False, "stderr": "", "exited": True},
+        )
+
+    monkeypatch.setattr(adapters_module, "_run_cli_once", fake_run_cli_once)
+    cfg = {
+        "type": "cli",
+        "family": "codex",
+        "command": "codex",
+        "args": ["exec"],
+        "model": None,
+        "fallback_chain": ["gpt-5-mini"],
+    }
+    result = asyncio.run(
+        adapters_module.run_cli_participant("codex", cfg, "prompt", tmp_path)
+    )
+    assert call_count == 2
+    assert result.ok is False
+    assert result.model_fallback_used == "gpt-5-mini"
+
+
+def test_quota_fallback_failed_retry_does_not_chain_launch_retry(
+    monkeypatch, tmp_path: Path
+):
+    """When `cli_retry_stderr_patterns` would otherwise match the
+    ORIGINAL call's quota stderr, the launch-retry must NOT fire after
+    the quota fallback already attempted recovery. Council finding:
+    `_fallback_meta` is discarded, so `_should_launch_retry(meta, cfg)`
+    seeing the original quota stderr could fire spuriously."""
+    import llm_council.adapters as adapters_module
+
+    call_count = 0
+
+    async def fake_run_cli_once(name, cfg, prompt, cwd, *, start, mode_multiplier, mode):
+        nonlocal call_count
+        call_count += 1
+        return (
+            ParticipantResult(
+                name, False, "", "Error: rate_limit_exceeded", 1.0,
+                model=cfg.get("model"),
+            ),
+            {"nonzero_exit": True, "stderr": "rate_limit_exceeded", "exited": True},
+        )
+
+    monkeypatch.setattr(adapters_module, "_run_cli_once", fake_run_cli_once)
+    # `cli_retry_stderr_patterns` matches the quota stderr, so without
+    # the early return the launch-retry would chain. The fix guarantees
+    # exactly ONE retry per quota incident regardless of pattern config.
+    cfg = {
+        "type": "cli",
+        "family": "codex",
+        "command": "codex",
+        "args": ["exec"],
+        "model": None,
+        "fallback_chain": ["gpt-5-mini"],
+        "cli_retry_stderr_patterns": ["rate_limit_exceeded"],
+    }
+    result = asyncio.run(
+        adapters_module.run_cli_participant("codex", cfg, "prompt", tmp_path)
+    )
+    assert call_count == 2  # initial + fallback retry; NO launch-retry
+    assert result.ok is False
+    assert result.model_fallback_used == "gpt-5-mini"
+
+
+def test_quota_regex_handles_real_world_provider_shapes():
+    """Regex hardening regression test: cover the false-negative shapes
+    the council flagged in dogfood — PascalCase Google SDK exception,
+    natural-language "resource has been exhausted", and "rate limit
+    exceeded" with spaces. All previously fell through to `unknown` /
+    `cli_nonzero_exit`."""
+    from llm_council.adapters import (
+        ERROR_KIND_QUOTA_EXHAUSTED,
+        classify_error,
+        is_quota_exhausted_error,
+    )
+
+    # Google Python SDK exception class (PascalCase, no underscore).
+    assert (
+        classify_error(
+            "google.api_core.exceptions.ResourceExhausted: 429 Resource has been exhausted (e.g. queries per minute limit was exceeded)."
+        ) == ERROR_KIND_QUOTA_EXHAUSTED
+    )
+    # The natural-language form alone (no 429 prefix).
+    assert is_quota_exhausted_error("Error: Resource has been exhausted; please retry later")
+    # snake_case → case insensitive now.
+    assert is_quota_exhausted_error("resource_exhausted")
+    assert is_quota_exhausted_error("RESOURCE_EXHAUSTED")
+    # "rate limit exceeded" with spaces (council finding — previously
+    # only the underscore form was matched).
+    assert is_quota_exhausted_error("Error: Rate limit exceeded for requests")
+    assert is_quota_exhausted_error("rate_limit_exceeded")
+    # OpenAI natural-language quota message.
+    assert is_quota_exhausted_error(
+        "You exceeded your current quota, please check your plan and billing details."
+    )
+    # Uppercase/lowercase parity for snake-case codes.
+    assert is_quota_exhausted_error("QUOTA_EXCEEDED")
+    assert is_quota_exhausted_error("quota_exceeded")
+    # The bare-429 + 60-char window catches the specific failing input
+    # the council flagged (where `limit` was 44 chars from `429`).
+    assert is_quota_exhausted_error(
+        "HTTP 429 Resource has been exhausted (e.g. queries per minute limit was exceeded)."
+    )
+
+    # Negative controls — these must NOT be misclassified as quota.
+    assert not is_quota_exhausted_error("Found 429 entries in database.")
+    assert not is_quota_exhausted_error("Run took 429 ms.")
+    assert not is_quota_exhausted_error("")
+
+
 def test_execute_council_emits_quota_recovered_event(
     monkeypatch, tmp_path: Path
 ):

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.8 - 2026-05-23
+
+v0.11.8 fixes two correctness bugs and one false-negative gap in the v0.11.6 quota fallback work, surfaced by the v0.11.7 dogfood council review.
+*   **Retry chain cost ceiling restored.** When the quota-fallback retry fails, `run_cli_participant` now returns early instead of falling through to launch-retry / label-repair / section-repair / strict-evidence branches. Previously, a fallback that returned (e.g.) an unlabeled response would trigger a 3rd `_run_cli_once` call against the ORIGINAL `cfg` — pointing back at the overloaded model AND violating the documented "one extra call per peer per round" budget. Council finding (`adapters.py:751-872`).
+*   **Quota regex hardening.** `QUOTA_EXHAUSTED_PATTERNS` is now case-insensitive across all entries and covers shapes the previous set silently missed:
+    *   Google Python SDK: `ResourceExhausted` (PascalCase exception class), `Resource has been exhausted` (natural-language).
+    *   OpenAI natural-language: `You exceeded your current quota, please check your plan and billing details.`
+    *   `rate limit exceeded` with spaces (previously only the underscore form matched).
+    *   Bare-429 window widened from 40 to 60 chars + `exhausted` added to the neighbor-word group, so `429 Resource has been exhausted (e.g. queries per minute limit was exceeded)` matches.
+*   Defense in depth: the merge-function field-loss the council also flagged (`_merge_cli_retry` / `_merge_cli_section_retry` / `_merge_hosted_*` discard `model_fallback_used` and `recovered_after_quota`) is intentionally **not** patched in this release because the early-return fix above makes those code paths unreachable from a fallback-stamped result. Adding 8 defensive copies would be dead-code today; will revisit if the retry flow ever permits multi-step chain walking.
+
 ## 0.11.7 - 2026-05-23
 
 v0.11.7 lands Phase 3 of quota resilience: visibility in `stats --reliability`.
