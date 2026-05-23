@@ -328,6 +328,55 @@ def _detect_quota_throttled(
     return new_entries
 
 
+def _drop_missing_key_participants(
+    participants: list[str],
+    participant_cfg: dict[str, Any],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Skip hosted peers whose `api_key_env` env var is unset.
+
+    Returns ``(active_participants, dropped_records)``. Each dropped
+    record carries the peer name, family, and the env var name that was
+    missing so the orchestrator can emit a `peer_missing_api_key`
+    progress event AND so the operator sees what to set.
+
+    v0.12.0 behavior: dropped peers are removed from the run roster
+    BEFORE the quorum denominator is computed, so a missing key on one
+    peer cannot flip the entire run to `degraded`. A run that ends with
+    one hosted peer missing its key looks identical (for degraded /
+    min_quorum purposes) to a run that never listed that peer at all.
+    The dropped list still surfaces in metadata as `missing_key_peers`
+    so the situation isn't invisible.
+
+    Only `type: openrouter` and `type: openai_compatible` participants
+    are checked here. CLI peers authenticate via the host CLI's own
+    session and don't have an `api_key_env` we can preflight; ollama
+    is local. Unknown types are left alone (the run-time adapter will
+    surface its own error).
+    """
+    import os as _os
+
+    active: list[str] = []
+    dropped: list[dict[str, Any]] = []
+    for name in participants:
+        cfg = participant_cfg.get(name) or {}
+        ptype = cfg.get("type")
+        if ptype not in {"openrouter", "openai_compatible"}:
+            active.append(name)
+            continue
+        key_env = cfg.get("api_key_env") or "OPENROUTER_API_KEY"
+        if _os.environ.get(key_env):
+            active.append(name)
+            continue
+        dropped.append(
+            {
+                "peer": name,
+                "family": cfg.get("family") or name,
+                "api_key_env": key_env,
+            }
+        )
+    return active, dropped
+
+
 def _detect_quota_recoveries(
     results: list[ParticipantResult],
     participant_cfg: dict[str, Any],
@@ -418,6 +467,17 @@ async def execute_council(
         progress_events.append(event)
         if progress:
             progress(event)
+
+    # v0.12.0: drop hosted peers with missing api_key_env BEFORE preflight
+    # / council_start, so the missing key never inflates the quorum
+    # denominator. The dropped peers are surfaced in `missing_key_peers`
+    # metadata + per-peer `peer_missing_api_key` events so the operator
+    # sees the situation without it counting as degraded.
+    participants, missing_key_records = _drop_missing_key_participants(
+        participants, participant_cfg
+    )
+    for record in missing_key_records:
+        emit({"event": "peer_missing_api_key", **record})
 
     emit(
         {
@@ -972,6 +1032,8 @@ async def execute_council(
         metadata["quota_throttled_peers"] = list(quota_throttled)
     if quota_recoveries:
         metadata["quota_recoveries"] = list(quota_recoveries)
+    if missing_key_records:
+        metadata["missing_key_peers"] = list(missing_key_records)
 
     if synthesize_flag and should_synthesize(synthesize_flag, metadata):
         try:

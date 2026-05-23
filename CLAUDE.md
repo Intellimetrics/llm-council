@@ -364,6 +364,44 @@ Key modules:
   (the `usage` field on API responses populates `prompt_tokens` /
   `completion_tokens` / `cost_usd` on `ParticipantResult`). Don't
   promise observability we don't have.
+- **Size-scaled timeouts.** `_resolve_effective_timeout` now adds a
+  prompt-size bonus on top of the per-participant base: 5s per KB above
+  a 4KB threshold by default, capped at +600s. The mode multiplier
+  (consensus 2.0x, deliberate 1.5x) layers on top of `(base + bonus)`,
+  so a 26KB prompt in consensus mode gets `(240 + 110) * 2 = 700s`
+  instead of the prior unconditional 480s. Per-peer override via
+  `timeout_per_kb_chars: 0` disables scaling entirely (used in tests
+  that need to pin the legacy behavior). Triggered by the v0.11.7
+  dogfood showing the same 240s wall hit on prompts of both 4KB and
+  26KB — context length scaling is real and prior fixed timeouts
+  understated it.
+- **Proportional terse-retry budget.** `_terse_retry_budget(original)`
+  returns `min(max(original * 0.4, 30), 120)` — floor 30s, ceiling
+  120s, 40% of the original timeout in between. Replaces the legacy
+  fixed `TERSE_RETRY_TIMEOUT_SECONDS = 60` constant which was
+  structurally unlikely to succeed when the original timeout was
+  240s+ (the retry nearly always re-timed-out, providing no recovery
+  signal). The retry runs with `timeout_per_kb_chars: 0` to prevent
+  double-scaling the size bonus already baked into the proportional
+  budget.
+- **Idle-read timeout (opt-in).** When `cfg.idle_timeout: float`
+  is set, `_run_cli_once` switches from `proc.communicate()` to a
+  streamed read loop with a per-stream idle deadline. The peer is
+  killed when no stdout/stderr data arrives for N seconds, in
+  addition to the wall-clock cap. Default OFF (None) for all
+  built-in peers since most CLIs (claude `-p`, codex `exec`, agy
+  `--print`) buffer everything to the end rather than streaming.
+  Operators with a known-streaming CLI can opt in per peer.
+- **Missing-key peer pre-drop.** `_drop_missing_key_participants`
+  scans hosted peers (openrouter / openai_compatible) at the top
+  of `execute_council` and removes any whose `api_key_env` env var
+  is unset. Dropped peers emit a `peer_missing_api_key` progress
+  event AND land in `metadata.missing_key_peers` for top-level
+  surfacing, BUT do NOT count toward the quorum denominator. A
+  run that ends with one hosted peer missing its key looks
+  identical (for `degraded` / `min_quorum` purposes) to a run that
+  never listed that peer at all — a missing key is an operator
+  configuration gap, not a council failure.
 - **`.mcp.json` stays local.** Setup adds it to `.gitignore`. It contains
   absolute paths and must not be committed.
 - **Version bumps.** `__version__` in `llm_council/__init__.py` and the

@@ -68,6 +68,209 @@ def test_resolve_effective_timeout_treats_one_x_as_base():
     assert _resolve_effective_timeout({"timeout": 240}, 1.0) == 240
 
 
+# --- v0.12.0 size-scaled timeout + proportional terse-retry -----------
+
+
+def test_resolve_effective_timeout_adds_size_bonus_above_threshold():
+    """Prompts above 4KB get +5s per KB by default."""
+    # 4KB exactly → no bonus.
+    assert _resolve_effective_timeout({"timeout": 240}, None, prompt_chars=4096) == 240
+    # 5KB → bonus of (1024/1024)*5 = 5s.
+    assert _resolve_effective_timeout({"timeout": 240}, None, prompt_chars=5120) == 245
+    # 26KB → bonus of ((26*1024 - 4096)/1024)*5 = 110s → 350s total.
+    assert _resolve_effective_timeout({"timeout": 240}, None, prompt_chars=26 * 1024) == 350
+
+
+def test_resolve_effective_timeout_size_bonus_capped():
+    """Runaway prompts can't inflate the timeout past +600s."""
+    # Massive prompt: bonus would be (10000-4)KB * 5 = ~50000s; capped at 600s.
+    # 10MB prompt → effective = 240 + 600 = 840.
+    huge = 10 * 1024 * 1024
+    assert _resolve_effective_timeout({"timeout": 240}, None, prompt_chars=huge) == 840
+
+
+def test_resolve_effective_timeout_size_bonus_disabled_by_per_kb_zero():
+    """`timeout_per_kb_chars: 0` opts out of size scaling per peer."""
+    assert (
+        _resolve_effective_timeout(
+            {"timeout": 240, "timeout_per_kb_chars": 0},
+            None,
+            prompt_chars=100_000,
+        )
+        == 240
+    )
+
+
+def test_resolve_effective_timeout_size_bonus_composes_with_multiplier():
+    """consensus 2.0x multiplies the (base + size_bonus) total."""
+    # base=240, prompt=26KB → bonus=110 → (240+110)*2 = 700.
+    assert (
+        _resolve_effective_timeout({"timeout": 240}, 2.0, prompt_chars=26 * 1024)
+        == 700
+    )
+
+
+def test_resolve_effective_timeout_per_peer_override():
+    """A user pinning a different slope per peer is honored."""
+    # 10s/KB instead of 5s/KB → 5KB prompt adds 10s, not 5s.
+    cfg = {"timeout": 240, "timeout_per_kb_chars": 10.0}
+    assert _resolve_effective_timeout(cfg, None, prompt_chars=5120) == 250
+
+
+def test_terse_retry_budget_proportional_with_floor_and_ceiling():
+    """40% of original, floor 30s, ceiling 120s."""
+    from llm_council.adapters import _terse_retry_budget
+
+    # Floor at 30s for tiny originals (1s → 0.4s, raised to 30s).
+    assert _terse_retry_budget(1) == 30
+    # Ceiling at 120s for huge originals (600s → 240s, capped at 120s).
+    assert _terse_retry_budget(600) == 120
+    # Mid: 240s * 0.4 = 96s.
+    assert _terse_retry_budget(240) == 96
+    # Boundary cases.
+    assert _terse_retry_budget(75) == 30  # 30s = max(30, round(75*0.4=30))
+    assert _terse_retry_budget(80) == 32   # 80*0.4=32, between floor and ceiling
+    assert _terse_retry_budget(300) == 120  # 300*0.4=120, hits ceiling exactly
+
+
+def test_drop_missing_key_participants_drops_openrouter_without_env():
+    """Missing api_key_env env var → peer dropped from active list."""
+    from llm_council.orchestrator import _drop_missing_key_participants
+    import os as _os
+
+    # Ensure the env var is NOT set (defensive — pytest isolates env
+    # but be explicit).
+    _os.environ.pop("MISSING_FOR_DROP_TEST", None)
+    cfg = {
+        "openrouter_a": {"type": "openrouter", "api_key_env": "MISSING_FOR_DROP_TEST"},
+        "cli_b": {"type": "cli", "command": "true"},
+        "ollama_c": {"type": "ollama"},
+    }
+    active, dropped = _drop_missing_key_participants(
+        ["openrouter_a", "cli_b", "ollama_c"], cfg
+    )
+    assert active == ["cli_b", "ollama_c"]
+    assert len(dropped) == 1
+    assert dropped[0]["peer"] == "openrouter_a"
+    assert dropped[0]["api_key_env"] == "MISSING_FOR_DROP_TEST"
+
+
+def test_drop_missing_key_participants_keeps_peer_when_env_set(monkeypatch):
+    """Env var present → peer stays in the active list."""
+    from llm_council.orchestrator import _drop_missing_key_participants
+
+    monkeypatch.setenv("PRESENT_KEY", "x")
+    cfg = {
+        "openrouter_a": {"type": "openrouter", "api_key_env": "PRESENT_KEY"},
+    }
+    active, dropped = _drop_missing_key_participants(["openrouter_a"], cfg)
+    assert active == ["openrouter_a"]
+    assert dropped == []
+
+
+def test_drop_missing_key_participants_uses_default_env_name():
+    """`api_key_env` absent defaults to OPENROUTER_API_KEY for openrouter peers."""
+    from llm_council.orchestrator import _drop_missing_key_participants
+    import os as _os
+
+    _os.environ.pop("OPENROUTER_API_KEY", None)
+    cfg = {"openrouter_a": {"type": "openrouter"}}
+    active, dropped = _drop_missing_key_participants(["openrouter_a"], cfg)
+    assert active == []
+    assert dropped[0]["api_key_env"] == "OPENROUTER_API_KEY"
+
+
+def test_execute_council_missing_key_peer_does_not_degrade_run(
+    monkeypatch, tmp_path: Path
+):
+    """A peer with a missing api_key_env should drop out + emit a
+    `peer_missing_api_key` event + appear in metadata.missing_key_peers
+    BUT NOT count toward the quorum denominator (so the run isn't
+    flagged as degraded just because one peer was unconfigured)."""
+    import os as _os
+    from llm_council import orchestrator as _orchestrator_module
+    from llm_council.orchestrator import execute_council
+
+    _os.environ.pop("ABSENT_FOR_DEGRADE_TEST", None)
+
+    async def fake_run_participants(participants, *args, **kwargs):
+        # Only the active peers (after key-drop) reach this point.
+        return [
+            ParticipantResult(name, True, f"RECOMMENDATION: yes - {name}", "", 1.0)
+            for name in participants
+        ]
+
+    monkeypatch.setattr(
+        _orchestrator_module, "run_participants", fake_run_participants
+    )
+
+    participant_cfg = {
+        "claude": {"type": "cli", "command": "claude", "args": []},
+        "codex": {"type": "cli", "command": "codex", "args": []},
+        "absent_remote": {
+            "type": "openrouter",
+            "model": "x/y",
+            "api_key_env": "ABSENT_FOR_DEGRADE_TEST",
+        },
+    }
+    _, metadata = asyncio.run(
+        execute_council(
+            ["claude", "codex", "absent_remote"],
+            participant_cfg,
+            "q",
+            tmp_path,
+            {},
+        )
+    )
+    # The missing-key peer was dropped from the run.
+    assert "missing_key_peers" in metadata
+    assert metadata["missing_key_peers"][0]["peer"] == "absent_remote"
+    assert metadata["missing_key_peers"][0]["api_key_env"] == "ABSENT_FOR_DEGRADE_TEST"
+    # The run is NOT degraded — the remaining two peers met quorum.
+    assert metadata["degraded"] is False
+    # Event was emitted before council_start.
+    events = metadata["progress_events"]
+    missing_events = [e for e in events if e.get("event") == "peer_missing_api_key"]
+    assert len(missing_events) == 1
+    assert missing_events[0]["peer"] == "absent_remote"
+
+
+def test_idle_read_helper_raises_on_silence():
+    """`_read_stream_with_idle_deadline` must raise TimeoutError when no
+    data arrives within the idle window. Wall-clock cap is enforced
+    separately by the outer `asyncio.wait_for` in `_run_cli_once`."""
+    import asyncio as _asyncio
+    from llm_council.adapters import _read_stream_with_idle_deadline
+
+    class _SilentStream:
+        async def read(self, n):
+            await _asyncio.sleep(10)  # never returns within idle window
+            return b""
+
+    with pytest.raises(TimeoutError):
+        _asyncio.run(_read_stream_with_idle_deadline(_SilentStream(), idle_timeout=0.05))
+
+
+def test_idle_read_helper_returns_all_bytes_on_eof():
+    """Idle reader returns the accumulated bytes once the stream EOFs."""
+    import asyncio as _asyncio
+    from llm_council.adapters import _read_stream_with_idle_deadline
+
+    chunks = [b"hello ", b"world", b""]
+
+    class _ChunkedStream:
+        def __init__(self):
+            self.i = 0
+
+        async def read(self, n):
+            chunk = chunks[self.i]
+            self.i += 1
+            return chunk
+
+    out = _asyncio.run(_read_stream_with_idle_deadline(_ChunkedStream(), idle_timeout=1.0))
+    assert out == b"hello world"
+
+
 def test_resolve_effective_timeout_ignores_invalid_multiplier():
     """Negative or zero multiplier falls back to base; never reduces."""
     assert _resolve_effective_timeout({"timeout": 240}, 0.0) == 240
@@ -327,10 +530,14 @@ def test_recovered_after_timeout_populates_prompt_chars():
                     "type": "cli",
                     "command": "echo",
                     "args": [],
-                    # First call uses 1s and times out; terse-retry uses
-                    # TERSE_RETRY_TIMEOUT_SECONDS (60s, fixed) which the
-                    # mocked success proc returns immediately.
+                    # First call uses 1s and times out; terse-retry budget
+                    # is proportional (v0.12.0) but the mocked success
+                    # proc returns immediately so the exact budget is
+                    # irrelevant. Disable size scaling so the 14K-char
+                    # prompt doesn't inflate the 1s base into ~50s,
+                    # which would let the first call succeed.
                     "timeout": 1,
+                    "timeout_per_kb_chars": 0,
                     "require_sections": False,
                 },
                 medium_prompt,
@@ -449,8 +656,11 @@ def test_pass8_terse_retry_failure_is_visible_in_result():
                     # Tiny timeouts so the test runs fast; the retry path
                     # itself is what we're verifying, not real wall-clock.
                     # `max_prompt_chars` high so the retry's longer prompt
-                    # (original + directive) isn't skipped.
+                    # (original + directive) isn't skipped. Disable size
+                    # scaling (v0.12.0) so the 14K-char prompt doesn't
+                    # inflate the 1s base into ~50s.
                     "timeout": 1,
+                    "timeout_per_kb_chars": 0,
                     "max_prompt_chars": 100_000,
                     "require_sections": False,
                 },
@@ -471,7 +681,7 @@ def test_pass8_terse_retry_failure_is_visible_in_result():
     # The error must still classify as a timeout (so quorum math is
     # unchanged and downstream consumers branching on `error_kind` keep
     # working) — but it must now carry the terse-retry-failed suffix.
-    from llm_council.adapters import classify_error, TERSE_RETRY_TIMEOUT_SECONDS
+    from llm_council.adapters import classify_error, _terse_retry_budget
 
     assert classify_error(result.error) == "timeout"
     assert result.error.startswith("Timeout:")
@@ -479,7 +689,12 @@ def test_pass8_terse_retry_failure_is_visible_in_result():
         f"Expected the failed-retry annotation in the error, got: "
         f"{result.error[:200]}"
     )
-    assert f"{TERSE_RETRY_TIMEOUT_SECONDS}s budget" in result.error
+    # v0.12.0: the budget is proportional to the ORIGINAL timeout
+    # (1s here → floor of 30s), so the suffix names the real budget
+    # rather than the legacy 60s constant. The test cfg disabled size
+    # scaling so original_timeout stays at 1s for budget math.
+    expected_budget = _terse_retry_budget(1)
+    assert f"{expected_budget}s budget" in result.error
     # The NEW field is the load-bearing signal — without it, transcripts
     # cannot distinguish "retry fired and failed" from "retry never fired".
     assert result.terse_retry_attempted is True

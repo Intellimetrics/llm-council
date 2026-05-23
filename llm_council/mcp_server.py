@@ -221,7 +221,7 @@ def council_run_schema() -> dict[str, Any]:
     }
 
 
-COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 4  # v4 = quota_throttled_peers (top-level), model_fallback_used / recovered_after_quota (per-result), quota_exhausted error_kind
+COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 5  # v5 = missing_key_peers (top-level), size-scaled timeouts (no schema change but new field semantics)
 COUNCIL_RUN_VALID_STANCES = ("for", "against", "neutral")
 COUNCIL_RUN_VALID_ERROR_KINDS = (
     "timeout",
@@ -605,6 +605,26 @@ def council_run_output_schema() -> dict[str, Any]:
                         "model": {"type": ["string", "null"]},
                     },
                     "required": ["peer", "family"],
+                },
+            },
+            "missing_key_peers": {
+                "type": "array",
+                "description": (
+                    "v0.12.0: hosted peers (openrouter / openai_compatible) "
+                    "dropped from the run because their `api_key_env` env "
+                    "var was unset. Excluded from the quorum denominator "
+                    "BEFORE the run starts, so a missing key on one peer "
+                    "doesn't flip the whole run to `degraded`. Omitted "
+                    "entirely when all configured keys are present."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "peer": {"type": "string"},
+                        "family": {"type": "string"},
+                        "api_key_env": {"type": "string"},
+                    },
+                    "required": ["peer", "family", "api_key_env"],
                 },
             },
             "metadata": {"type": "object"},
@@ -1339,6 +1359,15 @@ async def run_council(
         quota_recoveries = list(metadata.pop("quota_recoveries") or [])
     else:
         quota_recoveries = []
+    # v0.12.0: peers dropped before the run because their api_key_env was
+    # unset. Lifted top-level so the operator gets a "you forgot to set
+    # X env var" signal without parsing per-result errors (the peer
+    # never produced a result — it was excluded pre-run).
+    if isinstance(metadata, dict) and "missing_key_peers" in metadata:
+        metadata = dict(metadata)
+        missing_key_peers = list(metadata.pop("missing_key_peers") or [])
+    else:
+        missing_key_peers = []
     payload: dict[str, Any] = {
         "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
         "recommendation": recommendation,
@@ -1375,6 +1404,9 @@ async def run_council(
         payload["metadata"] = metadata
     if quota_recoveries:
         payload["quota_recoveries"] = quota_recoveries
+        payload["metadata"] = metadata
+    if missing_key_peers:
+        payload["missing_key_peers"] = missing_key_peers
         payload["metadata"] = metadata
     # v0.9.0 Feature 2: lift cross-rank fields to the top-level payload
     # mirroring finding_matrix. Strip them from metadata to avoid

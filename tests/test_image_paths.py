@@ -520,9 +520,13 @@ def test_image_attachment_violations_empty_when_under_cap(tmp_path: Path):
     assert image_attachment_violations(manifest) == []
 
 
-def test_execute_council_emits_images_skipped_for_non_vision(tmp_path: Path):
+def test_execute_council_emits_images_skipped_for_non_vision(tmp_path: Path, monkeypatch):
     from llm_council.orchestrator import execute_council
 
+    # v0.12.0 missing-key drop would otherwise remove both openrouter
+    # peers before the images_skipped loop runs; set a dummy key so
+    # they participate and the image-skip path is what's exercised.
+    monkeypatch.setenv("IMAGE_TEST_KEY", "dummy")
     image = _make_png(tmp_path / "ui.png")
     manifest = build_image_manifest([str(image)], cwd=tmp_path)
     participant_cfg = {
@@ -530,13 +534,13 @@ def test_execute_council_emits_images_skipped_for_non_vision(tmp_path: Path):
             "type": "openrouter",
             "model": "x/y",
             "vision": False,
-            "api_key_env": "MISSING_KEY_FOR_TEST",
+            "api_key_env": "IMAGE_TEST_KEY",
         },
         "vision_router": {
             "type": "openrouter",
             "model": "x/vision",
             "vision": True,
-            "api_key_env": "MISSING_KEY_FOR_TEST",
+            "api_key_env": "IMAGE_TEST_KEY",
         },
         "claude": {"type": "cli", "command": "true", "args": []},
     }
@@ -565,17 +569,22 @@ def test_execute_council_emits_images_skipped_for_non_vision(tmp_path: Path):
     assert skipped[0]["image_count"] == 1
 
 
-def test_skip_event_emitted_even_when_progress_callback_is_none(tmp_path: Path):
+def test_skip_event_emitted_even_when_progress_callback_is_none(
+    tmp_path: Path, monkeypatch
+):
     """Regression: skip events must reach metadata.progress_events without a printer."""
     from llm_council.orchestrator import execute_council
 
+    # v0.12.0: set the key so the missing-key drop doesn't preempt the
+    # images_skipped emission this test is validating.
+    monkeypatch.setenv("IMAGE_TEST_KEY", "dummy")
     image = _make_png(tmp_path / "ui.png")
     manifest = build_image_manifest([str(image)], cwd=tmp_path)
     participant_cfg = {
         "text_router": {
             "type": "openrouter",
             "model": "x/y",
-            "api_key_env": "MISSING_KEY_FOR_TEST",
+            "api_key_env": "IMAGE_TEST_KEY",
         },
     }
     config = {

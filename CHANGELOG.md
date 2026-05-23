@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.0 - 2026-05-23
+
+v0.12.0 lands four timeout-resilience improvements surfaced by the v0.11.7 dogfood (claude timed out at 240s on a 4KB prompt; codex timed out at 240s on a 26KB prompt; the 60s terse-retry on a 240s timeout was structurally doomed).
+*   **Size-scaled base timeouts.** `_resolve_effective_timeout` now adds 5s per KB above a 4KB threshold (capped at +600s), with the mode multiplier layered on top of `(base + bonus)`. Per-peer override via `timeout_per_kb_chars` (set to 0 to disable). A 26KB prompt in consensus mode now gets 700s instead of 480s.
+*   **Proportional terse-retry budget.** New `_terse_retry_budget(original)` returns `min(max(original * 0.4, 30), 120)` — floor 30s, ceiling 120s, 40% in between. Replaces the legacy fixed 60s constant which was structurally unlikely to succeed when the original timeout was 240s+. Retry runs with `timeout_per_kb_chars: 0` to avoid double-scaling. The failure-annotation suffix now names the real budget, not the legacy 60s.
+*   **Idle-read timeout (opt-in).** New per-peer `idle_timeout: float | None` field. When set, `_run_cli_once` switches to a streamed read loop with per-stream idle deadline; the peer is killed when no stdout/stderr arrives for N seconds (in addition to the wall-clock cap). Default OFF for all built-in peers since most CLIs (claude `-p`, codex `exec`, agy `--print`) buffer output rather than stream. Operators with a known-streaming CLI can opt in.
+*   **Missing-key peer pre-drop.** Hosted peers (openrouter / openai_compatible) whose `api_key_env` env var is unset are now removed from the run BEFORE preflight, with a `peer_missing_api_key` progress event + top-level `missing_key_peers` metadata field. Crucially, they do NOT count toward the quorum denominator — a missing key is an operator configuration gap, not a council failure that should degrade an otherwise-healthy run.
+*   MCP schema bumped to v5. Top-level `missing_key_peers` field added. Cache schema unchanged.
+
 ## 0.11.8 - 2026-05-23
 
 v0.11.8 fixes two correctness bugs and one false-negative gap in the v0.11.6 quota fallback work, surfaced by the v0.11.7 dogfood council review.

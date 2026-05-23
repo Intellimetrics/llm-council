@@ -97,7 +97,14 @@ TERSE_RETRY_INSTRUCTION = (
     "Keep the RECOMMENDATION: yes|no|tradeoff label and, at minimum, the "
     "BLOCKERS or ASSUMPTIONS list if you would otherwise abdicate."
 )
-TERSE_RETRY_TIMEOUT_SECONDS = 60
+TERSE_RETRY_TIMEOUT_SECONDS = 60  # legacy default; use _terse_retry_budget(original)
+# v0.12.0 size-scaled / proportional timeout knobs
+TERSE_RETRY_BUDGET_FRACTION = 0.4   # retry gets 40% of original
+TERSE_RETRY_MIN_SECONDS = 30        # always a fair shot
+TERSE_RETRY_MAX_SECONDS = 120       # but never excessive
+_TIMEOUT_PROMPT_BONUS_THRESHOLD_CHARS = 4096   # 4KB threshold before bonus kicks in
+_TIMEOUT_PROMPT_BONUS_MAX_SECONDS = 600        # cap bonus at +10 min
+_TIMEOUT_PER_KB_CHARS_DEFAULT = 5.0            # 5s extra per KB above threshold
 
 # Suffix appended to the original timeout error when the terse-retry fired
 # but also failed. Pass-8 dogfood surfaced the silent-failure mode: a
@@ -697,21 +704,30 @@ async def run_cli_participant(
     )
     # Terse-retry on timeout. Mutually exclusive with launch-retry: a
     # timeout never returns nonzero_exit+stderr (launch-retry's gate).
-    # The retry uses TERSE_RETRY_TIMEOUT_SECONDS regardless of the mode
-    # multiplier so the total wall-clock cost stays bounded.
+    # The retry budget is now PROPORTIONAL to the original timeout
+    # (v0.12.0) so a 240s original doesn't get a structurally-doomed
+    # 60s retry — see `_terse_retry_budget` for the math.
     if (
         not result.ok
         and is_timeout_error(result.error)
         and _terse_retry_enabled(cfg)
     ):
+        original_timeout = _resolve_effective_timeout(
+            cfg, mode_multiplier, prompt_chars=len(prompt)
+        )
+        retry_budget = _terse_retry_budget(original_timeout)
         terse_prompt = _build_terse_retry_prompt(prompt)
         max_prompt_chars = cfg.get("max_prompt_chars")
         if max_prompt_chars is None or len(terse_prompt) <= int(max_prompt_chars):
             terse_cfg = dict(cfg)
-            terse_cfg["timeout"] = TERSE_RETRY_TIMEOUT_SECONDS
+            terse_cfg["timeout"] = retry_budget
+            # Disable size scaling for the retry — the budget already
+            # accounts for original-call size; double-scaling would
+            # blow the bounded-cost ceiling.
+            terse_cfg["timeout_per_kb_chars"] = 0
             terse_result, _terse_meta = await _run_cli_once(
                 name, terse_cfg, terse_prompt, cwd, start=start,
-                mode_multiplier=None,  # fixed 60s budget; no scaling
+                mode_multiplier=None,  # proportional budget; no extra scaling
                 mode=mode,
             )
             if terse_result.ok:
@@ -738,7 +754,9 @@ async def run_cli_participant(
             # original (multiplier-scaled) budget by design — wall-clock
             # includes the retry, but the budget that gated the timeout
             # decision was the original one.
-            result = _annotate_timeout_retry_failure(result, terse_result, name)
+            result = _annotate_timeout_retry_failure(
+                result, terse_result, name, budget=retry_budget
+            )
     # Quota-fallback retry. Fires when a CLI peer exits with a known
     # quota / rate-limit signal AND `cfg.fallback_chain` has a
     # candidate model. Skipped for the Claude family because the
@@ -891,7 +909,7 @@ async def _run_cli_once(
     mode: str | None = None,
 ) -> tuple[ParticipantResult, dict[str, Any]]:
     base_timeout = int(cfg.get("timeout") or 240)
-    timeout = _resolve_effective_timeout(cfg, mode_multiplier)
+    timeout = _resolve_effective_timeout(cfg, mode_multiplier, prompt_chars=len(prompt))
     command = _build_cli_command(name, cfg, prompt, cwd)
     max_prompt_chars = cfg.get("max_prompt_chars")
     if max_prompt_chars is not None and len(prompt) > int(max_prompt_chars):
@@ -918,6 +936,13 @@ async def _run_cli_once(
         strict=bool(cfg.get("env_strict", False)),
     )
 
+    idle_timeout_raw = cfg.get("idle_timeout")
+    idle_timeout = (
+        float(idle_timeout_raw)
+        if idle_timeout_raw is not None and float(idle_timeout_raw) > 0
+        else None
+    )
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *command,
@@ -927,9 +952,30 @@ async def _run_cli_once(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        communicate = asyncio.create_task(
-            proc.communicate(stdin_data.encode() if stdin_data is not None else None)
-        )
+        if idle_timeout is not None:
+            # Streaming read path (v0.12.0 opt-in): kill on N seconds of
+            # no stdout/stderr activity, in addition to the wall-clock
+            # cap. Useful for CLIs that genuinely stream tokens — they
+            # can run past the wall-clock cap as long as they're
+            # producing output, and get killed sooner than wall-clock
+            # if they go silent.
+            if stdin_data is not None:
+                proc.stdin.write(stdin_data.encode())
+                await proc.stdin.drain()
+                proc.stdin.close()
+
+            async def _streamed_read() -> tuple[bytes, bytes]:
+                stdout_b, stderr_b = await asyncio.gather(
+                    _read_stream_with_idle_deadline(proc.stdout, idle_timeout),
+                    _read_stream_with_idle_deadline(proc.stderr, idle_timeout),
+                )
+                return stdout_b, stderr_b
+
+            communicate = asyncio.create_task(_streamed_read())
+        else:
+            communicate = asyncio.create_task(
+                proc.communicate(stdin_data.encode() if stdin_data is not None else None)
+            )
         try:
             stdout, stderr = await asyncio.wait_for(asyncio.shield(communicate), timeout)
         except TimeoutError:
@@ -1090,6 +1136,7 @@ def _annotate_timeout_retry_failure(
     original: "ParticipantResult",
     terse: "ParticipantResult",
     name: str,
+    budget: int = TERSE_RETRY_TIMEOUT_SECONDS,
 ) -> "ParticipantResult":
     """Return a copy of ``original`` annotated with terse-retry attempt info.
 
@@ -1099,11 +1146,17 @@ def _annotate_timeout_retry_failure(
     suffix to the error string naming the next mitigation lever. The
     base error prefix stays unchanged so ``classify_error`` still
     returns the original kind (typically ``timeout``).
+
+    ``budget`` parameter (v0.12.0) lets the caller pass the actual
+    proportional terse-retry budget that was used, so the human-readable
+    suffix names the real seconds rather than the legacy 60s constant.
+    Defaults to ``TERSE_RETRY_TIMEOUT_SECONDS`` for back-compat with
+    any caller that hasn't migrated yet.
     """
     from dataclasses import replace
     retry_kind = classify_error(terse.error) or "unknown"
     suffix = TERSE_RETRY_FAILED_SUFFIX.format(
-        budget=TERSE_RETRY_TIMEOUT_SECONDS,
+        budget=budget,
         retry_kind=retry_kind,
         name=name,
     )
@@ -1311,6 +1364,34 @@ def _merge_cli_section_retry(
     return original
 
 
+async def _read_stream_with_idle_deadline(
+    stream: asyncio.StreamReader, idle_timeout: float
+) -> bytes:
+    """Read a subprocess stream until EOF, killing on idle (v0.12.0).
+
+    Raises TimeoutError when ``idle_timeout`` seconds pass with no data
+    delivered. Distinct from the wall-clock cap in `_run_cli_once`:
+    idle-detection lets a peer that's actively producing output run
+    longer than the wall-clock cap would have allowed, AND kills a
+    peer that's stuck silent sooner than the wall-clock cap would.
+
+    Opt-in per peer via `cfg.idle_timeout`. When unset, the original
+    `proc.communicate()` path runs unchanged — no behavior change for
+    peers that haven't enabled it.
+    """
+    chunks = bytearray()
+    while True:
+        try:
+            chunk = await asyncio.wait_for(stream.read(8192), timeout=idle_timeout)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"Idle timeout: no subprocess output for {idle_timeout:.0f}s"
+            ) from exc
+        if not chunk:
+            return bytes(chunks)
+        chunks.extend(chunk)
+
+
 async def _cleanup_timed_out_process(
     proc: asyncio.subprocess.Process,
     communicate: asyncio.Task[tuple[bytes, bytes]],
@@ -1371,11 +1452,16 @@ async def run_openai_compatible_participant(
         and is_timeout_error(result.error)
         and _terse_retry_enabled(cfg)
     ):
+        original_timeout = _resolve_effective_timeout(
+            cfg, mode_multiplier, base_default=180, prompt_chars=len(prompt)
+        )
+        retry_budget = _terse_retry_budget(original_timeout)
         terse_prompt = _build_terse_retry_prompt(prompt)
         max_prompt_chars = cfg.get("max_prompt_chars")
         if max_prompt_chars is None or len(terse_prompt) <= int(max_prompt_chars):
             terse_cfg = dict(cfg)
-            terse_cfg["timeout"] = TERSE_RETRY_TIMEOUT_SECONDS
+            terse_cfg["timeout"] = retry_budget
+            terse_cfg["timeout_per_kb_chars"] = 0
             terse_result = await _run_openai_compatible_inner(
                 name, terse_cfg, terse_prompt,
                 image_manifest=image_manifest,
@@ -1397,7 +1483,7 @@ async def run_openai_compatible_participant(
                 # Annotate the original result so the retry attempt is
                 # visible in transcripts/stats (matches CLI path).
                 result = _annotate_timeout_retry_failure(
-                    result, terse_result, name
+                    result, terse_result, name, budget=retry_budget
                 )
     # Retry layering invariant: terse-retry → section-repair → strict-evidence.
     # Section-repair runs first because a section-fixed retry can introduce
@@ -1618,7 +1704,9 @@ async def _run_openai_compatible_inner(
         "usage": {"include": True},
     }
     headers = _build_openai_compatible_headers(api_key, cfg, is_openrouter=is_openrouter)
-    timeout = float(_resolve_effective_timeout(cfg, mode_multiplier, base_default=180))
+    timeout = float(_resolve_effective_timeout(
+        cfg, mode_multiplier, base_default=180, prompt_chars=len(prompt)
+    ))
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             response = await _request_with_retries(
@@ -1966,11 +2054,16 @@ async def run_ollama_participant(
         and is_timeout_error(result.error)
         and _terse_retry_enabled(cfg)
     ):
+        original_timeout = _resolve_effective_timeout(
+            cfg, mode_multiplier, base_default=180, prompt_chars=len(prompt)
+        )
+        retry_budget = _terse_retry_budget(original_timeout)
         terse_prompt = _build_terse_retry_prompt(prompt)
         max_prompt_chars = cfg.get("max_prompt_chars")
         if max_prompt_chars is None or len(terse_prompt) <= int(max_prompt_chars):
             terse_cfg = dict(cfg)
-            terse_cfg["timeout"] = TERSE_RETRY_TIMEOUT_SECONDS
+            terse_cfg["timeout"] = retry_budget
+            terse_cfg["timeout_per_kb_chars"] = 0
             terse_result = await _run_ollama_inner(
                 name, terse_cfg, terse_prompt,
                 image_manifest=image_manifest,
@@ -1992,7 +2085,7 @@ async def run_ollama_participant(
                 # Annotate the original result so the retry attempt is
                 # visible in transcripts/stats (matches CLI path).
                 result = _annotate_timeout_retry_failure(
-                    result, terse_result, name
+                    result, terse_result, name, budget=retry_budget
                 )
     # Retry layering invariant (see openai_compatible wrapper for full notes):
     # terse-retry → section-repair → strict-evidence, each capped at one
@@ -2097,7 +2190,9 @@ async def _run_ollama_inner(
         "stream": False,
     }
     try:
-        ollama_timeout = float(_resolve_effective_timeout(cfg, mode_multiplier, base_default=180))
+        ollama_timeout = float(_resolve_effective_timeout(
+            cfg, mode_multiplier, base_default=180, prompt_chars=len(prompt)
+        ))
         async with httpx.AsyncClient(timeout=ollama_timeout) as client:
             response = await _request_with_retries(
                 client,
@@ -2350,7 +2445,9 @@ async def run_participants(
                 family=cfg.get("family"),
                 tool_call_voting=tool_call_voting,
             )
-            timeout = _resolve_effective_timeout(cfg, mode_multiplier)
+            timeout = _resolve_effective_timeout(
+                cfg, mode_multiplier, prompt_chars=len(peer_prompt)
+            )
             override = cfg.get("slow_warn_after_seconds")
             if override is not None:
                 slow_after = float(override)
@@ -3048,21 +3145,64 @@ def _resolve_effective_timeout(
     mode_multiplier: float | None,
     *,
     base_default: int = 240,
+    prompt_chars: int = 0,
 ) -> int:
-    """Resolve the per-call timeout from per-participant base and mode multiplier.
+    """Resolve the per-call timeout from per-participant base, size bonus, and mode multiplier.
 
     Per-participant ``cfg["timeout"]`` stays the source of truth for the base
-    value; the multiplier is layered on top so users who raised the base for
-    a stubborn host CLI also benefit on consensus/deliberate runs. Pass-7's
-    14K-char prompt timed claude out at 240s; consensus mode's 2.0x raises
-    that to 480s without forcing the user to override the per-participant
-    config. Rounds up so 1.5x of 240 lands at 360, not 359.
+    value. A size bonus is added when ``prompt_chars`` exceeds the threshold
+    (default 4KB) so larger prompts get proportionally more wall-clock —
+    the v0.11.7 dogfood showed a 26KB prompt repeatedly tripping the 240s
+    wall while a 4KB prompt for the same peer succeeded, because processing
+    latency scales with context length. The size bonus is per-peer
+    overridable via ``cfg["timeout_per_kb_chars"]`` (default 5s/KB; set to
+    0 to disable). Max bonus is ``_TIMEOUT_PROMPT_BONUS_MAX_SECONDS`` so
+    a runaway prompt can't inflate timeout to infinity.
+
+    The mode multiplier (consensus 2.0x, deliberate 1.5x, etc.) layers on
+    top of base+bonus, so users who raised the base for a stubborn host
+    CLI also benefit on consensus/deliberate runs. Rounds up so 1.5x of
+    240 lands at 360, not 359.
     """
     base = int(cfg.get("timeout") or base_default)
+    bonus = _prompt_size_bonus(cfg, prompt_chars)
     if mode_multiplier is None or mode_multiplier <= 1.0:
-        return base
+        return base + bonus
     import math
-    return int(math.ceil(base * float(mode_multiplier)))
+    return int(math.ceil((base + bonus) * float(mode_multiplier)))
+
+
+def _prompt_size_bonus(cfg: dict[str, Any], prompt_chars: int) -> int:
+    """Compute the size-scaled timeout bonus in seconds.
+
+    Public-shaped helper (separate function) so tests can pin behavior
+    without round-tripping through `_resolve_effective_timeout`.
+    """
+    if prompt_chars <= _TIMEOUT_PROMPT_BONUS_THRESHOLD_CHARS:
+        return 0
+    per_kb = float(cfg.get("timeout_per_kb_chars", _TIMEOUT_PER_KB_CHARS_DEFAULT))
+    if per_kb <= 0:
+        return 0
+    kb_over = (prompt_chars - _TIMEOUT_PROMPT_BONUS_THRESHOLD_CHARS) / 1024.0
+    bonus = int(round(kb_over * per_kb))
+    return min(bonus, _TIMEOUT_PROMPT_BONUS_MAX_SECONDS)
+
+
+def _terse_retry_budget(original_timeout: float) -> int:
+    """Compute the terse-retry budget proportional to the original timeout.
+
+    The v0.11.7 dogfood showed a 60s fixed retry budget is structurally
+    unlikely to succeed when the original timeout was 240s — the retry
+    nearly always re-times out, providing no recovery signal. Scale to
+    40% of the original (floor 30s — always a fair shot, ceiling 120s —
+    a 600s original shouldn't get a 240s retry on top). Mode multiplier
+    is intentionally NOT applied to the retry budget; the terse retry
+    is a last-ditch effort with a tight wall-clock cap by design.
+    """
+    return min(
+        max(int(round(original_timeout * TERSE_RETRY_BUDGET_FRACTION)), TERSE_RETRY_MIN_SECONDS),
+        TERSE_RETRY_MAX_SECONDS,
+    )
 
 
 def _format_timeout_error(
