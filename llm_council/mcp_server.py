@@ -221,7 +221,7 @@ def council_run_schema() -> dict[str, Any]:
     }
 
 
-COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 3  # v3 = recovered_after_timeout, prompt_chars, incomplete_response/untagged_evidence error_kinds, structured evidence
+COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 4  # v4 = quota_throttled_peers (top-level), model_fallback_used / recovered_after_quota (per-result), quota_exhausted error_kind
 COUNCIL_RUN_VALID_STANCES = ("for", "against", "neutral")
 COUNCIL_RUN_VALID_ERROR_KINDS = (
     "timeout",
@@ -340,6 +340,29 @@ def council_run_output_schema() -> dict[str, Any]:
                                 "(launch failure) and `repair_retry_recovered` "
                                 "(missing label) so stats can attribute recovery "
                                 "to the right mechanism."
+                            ),
+                        },
+                        "model_fallback_used": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "v0.11.6 Phase 2. Next-in-chain model that ran "
+                                "after a quota_exhausted error fired and the "
+                                "adapter retried with `cfg.fallback_chain`. "
+                                "`null` on the common path (no fallback). "
+                                "Always `null` for the Claude family because "
+                                "Claude's CLI handles overload natively via "
+                                "`--fallback-model` and the swap is invisible "
+                                "to llm-council."
+                            ),
+                        },
+                        "recovered_after_quota": {
+                            "type": "boolean",
+                            "description": (
+                                "True when the quota-fallback retry succeeded. "
+                                "Set in tandem with `model_fallback_used`. A "
+                                "fallback that also fails leaves this False "
+                                "and `error_kind=quota_exhausted` so the peer "
+                                "still drops from quorum."
                             ),
                         },
                         "tool_call_status": {
@@ -539,6 +562,50 @@ def council_run_output_schema() -> dict[str, Any]:
                     "`--cross-rank` was not set."
                 ),
                 "additionalProperties": {"type": "string"},
+            },
+            "quota_throttled_peers": {
+                "type": "array",
+                "description": (
+                    "Peers that hit a known quota/rate-limit error during "
+                    "this run (`error_kind=quota_exhausted`) AND did NOT "
+                    "recover via fallback. Surfaced top-level so the "
+                    "calling agent can identify rate-limited peers "
+                    "without parsing per-result `error` strings. Omitted "
+                    "entirely when no peer was throttled (the common "
+                    "case). Peers that recovered via `fallback_chain` "
+                    "appear in `quota_recoveries` instead."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "peer": {"type": "string"},
+                        "family": {"type": "string"},
+                        "model": {"type": ["string", "null"]},
+                        "message": {"type": "string"},
+                    },
+                    "required": ["peer", "family", "message"],
+                },
+            },
+            "quota_recoveries": {
+                "type": "array",
+                "description": (
+                    "Phase 2: peers that hit quota but recovered via "
+                    "`cfg.fallback_chain` retry. Each entry names the "
+                    "fallback model that succeeded. Omitted entirely "
+                    "when no recovery fired. Disjoint from "
+                    "`quota_throttled_peers` (a peer is in exactly one "
+                    "list per run, keyed on its final state)."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "peer": {"type": "string"},
+                        "family": {"type": "string"},
+                        "fallback_model": {"type": ["string", "null"]},
+                        "model": {"type": ["string", "null"]},
+                    },
+                    "required": ["peer", "family"],
+                },
             },
             "metadata": {"type": "object"},
             "summary_markdown": {
@@ -1199,6 +1266,10 @@ async def run_council(
                 ),
                 "repair_retry_recovered": bool(result.repair_retry_recovered),
                 "recovered_after_timeout": bool(result.recovered_after_timeout),
+                "model_fallback_used": getattr(result, "model_fallback_used", None),
+                "recovered_after_quota": bool(
+                    getattr(result, "recovered_after_quota", False)
+                ),
                 "tool_call_status": getattr(result, "tool_call_status", None),
                 "prompt_chars": result.prompt_chars,
                 "effort": result.effort,
@@ -1250,6 +1321,24 @@ async def run_council(
         finding_matrix_payload = {}
     consensus_blockers = list(finding_matrix_payload.get("consensus_blockers") or [])
     single_peer_concerns = list(finding_matrix_payload.get("single_peer_concerns") or [])
+    # Mirror the finding-matrix pattern for quota-throttled peers: lift
+    # the cumulative list from `metadata.quota_throttled_peers` to a
+    # top-level payload key so a calling agent (e.g. Claude Code) can
+    # spot rate-limited peers without parsing per-result `error_kind`
+    # fields. Strip from metadata to avoid double-serialization.
+    if isinstance(metadata, dict) and "quota_throttled_peers" in metadata:
+        metadata = dict(metadata)
+        quota_throttled_peers = list(metadata.pop("quota_throttled_peers") or [])
+    else:
+        quota_throttled_peers = []
+    # Phase 2 parallel: quota recoveries. Lifted with the same pattern so
+    # the operator can see "this peer hit quota but recovered via fallback
+    # to <model>" without parsing per-result fields.
+    if isinstance(metadata, dict) and "quota_recoveries" in metadata:
+        metadata = dict(metadata)
+        quota_recoveries = list(metadata.pop("quota_recoveries") or [])
+    else:
+        quota_recoveries = []
     payload: dict[str, Any] = {
         "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
         "recommendation": recommendation,
@@ -1274,6 +1363,19 @@ async def run_council(
     if consensus_blockers or single_peer_concerns:
         payload["consensus_blockers"] = consensus_blockers
         payload["single_peer_concerns"] = single_peer_concerns
+    # Same omit-when-empty convention for quota_throttled_peers: the
+    # common case has no quota issues and we don't want to ship an
+    # empty array on every run.
+    if quota_throttled_peers:
+        payload["quota_throttled_peers"] = quota_throttled_peers
+        # Re-anchor `payload["metadata"]` only when the metadata-pop
+        # branch above actually mutated `metadata` (i.e., the key existed
+        # in the first place). The plain-dict assignment is safe even if
+        # this branch is a no-op for a given run.
+        payload["metadata"] = metadata
+    if quota_recoveries:
+        payload["quota_recoveries"] = quota_recoveries
+        payload["metadata"] = metadata
     # v0.9.0 Feature 2: lift cross-rank fields to the top-level payload
     # mirroring finding_matrix. Strip them from metadata to avoid
     # double-serialization (same data appearing under metadata.* AND

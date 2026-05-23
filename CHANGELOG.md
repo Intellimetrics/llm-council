@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.11.7 - 2026-05-23
+
+v0.11.7 lands Phase 3 of quota resilience: visibility in `stats --reliability`.
+*   `llm-council stats --reliability` now surfaces two new per-peer counters: `quota_incidents` (every quota wall hit, including recovered ones) and `quota_recoveries` (the subset rescued via `fallback_chain`). Derived `quota_recovery_rate` exposed in the JSON payload; text formatter renders `<recovered>/<incidents> (<pct>%)` under new `quotaInc` / `quotaRec` columns.
+*   A peer with ONLY quota-incident signal (no operator outcomes, no VERIFIED citations, no rank data) now appears in the reliability table — previously dropped as "no signal". So a quota-throttled antigravity shows up immediately, no `--participant` flag needed.
+*   Counters are mechanical from transcripts (no operator labeling needed) — same pattern as `verified_citation_rate`. A recovered call counts as 1 incident + 1 recovery; a hard-failed call counts as 1 incident + 0 recoveries.
+*   CLAUDE.md documents the honest gap: per-CLI token usage is NOT observable from outside the CLI (CLIs auth as the user, burn the user's quota, expose no metering hook). Only OpenRouter peers expose real `prompt_tokens` / `completion_tokens` / `cost_usd`. Quota incident counts are the observable proxy for CLI peers.
+
+## 0.11.6 - 2026-05-22
+
+v0.11.6 lands Phase 2 of quota resilience: actual fallback retries, not just detection.
+*   New participant config `fallback_chain: list[str]` — ordered model IDs to step down to on quota errors. Default chains shipped for `claude` / `claude_4_6` / `claude_4_7` → `claude-sonnet-4-6`, `codex` → `gpt-5-mini`, `gemini` → `gemini-2.5-flash`. Antigravity stays empty (no `--model` flag).
+*   **Claude**: `_build_cli_command` auto-injects `--fallback-model <chain[0]>` into the CLI args — Claude's native overload handling kicks in inside the CLI. llm-council-level retry is skipped for Claude to avoid double-paying the peer.
+*   **Codex / Gemini / any non-Claude CLI**: on `quota_exhausted` detection, the adapter retries ONCE with the next-in-chain model substituted into `cfg.model`. Success stamps `recovered_after_quota=True` + `model_fallback_used=<id>` on the result.
+*   New top-level field `quota_recoveries: [{peer, family, fallback_model, model}]` on transcript + MCP `structured_results`, disjoint from `quota_throttled_peers`. A peer is in exactly one list per run, keyed on its final state.
+*   New progress event `peer_quota_recovered` emitted in real-time, deduped per peer across rounds.
+*   New stats counter `quota_recoveries` per peer; together with `error_kind_counts.quota_exhausted` it tells the operator how often a peer absorbs vs. survives quota incidents over time.
+*   New per-result fields `model_fallback_used: str | None` and `recovered_after_quota: bool` surfaced in transcript JSON, MCP `structured_results`, and cache rehydrate.
+*   MCP `COUNCIL_RUN_OUTPUT_SCHEMA_VERSION` bumped to v4 (`quota_throttled_peers`, `quota_recoveries`, per-result fallback fields). Cache schema unchanged (new fields are write-only optional with default-on-missing reads).
+*   Antigravity is intentionally a no-op for Phase 2: `agy` has no `--model` flag, so the peer still drops with `quota_throttled_peers` (Phase 1 signal) — the calling agent's responsibility to re-run later.
+
+## 0.11.5 - 2026-05-22
+
+v0.11.5 adds quota-exhaustion detection across CLI and hosted peers (Phase 1 of resilience work).
+*   New `error_kind=quota_exhausted` classifies known rate-limit / quota signals (`RESOURCE_EXHAUSTED`, `quota_exceeded`, `rate_limit_exceeded`, `insufficient_quota`, `insufficient credits`, `usage limit`, `5-hour limit`, contextual HTTP 429) instead of falling through to `cli_nonzero_exit` / `downstream_error` / `unknown`.
+*   New top-level field `quota_throttled_peers: [{peer, family, model, message}]` on transcript JSON and MCP `structured_results`, lifted from metadata. Omitted entirely when no peer was throttled (common case).
+*   New progress event `peer_quota_throttled` emitted per peer; deduplicated across rounds so a peer throttled in round 1 doesn't re-emit in round 2.
+*   `stats.aggregate.error_kind_counts.quota_exhausted` now visible per peer without any stats changes (the bucket auto-populates from the new error_kind).
+*   No auto-fallback yet — that's Phase 2. For now the peer drops from quorum like any other failure; the new surfacing makes the cause visible to the calling agent.
+
+## 0.11.4 - 2026-05-22
+
+v0.11.4 makes `llm-council doctor` self-heal a stale OpenRouter catalog.
+*   `doctor` now refreshes a missing/stale catalog inline (10s timeout, best-effort) instead of nagging users to run `llm-council models refresh` manually.
+*   Fail-soft: a network failure during auto-refresh falls through to the previous stale-warning Check with the underlying error appended.
+*   New default `defaults.catalog_auto_refresh: true` (override to `false` to restore the prior manual-refresh-required behavior).
+*   Reminder: the catalog check still only fires when at least one OpenRouter participant is configured, so CLI-only users never see catalog warnings (unchanged).
+
 ## 0.11.3 - 2026-05-21
 
 v0.11.3 introduces dynamic stance balancing and robust diagnostics for missing tools.

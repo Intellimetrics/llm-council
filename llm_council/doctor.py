@@ -13,10 +13,15 @@ import httpx
 from llm_council.model_catalog import (
     openrouter_cache_age_seconds,
     openrouter_cache_path,
+    refresh_openrouter_cache,
 )
 
 
 CATALOG_STALE_SECONDS_DEFAULT = 14 * 24 * 60 * 60
+# Tighter than `refresh_openrouter_cache`'s 30s default so a slow connection
+# can't stall the doctor for half a minute. On failure we fall through to a
+# stale-warning Check, so the user still gets a usable report.
+CATALOG_AUTO_REFRESH_TIMEOUT_SECONDS = 10.0
 
 # Well-known local OpenAI-compatible inference servers. Listed in order of
 # rough popularity; the doctor port-scan iterates this list.
@@ -133,12 +138,53 @@ def check_environment(
 
 
 def _check_openrouter_catalog_age(config: dict[str, Any]) -> Check:
+    defaults = config.get("defaults", {}) or {}
     threshold = int(
-        (config.get("defaults", {}) or {}).get(
-            "catalog_stale_seconds", CATALOG_STALE_SECONDS_DEFAULT
-        )
+        defaults.get("catalog_stale_seconds", CATALOG_STALE_SECONDS_DEFAULT)
     )
+    auto_refresh = bool(defaults.get("catalog_auto_refresh", True))
+
     age = openrouter_cache_age_seconds()
+    needs_refresh = age is None or age > threshold
+
+    if not needs_refresh:
+        return Check(
+            name="catalog:openrouter",
+            ok=True,
+            detail=f"fresh ({_format_duration(age)} old)",
+        )
+
+    if auto_refresh:
+        # Best-effort inline refresh. The catalog is just OpenRouter's public
+        # model list — fetching it requires no auth and the failure mode is
+        # network-only. Fail-soft so a disconnected user still gets a useful
+        # diagnostic instead of an error.
+        try:
+            summary = refresh_openrouter_cache(
+                timeout=CATALOG_AUTO_REFRESH_TIMEOUT_SECONDS
+            )
+        except Exception as exc:
+            error_detail = f"{type(exc).__name__}: {exc}"
+            if age is None:
+                return Check(
+                    name="catalog:openrouter",
+                    ok=False,
+                    detail=f"missing — auto-refresh failed: {error_detail}",
+                )
+            return Check(
+                name="catalog:openrouter",
+                ok=False,
+                detail=(
+                    f"stale ({_format_duration(age)} old) — "
+                    f"auto-refresh failed: {error_detail}"
+                ),
+            )
+        return Check(
+            name="catalog:openrouter",
+            ok=True,
+            detail=f"auto-refreshed ({summary['model_count']} models)",
+        )
+
     if age is None:
         return Check(
             name="catalog:openrouter",
@@ -148,20 +194,14 @@ def _check_openrouter_catalog_age(config: dict[str, Any]) -> Check:
                 "run `llm-council models refresh`"
             ),
         )
-    if age > threshold:
-        return Check(
-            name="catalog:openrouter",
-            ok=False,
-            detail=(
-                f"stale ({_format_duration(age)} old > "
-                f"{_format_duration(threshold)} threshold) — "
-                "run `llm-council models refresh`"
-            ),
-        )
     return Check(
         name="catalog:openrouter",
-        ok=True,
-        detail=f"fresh ({_format_duration(age)} old)",
+        ok=False,
+        detail=(
+            f"stale ({_format_duration(age)} old > "
+            f"{_format_duration(threshold)} threshold) — "
+            "run `llm-council models refresh`"
+        ),
     )
 
 

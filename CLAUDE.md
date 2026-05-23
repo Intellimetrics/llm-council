@@ -329,6 +329,41 @@ Key modules:
   signal for raising `defaults.timeout` or a mode's `timeout_multiplier`
   rather than chunking. Bucket cutoffs are tuned to
   `MAX_PROMPT_CHARS=200_000`; revisit if the global cap changes.
+- **Quota-fallback chain semantics.** Each CLI participant carries an
+  optional `fallback_chain: list[str]` — ordered list of model IDs to
+  step down to on a `quota_exhausted` failure. Resolution: if `cfg.model`
+  is in the chain, pick the entry AFTER it; if it's None or absent from
+  the chain, pick `chain[0]`; if there's no next entry, no retry. The
+  retry walks AT MOST ONE step per call to bound wall-clock cost — a
+  multi-step walk happens only across separate council runs as the
+  operator overrides `cfg.model`. The Claude family is special-cased:
+  `_build_cli_command` auto-injects `--fallback-model <chain[0]>` so the
+  CLI itself handles overload internally, and the llm-council-level
+  retry is SKIPPED for Claude to avoid double-paying the peer.
+  Antigravity ships with `fallback_chain: []` because `agy` has no
+  `--model` flag — the peer drops with `quota_throttled_peers` (Phase 1
+  signal) and never enters the fallback path. Codex/Gemini ship best-
+  effort defaults (`gpt-5-mini`, `gemini-2.5-flash`); a wrong model id
+  just makes the retry fail and the peer drops normally, so being out of
+  date is degraded behavior, not a crash. Successful recoveries stamp
+  `recovered_after_quota=True` + `model_fallback_used=<id>` on the
+  result, emit a `peer_quota_recovered` progress event, and surface in
+  top-level `quota_recoveries: [{peer, family, fallback_model, model}]`
+  (disjoint from `quota_throttled_peers` — a peer is in exactly one
+  list per run, keyed on its final state).
+- **Per-CLI token usage is not observable.** CLI participants
+  (claude, codex, gemini, antigravity) authenticate as the user and
+  burn the user's own account quota. llm-council has no metering hook
+  into those CLIs — no way to read "X tokens consumed", "Y quota
+  remaining", or "Z requests this hour" from the outside. The only
+  observable usage signal for CLI peers is *failures we caught*:
+  `quota_incidents` (how many times the peer hit a quota wall) and
+  `quota_recoveries` (how many of those the fallback rescued),
+  surfaced per-peer via `llm-council stats --reliability`. Real
+  token-level usage is only available for hosted OpenRouter peers
+  (the `usage` field on API responses populates `prompt_tokens` /
+  `completion_tokens` / `cost_usd` on `ParticipantResult`). Don't
+  promise observability we don't have.
 - **`.mcp.json` stays local.** Setup adds it to `.gitignore`. It contains
   absolute paths and must not be committed.
 - **Version bumps.** `__version__` in `llm_council/__init__.py` and the
@@ -354,6 +389,7 @@ failure path; do not let strings drift.
 | `abdicated`          | Peer emitted `RECOMMENDATION:` and `EFFORT: blocked` with no concrete missing artifact in EITHER `BLOCKERS:` or `ASSUMPTIONS:`. Terminal for the round — no repair retry, drops quorum so consensus doesn't form on a non-vote. The cache DOES persist the raw output; `_with_envelope` re-derives `ok=False` on every read so repeat runs still drop quorum without paying the peer again. Prefix: `AbdicatedResponse:` |
 | `incomplete_response` | Response had the `RECOMMENDATION:` label but missed one or more `(REQUIRED)` sections from the prompt after one repair-retry. Prefix: `IncompleteResponse:` |
 | `untagged_evidence`  | `defaults.strict_evidence: true` AND one or more EVIDENCE bullets lacked a `[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]` tag after one repair-retry. Prefix: `UntaggedEvidence:` |
+| `quota_exhausted`    | Peer hit a known quota / rate-limit signal (`RESOURCE_EXHAUSTED`, `quota_exceeded`, `rate_limit_exceeded`, `insufficient_quota`, `insufficient credits`, `usage limit`, `5-hour limit`, HTTP 429 with quota-adjacent text). Detected by `adapters.is_quota_exhausted_error` over the raw error string — no prefix synthesized. Surfaced top-level in transcripts and MCP `structured_results` as `quota_throttled_peers: [{peer, family, model, message}]`; orchestrator emits a `peer_quota_throttled` progress event per peer (deduped across rounds). Phase 2 (v0.11.6): a peer with non-empty `cfg.fallback_chain` gets ONE retry with the next-in-chain model substituted into `cfg.model` BEFORE the result lands in quorum. On success the peer recovers (`recovered_after_quota=True`, `model_fallback_used=<id>`, appears in `quota_recoveries` not `quota_throttled_peers`). On failure the peer drops with this error_kind. Skipped for the Claude family because Claude's own `--fallback-model` CLI flag handles overload natively (auto-injected by `_build_cli_command` when chain non-empty). |
 | `unknown`            | Non-empty error that did not match any known prefix — file a dogfood note            |
 
 ## Custom CLI participant: minimal template

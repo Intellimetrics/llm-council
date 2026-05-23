@@ -238,6 +238,19 @@ class ParticipantResult:
     # through the cache only when True so payloads stay tight for the
     # overwhelming majority of runs that do not enable `--cross-rank`.
     is_ranking_round: bool = False
+    # Phase 2 quota-fallback retry. `model_fallback_used` records the
+    # next-in-chain model that ultimately ran when a quota_exhausted
+    # error fired and the adapter retried with a stepped-down model
+    # from `cfg.fallback_chain`. None when no fallback fired (the
+    # common case) OR when the family uses native CLI handling (Claude
+    # via `--fallback-model`, where llm-council never sees the swap).
+    # `recovered_after_quota` is True only when the fallback retry
+    # SUCCEEDED — a retry that also quota-fails leaves the field False
+    # and keeps `error_kind=quota_exhausted`. Distinct from
+    # `recovered_after_timeout` (the terse-retry path) so stats can
+    # attribute recoveries to the right mechanism.
+    model_fallback_used: str | None = None
+    recovered_after_quota: bool = False
 
 
 @dataclass
@@ -471,6 +484,8 @@ def _result_from_cache_payload(
         continue_debate=payload.get("continue_debate"),
         tool_call_status=payload.get("tool_call_status"),
         is_ranking_round=bool(payload.get("is_ranking_round", False)),
+        model_fallback_used=payload.get("model_fallback_used"),
+        recovered_after_quota=bool(payload.get("recovered_after_quota", False)),
     )
 
 
@@ -540,6 +555,8 @@ def _maybe_persist_cache(
         continue_debate=result.continue_debate,
         tool_call_status=result.tool_call_status,
         is_ranking_round=result.is_ranking_round,
+        model_fallback_used=result.model_fallback_used,
+        recovered_after_quota=result.recovered_after_quota,
     )
     try:
         cache_write(
@@ -592,6 +609,33 @@ def _format_arg(value: str, *, prompt: str, cwd: Path) -> str:
     return value.replace("{prompt}", prompt).replace("{cwd}", str(cwd))
 
 
+def _pick_quota_fallback_model(cfg: dict[str, Any]) -> str | None:
+    """Return the next-in-chain model to try after a quota error.
+
+    Resolution:
+    * `cfg.model` is in `cfg.fallback_chain` → return the entry AFTER it
+      (or None if it's already the last in the chain).
+    * `cfg.model` is None or not in the chain → return `chain[0]`.
+    * Empty chain → None.
+
+    For Phase 2 the adapter performs at most ONE quota-fallback retry per
+    call, so we never walk past chain[0] on a single quota error. A
+    multi-step walk would be cost-unbounded; the chain's later entries
+    are reachable only across separate council runs as the operator
+    overrides `cfg.model` to the previous fallback target.
+    """
+    chain = cfg.get("fallback_chain") or []
+    if not chain:
+        return None
+    current = cfg.get("model")
+    if current and current in chain:
+        idx = chain.index(current)
+        if idx + 1 < len(chain):
+            return chain[idx + 1]
+        return None
+    return chain[0]
+
+
 def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -> list[str]:
     command = [cfg.get("command", name)]
     args = [_format_arg(str(arg), prompt=prompt, cwd=cwd) for arg in cfg.get("args", [])]
@@ -611,6 +655,21 @@ def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -
             # claude, gemini, and any other family use the standard
             # `--model <id>` flag.
             command.extend(["--model", str(model)])
+
+    # Claude's native `--fallback-model` flag: when the user-selected model
+    # is overloaded the CLI transparently retries with the fallback model.
+    # We never see the swap (Claude handles it internally), so no per-call
+    # signal — but the council run survives an overload that would
+    # otherwise drop the peer. Only the first chain entry is honored
+    # because the flag itself accepts a single model.
+    if family == "claude":
+        fallback_chain = cfg.get("fallback_chain") or []
+        if fallback_chain:
+            primary = str(model) if model else None
+            for candidate in fallback_chain:
+                if candidate and candidate != primary:
+                    command.extend(["--fallback-model", str(candidate)])
+                    break
 
     return command + args
 
@@ -680,6 +739,46 @@ async def run_cli_participant(
             # includes the retry, but the budget that gated the timeout
             # decision was the original one.
             result = _annotate_timeout_retry_failure(result, terse_result, name)
+    # Quota-fallback retry. Fires when a CLI peer exits with a known
+    # quota / rate-limit signal AND `cfg.fallback_chain` has a
+    # candidate model. Skipped for the Claude family because the
+    # CLI's own `--fallback-model` flag (wired in `_build_cli_command`)
+    # already handles overload internally — adding our own retry on
+    # top would double-pay the peer. Mutually exclusive with terse-
+    # retry by precondition (quota_exhausted error vs. timeout), so
+    # the "one extra call per peer per round" wall-clock ceiling
+    # stays bounded.
+    if (
+        not result.ok
+        and is_quota_exhausted_error(result.error)
+        and cfg.get("family") != "claude"
+    ):
+        fallback_model = _pick_quota_fallback_model(cfg)
+        if fallback_model:
+            fallback_cfg = dict(cfg)
+            fallback_cfg["model"] = fallback_model
+            fallback_result, _fallback_meta = await _run_cli_once(
+                name, fallback_cfg, prompt, cwd, start=start,
+                mode_multiplier=mode_multiplier, mode=mode,
+            )
+            from dataclasses import replace as _replace
+            if fallback_result.ok:
+                merged = _replace(
+                    fallback_result,
+                    model_fallback_used=fallback_model,
+                    recovered_after_quota=True,
+                )
+                _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
+                return merged
+            # Retry also failed. Stamp `model_fallback_used` so the
+            # transcript reflects that fallback was attempted, but keep
+            # the retry's own error (which may itself be quota-exhausted
+            # on a different model — the chain only gets one step per
+            # call). `recovered_after_quota` stays False.
+            result = _replace(
+                fallback_result,
+                model_fallback_used=fallback_model,
+            )
     if _should_launch_retry(meta, cfg):
         await asyncio.sleep(_launch_retry_backoff(0))
         retry_result, retry_meta = await _run_cli_once(
@@ -3038,6 +3137,7 @@ ERROR_KIND_PREFLIGHT_FAILED = "preflight_failed"
 ERROR_KIND_ABDICATED = "abdicated"
 ERROR_KIND_INCOMPLETE_RESPONSE = "incomplete_response"
 ERROR_KIND_UNTAGGED_EVIDENCE = "untagged_evidence"
+ERROR_KIND_QUOTA_EXHAUSTED = "quota_exhausted"
 ERROR_KIND_UNKNOWN = "unknown"
 
 KNOWN_ERROR_KINDS = frozenset(
@@ -3052,6 +3152,7 @@ KNOWN_ERROR_KINDS = frozenset(
         ERROR_KIND_ABDICATED,
         ERROR_KIND_INCOMPLETE_RESPONSE,
         ERROR_KIND_UNTAGGED_EVIDENCE,
+        ERROR_KIND_QUOTA_EXHAUSTED,
         ERROR_KIND_UNKNOWN,
     }
 )
@@ -3060,6 +3161,40 @@ PREFLIGHT_FAILED_PREFIX = "PreflightFailed:"
 ABDICATED_ERROR_PREFIX = "AbdicatedResponse:"
 INCOMPLETE_RESPONSE_PREFIX = "IncompleteResponse:"
 UNTAGGED_EVIDENCE_PREFIX = "UntaggedEvidence:"
+
+# Quota-exhaustion / rate-limit detection. CLI peers expose this through
+# stderr; hosted APIs through httpx exception messages. The signal is
+# usually one of a small set of substrings — match case-insensitively
+# but keep each pattern specific enough to avoid false positives on
+# unrelated text. The bare token "429" matches only when paired with
+# contextual words ("Too Many", "quota", etc.) to avoid catching e.g.
+# port numbers or row counts.
+QUOTA_EXHAUSTED_PATTERNS = (
+    re.compile(r"RESOURCE_EXHAUSTED"),                       # Google/Gemini/Antigravity
+    re.compile(r"quota\s+exceeded", re.IGNORECASE),
+    re.compile(r"quota_exceeded"),                            # Anthropic-style
+    re.compile(r"rate_limit_exceeded"),                       # OpenAI/Codex
+    re.compile(r"insufficient_quota"),                        # OpenAI
+    re.compile(r"insufficient\s+credits", re.IGNORECASE),     # OpenRouter
+    re.compile(r"usage\s+limit", re.IGNORECASE),              # Claude
+    re.compile(r"\d+-hour\s+limit", re.IGNORECASE),           # Claude 5-hour limit
+    re.compile(r"Too\s+Many\s+Requests", re.IGNORECASE),      # HTTP 429 text
+    re.compile(r"HTTP\s+status\s+429\b", re.IGNORECASE),      # httpx Retryable…
+    re.compile(r"status\s+code\s+429\b", re.IGNORECASE),
+    re.compile(r"\b429\b.{0,40}(Too Many|quota|rate|limit|retry)", re.IGNORECASE),
+)
+
+
+def is_quota_exhausted_error(error: str) -> bool:
+    """Return True when ``error`` matches a known quota/rate-limit pattern.
+
+    Public so the orchestrator can build the `quota_throttled_peers` list
+    without re-running `classify_error` and so consumers (stats, tests)
+    can apply the same detection consistently.
+    """
+    if not error:
+        return False
+    return any(pattern.search(error) for pattern in QUOTA_EXHAUSTED_PATTERNS)
 
 
 def classify_error(error: str) -> str | None:
@@ -3096,6 +3231,14 @@ def classify_error(error: str) -> str | None:
         return ERROR_KIND_INCOMPLETE_RESPONSE
     if error.startswith(UNTAGGED_EVIDENCE_PREFIX):
         return ERROR_KIND_UNTAGGED_EVIDENCE
+    # Quota check runs BEFORE the downstream_markers fallthrough so an
+    # httpx 429 (which would otherwise match "HTTPStatusError") gets the
+    # more specific `quota_exhausted` classification. Also runs after the
+    # prefix-based checks above so a `CliExitNonZero:` synthesized error
+    # with the word "quota" in it still classifies as cli_nonzero_exit
+    # (the prefix is load-bearing for that path).
+    if is_quota_exhausted_error(error):
+        return ERROR_KIND_QUOTA_EXHAUSTED
     # httpx + downstream-API errors funnel through f"{type(exc).__name__}: ..."
     # in the openrouter / ollama paths; we don't try to introspect those
     # further here, just classify them as `downstream_error` so callers can

@@ -365,3 +365,172 @@ def test_format_reliability_text_with_rows(tmp_path):
     text = format_reliability_text(out)
     assert "claude" in text
     assert "50%" in text  # 1 verified / 2 total
+
+
+# --- quota counters (Phase 3 v0.11.7) -----------------------------------
+
+
+def test_quota_incidents_counted_from_quota_exhausted_errors(tmp_path):
+    """A peer with `error_kind=quota_exhausted` in transcripts must show
+    up in reliability with the right `quota_incidents` count, even
+    without any outcomes marked."""
+    runs = tmp_path / ".llm-council" / "runs"
+    _write_transcript(
+        runs,
+        "20260520_120000_run-q1",
+        participants=["antigravity"],
+        results=[
+            {
+                "name": "antigravity",
+                "ok": False,
+                "model": "gemini-3-flash",
+                "elapsed_seconds": 1.0,
+                "command": None,
+                "output": "",
+                "error": "Error: RESOURCE_EXHAUSTED: Quota exceeded",
+                "error_kind": "quota_exhausted",
+            }
+        ],
+    )
+    out = aggregate_reliability(tmp_path)
+    by_name = {row["name"]: row for row in out["peers"]}
+    # antigravity has NO outcomes marked, but quota_incidents alone
+    # should keep it visible in the table (Phase 3 invariant).
+    assert "antigravity" in by_name
+    row = by_name["antigravity"]
+    assert row["quota_incidents"] == 1
+    assert row["quota_recoveries"] == 0
+    assert row["quota_recovery_rate"] == 0.0
+    assert row["outcomes_marked"] == 0
+
+
+def test_quota_recoveries_count_both_as_incident_and_recovery(tmp_path):
+    """A `recovered_after_quota=True` result counts as 1 incident AND 1
+    recovery — the call DID hit quota; the fallback rescued it."""
+    runs = tmp_path / ".llm-council" / "runs"
+    _write_transcript(
+        runs,
+        "20260520_120000_run-q2",
+        participants=["codex"],
+        results=[
+            {
+                "name": "codex",
+                "ok": True,
+                "model": "gpt-5-mini",
+                "elapsed_seconds": 1.0,
+                "command": None,
+                "output": "RECOMMENDATION: yes - ship",
+                "error": "",
+                "recovered_after_quota": True,
+                "model_fallback_used": "gpt-5-mini",
+            }
+        ],
+    )
+    out = aggregate_reliability(tmp_path)
+    by_name = {row["name"]: row for row in out["peers"]}
+    assert "codex" in by_name
+    row = by_name["codex"]
+    assert row["quota_incidents"] == 1
+    assert row["quota_recoveries"] == 1
+    assert row["quota_recovery_rate"] == 1.0
+
+
+def test_quota_recovery_rate_with_mixed_outcomes(tmp_path):
+    """Multiple transcripts: 3 incidents total (2 recoveries, 1 hard fail)
+    → quota_recovery_rate = 2/3."""
+    runs = tmp_path / ".llm-council" / "runs"
+    # Two recovered calls.
+    for i in range(2):
+        _write_transcript(
+            runs,
+            f"20260520_12000{i}_run-rec",
+            participants=["codex"],
+            results=[
+                {
+                    "name": "codex",
+                    "ok": True,
+                    "model": "gpt-5-mini",
+                    "elapsed_seconds": 1.0,
+                    "command": None,
+                    "output": "RECOMMENDATION: yes - ok",
+                    "error": "",
+                    "recovered_after_quota": True,
+                }
+            ],
+        )
+    # One hard-failed call.
+    _write_transcript(
+        runs,
+        "20260520_120002_run-fail",
+        participants=["codex"],
+        results=[
+            {
+                "name": "codex",
+                "ok": False,
+                "model": "gpt-5-mini",
+                "elapsed_seconds": 1.0,
+                "command": None,
+                "output": "",
+                "error": "Error: rate_limit_exceeded",
+                "error_kind": "quota_exhausted",
+            }
+        ],
+    )
+    out = aggregate_reliability(tmp_path)
+    by_name = {row["name"]: row for row in out["peers"]}
+    row = by_name["codex"]
+    assert row["quota_incidents"] == 3
+    assert row["quota_recoveries"] == 2
+    assert row["quota_recovery_rate"] == pytest.approx(2 / 3)
+
+
+def test_quota_columns_appear_in_format_reliability_text(tmp_path):
+    """The text formatter must render the new quotaInc/quotaRec columns
+    with the "<recovered>/<incidents> (<pct>%)" notation when incidents > 0,
+    and dashes when no quota signal."""
+    runs = tmp_path / ".llm-council" / "runs"
+    _write_transcript(
+        runs,
+        "20260520_120000_run-fmt",
+        participants=["codex", "claude"],
+        results=[
+            {
+                "name": "codex",
+                "ok": True,
+                "model": "gpt-5-mini",
+                "elapsed_seconds": 1.0,
+                "command": None,
+                "output": "RECOMMENDATION: yes - ok",
+                "error": "",
+                "recovered_after_quota": True,
+            },
+            _result(
+                "claude",
+                evidence=[{"text": "a", "tag": "verified", "verified": True}],
+            ),
+        ],
+    )
+    out = aggregate_reliability(tmp_path)
+    text = format_reliability_text(out)
+    assert "quotaInc" in text
+    assert "quotaRec" in text
+    # codex: 1/1 (100%)
+    assert "1/1" in text
+    assert "100%" in text
+
+
+def test_peer_with_no_signal_still_skipped(tmp_path):
+    """Belt-and-braces: a peer with truly nothing (no outcomes, no
+    VERIFIED, no rank, no quota) is dropped from the rendered table.
+    This regression-tests that the new quota condition didn't loosen
+    the skip rule for unrelated peers."""
+    runs = tmp_path / ".llm-council" / "runs"
+    _write_transcript(
+        runs,
+        "20260520_120000_run-empty",
+        participants=["alpha"],
+        results=[_result("alpha", recommendation="yes")],
+    )
+    # No outcome, no VERIFIED, no quota → alpha contributes no signal.
+    out = aggregate_reliability(tmp_path)
+    assert out["peers"] == []

@@ -166,3 +166,137 @@ modes:
     assert "| cheap_b | tradeoff |" in payload
     # The `:round2` suffix must be stripped for display.
     assert ":round2" not in payload
+
+
+def test_mcp_lifts_quota_throttled_peers_to_top_level(
+    monkeypatch, tmp_path: Path
+):
+    """When `metadata.quota_throttled_peers` is set, the MCP payload should
+    expose it as a top-level field (parallel to consensus_blockers) and
+    strip it from metadata to avoid double-serialization."""
+    from llm_council.mcp_server import run_council
+
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    (tmp_path / ".llm-council.yaml").write_text(
+        """
+defaults:
+  mode: quota-test
+participants:
+  cheap_a:
+    type: openrouter
+    model: openai/gpt-4o-mini
+    api_key_env: X
+    input_per_million: 0.1
+    output_per_million: 0.4
+  cheap_b:
+    type: openrouter
+    model: openai/gpt-4o-mini
+    api_key_env: X
+    input_per_million: 0.1
+    output_per_million: 0.4
+modes:
+  quota-test:
+    participants: [cheap_a, cheap_b]
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("X", "secret")
+
+    quota_record = {
+        "peer": "cheap_a",
+        "family": "openrouter",
+        "model": "openai/gpt-4o-mini",
+        "message": "HTTPStatusError: 429 Too Many Requests",
+    }
+
+    async def fake_execute_council(*args, **kwargs):
+        return (
+            [
+                ParticipantResult(
+                    "cheap_a",
+                    False,
+                    "",
+                    "HTTPStatusError: 429 Too Many Requests",
+                    1.0,
+                ),
+                ParticipantResult(
+                    "cheap_b", True, "RECOMMENDATION: yes - ship", "", 1.0
+                ),
+            ],
+            {
+                "rounds": 1,
+                "deliberated": False,
+                "min_quorum": 1,
+                "labeled_quorum": 1,
+                "degraded": False,
+                "quota_throttled_peers": [quota_record],
+            },
+        )
+
+    import llm_council.mcp_server as mcp_module
+
+    monkeypatch.setattr(mcp_module, "execute_council", fake_execute_council)
+
+    result = asyncio.run(
+        run_council({"question": "ping", "working_directory": str(tmp_path)})
+    )
+    assert result.get("quota_throttled_peers") == [quota_record]
+    # The field must be stripped from metadata to avoid double-encoding.
+    assert "quota_throttled_peers" not in (result.get("metadata") or {})
+
+
+def test_mcp_omits_quota_throttled_peers_when_empty(
+    monkeypatch, tmp_path: Path
+):
+    """No quota issues -> the key must be absent from the payload, not an empty list."""
+    from llm_council.mcp_server import run_council
+
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    (tmp_path / ".llm-council.yaml").write_text(
+        """
+defaults:
+  mode: quota-test
+participants:
+  cheap_a:
+    type: openrouter
+    model: openai/gpt-4o-mini
+    api_key_env: X
+    input_per_million: 0.1
+    output_per_million: 0.4
+  cheap_b:
+    type: openrouter
+    model: openai/gpt-4o-mini
+    api_key_env: X
+    input_per_million: 0.1
+    output_per_million: 0.4
+modes:
+  quota-test:
+    participants: [cheap_a, cheap_b]
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("X", "secret")
+
+    async def fake_execute_council(*args, **kwargs):
+        return (
+            [
+                ParticipantResult("cheap_a", True, "RECOMMENDATION: yes - ok", "", 1),
+                ParticipantResult("cheap_b", True, "RECOMMENDATION: yes - ok", "", 1),
+            ],
+            {
+                "rounds": 1,
+                "deliberated": False,
+                "min_quorum": 1,
+                "labeled_quorum": 2,
+                "degraded": False,
+            },
+        )
+
+    import llm_council.mcp_server as mcp_module
+
+    monkeypatch.setattr(mcp_module, "execute_council", fake_execute_council)
+
+    result = asyncio.run(
+        run_council({"question": "ping", "working_directory": str(tmp_path)})
+    )
+    assert "quota_throttled_peers" not in result

@@ -161,6 +161,8 @@ def build_payload(
     continue_debate: str | None = None,
     tool_call_status: str | None = None,
     is_ranking_round: bool = False,
+    model_fallback_used: str | None = None,
+    recovered_after_quota: bool = False,
 ) -> dict[str, Any]:
     preview = prompt[:PROMPT_PREVIEW_CHARS]
     payload: dict[str, Any] = {
@@ -224,6 +226,16 @@ def build_payload(
     # identical to "primary response, not a ranking pass".
     if is_ranking_round:
         payload["is_ranking_round"] = True
+    # v0.11.6 Phase 2: persist quota-fallback receipts so a cache hit
+    # surfaces the same fallback context as the original run. Only
+    # written when the fallback fired (default state on a non-fallback
+    # call is None/False), keeping payloads tight for the common case.
+    # Readers default-on-missing to None/False; absence is semantically
+    # identical to "no fallback fired". Schema version NOT bumped.
+    if model_fallback_used:
+        payload["model_fallback_used"] = str(model_fallback_used)
+    if recovered_after_quota:
+        payload["recovered_after_quota"] = True
     return payload
 
 

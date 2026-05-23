@@ -118,6 +118,12 @@ DEFAULT_CONFIG: dict = {
         "transparent": False,
         "max_deliberation_rounds": 2,
         "convergence_thresholds": {"converged": 0.80, "refining": 0.50},
+        # When True, `llm-council doctor` refreshes a missing/stale OpenRouter
+        # catalog inline (best-effort, 10s timeout) instead of asking the user
+        # to run `llm-council models refresh` manually. Fail-soft: a network
+        # failure falls through to the existing stale-warning Check so a
+        # disconnected user still gets a usable diagnostic.
+        "catalog_auto_refresh": True,
     },
     "participants": {
         "claude": {
@@ -139,6 +145,12 @@ DEFAULT_CONFIG: dict = {
             "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["ANTHROPIC_API_KEY"],
+            # Quota / overload fallback chain. For Claude family this is
+            # consumed natively via the CLI's `--fallback-model` flag (only
+            # the first entry is used — the CLI handles the retry itself).
+            # For other families llm-council retries one step down the chain
+            # on quota detection. Empty chain disables fallback.
+            "fallback_chain": ["claude-sonnet-4-6"],
         },
         # Temporary: pinned-version Claude participants for opt-in head-to-head
         # review when the user wants a specific Opus version's perspective.
@@ -164,6 +176,7 @@ DEFAULT_CONFIG: dict = {
             "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["ANTHROPIC_API_KEY"],
+            "fallback_chain": ["claude-sonnet-4-6"],
         },
         "claude_4_7": {
             "type": "cli",
@@ -184,6 +197,7 @@ DEFAULT_CONFIG: dict = {
             "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["ANTHROPIC_API_KEY"],
+            "fallback_chain": ["claude-sonnet-4-6"],
         },
         "codex": {
             "type": "cli",
@@ -205,6 +219,11 @@ DEFAULT_CONFIG: dict = {
             "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["OPENAI_API_KEY"],
+            # Best-effort step-down on quota. Users on a different account
+            # tier or with custom routing should override in
+            # .llm-council.yaml; an unknown model id just makes the
+            # fallback retry fail and the peer drops normally.
+            "fallback_chain": ["gpt-5-mini"],
         },
         "gemini": {
             "type": "cli",
@@ -221,6 +240,7 @@ DEFAULT_CONFIG: dict = {
             "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+            "fallback_chain": ["gemini-2.5-flash"],
         },
         "deepseek_v4_pro": {
             "type": "openrouter",
@@ -335,6 +355,11 @@ DEFAULT_CONFIG: dict = {
             "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTIGRAVITY_API_KEY"],
+            # `agy` has no --model flag — model is session-state only.
+            # Fallback is impossible from outside the CLI, so the chain
+            # stays empty and quota-throttled antigravity drops with the
+            # `quota_throttled_peers` signal alone (Phase 1).
+            "fallback_chain": [],
         },
     },
     # Mode shape (recognized optional keys per entry):

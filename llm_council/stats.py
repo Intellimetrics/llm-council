@@ -113,6 +113,13 @@ def _new_peer_bucket() -> dict[str, Any]:
         # tells the operator how often the recovery path actually saves
         # the run vs. how often the prompt is just too big.
         "timeout_recoveries": 0,
+        # v0.11.6 Phase 2: count of successful runs that recovered from a
+        # quota_exhausted error via the `fallback_chain` retry path.
+        # Distinct from `timeout_recoveries` (terse-retry) and from the
+        # error_kind_counts.quota_exhausted bucket (final-state failures).
+        # Together: error_kind_counts.quota_exhausted + quota_recoveries =
+        # total quota incidents this peer absorbed in the window.
+        "quota_recoveries": 0,
         # Count of runs where the terse-retry path fired at all (success
         # or failure). Pass-8 dogfood surfaced a silent-failure mode where
         # the retry attempt was invisible in transcripts: only successful
@@ -265,6 +272,8 @@ def aggregate(
                     bucket["timeout_recoveries_by_prompt_size"][
                         recovery_bucket
                     ] += 1
+                if result.get("recovered_after_quota"):
+                    bucket["quota_recoveries"] += 1
                 # Evidence-tag distribution: count each EVIDENCE bullet
                 # by its tag. Entries shape from v0.7 onward is
                 # list[{text, tag}]; legacy list[str] entries (pre-v0.7
@@ -335,6 +344,7 @@ def aggregate(
                 "timeout_recoveries_by_prompt_size": dict(
                     bucket["timeout_recoveries_by_prompt_size"]
                 ),
+                "quota_recoveries": bucket["quota_recoveries"],
                 "evidence_tag_distribution": dict(bucket["evidence_tag_distribution"]),
                 "last_used": bucket["last_used"],
             }
@@ -548,6 +558,16 @@ def _empty_reliability_bucket() -> dict[str, Any]:
         # "no data" semantic.
         "_rank_position_sum": 0.0,
         "_rank_position_count": 0,
+        # v0.11.7 Phase 3: mechanical quota counters across all
+        # transcripts (not outcome-dependent). `quota_incidents` =
+        # every result that hit a quota wall (failed-final
+        # quota_exhausted OR recovered-after-quota). `quota_recoveries`
+        # = subset that recovered via `fallback_chain`. The derived
+        # `quota_recovery_rate` (recoveries / incidents) goes in the
+        # public payload; both raw counters stay so the operator can
+        # eyeball "1/2 vs 50/100".
+        "quota_incidents": 0,
+        "quota_recoveries": 0,
     }
 
 
@@ -624,6 +644,18 @@ def aggregate_reliability(
                 bucket["_verified_total"] += 1
                 if entry.get("verified") is True:
                     bucket["_verified_ok"] += 1
+            # v0.11.7 Phase 3 mechanical quota counters. Walk every
+            # round (not just the final round) so a peer that hit
+            # quota in round 1 and again in round 2 is counted twice,
+            # which is the operationally useful "how often does this
+            # peer hit a quota wall" signal. A recovered call counts
+            # as both an incident AND a recovery — the call DID hit
+            # quota; the fallback rescued it.
+            if result.get("recovered_after_quota"):
+                bucket["quota_incidents"] += 1
+                bucket["quota_recoveries"] += 1
+            elif result.get("error_kind") == "quota_exhausted":
+                bucket["quota_incidents"] += 1
         # v0.9.0 Feature 2: accumulate per-peer rank-position mean from
         # transcripts that ran `--cross-rank`. Each per-run mean is one
         # observation; the aggregate is the mean across observations.
@@ -699,16 +731,24 @@ def aggregate_reliability(
             rank_position_mean = bucket["_rank_position_sum"] / rank_count
         else:
             rank_position_mean = None
-        # A peer that has neither outcomes nor VERIFIED evidence
-        # nor rank-position data contributes no signal — drop it
-        # from the rendered output to avoid swamping the table
-        # with zero rows. Callers that want "this peer exists but
-        # has nothing yet" can use `llm-council stats --participant
+        quota_incidents = bucket["quota_incidents"]
+        quota_recoveries = bucket["quota_recoveries"]
+        quota_recovery_rate: float | None
+        if quota_incidents > 0:
+            quota_recovery_rate = quota_recoveries / quota_incidents
+        else:
+            quota_recovery_rate = None
+        # A peer that has neither outcomes nor VERIFIED evidence nor
+        # rank-position data nor quota incidents contributes no
+        # signal — drop it from the rendered output to avoid swamping
+        # the table with zero rows. Callers that want "this peer exists
+        # but has nothing yet" can use `llm-council stats --participant
         # <peer>` (separate code path).
         if (
             bucket["outcomes_marked"] == 0
             and verified_total == 0
             and rank_count == 0
+            and quota_incidents == 0
         ):
             continue
         rows.append(
@@ -722,6 +762,9 @@ def aggregate_reliability(
                 "verified_total": verified_total,
                 "rank_position_mean": rank_position_mean,
                 "rank_position_count": rank_count,
+                "quota_incidents": quota_incidents,
+                "quota_recoveries": quota_recoveries,
+                "quota_recovery_rate": quota_recovery_rate,
             }
         )
 
@@ -756,13 +799,27 @@ def format_reliability_text(reliability: dict[str, Any]) -> str:
     lines.append(
         f"{'participant':14} {'marked':>7} {'useful':>7} "
         f"{'falseB':>7} {'uniqCatch':>10} {'verifCite':>10} "
-        f"{'rankPos':>8}"
+        f"{'rankPos':>8} {'quotaInc':>9} {'quotaRec':>9}"
     )
     for row in rows:
         rate = row.get("verified_citation_rate")
         rate_str = "—" if rate is None else f"{rate * 100:.0f}%"
         rank_mean = row.get("rank_position_mean")
         rank_str = "—" if rank_mean is None else f"{rank_mean:.2f}"
+        # Quota columns: incidents is a raw count; recoveries is rendered
+        # as "<n>/<incidents>" so the operator can eyeball the rate
+        # without scanning a separate column. Dash both when no incidents
+        # (mirrors the verified/rank "no signal" rendering above).
+        quota_inc = row.get("quota_incidents", 0)
+        quota_rec = row.get("quota_recoveries", 0)
+        if quota_inc == 0:
+            quota_inc_str = "—"
+            quota_rec_str = "—"
+        else:
+            quota_inc_str = str(quota_inc)
+            rate = row.get("quota_recovery_rate")
+            pct = "" if rate is None else f" ({rate * 100:.0f}%)"
+            quota_rec_str = f"{quota_rec}/{quota_inc}{pct}"
         lines.append(
             f"{row['name'][:14]:14} "
             f"{row['outcomes_marked']:>7} "
@@ -770,7 +827,9 @@ def format_reliability_text(reliability: dict[str, Any]) -> str:
             f"{row['false_blocker_count']:>7} "
             f"{row['unique_blocker_catch_count']:>10} "
             f"{rate_str:>10} "
-            f"{rank_str:>8}"
+            f"{rank_str:>8} "
+            f"{quota_inc_str:>9} "
+            f"{quota_rec_str:>9}"
         )
     return "\n".join(lines)
 

@@ -4072,7 +4072,8 @@ def test_models_refresh_network_error_exits_1(monkeypatch, tmp_path, capsys):
     assert "openrouter catalog refresh failed" in captured.err
 
 
-def test_doctor_warns_when_openrouter_catalog_is_stale(monkeypatch, tmp_path):
+def test_doctor_falls_back_to_warning_when_auto_refresh_fails(monkeypatch, tmp_path):
+    """Network failure during auto-refresh should fall through to a stale warning."""
     import llm_council.doctor as doctor_module
 
     cache = tmp_path / "openrouter-models.json"
@@ -4085,6 +4086,11 @@ def test_doctor_warns_when_openrouter_catalog_is_stale(monkeypatch, tmp_path):
         "openrouter_cache_age_seconds",
         lambda: time.time() - cache.stat().st_mtime,
     )
+
+    def _boom(timeout=30):
+        raise RuntimeError("no network")
+
+    monkeypatch.setattr(doctor_module, "refresh_openrouter_cache", _boom)
 
     config = {
         "defaults": {},
@@ -4103,7 +4109,128 @@ def test_doctor_warns_when_openrouter_catalog_is_stale(monkeypatch, tmp_path):
     catalog_check = next(c for c in checks if c.name == "catalog:openrouter")
     assert catalog_check.ok is False
     assert "stale" in catalog_check.detail
+    assert "auto-refresh failed" in catalog_check.detail
+    assert "RuntimeError: no network" in catalog_check.detail
+
+
+def test_doctor_auto_refreshes_stale_catalog(monkeypatch, tmp_path):
+    """Stale catalog should be refreshed inline on doctor invocation."""
+    import llm_council.doctor as doctor_module
+
+    cache = tmp_path / "openrouter-models.json"
+    cache.write_text("[]")
+    very_old = time.time() - (60 * 24 * 60 * 60)
+    os.utime(cache, (very_old, very_old))
+    monkeypatch.setattr(doctor_module, "openrouter_cache_path", lambda: cache)
+    monkeypatch.setattr(
+        doctor_module,
+        "openrouter_cache_age_seconds",
+        lambda: time.time() - cache.stat().st_mtime,
+    )
+
+    calls: list[float] = []
+
+    def _refresh(timeout=30):
+        calls.append(timeout)
+        return {"model_count": 358, "cache_path": str(cache), "fetched_at": time.time()}
+
+    monkeypatch.setattr(doctor_module, "refresh_openrouter_cache", _refresh)
+
+    config = {
+        "defaults": {},
+        "participants": {
+            "remote": {
+                "type": "openrouter",
+                "model": "anthropic/claude-sonnet-4-6",
+                "api_key_env": "X",
+            }
+        },
+        "modes": {"remote": {"participants": ["remote"]}},
+    }
+    monkeypatch.setenv("X", "secret")
+
+    checks = check_environment(config)
+    catalog_check = next(c for c in checks if c.name == "catalog:openrouter")
+    assert catalog_check.ok is True
+    assert "auto-refreshed" in catalog_check.detail
+    assert "358 models" in catalog_check.detail
+    assert calls == [doctor_module.CATALOG_AUTO_REFRESH_TIMEOUT_SECONDS]
+
+
+def test_doctor_auto_refreshes_missing_catalog(monkeypatch, tmp_path):
+    """Missing catalog (no cache file) should also trigger inline refresh."""
+    import llm_council.doctor as doctor_module
+
+    cache = tmp_path / "openrouter-models.json"  # intentionally not created
+    monkeypatch.setattr(doctor_module, "openrouter_cache_path", lambda: cache)
+    monkeypatch.setattr(doctor_module, "openrouter_cache_age_seconds", lambda: None)
+
+    def _refresh(timeout=30):
+        return {"model_count": 42, "cache_path": str(cache), "fetched_at": time.time()}
+
+    monkeypatch.setattr(doctor_module, "refresh_openrouter_cache", _refresh)
+
+    config = {
+        "defaults": {},
+        "participants": {
+            "remote": {
+                "type": "openrouter",
+                "model": "anthropic/claude-sonnet-4-6",
+                "api_key_env": "X",
+            }
+        },
+        "modes": {"remote": {"participants": ["remote"]}},
+    }
+    monkeypatch.setenv("X", "secret")
+
+    checks = check_environment(config)
+    catalog_check = next(c for c in checks if c.name == "catalog:openrouter")
+    assert catalog_check.ok is True
+    assert "auto-refreshed" in catalog_check.detail
+
+
+def test_doctor_skips_auto_refresh_when_disabled(monkeypatch, tmp_path):
+    """`catalog_auto_refresh: false` restores the manual-refresh-required behavior."""
+    import llm_council.doctor as doctor_module
+
+    cache = tmp_path / "openrouter-models.json"
+    cache.write_text("[]")
+    very_old = time.time() - (60 * 24 * 60 * 60)
+    os.utime(cache, (very_old, very_old))
+    monkeypatch.setattr(doctor_module, "openrouter_cache_path", lambda: cache)
+    monkeypatch.setattr(
+        doctor_module,
+        "openrouter_cache_age_seconds",
+        lambda: time.time() - cache.stat().st_mtime,
+    )
+
+    calls: list[float] = []
+
+    def _refresh(timeout=30):
+        calls.append(timeout)
+        return {"model_count": 1, "cache_path": str(cache), "fetched_at": time.time()}
+
+    monkeypatch.setattr(doctor_module, "refresh_openrouter_cache", _refresh)
+
+    config = {
+        "defaults": {"catalog_auto_refresh": False},
+        "participants": {
+            "remote": {
+                "type": "openrouter",
+                "model": "anthropic/claude-sonnet-4-6",
+                "api_key_env": "X",
+            }
+        },
+        "modes": {"remote": {"participants": ["remote"]}},
+    }
+    monkeypatch.setenv("X", "secret")
+
+    checks = check_environment(config)
+    catalog_check = next(c for c in checks if c.name == "catalog:openrouter")
+    assert catalog_check.ok is False
+    assert "stale" in catalog_check.detail
     assert "models refresh" in catalog_check.detail
+    assert calls == []
 
 
 def test_doctor_catalog_check_ok_when_cache_is_fresh(monkeypatch, tmp_path):
@@ -4162,7 +4289,9 @@ def test_doctor_catalog_age_uses_adaptive_units(monkeypatch, tmp_path):
     )
 
     config = {
-        "defaults": {"catalog_stale_seconds": 60},
+        # Disable auto-refresh so we exercise the manual-warning detail
+        # string this test cares about.
+        "defaults": {"catalog_stale_seconds": 60, "catalog_auto_refresh": False},
         "participants": {
             "remote": {
                 "type": "openrouter",
@@ -5345,7 +5474,9 @@ def test_doctor_requires_python_mcp(monkeypatch):
 
 def test_doctor_openrouter_only_does_not_require_native_clis(monkeypatch):
     config = {
-        "defaults": {"mode": "remote"},
+        # Disable auto-refresh so the test doesn't make a real network call
+        # against the live OpenRouter API (or stall when offline).
+        "defaults": {"mode": "remote", "catalog_auto_refresh": False},
         "participants": {
             "remote": {
                 "type": "openrouter",
@@ -9577,6 +9708,543 @@ def test_classify_error_recognizes_known_prefixes():
     assert classify_error("HTTPStatusError: 503") == ERROR_KIND_DOWNSTREAM
     assert classify_error("ConnectError: connection refused") == ERROR_KIND_DOWNSTREAM
     assert classify_error("Some entirely unknown error") == ERROR_KIND_UNKNOWN
+
+
+def test_classify_error_recognizes_quota_patterns():
+    """Quota/rate-limit signals must classify as `quota_exhausted` so the
+    orchestrator can surface them via `quota_throttled_peers` and stats can
+    bucket them separately from generic downstream / cli_nonzero errors."""
+    from llm_council.adapters import (
+        ERROR_KIND_DOWNSTREAM,
+        ERROR_KIND_QUOTA_EXHAUSTED,
+        ERROR_KIND_UNKNOWN,
+        classify_error,
+        is_quota_exhausted_error,
+    )
+
+    # Google / Gemini / Antigravity
+    assert (
+        classify_error("Error: RESOURCE_EXHAUSTED: Quota exceeded for model gemini-3-flash")
+        == ERROR_KIND_QUOTA_EXHAUSTED
+    )
+    assert (
+        classify_error("rpc error: code = ResourceExhausted desc = quota exceeded")
+        == ERROR_KIND_QUOTA_EXHAUSTED
+    )
+    # Anthropic / Claude
+    assert (
+        classify_error("Error: quota_exceeded for organization X")
+        == ERROR_KIND_QUOTA_EXHAUSTED
+    )
+    assert (
+        classify_error("You have reached your 5-hour limit. Try again later.")
+        == ERROR_KIND_QUOTA_EXHAUSTED
+    )
+    assert (
+        classify_error("Reached usage limit on Claude Opus")
+        == ERROR_KIND_QUOTA_EXHAUSTED
+    )
+    # OpenAI / Codex
+    assert (
+        classify_error('{"error":{"code":"rate_limit_exceeded"}}')
+        == ERROR_KIND_QUOTA_EXHAUSTED
+    )
+    assert (
+        classify_error("insufficient_quota: please add billing")
+        == ERROR_KIND_QUOTA_EXHAUSTED
+    )
+    # OpenRouter / generic
+    assert (
+        classify_error("HTTPStatusError: 429 Too Many Requests")
+        == ERROR_KIND_QUOTA_EXHAUSTED
+    )
+    assert (
+        classify_error("HTTPStatusError: Retryable HTTP status 429")
+        == ERROR_KIND_QUOTA_EXHAUSTED
+    )
+    assert (
+        classify_error("Error: insufficient credits on this account")
+        == ERROR_KIND_QUOTA_EXHAUSTED
+    )
+    # Negative: random "429" without context (e.g. port number, count) must
+    # NOT trigger quota detection. The bare-token pattern requires a quota-
+    # related neighbor word within ~40 chars.
+    assert (
+        classify_error("ConnectionRefused on port 4290")
+        == ERROR_KIND_DOWNSTREAM
+        or classify_error("ConnectionRefused on port 4290") == ERROR_KIND_UNKNOWN
+    )
+    assert is_quota_exhausted_error("") is False
+    assert is_quota_exhausted_error("RESOURCE_EXHAUSTED") is True
+
+
+def test_execute_council_surfaces_quota_throttled_peers(
+    monkeypatch, tmp_path: Path
+):
+    """When a peer fails with a quota-exhausted error, the orchestrator should:
+    - emit a `peer_quota_throttled` progress event with the peer name + family,
+    - stamp a top-level `quota_throttled_peers` field on metadata.
+    The peer still drops from quorum via existing `ok=False` handling — this
+    test only validates the surfacing path."""
+
+    async def fake_run_participants(*args, **kwargs):
+        return [
+            ParticipantResult(
+                "antigravity",
+                False,
+                "",
+                "Error: RESOURCE_EXHAUSTED: Quota exceeded for gemini-3-flash",
+                1.2,
+                model="gemini-3-flash",
+            ),
+            ParticipantResult(
+                "claude", True, "RECOMMENDATION: yes - proceed", "", 0.8
+            ),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    participant_cfg = {
+        "antigravity": {"family": "antigravity", "type": "cli"},
+        "claude": {"family": "claude", "type": "cli"},
+    }
+    _, metadata = asyncio.run(
+        execute_council(
+            ["antigravity", "claude"], participant_cfg, "q", tmp_path, {}
+        )
+    )
+    assert "quota_throttled_peers" in metadata
+    throttled = metadata["quota_throttled_peers"]
+    assert len(throttled) == 1
+    assert throttled[0]["peer"] == "antigravity"
+    assert throttled[0]["family"] == "antigravity"
+    assert throttled[0]["model"] == "gemini-3-flash"
+    assert "RESOURCE_EXHAUSTED" in throttled[0]["message"]
+    events = metadata["progress_events"]
+    quota_events = [e for e in events if e.get("event") == "peer_quota_throttled"]
+    assert len(quota_events) == 1
+    assert quota_events[0]["peer"] == "antigravity"
+    assert quota_events[0]["round"] == 1
+
+
+def test_execute_council_dedupes_quota_events_across_rounds(
+    monkeypatch, tmp_path: Path
+):
+    """A peer throttled in round 1 must not re-emit a quota event in round 2
+    if it hits the same wall — operator-visible noise reduction."""
+    calls = 0
+
+    async def fake_run_participants(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [
+                ParticipantResult(
+                    "antigravity",
+                    False,
+                    "",
+                    "Error: RESOURCE_EXHAUSTED",
+                    1.0,
+                ),
+                ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+                ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1),
+            ]
+        # Round 2: antigravity still throttled, a and b converge.
+        return [
+            ParticipantResult(
+                "antigravity",
+                False,
+                "",
+                "Error: RESOURCE_EXHAUSTED",
+                1.0,
+            ),
+            ParticipantResult(
+                "a", True, "RECOMMENDATION: tradeoff - guarded", "", 1
+            ),
+            ParticipantResult(
+                "b", True, "RECOMMENDATION: tradeoff - guarded", "", 1
+            ),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    participant_cfg = {
+        "antigravity": {"family": "antigravity", "type": "cli"},
+        "a": {"family": "a", "type": "cli"},
+        "b": {"family": "b", "type": "cli"},
+    }
+    _, metadata = asyncio.run(
+        execute_council(
+            ["antigravity", "a", "b"],
+            participant_cfg,
+            "question",
+            tmp_path,
+            {},
+            deliberate=True,
+        )
+    )
+    quota_events = [
+        e for e in metadata["progress_events"] if e.get("event") == "peer_quota_throttled"
+    ]
+    assert len(quota_events) == 1
+    assert quota_events[0]["round"] == 1
+    assert len(metadata["quota_throttled_peers"]) == 1
+
+
+def test_execute_council_omits_quota_field_when_no_quota_error(
+    monkeypatch, tmp_path: Path
+):
+    """The metadata key must be absent (not an empty list) on a clean run so
+    the common case doesn't pollute the schema."""
+
+    async def fake_run_participants(*args, **kwargs):
+        return [
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+            ParticipantResult("b", True, "RECOMMENDATION: yes - ship", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    _, metadata = asyncio.run(
+        execute_council(["a", "b"], {}, "q", tmp_path, {})
+    )
+    assert "quota_throttled_peers" not in metadata
+
+
+def test_pick_quota_fallback_model_picks_next_in_chain():
+    """When cfg.model is in the chain, fallback is the next entry; when
+    it's not (or None), fallback is chain[0]; when no next, None."""
+    from llm_council.adapters import _pick_quota_fallback_model
+
+    chain = ["sonnet", "haiku"]
+    assert _pick_quota_fallback_model({"model": None, "fallback_chain": chain}) == "sonnet"
+    assert _pick_quota_fallback_model({"model": "opus", "fallback_chain": chain}) == "sonnet"
+    assert _pick_quota_fallback_model({"model": "sonnet", "fallback_chain": chain}) == "haiku"
+    assert _pick_quota_fallback_model({"model": "haiku", "fallback_chain": chain}) is None
+    assert _pick_quota_fallback_model({"model": None, "fallback_chain": []}) is None
+    assert _pick_quota_fallback_model({"model": None}) is None
+
+
+def test_build_cli_command_injects_fallback_model_for_claude(tmp_path):
+    """Claude family gets `--fallback-model <chain[0]>` baked in so the CLI
+    handles overload natively. Non-Claude families do NOT get this flag
+    even when fallback_chain is set — they rely on llm-council's retry."""
+    from llm_council.adapters import _build_cli_command
+
+    claude_cfg = {
+        "command": "claude",
+        "family": "claude",
+        "model": "claude-opus-4-7",
+        "args": ["-p"],
+        "fallback_chain": ["claude-sonnet-4-6"],
+    }
+    cmd = _build_cli_command("claude", claude_cfg, "hi", tmp_path)
+    assert "--fallback-model" in cmd
+    assert "claude-sonnet-4-6" in cmd
+
+    # Codex with a chain should NOT get --fallback-model (codex CLI has no
+    # such flag; we retry inside llm-council).
+    codex_cfg = {
+        "command": "codex",
+        "family": "codex",
+        "model": "gpt-5",
+        "args": ["exec"],
+        "fallback_chain": ["gpt-5-mini"],
+    }
+    cmd = _build_cli_command("codex", codex_cfg, "hi", tmp_path)
+    assert "--fallback-model" not in cmd
+
+    # Claude WITHOUT a chain should not get the flag either.
+    claude_no_chain = {
+        "command": "claude",
+        "family": "claude",
+        "model": "claude-opus-4-7",
+        "args": ["-p"],
+        "fallback_chain": [],
+    }
+    cmd = _build_cli_command("claude", claude_no_chain, "hi", tmp_path)
+    assert "--fallback-model" not in cmd
+
+    # Edge case: chain[0] equals the primary model — should fall through to
+    # the next entry (if any) rather than emitting `--fallback-model X`
+    # where X == primary (which would be a no-op for the CLI).
+    claude_self_first = {
+        "command": "claude",
+        "family": "claude",
+        "model": "claude-opus-4-7",
+        "args": ["-p"],
+        "fallback_chain": ["claude-opus-4-7", "claude-sonnet-4-6"],
+    }
+    cmd = _build_cli_command("claude", claude_self_first, "hi", tmp_path)
+    assert "--fallback-model" in cmd
+    fb_idx = cmd.index("--fallback-model")
+    assert cmd[fb_idx + 1] == "claude-sonnet-4-6"
+
+
+def test_quota_fallback_retry_recovers_non_claude_family(
+    monkeypatch, tmp_path: Path
+):
+    """When a non-Claude CLI hits quota, the adapter retries with the next
+    model in the chain and stamps `model_fallback_used` +
+    `recovered_after_quota=True` on the recovered result."""
+    import llm_council.adapters as adapters_module
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_cli_once(name, cfg, prompt, cwd, *, start, mode_multiplier, mode):
+        calls.append(dict(cfg))
+        if len(calls) == 1:
+            # First call: quota error.
+            return (
+                ParticipantResult(
+                    name,
+                    False,
+                    "",
+                    "Error: rate_limit_exceeded for codex",
+                    1.0,
+                    model=cfg.get("model"),
+                ),
+                {"nonzero_exit": True, "stderr": "rate_limit_exceeded", "exited": True},
+            )
+        # Second call (fallback retry with the next model): success.
+        return (
+            ParticipantResult(
+                name,
+                True,
+                "RECOMMENDATION: yes - ship",
+                "",
+                0.5,
+                model=cfg.get("model"),
+            ),
+            {"nonzero_exit": False, "stderr": "", "exited": True},
+        )
+
+    monkeypatch.setattr(adapters_module, "_run_cli_once", fake_run_cli_once)
+
+    cfg = {
+        "type": "cli",
+        "family": "codex",
+        "command": "codex",
+        "args": ["exec"],
+        "model": None,
+        "fallback_chain": ["gpt-5-mini"],
+    }
+    result = asyncio.run(
+        adapters_module.run_cli_participant("codex", cfg, "prompt", tmp_path)
+    )
+    assert result.ok is True
+    assert result.recovered_after_quota is True
+    assert result.model_fallback_used == "gpt-5-mini"
+    # The retry MUST have substituted the model in cfg before the second call.
+    assert calls[1]["model"] == "gpt-5-mini"
+
+
+def test_quota_fallback_retry_skipped_for_claude_family(
+    monkeypatch, tmp_path: Path
+):
+    """Claude family must NOT trigger llm-council's quota retry because the
+    CLI's own `--fallback-model` flag handles overload natively. Doubling
+    up would double-pay the peer for the same incident."""
+    import llm_council.adapters as adapters_module
+
+    call_count = 0
+
+    async def fake_run_cli_once(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        # Always return quota error so we can detect if a retry fires.
+        return (
+            ParticipantResult(
+                "claude",
+                False,
+                "",
+                "rate_limit_exceeded",
+                1.0,
+            ),
+            {"nonzero_exit": True, "stderr": "rate_limit_exceeded", "exited": True},
+        )
+
+    monkeypatch.setattr(adapters_module, "_run_cli_once", fake_run_cli_once)
+
+    cfg = {
+        "type": "cli",
+        "family": "claude",
+        "command": "claude",
+        "args": ["-p"],
+        "model": None,
+        "fallback_chain": ["claude-sonnet-4-6"],
+    }
+    result = asyncio.run(
+        adapters_module.run_cli_participant("claude", cfg, "prompt", tmp_path)
+    )
+    # The first call returned quota; Claude must NOT have retried via the
+    # llm-council fallback path. (The launch-retry path could still fire
+    # via stderr patterns; codex's stderr `rate_limit_exceeded` doesn't
+    # match `cli_retry_stderr_patterns` by default, so no retry.)
+    assert call_count == 1
+    assert result.ok is False
+    assert result.recovered_after_quota is False
+    assert result.model_fallback_used is None
+
+
+def test_quota_fallback_retry_skipped_when_chain_empty(
+    monkeypatch, tmp_path: Path
+):
+    """An empty fallback_chain (e.g., antigravity) means no retry — the peer
+    drops with the original quota error like Phase 1."""
+    import llm_council.adapters as adapters_module
+
+    call_count = 0
+
+    async def fake_run_cli_once(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return (
+            ParticipantResult(
+                "antigravity",
+                False,
+                "",
+                "Error: RESOURCE_EXHAUSTED",
+                1.0,
+            ),
+            {"nonzero_exit": True, "stderr": "RESOURCE_EXHAUSTED", "exited": True},
+        )
+
+    monkeypatch.setattr(adapters_module, "_run_cli_once", fake_run_cli_once)
+
+    cfg = {
+        "type": "cli",
+        "family": "antigravity",
+        "command": "agy",
+        "args": ["--print"],
+        "model": None,
+        "fallback_chain": [],
+    }
+    result = asyncio.run(
+        adapters_module.run_cli_participant("antigravity", cfg, "prompt", tmp_path)
+    )
+    assert call_count == 1
+    assert result.ok is False
+    assert result.recovered_after_quota is False
+    from llm_council.adapters import classify_error, ERROR_KIND_QUOTA_EXHAUSTED
+    assert classify_error(result.error) == ERROR_KIND_QUOTA_EXHAUSTED
+
+
+def test_quota_fallback_retry_also_fails_keeps_quota_classification(
+    monkeypatch, tmp_path: Path
+):
+    """If the fallback retry ALSO hits quota, the final result must still
+    classify as `quota_exhausted` (so it drops from quorum) and carry the
+    `model_fallback_used` stamp so the operator sees the attempt happened."""
+    import llm_council.adapters as adapters_module
+
+    async def fake_run_cli_once(name, cfg, prompt, cwd, *, start, mode_multiplier, mode):
+        return (
+            ParticipantResult(
+                name,
+                False,
+                "",
+                "Error: rate_limit_exceeded",
+                1.0,
+                model=cfg.get("model"),
+            ),
+            {"nonzero_exit": True, "stderr": "rate_limit_exceeded", "exited": True},
+        )
+
+    monkeypatch.setattr(adapters_module, "_run_cli_once", fake_run_cli_once)
+
+    cfg = {
+        "type": "cli",
+        "family": "codex",
+        "command": "codex",
+        "args": ["exec"],
+        "model": None,
+        "fallback_chain": ["gpt-5-mini"],
+    }
+    result = asyncio.run(
+        adapters_module.run_cli_participant("codex", cfg, "prompt", tmp_path)
+    )
+    assert result.ok is False
+    assert result.recovered_after_quota is False
+    assert result.model_fallback_used == "gpt-5-mini"
+    from llm_council.adapters import classify_error, ERROR_KIND_QUOTA_EXHAUSTED
+    assert classify_error(result.error) == ERROR_KIND_QUOTA_EXHAUSTED
+
+
+def test_execute_council_emits_quota_recovered_event(
+    monkeypatch, tmp_path: Path
+):
+    """When a result carries `recovered_after_quota=True`, the orchestrator
+    must emit a `peer_quota_recovered` event AND stamp `quota_recoveries`
+    on metadata. The peer should NOT appear in `quota_throttled_peers`
+    because its final state is ok."""
+
+    async def fake_run_participants(*args, **kwargs):
+        return [
+            ParticipantResult(
+                "codex",
+                True,
+                "RECOMMENDATION: yes - ship",
+                "",
+                0.5,
+                model="gpt-5-mini",
+                model_fallback_used="gpt-5-mini",
+                recovered_after_quota=True,
+            ),
+            ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1),
+        ]
+
+    monkeypatch.setattr(orchestrator_module, "run_participants", fake_run_participants)
+    participant_cfg = {
+        "codex": {"family": "codex", "type": "cli"},
+        "a": {"family": "a", "type": "cli"},
+    }
+    _, metadata = asyncio.run(
+        execute_council(["codex", "a"], participant_cfg, "q", tmp_path, {})
+    )
+    assert "quota_throttled_peers" not in metadata
+    assert "quota_recoveries" in metadata
+    recoveries = metadata["quota_recoveries"]
+    assert len(recoveries) == 1
+    assert recoveries[0]["peer"] == "codex"
+    assert recoveries[0]["fallback_model"] == "gpt-5-mini"
+    events = [
+        e for e in metadata["progress_events"]
+        if e.get("event") == "peer_quota_recovered"
+    ]
+    assert len(events) == 1
+    assert events[0]["peer"] == "codex"
+
+
+def test_stats_counts_quota_recoveries():
+    """stats.aggregate must surface a per-peer `quota_recoveries` counter
+    derived from `recovered_after_quota=True` on successful results."""
+    from llm_council.stats import aggregate
+
+    records = [
+        {
+            "mtime": 1_700_000_000,
+            "data": {
+                "mode": "quick",
+                "results": [
+                    {
+                        "name": "codex",
+                        "ok": True,
+                        "output": "RECOMMENDATION: yes - ok",
+                        "model": "gpt-5-mini",
+                        "recovered_after_quota": True,
+                    },
+                    {
+                        "name": "claude",
+                        "ok": True,
+                        "output": "RECOMMENDATION: yes - ok",
+                        "model": "claude-opus-4-7",
+                    },
+                ],
+            },
+        }
+    ]
+    result = aggregate(records)
+    by_peer = {row["name"]: row for row in result["participants"]}
+    assert by_peer["codex"]["quota_recoveries"] == 1
+    assert by_peer["claude"]["quota_recoveries"] == 0
 
 
 def test_count_continuation_depth_walks_parent_chain(tmp_path: Path):

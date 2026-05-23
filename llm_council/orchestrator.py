@@ -16,6 +16,7 @@ from llm_council.adapters import (
     CacheContext,
     ParticipantResult,
     PREFLIGHT_FAILED_PREFIX,
+    is_quota_exhausted_error,
     is_timeout_error,
     run_participants,
 )
@@ -289,6 +290,75 @@ def _failed_for_deliberation(results: list[ParticipantResult]) -> set[str]:
     return excluded
 
 
+def _detect_quota_throttled(
+    results: list[ParticipantResult],
+    participant_cfg: dict[str, Any],
+    *,
+    already_emitted: set[str],
+) -> list[dict[str, Any]]:
+    """Find newly quota-throttled peers in this round's results.
+
+    Returns one record per peer whose error matches a quota-exhausted
+    pattern AND whose base name is not yet in ``already_emitted``. The
+    caller appends the base names it acts on to ``already_emitted`` so a
+    peer throttled in round 1 doesn't produce a duplicate event in
+    round 2's pass.
+    """
+    new_entries: list[dict[str, Any]] = []
+    for result in results:
+        if result.ok or not result.error:
+            continue
+        if not is_quota_exhausted_error(result.error):
+            continue
+        base = result.name.split(":round", 1)[0]
+        if base in already_emitted:
+            continue
+        cfg = participant_cfg.get(base) or {}
+        new_entries.append(
+            {
+                "peer": base,
+                "family": cfg.get("family") or base,
+                "model": result.model or cfg.get("model"),
+                # Trim the raw error to one line for the metadata summary —
+                # the full string is still on ParticipantResult.error for
+                # consumers who want it.
+                "message": result.error.splitlines()[0][:200],
+            }
+        )
+    return new_entries
+
+
+def _detect_quota_recoveries(
+    results: list[ParticipantResult],
+    participant_cfg: dict[str, Any],
+    *,
+    already_emitted: set[str],
+) -> list[dict[str, Any]]:
+    """Find newly recovered peers (quota hit → fallback succeeded) in this round.
+
+    Mirror of `_detect_quota_throttled` for the success case. Distinct
+    `already_emitted` set from the throttled path so a peer that
+    recovered in round 1 then re-failed in round 2 emits BOTH a
+    recovery event (round 1) and a throttle event (round 2)."""
+    new_entries: list[dict[str, Any]] = []
+    for result in results:
+        if not getattr(result, "recovered_after_quota", False):
+            continue
+        base = result.name.split(":round", 1)[0]
+        if base in already_emitted:
+            continue
+        cfg = participant_cfg.get(base) or {}
+        new_entries.append(
+            {
+                "peer": base,
+                "family": cfg.get("family") or base,
+                "fallback_model": getattr(result, "model_fallback_used", None),
+                "model": result.model,
+            }
+        )
+    return new_entries
+
+
 async def execute_council(
     participants: list[str],
     participant_cfg: dict[str, Any],
@@ -453,6 +523,29 @@ async def execute_council(
     # only mutation site that requires the split.
     round_results = list(results)
     round_number = 1
+    # Track peers that hit a quota wall during this run. Accumulated across
+    # rounds (round 1 + optional deliberation) with per-peer dedup so a
+    # throttled peer doesn't emit a duplicate event when round 2 re-fires
+    # the same failure.
+    quota_throttled: list[dict[str, Any]] = []
+    quota_throttled_seen: set[str] = set()
+    # Phase 2: parallel tracking for peers that hit quota but recovered
+    # via the `fallback_chain` retry. Separate dedup set so a peer that
+    # recovered round-1 and then re-failed round-2 emits BOTH events.
+    quota_recoveries: list[dict[str, Any]] = []
+    quota_recoveries_seen: set[str] = set()
+    for entry in _detect_quota_throttled(
+        results, participant_cfg, already_emitted=quota_throttled_seen
+    ):
+        quota_throttled.append(entry)
+        quota_throttled_seen.add(entry["peer"])
+        emit({"event": "peer_quota_throttled", "round": round_number, **entry})
+    for entry in _detect_quota_recoveries(
+        results, participant_cfg, already_emitted=quota_recoveries_seen
+    ):
+        quota_recoveries.append(entry)
+        quota_recoveries_seen.add(entry["peer"])
+        emit({"event": "peer_quota_recovered", "round": round_number, **entry})
     initial_disagreement = has_disagreement(round_results)
     metadata = {
         "rounds": round_number,
@@ -740,6 +833,21 @@ async def execute_council(
         results.extend(round_results)
         metadata["rounds"] = round_number
         metadata["deliberated"] = True
+        # Round-2 quota detection. Skips peers already in
+        # `quota_throttled_seen` from round 1, so a peer throttled once
+        # doesn't emit a second event when round 2 hits the same wall.
+        for entry in _detect_quota_throttled(
+            round_results, participant_cfg, already_emitted=quota_throttled_seen
+        ):
+            quota_throttled.append(entry)
+            quota_throttled_seen.add(entry["peer"])
+            emit({"event": "peer_quota_throttled", "round": round_number, **entry})
+        for entry in _detect_quota_recoveries(
+            round_results, participant_cfg, already_emitted=quota_recoveries_seen
+        ):
+            quota_recoveries.append(entry)
+            quota_recoveries_seen.add(entry["peer"])
+            emit({"event": "peer_quota_recovered", "round": round_number, **entry})
 
         round_convergence = _compute_round_convergence(
             prior_round_results, round_results, convergence_thresholds
@@ -855,6 +963,15 @@ async def execute_council(
     finding_matrix = build_matrix_from_results(final_results)
     if not finding_matrix.is_empty():
         metadata["finding_matrix"] = matrix_to_dict(finding_matrix)
+
+    # Surface quota-throttled peers as a top-level metadata field so the
+    # transcript JSON + MCP `structured_results` can lift them out of the
+    # per-result `error` strings. Omit the key entirely when empty so the
+    # common case (no quota issues) leaves the schema unchanged.
+    if quota_throttled:
+        metadata["quota_throttled_peers"] = list(quota_throttled)
+    if quota_recoveries:
+        metadata["quota_recoveries"] = list(quota_recoveries)
 
     if synthesize_flag and should_synthesize(synthesize_flag, metadata):
         try:
