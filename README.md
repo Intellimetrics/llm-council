@@ -96,6 +96,8 @@ llm-council estimate --mode consensus --diff "Should we merge this?"
 llm-council last
 ```
 
+Additional capabilities not shown above — anonymized cross-ranking (`--cross-rank`), a synthesis-chair decision memo (`--synthesize`), continuation chains (`--continue`), outcome tracking (`llm-council outcome`), and the eval/scorecard harness (`llm-council eval`) — are documented in [`CHANGELOG.md`](CHANGELOG.md) and `llm-council <command> --help`.
+
 ---
 
 ## Presets & Configuration
@@ -122,16 +124,19 @@ LLM Council supports three classes of peer participants:
 3.  **Local Models**: Communicates with local instances via **Ollama**.
 
 ### Dynamic Triad Resolution & Family Exclusions
-*   **The 3-CLI Triad**: The `tri-cli` preset dynamically selects exactly three active local CLIs. If both `antigravity` (`agy`) and `gemini` are installed, `llm-council` prioritizes `antigravity` as the active Gemini-family peer.
+*   **The 3-CLI Triad**: The `tri-cli` preset dynamically selects exactly three active local CLIs. If both `antigravity` (`agy`) and `gemini` are installed, `llm-council` prioritizes `antigravity` as the active Gemini-family peer (it reaches the latest Gemini model — but note it is only *soft*, prompt-enforced read-only; see [Read-Only Safety](#read-only-safety), and pin `gemini` instead if you need the hard guarantee).
 *   **Family Exclusions**: If the primary driver running your session is a Gemini-family agent (e.g., Antigravity CLI or Gemini CLI), `llm-council` automatically excludes other Gemini-family peers from the voting pool to avoid redundant reviews. It instead recruits independent peers (such as Claude Code and Codex CLI) for a balanced triad.
 
 ---
 
 ## Read-Only Safety
 
-Peers act strictly as advisors, not co-authors:
-*   **No File Modifications**: Every native CLI peer is invoked with read-only or strict approval-only flags (e.g., `agy --sandbox --dangerously-skip-permissions -` or `claude --read-only`). They cannot modify your files.
-*   **Isolated Environments**: Peers inspect the codebase or diff via standard input, protecting your repository from accidental writes.
+Peers act strictly as advisors, not co-authors. How strongly that's enforced differs by peer type — know the difference before reviewing untrusted code:
+
+*   **Flag-enforced (hard) — `claude`, `codex`, `gemini`**: invoked with flags that disable their write tools at the CLI level (`--permission-mode default` for Claude, `--sandbox read-only` for Codex, `--approval-mode plan` for Gemini). A misbehaving model — or a prompt-injected diff — *cannot* write files.
+*   **Hosted & local models** (OpenRouter / Ollama): plain API calls with no filesystem access at all — inherently read-only.
+*   **Prompt-enforced (soft) — `antigravity` (`agy`)**: `agy` exposes no read-only / approval-mode / tools-allowlist flag, and its `--sandbox` only restricts the *terminal*, not the model's native file-write tool — so `agy` *can* write files. Its read-only behavior is carried by the council prompt's read-only directive, which `agy` reliably honors (it refuses write requests). `--dangerously-skip-permissions` is deliberately **omitted** so a stray write isn't auto-approved. This is a **softer** guarantee than the flag-enforced peers: a determined prompt-injection in reviewed content could in principle override the directive with no hard backstop. If you review untrusted code, prefer `gemini` (hard) over `antigravity`.
+*   **Stdin isolation**: peers receive the codebase or diff via standard input.
 
 ---
 
@@ -167,10 +172,11 @@ The `consensus` mode is designed for critical decisions (e.g., database schema c
     llm-council run --mode consensus --diff --max-cost-usd 0.50 "Is this migration safe?"
     ```
 *   **Pre-flight Estimation**: Run `llm-council estimate` to calculate prompt tokens and project costs before making API calls.
+*   **Secret Scanning**: Every prompt is scanned for likely credentials (API keys, tokens, private keys) before it leaves your machine. The `secret_scan` policy in `.llm-council.yaml` sets the response: `warn` (default — logs a count, ships the prompt unchanged), `block` (refuses the run), `redact` (masks each match as `[REDACTED:<kind>]` in both the peer-bound prompt **and** the saved transcript), or `off`. An allowlist (`.llm-council-secrets-allow`) covers test fixtures.
 *   **API Credentials**: Put keys in `.env`, `.env.local`, or `.llm-council.env`. Keys are never written directly into the shared `.mcp.json`.
 
 > [!CAUTION]
-> Do not use hosted council modes for classified, regulated, or credentialed codebases unless all configured models/providers are compliant with your security standards. For restricted codebases, use `local-private` or `private-local`.
+> Do not use hosted council modes for classified, regulated, or credentialed codebases unless all configured models/providers are compliant with your security standards. For restricted codebases, use a local-only route — the `local-private` preset, or the `private-local` / `local-only` modes.
 
 ---
 
