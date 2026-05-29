@@ -145,10 +145,24 @@ Key modules:
 
 ## Invariants worth preserving
 
-- **Read-only by default.** Council participants must not edit files. CLI
-  adapters pass flags like `--permission-mode default` (Claude),
-  `--sandbox read-only` (Codex), `--approval-mode plan` (Gemini). Don't
-  remove these from `defaults.py` without an explicit reason.
+- **Read-only by default (hard for most peers, SOFT for antigravity).**
+  Council participants must not edit files. claude/codex/gemini get a HARD
+  guarantee from CLI flags that physically disable the write tool
+  (`--permission-mode default` Claude, `--sandbox read-only` Codex,
+  `--approval-mode plan` Gemini) — a misbehaving model or a prompt-injected
+  diff cannot write. Don't remove these from `defaults.py` without an explicit
+  reason. **antigravity (`agy`) is the exception: its read-only-ness is SOFT
+  (prompt-enforced).** `agy` exposes no read-only / approval-mode / tools-
+  allowlist flag, and `--sandbox` only restricts the terminal (shell), not the
+  model's native write tool — agy CAN write files when ordered with no
+  read-only framing. What keeps it read-only is the prompt directive in
+  `context.build_prompt` ("Do not edit files. Do not run write operations."),
+  which agy reliably honors (verified 4/4). We still omit
+  `--dangerously-skip-permissions` so a stray write isn't auto-approved. The
+  residual risk: a prompt-injection in reviewed content could override the
+  directive with no hard backstop. The opt-in canary
+  `tests/test_live_agy_readonly.py` (gated by `LLM_COUNCIL_LIVE_AGY_TEST=1`)
+  guards that agy still honors the directive across upstream releases.
 - **`RECOMMENDATION:` label.** CLI output is rejected if it lacks the label;
   prompts in `context.py` ask for it. Adapter and prompt changes must keep
   these in sync. The label match is fence-aware: a `RECOMMENDATION:` line
@@ -178,8 +192,8 @@ Key modules:
   `deliberation_status: skipped_continue_debate_unanimous` plus a
   `deliberation_skipped` progress event with `no_votes` + `denominator`
   counts. Unanimity (not 66%) is conservative-until-measured — revisit
-  once a transcript corpus exists to audit gaming risk
-  (`orchestrator.py:489-525`).
+  once a transcript corpus exists to audit gaming risk (see the
+  `CONTINUE_DEBATE` unanimity skip in `orchestrator.execute_council`).
 - **Config migration is silent.** `migrate_known_cli_defaults` rewrites old
   `OLD_CLAUDE_PLAN_ARGS` / `OLD_CODEX_APPROVAL_ARGS` and back-fills
   `peer-only` mode and `include_current` for built-in `other_cli_peers`
@@ -217,7 +231,13 @@ Key modules:
   `PART N — TITLE (REQUIRED BY ...)` headers
   (`llm_council/sections.REQUIRED_SECTION_HEADER_RE`), the validator
   scans each peer response for a matching marker (literal `PART N` token
-  OR all salient title tokens within a 200-char window). Missing
+  OR all salient title tokens co-occurring within a window anchored on the
+  first title token — `-100`/`+200` chars, i.e. ~300 chars total). When two
+  REQUIRED sections share a salient title token (e.g. `SECURITY ANALYSIS`
+  and `SECURITY HARDENING`), the loose window is ambiguous, so those
+  collision-prone sections instead require the full title as a
+  near-contiguous phrase (`_section_present(..., ambiguous_anchor=True)`)
+  to avoid a sibling's header falsely satisfying them. Missing
   sections trigger one repair-retry with `SECTION_REPAIR_RETRY_INSTRUCTION`;
   if the retry also misses, the result is
   `ok=False, error_kind=incomplete_response`. PART 6 (`RECOMMENDATION`)
@@ -241,7 +261,7 @@ Key modules:
 - **`[VERIFIED:path:start-end]` is a fifth optional evidence tag.**
   Joins `[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]`. The
   orchestrator runs `citations.verify_evidence_citations` after every
-  round (`orchestrator.py:424,547`); failed refs land on
+  round (in `orchestrator.execute_council`); failed refs land on
   `ParticipantResult.evidence_verification_failures` as
   `path:start-end` strings but the entry is NOT dropped — coverage >
   filtering. The prompt directive in `context.py`'s envelope block
@@ -272,13 +292,14 @@ Key modules:
   `structured_results`, and `stats.aggregate_reliability`. Ranking-
   round results carry `is_ranking_round=True` on `ParticipantResult`,
   are persisted and cached, and are EXCLUDED from the round-2
-  deliberation prompt builder (`transcript.py:470`) — same MAD-
-  literature invariant as the finding matrix. Promotion gate keeps an
-  optional `cross_rank_correlation_floor` slot for the eventual
-  default flip.
+  deliberation prompt builder (`transcript.final_round_results` filters
+  `is_ranking_round`) — same MAD-literature invariant as the finding
+  matrix. Promotion gate keeps an optional `cross_rank_correlation_floor`
+  slot for the eventual default flip.
 - **Tool-call voting is opt-in even within `review-with-tools`.**
   `tool_call_voting: false` by default on the `review-with-tools` mode
-  (`defaults.py:397`). When flipped to `true`, the orchestrator
+  (`DEFAULT_CONFIG["modes"]["review-with-tools"]` in `defaults.py`).
+  When flipped to `true`, the orchestrator
   appends a `record_recommendation(verdict, blockers, evidence)` tool
   schema to the per-peer directive and runs a unified
   `_extract_tool_call_recommendation` parser; regex
@@ -310,7 +331,7 @@ Key modules:
   that ships under this discipline. CLI flags:
   `--compare-against <baseline.json>`, `--promotion-recall-lift`,
   `--promotion-snr-floor-ratio`. The `[EXPERIMENTAL]` marker is
-  surfaced in `llm-council list` (`cli.py:845`) and visible via MCP
+  surfaced in `llm-council list` (`cli.cmd_list`) and visible via MCP
   `council_list_modes` (the raw `modes` dict carries the flag).
 - **Outcome tracking is sidecar.**
   `.llm-council/outcomes/<run-id>.json` is persisted separately from

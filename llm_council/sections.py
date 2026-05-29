@@ -14,7 +14,8 @@ separators, and mixed case in both the `PART` keyword and the title
 Response-side detection is strict against prose mentions: a literal
 `PART N` token only counts when it appears at the start of a line
 (optionally preceded by `#`/`##`/`**` markers) OR is accompanied by
-the first salient title token within a 200-char window. Prose
+the first salient title token within a ~300-char window (`-100`/`+200`
+around the anchor token). Prose
 mentions like `I skipped PART 2` or `PART 2 was not addressed` are
 explicitly rejected via a skip-prose pattern. Paraphrased headers
 (e.g. `## Concept Grid` satisfying `PART 2 — CONCEPT-BY-CONCEPT GRID`)
@@ -46,7 +47,11 @@ REQUIRED_SECTION_HEADER_RE = re.compile(
     (?:\*\*[\ \t]*)?                 # optional leading markdown bold wrapper
     (?P<label>
         PART\s+(?P<num>\d+)          # PART <n>
-        \s*[—\-–:]\s+                # em-dash / hyphen / en-dash / colon separator
+        \s*[—\-–:]\s*                # em-dash / hyphen / en-dash / colon separator
+                                     # (trailing space optional: `PART 1 —OVERVIEW`
+                                     # and `PART 1:OVERVIEW` must still match; the
+                                     # title group requires a leading [A-Za-z] so
+                                     # the separator can't be swallowed into it)
         (?P<title>
             [A-Za-z][A-Za-z0-9\ /,&\-–—']+?
         )
@@ -106,7 +111,12 @@ def required_sections(prompt: str) -> list[dict[str, object]]:
     return out
 
 
-def _section_present(response_upper: str, requirement: dict[str, object]) -> bool:
+def _section_present(
+    response_upper: str,
+    requirement: dict[str, object],
+    *,
+    ambiguous_anchor: bool = False,
+) -> bool:
     """True when a response plausibly satisfies a required section.
 
     Two acceptance routes, in priority order:
@@ -114,16 +124,17 @@ def _section_present(response_upper: str, requirement: dict[str, object]) -> boo
     1. A `PART N` mention that LOOKS LIKE A HEADER, not just a passing
        reference. A header-shaped mention is either at the start of a
        line (optionally after `#`/`##`/`**` markdown markers) OR is
-       accompanied by the first salient title token within a 200-char
-       window. This rejects prose mentions like `I skipped PART 2`,
+       accompanied by the first salient title token within the
+       confirmation window (`_LITERAL_PART_CONFIRM_WINDOW`, 200 chars).
+       This rejects prose mentions like `I skipped PART 2`,
        `PART 2 was not addressed`, or `see PART 2 instructions` —
        a peer must STRUCTURALLY commit to the section, not just name
        it. Pure literal mentions like `PART 2.` with nothing else are
        insufficient on their own.
     2. Salient title tokens — the first title token with all remaining
-       title tokens within a 200-char window. Catches paraphrased
-       headers like `## Concept Grid` for
-       `PART 2 — CONCEPT-BY-CONCEPT GRID`.
+       title tokens within a ~300-char window (`-100`/`+200` around that
+       anchor token). Catches paraphrased headers like `## Concept Grid`
+       for `PART 2 — CONCEPT-BY-CONCEPT GRID`.
 
     A title with no salient tokens (e.g. a one-letter title) falls back
     to the literal `PART N` route alone, since there's nothing else
@@ -139,6 +150,21 @@ def _section_present(response_upper: str, requirement: dict[str, object]) -> boo
         # failed above, the only remaining signal would be the bare
         # number, which is too noisy. Treat as missing.
         return False
+    if ambiguous_anchor:
+        # This requirement shares a salient title token with a sibling
+        # requirement, so the loose co-occurrence window below is unsafe: a
+        # sibling's header plus nearby prose can satisfy it (e.g. a response
+        # delivering only PART 1 "SECURITY ANALYSIS" but mentioning "hardening"
+        # nearby would falsely satisfy PART 2 "SECURITY HARDENING"). Demand the
+        # full title as a near-contiguous phrase — tokens in order separated
+        # only by non-word characters — which only a real (possibly
+        # paraphrased) header of THIS section produces. With fewer than two
+        # tokens there is nothing to anchor a phrase on, so rely on the literal
+        # `PART N` route alone (already checked above).
+        if len(tokens) < 2:
+            return False
+        phrase = r"\b" + r"[\W_]+".join(re.escape(t) for t in tokens) + r"\b"
+        return re.search(phrase, response_upper) is not None
     first = tokens[0]
     for m in re.finditer(rf"\b{re.escape(first)}\b", response_upper):
         window_start = max(0, m.start() - 100)
@@ -151,8 +177,9 @@ def _section_present(response_upper: str, requirement: dict[str, object]) -> boo
 
 # Window in which a literal `PART N` mention must be accompanied by the
 # first salient title token to be treated as a section header rather
-# than a passing prose reference. Chosen to match the 200-char window
-# already used by the paraphrased-title route.
+# than a passing prose reference. This is a flat 200-char lookahead from
+# the `PART N` match; note it differs from the paraphrased-title route's
+# wider `-100`/`+200` (~300-char) window anchored on the first title token.
 _LITERAL_PART_CONFIRM_WINDOW = 200
 
 # Prefix patterns that mark `PART N` as header-shaped on its own — start
@@ -244,11 +271,21 @@ def required_sections_missing(prompt: str, response: str) -> list[str]:
     if not requirements:
         return []
     response_upper = (response or "").upper()
+    # A salient title token shared by two+ checkable requirements makes the
+    # loose paraphrase route ambiguous (it can be satisfied by a sibling's
+    # header). Flag those requirements so _section_present demands a stronger
+    # phrase-level match instead. PART 6 / RECOMMENDATION is excluded from the
+    # frequency count since it's never matched here.
+    checkable = [req for req in requirements if not _is_recommendation_part(req)]
+    token_freq: dict[str, int] = {}
+    for req in checkable:
+        for token in set(req.get("title_tokens") or []):
+            token_freq[token] = token_freq.get(token, 0) + 1
     missing: list[str] = []
-    for req in requirements:
-        if _is_recommendation_part(req):
-            continue
-        if _section_present(response_upper, req):
+    for req in checkable:
+        tokens = req.get("title_tokens") or []
+        ambiguous = any(token_freq.get(token, 0) > 1 for token in tokens)
+        if _section_present(response_upper, req, ambiguous_anchor=ambiguous):
             continue
         missing.append(str(req["label"]))
     return missing

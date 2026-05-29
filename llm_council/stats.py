@@ -75,8 +75,17 @@ def load_transcript_files(base_dir: Path) -> list[dict[str, Any]]:
 def _final_round_only(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not results:
         return []
-    final = max(result_round(r.get("name", "")) for r in results)
-    return [r for r in results if result_round(r.get("name", "")) == final]
+    # Ranking-round results (`peer:rank`, is_ranking_round=True) are
+    # post-deliberation telemetry, not primary votes — exclude them from the
+    # final-round view exactly as transcript.final_round_results does. Without
+    # this, a single-round `--cross-rank` run (no `:round` suffix anywhere, so
+    # every result is "round 1") counts each `peer:rank` response as a primary
+    # peer row, inflating total_runs and per-peer counts.
+    primary = [r for r in results if not r.get("is_ranking_round")]
+    if not primary:
+        return []
+    final = max(result_round(r.get("name", "")) for r in primary)
+    return [r for r in primary if result_round(r.get("name", "")) == final]
 
 
 def _empty_label_counts() -> dict[str, int]:
@@ -196,7 +205,10 @@ def aggregate(
 
         for result in results:
             raw_name = result.get("name") or ""
-            name = raw_name.split(":round")[0] or "unknown"
+            # Strip both `:round\d+` (deliberation) and `:rank` (cross-rank)
+            # so a peer's ranking-pass cost/tokens/latency fold into its own
+            # row instead of a phantom `<peer>:rank` participant.
+            name = raw_name.split(":round")[0].split(":rank")[0] or "unknown"
             bucket = peers.setdefault(name, _new_peer_bucket())
             elapsed = result.get("elapsed_seconds")
             if elapsed is not None:
@@ -225,7 +237,7 @@ def aggregate(
         seen_in_transcript: set[str] = set()
         for result in final_results:
             raw_name = result.get("name") or ""
-            name = raw_name.split(":round")[0] or "unknown"
+            name = raw_name.split(":round")[0].split(":rank")[0] or "unknown"
             if name in seen_in_transcript:
                 continue
             seen_in_transcript.add(name)
@@ -578,7 +590,7 @@ def _final_round_record_for_peer(
     final = _final_round_only(results)
     for record in final:
         raw = record.get("name") or ""
-        name = raw.split(":round")[0]
+        name = raw.split(":round")[0].split(":rank")[0]
         if name == peer:
             return record
     return None

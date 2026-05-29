@@ -481,6 +481,7 @@ def _result_from_cache_payload(
         cost_usd=payload.get("cost_usd"),
         from_cache=True,
         recovered_after_timeout=bool(payload.get("recovered_after_timeout", False)),
+        terse_retry_attempted=bool(payload.get("terse_retry_attempted", False)),
         prompt_chars=payload.get("prompt_chars"),
         section_repair_attempted=bool(
             payload.get("section_repair_attempted", False)
@@ -558,6 +559,7 @@ def _maybe_persist_cache(
         recovered_after_timeout=result.recovered_after_timeout,
         prompt_chars=result.prompt_chars,
         section_repair_attempted=result.section_repair_attempted,
+        terse_retry_attempted=result.terse_retry_attempted,
         evidence_verification_failures=result.evidence_verification_failures or None,
         continue_debate=result.continue_debate,
         tool_call_status=result.tool_call_status,
@@ -617,18 +619,6 @@ def _format_arg(value: str, *, prompt: str, cwd: Path) -> str:
 
 
 QUOTA_FALLBACK_MAX_STEPS = 3
-
-
-def _pick_quota_fallback_model(cfg: dict[str, Any]) -> str | None:
-    """Return the FIRST next-in-chain model to try after a quota error.
-
-    Single-step helper kept for back-compat with callers / tests that
-    want just the first candidate. The multi-step walker
-    (:func:`_quota_fallback_walk`) is the new primary path used by
-    :func:`run_cli_participant`.
-    """
-    walk = _quota_fallback_walk(cfg)
-    return walk[0] if walk else None
 
 
 def _quota_fallback_walk(cfg: dict[str, Any]) -> list[str]:
@@ -986,17 +976,57 @@ async def _run_cli_once(
             # can run past the wall-clock cap as long as they're
             # producing output, and get killed sooner than wall-clock
             # if they go silent.
-            if stdin_data is not None:
-                proc.stdin.write(stdin_data.encode())
-                await proc.stdin.drain()
-                proc.stdin.close()
-
             async def _streamed_read() -> tuple[bytes, bytes]:
-                stdout_b, stderr_b = await asyncio.gather(
-                    _read_stream_with_idle_deadline(proc.stdout, idle_timeout),
-                    _read_stream_with_idle_deadline(proc.stderr, idle_timeout),
+                # Drain stdout/stderr CONCURRENTLY with the stdin write. The
+                # previous implementation wrote+drained+closed the entire prompt
+                # before starting the readers, which pipe-deadlocks on a large
+                # prompt: a child that emits output while still consuming stdin
+                # fills its ~64KB stdout buffer and blocks (no reader), while we
+                # block in drain() (child not reading). proc.communicate()
+                # interleaves precisely to avoid this; the idle path now does too.
+                writer: asyncio.Task | None = None
+                if stdin_data is not None:
+
+                    async def _write_stdin() -> None:
+                        try:
+                            proc.stdin.write(stdin_data.encode())
+                            await proc.stdin.drain()
+                        finally:
+                            proc.stdin.close()
+
+                    writer = asyncio.create_task(_write_stdin())
+
+                read_stdout = asyncio.create_task(
+                    _read_stream_with_idle_deadline(proc.stdout, idle_timeout)
                 )
-                return stdout_b, stderr_b
+                read_stderr = asyncio.create_task(
+                    _read_stream_with_idle_deadline(proc.stderr, idle_timeout)
+                )
+                pending = [read_stdout, read_stderr] + ([writer] if writer else [])
+                try:
+                    await asyncio.gather(read_stdout, read_stderr)
+                except BaseException:
+                    # One stream hit its idle deadline (or errored). Cancel the
+                    # siblings so neither a reader nor the writer leaks, then
+                    # re-raise to the wall-clock handler that kills the process.
+                    for task in pending:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    raise
+                # Reads hit EOF (process wrapping up). If the writer is still
+                # draining because the child stopped reading stdin, cancel it.
+                if writer is not None and not writer.done():
+                    writer.cancel()
+                if writer is not None:
+                    await asyncio.gather(writer, return_exceptions=True)
+                # EOF on the pipes can land a hair before the child is reaped,
+                # leaving proc.returncode None when the caller checks it (read
+                # as a spurious CliExitNonZero under load). communicate() awaits
+                # exit internally; the streamed path must do the same. Bounded
+                # by the enclosing wall-clock wait_for.
+                await proc.wait()
+                return read_stdout.result(), read_stderr.result()
 
             communicate = asyncio.create_task(_streamed_read())
         else:
@@ -1298,97 +1328,102 @@ def _merge_cli_retry(
     return original
 
 
-def _merge_cli_section_retry(
+def _merge_section_retry(
     original: ParticipantResult, retry: ParticipantResult
 ) -> ParticipantResult:
-    """Merge a CLI section-repair retry attempt with the original failure.
+    """Merge a section-repair retry attempt with the original failure.
 
-    Mirrors `_merge_cli_retry` but for the section-coverage path:
+    Unified across CLI and hosted/local peers. It copies every passthrough
+    field that exists on a `ParticipantResult` (`command` for CLI peers;
+    `prompt_tokens`/`completion_tokens`/`total_tokens`/`cost_usd` for hosted
+    peers). Each family leaves the *other* family's fields at their `None`
+    default, so copying both is always correct and lets a single function
+    serve both call sites — eliminating the prior near-identical
+    `_merge_cli_section_retry` / `_merge_hosted_section_retry` bodies that
+    could drift apart on a fix to only one.
+
+    Branches:
     - retry succeeded → ok=True with section-themed recovery header
-    - retry came back missing sections again → ok=False with the
-      `IncompleteResponse:` prefix preserved (so error_kind stays
-      `incomplete_response`) and a section-themed exhausted-retry header
-    - retry came back with sections OK but EVIDENCE untagged
-      (`UntaggedEvidence:` — strict-evidence is the gate AFTER
-      sections in `_response_validation_error`) → ok=False with the
-      retry's `UntaggedEvidence:` error preserved so `classify_error`
-      returns `untagged_evidence`. Pass-9 dogfood found this case used
-      to fall through to `return original`, silently discarding the
-      section-fixed retry and undercounting `untagged_evidence`.
-    - retry failed for an unrelated reason (downstream/timeout/etc.) →
-      preserve the original failure so the operator sees the section-
-      coverage error, not the retry's incidental failure
+    - retry came back missing sections again (`IncompleteResponse:` + output)
+      → ok=False with the prefix preserved so error_kind stays
+      `incomplete_response`
+    - retry recovered the sections but EVIDENCE is untagged
+      (`UntaggedEvidence:` + output — strict-evidence is the gate AFTER
+      sections in `_response_validation_error`) → ok=False with the retry's
+      `UntaggedEvidence:` error preserved so `classify_error` returns
+      `untagged_evidence` (Pass-9 dogfood found this case used to fall through
+      to `return original`, silently discarding the section-fixed retry)
+    - retry failed for an unrelated reason → preserve the original failure so
+      the operator sees the section-coverage error, not the incidental failure
 
-    ALL non-fall-through branches set `section_repair_attempted=True`
-    so the strict-evidence wrapper can refuse to fire on the
-    sections-recovered-but-evidence-untagged result (without that
-    guard, the wrapper would chain a third call, breaking the "one
+    ALL non-fall-through branches set `section_repair_attempted=True` so the
+    strict-evidence wrapper refuses to chain a third call (holding the "one
     extra call per peer per round" invariant).
     """
-    if retry.ok:
-        merged_output = _format_retry_transcript(
-            original_output=original.output,
-            retry_output=retry.output,
-            recovered=True,
-            header_kind="sections",
-        )
+
+    def _merged(*, ok: bool, output: str, error: str) -> ParticipantResult:
         return ParticipantResult(
             name=retry.name,
-            ok=True,
-            output=merged_output,
-            error="",
+            ok=ok,
+            output=output,
+            error=error,
             elapsed_seconds=retry.elapsed_seconds,
             command=retry.command,
             model=retry.model,
-            repair_retry_recovered=True,
+            prompt_tokens=retry.prompt_tokens,
+            completion_tokens=retry.completion_tokens,
+            total_tokens=retry.total_tokens,
+            cost_usd=retry.cost_usd,
+            repair_retry_recovered=ok,
             section_repair_attempted=True,
         )
-    if retry.error.startswith(INCOMPLETE_RESPONSE_PREFIX) and retry.output:
-        merged_output = _format_retry_transcript(
-            original_output=original.output,
-            retry_output=retry.output,
-            recovered=False,
-            header_kind="sections",
+
+    if retry.ok:
+        return _merged(
+            ok=True,
+            output=_format_retry_transcript(
+                original_output=original.output,
+                retry_output=retry.output,
+                recovered=True,
+                header_kind="sections",
+            ),
+            error="",
         )
-        return ParticipantResult(
-            name=retry.name,
+    if retry.error.startswith(INCOMPLETE_RESPONSE_PREFIX) and retry.output:
+        return _merged(
             ok=False,
-            output=merged_output,
+            output=_format_retry_transcript(
+                original_output=original.output,
+                retry_output=retry.output,
+                recovered=False,
+                header_kind="sections",
+            ),
             error=(
                 f"{INCOMPLETE_RESPONSE_PREFIX} response had the RECOMMENDATION "
                 "label but missed one or more REQUIRED sections after one "
                 "repair retry"
             ),
-            elapsed_seconds=retry.elapsed_seconds,
-            command=retry.command,
-            model=retry.model,
-            section_repair_attempted=True,
         )
     if retry.error.startswith(UNTAGGED_EVIDENCE_PREFIX) and retry.output:
-        # Pass-9 fix: section-repair retry recovered the missing sections
-        # but the now-visible EVIDENCE bullets lack epistemic tags.
-        # Preserve the retry's `UntaggedEvidence:` error so error_kind
-        # routes correctly, and surface BOTH attempts in the merged
-        # output so the operator can see what happened. The
-        # strict-evidence wrapper checks `section_repair_attempted`
-        # and refuses to chain another retry.
-        merged_output = _format_retry_transcript(
-            original_output=original.output,
-            retry_output=retry.output,
-            recovered=False,
-            header_kind="sections_then_evidence",
-        )
-        return ParticipantResult(
-            name=retry.name,
+        return _merged(
             ok=False,
-            output=merged_output,
+            output=_format_retry_transcript(
+                original_output=original.output,
+                retry_output=retry.output,
+                recovered=False,
+                header_kind="sections_then_evidence",
+            ),
             error=retry.error,
-            elapsed_seconds=retry.elapsed_seconds,
-            command=retry.command,
-            model=retry.model,
-            section_repair_attempted=True,
         )
     return original
+
+
+def _merge_cli_section_retry(
+    original: ParticipantResult, retry: ParticipantResult
+) -> ParticipantResult:
+    """CLI section-repair merge — delegates to the unified
+    `_merge_section_retry` (kept as a named entry point for callers/tests)."""
+    return _merge_section_retry(original, retry)
 
 
 async def _read_stream_with_idle_deadline(
@@ -1606,88 +1641,9 @@ async def _maybe_section_repair_openai_compatible(
 def _merge_hosted_section_retry(
     original: ParticipantResult, retry: ParticipantResult
 ) -> ParticipantResult:
-    """Merge a hosted/local section-repair retry with the original failure.
-
-    Same semantics as `_merge_cli_section_retry` but written against
-    the hosted/local `ParticipantResult` shape (no `command`, has
-    `prompt_tokens`/`completion_tokens`/`total_tokens`/`cost_usd`).
-    See `_merge_cli_section_retry` for the third-branch rationale
-    (sections recovered but EVIDENCE untagged → preserve the retry's
-    `UntaggedEvidence:` error and set `section_repair_attempted=True`).
-    """
-    if retry.ok:
-        merged_output = _format_retry_transcript(
-            original_output=original.output,
-            retry_output=retry.output,
-            recovered=True,
-            header_kind="sections",
-        )
-        return ParticipantResult(
-            name=retry.name,
-            ok=True,
-            output=merged_output,
-            error="",
-            elapsed_seconds=retry.elapsed_seconds,
-            model=retry.model,
-            prompt_tokens=retry.prompt_tokens,
-            completion_tokens=retry.completion_tokens,
-            total_tokens=retry.total_tokens,
-            cost_usd=retry.cost_usd,
-            repair_retry_recovered=True,
-            section_repair_attempted=True,
-        )
-    if retry.error.startswith(INCOMPLETE_RESPONSE_PREFIX) and retry.output:
-        merged_output = _format_retry_transcript(
-            original_output=original.output,
-            retry_output=retry.output,
-            recovered=False,
-            header_kind="sections",
-        )
-        return ParticipantResult(
-            name=retry.name,
-            ok=False,
-            output=merged_output,
-            error=(
-                f"{INCOMPLETE_RESPONSE_PREFIX} response had the RECOMMENDATION "
-                "label but missed one or more REQUIRED sections after one "
-                "repair retry"
-            ),
-            elapsed_seconds=retry.elapsed_seconds,
-            model=retry.model,
-            prompt_tokens=retry.prompt_tokens,
-            completion_tokens=retry.completion_tokens,
-            total_tokens=retry.total_tokens,
-            cost_usd=retry.cost_usd,
-            section_repair_attempted=True,
-        )
-    if retry.error.startswith(UNTAGGED_EVIDENCE_PREFIX) and retry.output:
-        # Pass-9 fix: section-repair retry recovered the missing sections
-        # but the now-visible EVIDENCE bullets lack epistemic tags. See
-        # `_merge_cli_section_retry` for the full rationale.
-        merged_output = _format_retry_transcript(
-            original_output=original.output,
-            retry_output=retry.output,
-            recovered=False,
-            header_kind="sections_then_evidence",
-        )
-        return ParticipantResult(
-            name=retry.name,
-            ok=False,
-            output=merged_output,
-            error=retry.error,
-            elapsed_seconds=retry.elapsed_seconds,
-            model=retry.model,
-            prompt_tokens=retry.prompt_tokens,
-            completion_tokens=retry.completion_tokens,
-            total_tokens=retry.total_tokens,
-            cost_usd=retry.cost_usd,
-            section_repair_attempted=True,
-        )
-    # Retry failed for an unrelated reason (downstream/timeout/empty
-    # response/etc.). Preserve the original failure so the operator
-    # sees the section-coverage error rather than the retry's
-    # incidental failure.
-    return original
+    """Hosted/local section-repair merge — delegates to the unified
+    `_merge_section_retry` (kept as a named entry point for callers/tests)."""
+    return _merge_section_retry(original, retry)
 
 
 async def _run_openai_compatible_inner(
@@ -2563,7 +2519,32 @@ async def run_participants(
                 )
             return result
 
-    return await asyncio.gather(*[run_one(name) for name in selected])
+    # return_exceptions=True so an unguarded per-peer setup error (a bad cfg
+    # lookup, a timeout-resolution crash on a value that slipped validation)
+    # degrades that ONE peer instead of aborting the whole round and losing
+    # every other peer's result. run_one's own try/except already handles
+    # in-flight failures; this guards the setup that runs before it.
+    raw = await asyncio.gather(
+        *[run_one(name) for name in selected], return_exceptions=True
+    )
+    results: list[ParticipantResult] = []
+    for name, item in zip(selected, raw):
+        if isinstance(item, ParticipantResult):
+            results.append(item)
+        elif isinstance(item, asyncio.CancelledError):
+            raise item
+        else:
+            results.append(
+                ParticipantResult(
+                    name=name,
+                    ok=False,
+                    output="",
+                    error=f"{type(item).__name__}: {item}",
+                    elapsed_seconds=0.0,
+                    model=(participant_cfg.get(name) or {}).get("model"),
+                )
+            )
+    return results
 
 
 def _coerce_retries(value: Any, *, default: int) -> int:
@@ -2770,12 +2751,15 @@ _ENVELOPE_ENUM_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-# Free-form sentence for RISK. Captures rest-of-line preserving case so
-# something like `RISK: The single biggest risk is X.` is stored whole
-# instead of being truncated to "the" — the v0.10.1 bug surfaced when
-# the council reviewed itself and the parsed `risk` field showed only
-# the first word of every peer's sentence. Trailing `**` markdown
-# emphasis is tolerated.
+# RISK is REQUESTED as a categorical enum (low|medium|high|critical — see
+# context.py's directive and the MCP risk schema), but this parser captures
+# the whole rest-of-line LENIENTLY rather than enum-matching. A peer that
+# ignores the directive and writes `RISK: The single biggest risk is X.`
+# is then stored whole instead of being truncated to "the" — the v0.10.1
+# bug surfaced when the council reviewed itself and the parsed `risk` field
+# showed only the first word of every peer's sentence. Trailing `**`
+# markdown emphasis is tolerated. (Lenient capture, enum-requested: do not
+# describe this as a "free-form" contract — the requested format is the enum.)
 _ENVELOPE_RISK_RE = re.compile(
     r"""
     ^\s*(?:>\s*)?(?:[-*]\s+)?(?:\*\*)?

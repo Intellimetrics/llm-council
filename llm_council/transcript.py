@@ -131,6 +131,36 @@ def count_continuation_depth(base_dir: Path, run_id: str, *, max_depth: int = 32
     return depth
 
 
+def continuation_depth_limit_error(
+    config: dict[str, Any], transcripts_dir: Path, run_id: str
+) -> str | None:
+    """Return an error message if continuing ``run_id`` would exceed the
+    configured ``defaults.max_continuation_depth``, else None.
+
+    Shared by the CLI (`cmd_run_async`) and MCP (`run_council`) run pipelines so
+    the cap computation and the message can't drift between them (they had
+    already drifted slightly before this was extracted). Each caller raises its
+    own exception type (SystemExit / ValueError) with the returned message.
+    Passes ``max_depth + 1`` to the walker so it can count strictly past the cap
+    even when the user-configured cap exceeds the walker's internal ceiling.
+    """
+    max_depth = int(
+        config.get("defaults", {}).get(
+            "max_continuation_depth", DEFAULT_MAX_CONTINUATION_DEPTH
+        )
+    )
+    depth = count_continuation_depth(transcripts_dir, run_id, max_depth=max_depth + 1)
+    if depth >= max_depth:
+        return (
+            f"Continuation chain depth ({depth} parents) reaches the configured "
+            f"limit of {max_depth}. Each link summarizes its predecessor, so deep "
+            "chains eat into MAX_PROMPT_CHARS without adding new signal. Start a "
+            "fresh run, or raise `defaults.max_continuation_depth` in "
+            "`.llm-council.yaml`."
+        )
+    return None
+
+
 def _load_transcript_json(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -396,6 +426,16 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
     for field_name, items in envelope_lists.items():
         if items:
             payload[field_name] = items
+    # continue_debate (round-2 vote) and evidence_verification_failures
+    # (failed [VERIFIED:...] cites) are part of the documented envelope /
+    # citations surface — emit them so the transcript JSON matches the
+    # docstrings and the MCP structured_results shape.
+    if getattr(result, "continue_debate", None) is not None:
+        payload["continue_debate"] = result.continue_debate
+    if getattr(result, "evidence_verification_failures", None):
+        payload["evidence_verification_failures"] = list(
+            result.evidence_verification_failures
+        )
     from llm_council.adapters import classify_error
 
     error_kind = classify_error(result.error)
@@ -880,6 +920,25 @@ def write_transcript(
             for name, label in sorted(anonymization_map_md.items()):
                 lines.append(f"- {name} → {label}")
             lines.append("")
+
+    synthesis_md = metadata.get("synthesis")
+    if (
+        isinstance(synthesis_md, dict)
+        and synthesis_md.get("ok")
+        and (synthesis_md.get("output") or "").strip()
+    ):
+        # The synthesis chair is an opt-in, PAID extra call; its decision memo
+        # was previously preserved only in the JSON transcript, invisible on
+        # the human-facing markdown surface. The chair's `output` already
+        # carries the structured ## Decision / ## Consensus blockers / ## Dissent
+        # sections, so render it verbatim under a header plus the parsed label.
+        chair = synthesis_md.get("chair") or "?"
+        decision = synthesis_md.get("decision_label") or "unknown"
+        lines.extend([f"## Synthesis (chair: {chair})", ""])
+        lines.append(f"**Decision:** {decision}")
+        lines.append("")
+        lines.append(synthesis_md["output"].strip())
+        lines.append("")
 
     fence = markdown_fence(prompt)
     lines.extend(["## Prompt Sent", "", f"{fence}text", prompt, fence, ""])

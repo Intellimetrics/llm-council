@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.13.0 - 2026-05-28
+
+v0.13.0 lands a batch of fixes from a multi-dimension self-review (35 verified findings). Theme: close correctness/safety gaps where a field or config key was added to the data model but the validation, serialization, or concurrency discipline that should accompany it lagged behind.
+
+**Safety**
+*   **Antigravity read-only hardening (SOFT / prompt-enforced).** The `antigravity` peer no longer ships `--dangerously-skip-permissions` (which auto-approved every tool call, including Write/Edit). Important nuance discovered via a live canary: `agy` has no read-only / `--approval-mode` / `--tools` flag, and `--sandbox` only restricts the *terminal*, NOT the model's native write tool — so agy *can* write files when ordered with no read-only framing. What actually keeps it read-only is the council prompt's read-only directive (`context.build_prompt`), which agy reliably honors (verified 4/4: it refuses an explicit write request when the directive is present). Dropping `--dangerously-skip-permissions` ensures a stray write isn't auto-approved. This is a **softer** guarantee than the flag-enforced peers (claude/codex/gemini physically can't write); the residual risk is a prompt-injection in reviewed content overriding the directive. New guards: `tests/test_adapters_safety.py` fails if any default CLI peer re-adds an auto-approve flag, and the opt-in `tests/test_live_agy_readonly.py` canary (gated by `LLM_COUNCIL_LIVE_AGY_TEST=1`) verifies agy still honors the read-only directive across upstream releases.
+
+**Correctness**
+*   **Config validation gaps closed (fail-fast at load).** `fallback_chain` (CLI), `timeout_multiplier` (mode), `idle_timeout` and `timeout_per_kb_chars` (participant) are now validated at config-load. Previously a string `fallback_chain` was character-sliced into bogus model ids on the quota path, and `timeout_multiplier: "fast"` raised an uncaught `ValueError` mid-run. `timeout_per_kb_chars: 0` (disable-scaling sentinel) validates as non-negative.
+*   **`detect_current_agent` PPID parse** no longer breaks when a parent process `comm` contains spaces/parens (e.g. tmux's `(tmux: server)`); it now parses ppid relative to the final `)` in `/proc/<pid>/stat`. Previously the broad except silently aborted the walk and the host CLI wasn't excluded from its own review.
+*   **`.llm-council.env` precedence is now nearest-wins.** A subproject's env file beats an ancestor's, mirroring `find_config` — the override=True last-load-wins tie-break previously inverted this so a stale repo-root file shadowed the child.
+*   **`stats.aggregate` no longer double-counts `--cross-rank`.** Ranking-pass results (`<peer>:rank`) are excluded from the final-round view and their cost/latency folds into the base peer instead of phantom `<peer>:rank` rows that inflated `total_runs`.
+*   **Section-coverage validator** no longer false-accepts a missing section when two REQUIRED sections share a salient title token (e.g. `SECURITY ANALYSIS` / `SECURITY HARDENING`): collision-prone sections now require the full title as a near-contiguous phrase. Also detects separators with no trailing space (`PART 1 —OVERVIEW`).
+*   **Cache round-trip** now preserves `terse_retry_attempted`, so a timeout-recovered result no longer rehydrates to the contradictory `recovered_after_timeout=True, terse_retry_attempted=False`.
+
+**Resilience / concurrency**
+*   **Idle-read path no longer pipe-deadlocks** on large prompts: the stdin write now interleaves with the stdout/stderr reads (like `proc.communicate()`), and a stream's idle-timeout cancels its siblings instead of leaking them.
+*   **`--cross-rank` ranking pass** runs under the same `max_concurrency` semaphore as the primary rounds (no more unbounded subprocess fan-out) and uses `return_exceptions=True` so one ranking failure can't abort the whole council.
+*   **`run_participants`** guards the gather with `return_exceptions=True`: an unguarded per-peer setup error degrades that one peer to a failed result instead of aborting the round.
+
+**Surfacing / schema (MCP outputSchema bumped to v6)**
+*   `continue_debate`, `evidence_verification_failures`, `terse_retry_attempted`, `section_repair_attempted`, and `is_ranking_round` are now surfaced in transcript JSON and MCP `structured_results` (and declared in the per-result schema). New drift-guard test asserts every emitted key is declared.
+*   The MCP `prompt_chars` description no longer falsely claims `null` on success.
+*   The MCP budget pre-flight now counts `cross_rank` (an extra ranking round) and a paid-hosted `synthesize` chair, so a run that should trip `mcp_max_estimated_cost_usd` is no longer under-counted into passing.
+*   The synthesis chair's decision memo is now rendered in the markdown transcript (previously only in JSON).
+
+**CLI / UX**
+*   `transcripts show <bad-path>` and `models openrouter` network failures now print a clean error instead of a raw traceback.
+*   `outcome list --last 0` (or negative) is now rejected instead of silently showing ALL records.
+*   `outcome mark` honors a relocated `transcripts_dir` (`resolve_run_id` gained a `transcripts_dir` param) instead of hardcoding `.llm-council/runs`.
+*   The update-nag no longer steers a stable install onto a prerelease tag (`v…-rc1`).
+*   `transcripts prune --keep-last`/`--keep-since` help text now states the two flags form a UNION.
+
+**Docs / cleanup**
+*   `secret_scan`'s `scrubbed_count` renamed to `detected_count` (warn mode never scrubbed anything — it counts and logs but ships the prompt verbatim, now documented).
+*   Removed dead `_pick_quota_fallback_model`; consolidated the two near-identical section-retry merge helpers into one `_merge_section_retry`.
+*   Reconciled the RISK envelope contract (enum-requested, lenient capture), the `_aggregate_fixture` docstring, the section-matcher window docs (`-100`/`+200` ≈ 300 chars), and refreshed stale CLAUDE.md line refs to stable symbol names.
+*   `diff_chunking` now lists every file in `oversize_files` when prompt framing alone exhausts the budget.
+*   New tests for the promotion-gate `cross_rank_correlation_floor` branch and the strict-evidence `[VERIFIED:...]` invariant.
+
+**Post-review follow-ups (same release)**
+*   **New `redact` secret-scan policy.** `secret_scan: redact` masks each detected credential with `[REDACTED:<kind>]` in the prompt sent to peers AND persisted to the transcript — the only policy with transcript-level protection (`warn` never altered the prompt). New `safety.redact_secrets` re-scans and splices without ever exposing the value.
+*   **Real MCP stdio integration test.** `tests/test_mcp_stdio_integration.py` spawns the server over stdio and does the full initialize → list_tools → call_tool round trip, asserting the advertised `schema_version` + required fields — automating the manual MCP-restart dogfood ritual that previously caught schema gaps by hand.
+*   **CLI/MCP pipeline de-duplication (partial).** Extracted the two drift-prone shared blocks — `transcript.continuation_depth_limit_error` and `budget.summarize_preflight_caps` (cost/token/unpriced-paid reduction) — now used by `cmd_run_async`, `cmd_estimate`, and `run_council`. Each surface keeps its tailored refusal messages.
+*   **Idle-read reap race fixed.** The streamed-read path now `await proc.wait()`s after EOF, so `proc.returncode` is set before it's checked (a pipe-EOF-before-reap race surfaced a spurious `CliExitNonZero` under load — caught by the new idle-deadlock regression test).
+*   **Antigravity read-only reframed honestly (see Safety above).** A live canary (`tests/test_live_agy_readonly.py`) proved `agy` is *soft* (prompt-enforced) read-only, not flag-enforced — `--sandbox` is terminal-only and does not block writes. Docs/comments corrected; the canary guards against upstream drift.
+*   **Eval harness exercised for `review-with-tools`.** Ran review baseline vs review-with-tools through the promotion gate; the gate correctly returns `promoted: false`. The mode stays `experimental` — the lone bundled fixture yields zero structured findings (no usable signal), so promotion is blocked on a real fixture corpus, not on code.
+
+Known deferred (tracked for a focused follow-up): the full `prepare_council_run` unification of the ~550-line `cmd_run_async` / `mcp_server.run_council` pipelines (the high-value shared blocks are now extracted; the remainder diverges by transport), and the 228-line `run_cli_participant` repair-block boilerplate.
+
 ## 0.12.2 - 2026-05-23
 
 v0.12.2 fixes a council-flagged false-drop in `_drop_missing_key_participants`.

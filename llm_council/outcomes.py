@@ -161,7 +161,12 @@ def iter_outcomes(cwd: Path) -> Iterator[OutcomeRecord]:
     yield from records
 
 
-def resolve_run_id(cwd: Path, run_id_or_prefix: str) -> str | None:
+def resolve_run_id(
+    cwd: Path,
+    run_id_or_prefix: str,
+    *,
+    transcripts_dir: Path | None = None,
+) -> str | None:
     """Resolve a partial run_id (timestamp prefix) against transcripts.
 
     Mirrors how `cli` resolves IDs via
@@ -176,13 +181,19 @@ def resolve_run_id(cwd: Path, run_id_or_prefix: str) -> str | None:
     require an outcome to already exist (mark-before-list is the common
     workflow). Pass the FULL prefix when ambiguous — same rule as
     `--continue`.
+
+    ``transcripts_dir`` should be the config-resolved transcripts directory
+    (the caller honors ``defaults.transcripts_dir``). When omitted it falls
+    back to the default ``cwd/.llm-council/runs``; an operator who relocated
+    transcripts MUST pass the configured dir or prefix resolution silently
+    looks in the wrong place.
     """
     if not run_id_or_prefix:
         return None
-    # Load the config-driven transcripts dir; fall back to the default
-    # path. We avoid importing config.load_config here to keep this
-    # module dependency-light (the CLI does the heavy resolution for us).
-    transcripts = cwd / ".llm-council" / "runs"
+    transcripts = (
+        transcripts_dir if transcripts_dir is not None
+        else cwd / ".llm-council" / "runs"
+    )
     try:
         normalized = normalize_run_id(run_id_or_prefix)
     except ValueError:

@@ -124,3 +124,72 @@ def test_load_config_missing_explicit_path_is_clear(tmp_path: Path):
 def test_load_config_search_false_uses_defaults():
     config = load_config(None, search=False)
     assert "qwen_coder_flash" in config["participants"]
+
+
+def test_load_config_rejects_string_fallback_chain(tmp_path: Path):
+    """A bare string fallback_chain used to be character-sliced into bogus
+    single-char model ids on the quota path — fail fast at load instead."""
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump({"participants": {"claude": {"fallback_chain": "gpt-5.4"}}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="fallback_chain must be a string list"):
+        load_config(path)
+
+
+def test_load_config_accepts_valid_fallback_chain(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {"participants": {"claude": {"fallback_chain": ["a", "b"]}}}
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config["participants"]["claude"]["fallback_chain"] == ["a", "b"]
+
+
+def test_load_config_rejects_nonnumeric_timeout_multiplier(tmp_path: Path):
+    """timeout_multiplier: "fast" used to pass load then raise an uncaught
+    ValueError mid-run in _resolve_effective_timeout."""
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump({"modes": {"quick": {"timeout_multiplier": "fast"}}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="timeout_multiplier must be a positive number"):
+        load_config(path)
+
+
+def test_load_config_rejects_nonnumeric_idle_timeout(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump({"participants": {"claude": {"idle_timeout": "fast"}}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="idle_timeout must be a positive number"):
+        load_config(path)
+
+
+def test_load_config_accepts_zero_timeout_per_kb_chars(tmp_path: Path):
+    """0 is the documented "disable size-scaling" sentinel — must validate."""
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump({"participants": {"claude": {"timeout_per_kb_chars": 0}}}),
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config["participants"]["claude"]["timeout_per_kb_chars"] == 0
+
+
+def test_load_config_rejects_negative_timeout_per_kb_chars(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump({"participants": {"claude": {"timeout_per_kb_chars": -5}}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValueError, match="timeout_per_kb_chars must be a non-negative number"
+    ):
+        load_config(path)

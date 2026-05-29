@@ -25,7 +25,7 @@ from llm_council.config import (
     select_participants,
 )
 from llm_council.adapters import classify_error
-from llm_council.budget import image_attachment_violations
+from llm_council.budget import image_attachment_violations, summarize_preflight_caps
 from llm_council import display
 from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_prompt
 from llm_council.doctor import check_environment, checks_to_dict, probe_local_openai
@@ -42,8 +42,7 @@ from llm_council.policy import should_use_council
 from llm_council.setup_wizard import write_setup_files
 from llm_council.stats import compute_stats, format_stats_text
 from llm_council.transcript import (
-    DEFAULT_MAX_CONTINUATION_DEPTH,
-    count_continuation_depth,
+    continuation_depth_limit_error,
     find_transcript_by_id,
     format_prior_council_context,
     latest_transcript,
@@ -474,16 +473,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-last",
         type=int,
         default=None,
-        help="Keep only the N most recent transcripts; older are pruned",
+        help=(
+            "Keep the N most recent transcripts; older are pruned. Combined "
+            "with --keep-since the UNION is retained (a transcript survives if "
+            "it matches EITHER rule)."
+        ),
     )
     transcripts_prune.add_argument(
         "--keep-since",
         type=_parse_keep_since_arg,
         default=None,
         help=(
-            "Keep only transcripts newer than the cutoff (integer days back "
+            "Keep transcripts newer than the cutoff (integer days back "
             "or ISO date YYYY-MM-DD; ISO dates snap to midnight UTC); older "
-            "are pruned"
+            "are pruned. Combined with --keep-last the UNION is retained (a "
+            "transcript survives if it matches EITHER rule)."
         ),
     )
     transcripts_prune.add_argument(
@@ -1526,23 +1530,7 @@ def cmd_estimate(args: argparse.Namespace) -> int:
     max_cost_usd = getattr(args, "max_cost_usd", None)
     max_tokens = getattr(args, "max_tokens", None)
     if max_cost_usd is not None or max_tokens is not None:
-        cost_total = float(
-            estimate.get("known_total_with_retry_safety_usd")
-            if estimate.get("known_total_with_retry_safety_usd") is not None
-            else (estimate.get("known_total_usd") or 0.0)
-        )
-        token_rows = estimate.get("rows") or []
-        token_total = sum(
-            int(row.get("estimated_input_tokens") or 0)
-            + int(row.get("estimated_output_tokens") or 0)
-            for row in token_rows
-        )
-        unpriced_paid = [
-            row.get("name")
-            for row in token_rows
-            if row.get("type") in {"openrouter", "openai_compatible"}
-            and row.get("estimated_total_cost_usd") is None
-        ]
+        cost_total, token_total, unpriced_paid = summarize_preflight_caps(estimate)
         if max_cost_usd is not None and unpriced_paid:
             raise SystemExit(
                 "Pre-flight estimate cannot enforce --max-cost-usd: hosted "
@@ -1883,13 +1871,20 @@ def cmd_outcome(args: argparse.Namespace) -> int:
     )
 
     cwd = Path(args.cwd).resolve()
+    # Honor a relocated `transcripts_dir`: resolve_run_id otherwise hardcodes
+    # cwd/.llm-council/runs and silently fails to resolve a prefix for any
+    # operator who moved transcripts (the reliability layer that consumes
+    # these outcomes then degrades).
+    load_project_env(cwd)
+    _outcome_config = load_config(find_config(cwd), search=False)
+    runs_dir = _transcript_dir(cwd, _outcome_config)
 
     if sub_cmd == "mark":
-        run_id = resolve_run_id(cwd, args.run_id)
+        run_id = resolve_run_id(cwd, args.run_id, transcripts_dir=runs_dir)
         if run_id is None:
             print(
                 f"error: could not resolve run id '{args.run_id}' to a single "
-                f"transcript under {cwd}/.llm-council/runs/",
+                f"transcript under {runs_dir}/",
                 file=sys.stderr,
             )
             return 1
@@ -1913,9 +1908,13 @@ def cmd_outcome(args: argparse.Namespace) -> int:
         records: list = list(iter_outcomes(cwd))
         if args.peer:
             records = [r for r in records if r.winning_peer == args.peer]
-        last_n = max(0, int(args.last or 0))
-        if last_n:
-            records = records[:last_n]
+        # Distinguish "unset" (show all) from an explicit non-positive value.
+        # `--last 0` / negative previously fell through to showing ALL records,
+        # the opposite of the user's intent.
+        if args.last is not None and int(args.last) < 1:
+            raise SystemExit("--last must be a positive integer")
+        if args.last:
+            records = records[: int(args.last)]
         if args.json:
             print(
                 json.dumps(
@@ -1986,7 +1985,10 @@ def cmd_transcripts(args: argparse.Namespace) -> int:
             path = latest_transcript(out_dir, suffix=".json" if args.json_file else ".md")
             if path is None:
                 raise SystemExit(f"No council transcripts found in {out_dir}")
-        print(path.read_text(encoding="utf-8"))
+        try:
+            print(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise SystemExit(f"Failed to read transcript {path}: {exc}") from exc
         return 0
 
     if args.transcripts_command == "summary":
@@ -2278,7 +2280,15 @@ def cmd_models(args: argparse.Namespace) -> int:
         return _cmd_models_refresh(args)
     if args.models_command != "openrouter":
         raise SystemExit("models subcommand is required (openrouter|refresh)")
-    models = fetch_openrouter_models(use_cache=not args.no_cache)
+    try:
+        models = fetch_openrouter_models(use_cache=not args.no_cache)
+    except Exception as exc:
+        message = f"openrouter catalog fetch failed: {type(exc).__name__}: {exc}"
+        if args.json:
+            print(json.dumps({"ok": False, "error": message}, indent=2))
+        else:
+            print(message, file=sys.stderr)
+        return 1
     if args.filter:
         needle = args.filter.lower()
         models = [
@@ -2377,26 +2387,9 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     if continue_id:
         try:
             normalize_run_id(continue_id)
-            max_depth = int(
-                config.get("defaults", {}).get(
-                    "max_continuation_depth", DEFAULT_MAX_CONTINUATION_DEPTH
-                )
-            )
-            # Pass the user-configured cap + 1 so the walker can count past
-            # the cap and report it accurately. Without this, the walker's
-            # internal default ceiling (32) would silently mask any
-            # user-configured cap higher than 32.
-            depth = count_continuation_depth(
-                out_dir, continue_id, max_depth=max_depth + 1
-            )
-            if depth >= max_depth:
-                raise SystemExit(
-                    f"Continuation chain depth ({depth} parents) reaches the "
-                    f"configured limit of {max_depth}. Each link summarizes "
-                    "its predecessor, so deep chains eat into MAX_PROMPT_CHARS "
-                    "without adding new signal. Start a fresh run, or raise "
-                    "`defaults.max_continuation_depth` in `.llm-council.yaml`."
-                )
+            _depth_err = continuation_depth_limit_error(config, out_dir, continue_id)
+            if _depth_err:
+                raise SystemExit(_depth_err)
             prior_transcript = find_transcript_by_id(out_dir, continue_id)
             prior_path = prior_transcript.get("_path")
             parent_run_id = (
@@ -2509,14 +2502,20 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     except ValueError as exc:
         # block-mode hit; surface and halt before any participant runs.
         raise SystemExit(str(exc)) from exc
-    if scan_result.get("scrubbed_count"):
+    # redact policy: swap in the masked prompt before it reaches peers OR the
+    # transcript. Pop it so the (large) redacted prompt isn't duplicated into
+    # metadata.secret_scan below.
+    _redacted = scan_result.pop("redacted_prompt", None)
+    if _redacted is not None:
+        prompt = _redacted
+    if scan_result.get("detected_count"):
         kinds_summary = ", ".join(
             f"{k}={v}" for k, v in sorted(scan_result["kinds"].items())
         )
         print(
             display.format_gutter(
                 "warn",
-                f"secret_scan: {scan_result['scrubbed_count']} likely "
+                f"secret_scan: {scan_result['detected_count']} likely "
                 f"credential(s) detected in prompt ({kinds_summary}). "
                 f"Allowlist: ./{scan_allowlist}. Policy: {scan_policy}.",
                 color=display.wants_color(sys.stdout),
@@ -2569,31 +2568,11 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             )
         except (OSError, ValueError) as exc:
             raise SystemExit(f"failed to compute pre-flight estimate: {exc}") from exc
-        # Use the retry-safety total so a worst-case repair retry can't
-        # silently push spend past the cap after preflight clears.
-        cost_total = float(
-            preflight.get("known_total_with_retry_safety_usd")
-            if preflight.get("known_total_with_retry_safety_usd") is not None
-            else (preflight.get("known_total_usd") or 0.0)
-        )
-        token_rows = preflight.get("rows") or []
-        token_total = sum(
-            int(row.get("estimated_input_tokens") or 0)
-            + int(row.get("estimated_output_tokens") or 0)
-            for row in token_rows
-        )
-        # Refuse when a hosted (paid-API) peer has unknown cost. CLI / Ollama
-        # rows legitimately report `estimated_total_cost_usd: None` because
-        # they're not API-priced here — those don't compromise a $-cap.
-        # OpenRouter / openai_compatible rows that come back as None mean
-        # the catalog lookup missed, which would silently let a paid peer
-        # slip past the safety cap if we trusted `known_total_usd` alone.
-        unpriced_paid = [
-            row.get("name")
-            for row in token_rows
-            if row.get("type") in {"openrouter", "openai_compatible"}
-            and row.get("estimated_total_cost_usd") is None
-        ]
+        # summarize_preflight_caps uses the retry-safety total so a worst-case
+        # repair retry can't silently push spend past the cap, and flags hosted
+        # peers with unknown catalog price (which would otherwise slip past a
+        # $-cap). Shared with cmd_estimate + the MCP run pipeline.
+        cost_total, token_total, unpriced_paid = summarize_preflight_caps(preflight)
         if max_cost_usd is not None and unpriced_paid:
             raise SystemExit(
                 "Pre-flight estimate cannot enforce --max-cost-usd: hosted "
@@ -2705,7 +2684,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     # transcripts need their own copy because audit pipelines don't read
     # stderr. Keep parity with mcp_server.run_council, which stamps the
     # same field.
-    if scan_result.get("scrubbed_count") or scan_policy != "off":
+    if scan_result.get("detected_count") or scan_policy != "off":
         metadata["secret_scan"] = scan_result
     # Surface a synthesis configuration error inline. The orchestrator
     # catches ValueError from the chair-resolution path and stamps it as

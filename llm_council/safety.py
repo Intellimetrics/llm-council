@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 
-VALID_POLICIES = ("off", "warn", "block")
+VALID_POLICIES = ("off", "warn", "block", "redact")
 DEFAULT_ALLOWLIST_FILENAME = ".llm-council-secrets-allow"
 
 # Pattern catalogue. Each entry is (kind, regex, min_match_len). Keep the
@@ -105,6 +105,53 @@ def scan_prompt_for_secrets(
     return findings
 
 
+def redact_secrets(
+    prompt: str,
+    *,
+    cwd: Path | None = None,
+    allowlist_filename: str = DEFAULT_ALLOWLIST_FILENAME,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Return ``(redacted_prompt, findings)`` with every detected secret span
+    replaced by ``[REDACTED:<kind>]``.
+
+    Unlike :func:`scan_prompt_for_secrets`, this MUST locate the matched spans
+    to splice them out — but it still never returns the raw value: the findings
+    it returns carry only ``kind`` + ``line`` (preview is the literal
+    ``"[redacted]"``). Overlapping matches across patterns are coalesced
+    (earliest start wins, longest on ties) so a span is never double-replaced or
+    partially mangled.
+    """
+    if not prompt:
+        return prompt, []
+    allowlist = _load_allowlist(cwd or Path("."), allowlist_filename)
+    spans: list[tuple[int, int, str]] = []
+    for kind, pattern in _PATTERNS:
+        for match in pattern.finditer(prompt):
+            if _is_allowlisted(match.group(0), allowlist):
+                continue
+            spans.append((match.start(), match.end(), kind))
+    if not spans:
+        return prompt, []
+    # Earliest start first; on equal starts the longest match wins so a shorter
+    # overlapping match is skipped rather than truncating the longer one.
+    spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+    out: list[str] = []
+    findings: list[dict[str, Any]] = []
+    cursor = 0
+    for start, end, kind in spans:
+        if start < cursor:
+            continue  # overlaps an already-redacted span
+        out.append(prompt[cursor:start])
+        out.append(f"[REDACTED:{kind}]")
+        findings.append(
+            {"kind": kind, "line": prompt.count("\n", 0, start) + 1, "preview": "[redacted]"}
+        )
+        cursor = end
+    out.append(prompt[cursor:])
+    findings.sort(key=lambda f: (f["line"], f["kind"]))
+    return "".join(out), findings
+
+
 def apply_secret_scan_policy(
     prompt: str,
     *,
@@ -114,10 +161,22 @@ def apply_secret_scan_policy(
 ) -> dict[str, Any]:
     """Run the scanner and apply the configured policy.
 
-    Returns a dict with ``findings`` (list), ``scrubbed_count`` (int),
+    Returns a dict with ``findings`` (list), ``detected_count`` (int),
     ``policy`` (the effective policy), and ``kinds`` (dict mapping kind→count).
     Raises ``ValueError`` with the leading prefix ``SecretsBlocked:`` when
     policy is ``block`` and findings are non-empty.
+
+    NOTE: ``warn`` mode does NOT alter the prompt — it counts and logs matches
+    but ships the original prompt to peers AND persists it verbatim to the
+    on-disk transcript. The count is named ``detected_count`` (not "scrubbed")
+    to avoid implying mitigation that does not happen; use ``block`` to refuse
+    a run that contains likely credentials, or ``redact`` to mask them.
+
+    ``redact`` returns an extra ``redacted_prompt`` key: each detected secret
+    span is replaced with ``[REDACTED:<kind>]``. The caller is responsible for
+    using ``redacted_prompt`` as the prompt actually sent to peers / persisted
+    (so the secret reaches neither). This is the only policy that provides
+    transcript-level protection.
     """
     if policy not in VALID_POLICIES:
         raise ValueError(
@@ -125,7 +184,21 @@ def apply_secret_scan_policy(
             f"Expected one of: {', '.join(VALID_POLICIES)}"
         )
     if policy == "off":
-        return {"findings": [], "scrubbed_count": 0, "policy": "off", "kinds": {}}
+        return {"findings": [], "detected_count": 0, "policy": "off", "kinds": {}}
+    if policy == "redact":
+        redacted, findings = redact_secrets(
+            prompt, cwd=cwd, allowlist_filename=allowlist_filename
+        )
+        kinds_r: dict[str, int] = {}
+        for f in findings:
+            kinds_r[f["kind"]] = kinds_r.get(f["kind"], 0) + 1
+        return {
+            "findings": findings,
+            "detected_count": len(findings),
+            "policy": "redact",
+            "kinds": kinds_r,
+            "redacted_prompt": redacted,
+        }
     findings = scan_prompt_for_secrets(
         prompt, cwd=cwd, allowlist_filename=allowlist_filename
     )
@@ -134,7 +207,7 @@ def apply_secret_scan_policy(
         kinds[f["kind"]] = kinds.get(f["kind"], 0) + 1
     payload = {
         "findings": findings,
-        "scrubbed_count": len(findings),
+        "detected_count": len(findings),
         "policy": policy,
         "kinds": kinds,
     }
@@ -153,5 +226,6 @@ __all__ = [
     "DEFAULT_ALLOWLIST_FILENAME",
     "VALID_POLICIES",
     "apply_secret_scan_policy",
+    "redact_secrets",
     "scan_prompt_for_secrets",
 ]

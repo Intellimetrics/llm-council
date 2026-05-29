@@ -9,6 +9,7 @@ import pytest
 from llm_council.safety import (
     DEFAULT_ALLOWLIST_FILENAME,
     apply_secret_scan_policy,
+    redact_secrets,
     scan_prompt_for_secrets,
 )
 
@@ -72,7 +73,7 @@ def test_policy_off_returns_empty(tmp_path: Path):
     payload = apply_secret_scan_policy(
         "AKIAIOSFODNN7EXAMPLE", policy="off", cwd=tmp_path
     )
-    assert payload["scrubbed_count"] == 0
+    assert payload["detected_count"] == 0
     assert payload["policy"] == "off"
 
 
@@ -82,7 +83,7 @@ def test_policy_warn_returns_findings_without_raising(tmp_path: Path):
         policy="warn",
         cwd=tmp_path,
     )
-    assert payload["scrubbed_count"] == 2
+    assert payload["detected_count"] == 2
     assert payload["kinds"] == {"aws_access_key": 1, "github_token": 1}
 
 
@@ -97,9 +98,60 @@ def test_policy_block_no_findings_is_clean(tmp_path: Path):
     payload = apply_secret_scan_policy(
         "harmless prompt body", policy="block", cwd=tmp_path
     )
-    assert payload["scrubbed_count"] == 0
+    assert payload["detected_count"] == 0
 
 
 def test_invalid_policy_raises(tmp_path: Path):
     with pytest.raises(ValueError, match="Invalid secret_scan policy"):
         apply_secret_scan_policy("x", policy="rage", cwd=tmp_path)
+
+
+# --- redact policy -------------------------------------------------------
+
+def test_redact_secrets_masks_value_and_returns_value_free_findings(tmp_path: Path):
+    prompt = "here is the key AKIAIOSFODNN7EXAMPLE in the config"
+    redacted, findings = redact_secrets(prompt, cwd=tmp_path)
+    assert "AKIAIOSFODNN7EXAMPLE" not in redacted
+    assert "[REDACTED:aws_access_key]" in redacted
+    assert len(findings) == 1
+    # Findings must never carry the raw value.
+    assert "AKIAIOSFODNN7EXAMPLE" not in str(findings)
+    assert findings[0]["kind"] == "aws_access_key"
+
+
+def test_redact_secrets_clean_prompt_unchanged(tmp_path: Path):
+    redacted, findings = redact_secrets("just a normal prompt", cwd=tmp_path)
+    assert redacted == "just a normal prompt"
+    assert findings == []
+
+
+def test_redact_secrets_masks_multiple_distinct_secrets(tmp_path: Path):
+    prompt = (
+        "aws AKIAIOSFODNN7EXAMPLE and gh ghp_"
+        + "a" * 36
+        + " end"
+    )
+    redacted, findings = redact_secrets(prompt, cwd=tmp_path)
+    assert "AKIAIOSFODNN7EXAMPLE" not in redacted
+    assert "ghp_" + "a" * 36 not in redacted
+    assert "[REDACTED:aws_access_key]" in redacted
+    assert "[REDACTED:github_token]" in redacted
+    assert {f["kind"] for f in findings} == {"aws_access_key", "github_token"}
+
+
+def test_policy_redact_returns_redacted_prompt(tmp_path: Path):
+    payload = apply_secret_scan_policy(
+        "key AKIAIOSFODNN7EXAMPLE here", policy="redact", cwd=tmp_path
+    )
+    assert payload["policy"] == "redact"
+    assert payload["detected_count"] == 1
+    assert "AKIAIOSFODNN7EXAMPLE" not in payload["redacted_prompt"]
+    assert "[REDACTED:aws_access_key]" in payload["redacted_prompt"]
+
+
+def test_policy_redact_clean_prompt_has_no_changes(tmp_path: Path):
+    payload = apply_secret_scan_policy(
+        "nothing secret here", policy="redact", cwd=tmp_path
+    )
+    assert payload["detected_count"] == 0
+    assert payload["redacted_prompt"] == "nothing secret here"

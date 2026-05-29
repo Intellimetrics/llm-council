@@ -198,8 +198,9 @@ def _score_peer(
 def _aggregate_fixture(peers: list[PeerScore]) -> dict[str, Any]:
     """Aggregate peer metrics for one fixture into a single block.
 
-    `blocker_recall` is reported as BOTH max (did ANY peer catch the
-    bug?) and mean (collective coverage). `false_blocker_rate`,
+    `blocker_recall` is reported as the max across peers (did ANY peer
+    catch the bug?) — emitted as `blocker_recall_max`, which the
+    suite-level rollup keys off. `false_blocker_rate`,
     `signal_to_noise_ratio`, and `evidence_density` are averaged across
     peers (per-peer noise floor). `citation_accuracy` is averaged only
     over peers that emitted a VERIFIED entry — None inputs are skipped.

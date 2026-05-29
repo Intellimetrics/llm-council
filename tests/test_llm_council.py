@@ -3705,6 +3705,74 @@ def test_load_project_env_precedence(tmp_path: Path, monkeypatch):
     assert __import__("os").environ["OPENROUTER_API_KEY"] == "from-council"
 
 
+def test_load_project_env_nested_llm_council_env_nearest_wins(tmp_path: Path, monkeypatch):
+    """A subproject's `.llm-council.env` must beat an ancestor's, mirroring
+    find_config's nearest-wins. The override=True last-load-wins tie-break
+    previously inverted this so the farthest ancestor silently shadowed the
+    child."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    child = tmp_path / "monorepo" / "subproject"
+    child.mkdir(parents=True)
+    (tmp_path / "monorepo" / ".llm-council.env").write_text(
+        "OPENROUTER_API_KEY=stale-parent\n"
+    )
+    (child / ".llm-council.env").write_text("OPENROUTER_API_KEY=correct-child\n")
+    load_project_env(child)
+    assert __import__("os").environ["OPENROUTER_API_KEY"] == "correct-child"
+
+
+def test_load_project_env_nested_dotenv_nearest_wins(tmp_path: Path, monkeypatch):
+    """The same nearest-wins guarantee for the non-overriding `.env` class."""
+    monkeypatch.delenv("SOME_PROJECT_VAR", raising=False)
+    child = tmp_path / "monorepo" / "subproject"
+    child.mkdir(parents=True)
+    (tmp_path / "monorepo" / ".env").write_text("SOME_PROJECT_VAR=stale-parent\n")
+    (child / ".env").write_text("SOME_PROJECT_VAR=correct-child\n")
+    load_project_env(child)
+    assert __import__("os").environ["SOME_PROJECT_VAR"] == "correct-child"
+
+
+def test_detect_current_agent_handles_parent_comm_with_spaces(monkeypatch):
+    """A parent process whose /proc comm contains spaces (e.g. tmux's
+    "(tmux: server)") must not abort the PPID walk — the host CLI further up
+    the chain still has to be detected and excluded."""
+    from llm_council import config as config_module
+
+    monkeypatch.delenv("LLM_COUNCIL_CURRENT", raising=False)
+    monkeypatch.delenv("LLM_COUNCIL_AGENT", raising=False)
+    monkeypatch.setattr(config_module.os, "getppid", lambda: 100)
+
+    fake_cmdline = {
+        100: b"tmux: server\x00",                 # no CLI match
+        50: b"/usr/local/bin/claude\x00-p\x00",   # host CLI two hops up
+    }
+    fake_stat = {
+        100: "100 (tmux: server) S 50 50 0 0 -1 0 0",  # comm has a space + ')'
+        50: "50 (bash) S 1 1 0 0 -1 0 0",
+    }
+
+    def pid_of(path: Path) -> int:
+        return int(str(path).split("/")[2])
+
+    real_read_bytes = Path.read_bytes
+    real_read_text = Path.read_text
+
+    def fake_read_bytes(self):
+        if str(self).startswith("/proc/"):
+            return fake_cmdline[pid_of(self)]
+        return real_read_bytes(self)
+
+    def fake_read_text(self, *args, **kwargs):
+        if str(self).startswith("/proc/"):
+            return fake_stat[pid_of(self)]
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+
+    assert config_module.detect_current_agent() == "claude"
+
+
 def test_origin_inference_for_us_model():
     assert infer_origin("openai/gpt-5.2") == "US / OpenAI"
     assert infer_origin("~anthropic/claude-opus-latest") == "US / Anthropic"
@@ -3749,6 +3817,30 @@ def test_check_update_reports_available(monkeypatch, capsys):
     assert "update_available: true" in output
     assert "uv tool install --force" in output
     assert "@v9.9.9" in output
+
+
+def test_latest_tag_version_skips_prereleases():
+    """A stable install must not be nagged onto an rc/beta build; the latest
+    STABLE tag wins even when a higher prerelease tag exists."""
+    from llm_council.update_check import _latest_tag_version
+
+    tags = [
+        {"name": "v0.13.0"},
+        {"name": "v0.14.0-rc1"},
+        {"name": "v0.13.0-rc2"},
+    ]
+    version, tag = _latest_tag_version(tags)
+    assert version == "0.13.0"
+    assert tag == "v0.13.0"
+
+
+def test_latest_tag_version_all_prereleases_raises():
+    """If only prereleases exist, surface "no version" (fail-soft, no nag)
+    rather than steering a stable user onto an rc."""
+    from llm_council.update_check import _latest_tag_version
+
+    with pytest.raises(ValueError):
+        _latest_tag_version([{"name": "v0.14.0-rc1"}, {"name": "v0.15.0-beta"}])
 
 
 def test_check_update_json_reports_current(monkeypatch, capsys):
@@ -5642,6 +5734,70 @@ def test_write_transcript_emits_remaining_disagreement_section(tmp_path: Path):
     assert all(entry["ok"] is True for entry in remaining["participants"])
 
 
+def test_write_transcript_renders_synthesis_section(tmp_path: Path):
+    """The opt-in (paid) synthesis chair memo must appear in the human-facing
+    markdown transcript, not only the JSON."""
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "synth.md"
+    json_path = out_dir / "synth.json"
+    results = [
+        ParticipantResult("a", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        ParticipantResult("b", True, "RECOMMENDATION: no - wait", "", 1.0),
+    ]
+    write_transcript(
+        md_path,
+        json_path,
+        question="q",
+        mode="review",
+        current="codex",
+        participants=["a", "b"],
+        prompt="prompt",
+        results=results,
+        metadata={
+            "synthesis": {
+                "chair": "claude",
+                "ok": True,
+                "decision_label": "tradeoff",
+                "output": (
+                    "## Decision\nProceed with caveats.\n"
+                    "## Consensus blockers\n- none"
+                ),
+            }
+        },
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "## Synthesis (chair: claude)" in md
+    assert "**Decision:** tradeoff" in md
+    assert "Proceed with caveats." in md
+
+
+def test_write_transcript_omits_synthesis_section_when_failed(tmp_path: Path):
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / "synth2.md"
+    json_path = out_dir / "synth2.json"
+    results = [ParticipantResult("a", True, "RECOMMENDATION: yes - ok", "", 1.0)]
+    write_transcript(
+        md_path,
+        json_path,
+        question="q",
+        mode="review",
+        current="codex",
+        participants=["a"],
+        prompt="prompt",
+        results=results,
+        metadata={
+            "synthesis": {
+                "chair": "claude",
+                "ok": False,
+                "output": "",
+                "error": "boom",
+            }
+        },
+    )
+    md = md_path.read_text(encoding="utf-8")
+    assert "## Synthesis" not in md
+
+
 def test_write_transcript_remaining_disagreement_handles_failed_and_whitespace_errors(
     tmp_path: Path,
 ):
@@ -5773,6 +5929,41 @@ def test_transcripts_cli_limit_zero_and_relative_show(tmp_path: Path, capsys):
     )
     assert cmd_transcripts(args) == 0
     assert "LLM Council Transcript" in capsys.readouterr().out
+
+
+def test_transcripts_show_missing_path_exits_without_traceback(tmp_path: Path):
+    parser = build_parser()
+    args = parser.parse_args(
+        ["transcripts", "show", "does-not-exist.md", "--cwd", str(tmp_path)]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cmd_transcripts(args)
+    assert "Failed to read transcript" in str(exc.value)
+
+
+def test_outcome_list_rejects_nonpositive_last(tmp_path: Path):
+    from llm_council.cli import cmd_outcome
+
+    parser = build_parser()
+    args = parser.parse_args(
+        ["outcome", "list", "--cwd", str(tmp_path), "--last", "0"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cmd_outcome(args)
+    assert "--last must be a positive integer" in str(exc.value)
+
+
+def test_models_openrouter_fetch_failure_returns_1_without_traceback(monkeypatch, capsys):
+    from llm_council import cli as cli_module
+
+    def _boom(**_kwargs):
+        raise ConnectionError("network down")
+
+    monkeypatch.setattr(cli_module, "fetch_openrouter_models", _boom)
+    parser = build_parser()
+    args = parser.parse_args(["models", "openrouter"])
+    assert cli_module.cmd_models(args) == 1
+    assert "openrouter catalog fetch failed" in capsys.readouterr().err
 
 
 def _write_synth_transcript(
@@ -9908,20 +10099,6 @@ def test_execute_council_omits_quota_field_when_no_quota_error(
     assert "quota_throttled_peers" not in metadata
 
 
-def test_pick_quota_fallback_model_picks_next_in_chain():
-    """When cfg.model is in the chain, fallback is the next entry; when
-    it's not (or None), fallback is chain[0]; when no next, None."""
-    from llm_council.adapters import _pick_quota_fallback_model
-
-    chain = ["sonnet", "haiku"]
-    assert _pick_quota_fallback_model({"model": None, "fallback_chain": chain}) == "sonnet"
-    assert _pick_quota_fallback_model({"model": "opus", "fallback_chain": chain}) == "sonnet"
-    assert _pick_quota_fallback_model({"model": "sonnet", "fallback_chain": chain}) == "haiku"
-    assert _pick_quota_fallback_model({"model": "haiku", "fallback_chain": chain}) is None
-    assert _pick_quota_fallback_model({"model": None, "fallback_chain": []}) is None
-    assert _pick_quota_fallback_model({"model": None}) is None
-
-
 def test_build_cli_command_injects_fallback_model_for_claude(tmp_path):
     """Claude family gets `--fallback-model <chain[0]>` baked in so the CLI
     handles overload natively. Non-Claude families do NOT get this flag
@@ -10609,6 +10786,64 @@ def test_stats_counts_quota_recoveries():
     assert by_peer["claude"]["quota_recoveries"] == 0
 
 
+def test_stats_aggregate_does_not_double_count_cross_rank(tmp_path: Path):
+    """A single-round --cross-rank transcript carries `<peer>:rank` ranking
+    results alongside the primary votes. stats.aggregate must fold their
+    cost/latency into the base peer and must NOT count them as extra runs or
+    phantom `<peer>:rank` participant rows."""
+    from llm_council.stats import aggregate
+
+    records = [
+        {
+            "mtime": 1_700_000_000,
+            "data": {
+                "mode": "quick",
+                "results": [
+                    {
+                        "name": "claude",
+                        "ok": True,
+                        "output": "RECOMMENDATION: yes - ok",
+                        "cost_usd": 0.10,
+                    },
+                    {
+                        "name": "codex",
+                        "ok": True,
+                        "output": "RECOMMENDATION: no - nope",
+                        "cost_usd": 0.20,
+                    },
+                    {
+                        "name": "claude:rank",
+                        "ok": True,
+                        "output": "FINAL RANKING: A, B",
+                        "is_ranking_round": True,
+                        "cost_usd": 0.01,
+                    },
+                    {
+                        "name": "codex:rank",
+                        "ok": True,
+                        "output": "FINAL RANKING: B, A",
+                        "is_ranking_round": True,
+                        "cost_usd": 0.02,
+                    },
+                ],
+            },
+        }
+    ]
+    result = aggregate(records)
+    by_peer = {row["name"]: row for row in result["participants"]}
+    # No phantom :rank rows.
+    assert "claude:rank" not in by_peer
+    assert "codex:rank" not in by_peer
+    # Exactly the two real peers, each counted once.
+    assert set(by_peer) == {"claude", "codex"}
+    assert result["total_runs"] == 2
+    assert by_peer["claude"]["runs"] == 1
+    assert by_peer["codex"]["runs"] == 1
+    # Ranking-pass cost folds into the base peer's cost total.
+    assert by_peer["claude"]["cost_total"] == pytest.approx(0.11)
+    assert by_peer["codex"]["cost_total"] == pytest.approx(0.22)
+
+
 def test_count_continuation_depth_walks_parent_chain(tmp_path: Path):
     """Each transcript records parent_run_id; the helper walks the chain."""
     from llm_council.transcript import count_continuation_depth
@@ -10638,6 +10873,46 @@ def test_count_continuation_depth_walks_parent_chain(tmp_path: Path):
     assert count_continuation_depth(out_dir, "20260101_000000_root") == 0
     assert count_continuation_depth(out_dir, "20260102_000000_child") == 1
     assert count_continuation_depth(out_dir, "20260103_000000_grandchild") == 2
+
+
+def test_continuation_depth_limit_error_shared_helper(tmp_path: Path):
+    """The CLI + MCP run pipelines share `continuation_depth_limit_error`:
+    returns a message at/over the configured cap, None below it."""
+    from llm_council.transcript import continuation_depth_limit_error
+
+    out_dir = tmp_path / "runs"
+    out_dir.mkdir()
+
+    def _write(stem: str, parent: str | None) -> None:
+        payload = {
+            "question": "q",
+            "mode": "quick",
+            "current": None,
+            "participants": ["a"],
+            "prompt": "p",
+            "metadata": {"rounds": 1},
+            "results": [],
+        }
+        if parent:
+            payload["parent_run_id"] = parent
+        (out_dir / f"{stem}.json").write_text(json.dumps(payload), encoding="utf-8")
+        (out_dir / f"{stem}.md").write_text(f"# {stem}", encoding="utf-8")
+
+    # Chain of depth 2 (grandchild has 2 parents).
+    _write("20260101_000000_root", None)
+    _write("20260102_000000_child", "20260101_000000_root")
+    _write("20260103_000000_grandchild", "20260102_000000_child")
+    leaf = "20260103_000000_grandchild"
+
+    # cap=2: depth(2) >= 2 -> message.
+    cfg_at = {"defaults": {"max_continuation_depth": 2}}
+    msg = continuation_depth_limit_error(cfg_at, out_dir, leaf)
+    assert msg is not None
+    assert "reaches the configured limit of 2" in msg
+
+    # cap=5: depth(2) < 5 -> None.
+    cfg_below = {"defaults": {"max_continuation_depth": 5}}
+    assert continuation_depth_limit_error(cfg_below, out_dir, leaf) is None
 
 
 def test_count_continuation_depth_raises_on_cycle(tmp_path: Path):
@@ -10819,6 +11094,85 @@ modes:
     assert result["results"] == []
     assert result["metadata"]["dry_run"] is True
     assert result["metadata"]["participant_models"] == {"cheap": "openai/gpt-4o-mini"}
+
+
+@pytest.mark.asyncio
+async def test_mcp_structured_results_keys_match_declared_schema(tmp_path, monkeypatch):
+    """Drift-guard (MEMORY: MCP-restart dogfood): every key emitted in a
+    structured_results item must be declared in the per-result outputSchema. A
+    field added to ParticipantResult + emitted but never declared lets a strict
+    MCP client reject the whole call — the exact recurring gap this pins down."""
+    from llm_council import mcp_server as mcp_module
+    from llm_council.adapters import ParticipantResult
+    from llm_council.mcp_server import council_run_output_schema, run_council
+
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    (tmp_path / ".llm-council.yaml").write_text(
+        """
+defaults:
+  mode: review-local
+participants:
+  local_peer:
+    type: ollama
+    model: llama3
+    base_url: http://localhost:11434
+modes:
+  review-local:
+    participants: [local_peer]
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    fully_populated = ParticipantResult(
+        name="local_peer",
+        ok=True,
+        output="RECOMMENDATION: yes - looks good",
+        error="",
+        elapsed_seconds=1.5,
+        model="llama3",
+        total_tokens=100,
+        cost_usd=0.01,
+        effort="full",
+        confidence="high",
+        risk="low",
+        blockers=["b"],
+        evidence=[{"text": "e", "tag": "published"}],
+        tests_to_run=["pytest"],
+        assumptions=["a"],
+        continue_debate="no",
+        evidence_verification_failures=["foo.py:1-3"],
+        terse_retry_attempted=True,
+        section_repair_attempted=True,
+        is_ranking_round=False,
+        prompt_chars=42,
+    )
+
+    async def fake_execute_council(*_args, **_kwargs):
+        return [fully_populated], {}
+
+    monkeypatch.setattr(mcp_module, "execute_council", fake_execute_council)
+
+    result = await run_council({"question": "ping", "working_directory": str(tmp_path)})
+
+    schema = council_run_output_schema()
+    declared = set(schema["properties"]["results"]["items"]["properties"])
+    assert result["results"], "expected at least one structured result"
+    for item in result["results"]:
+        undeclared = set(item) - declared
+        assert not undeclared, (
+            f"structured_results emits undeclared keys {sorted(undeclared)} — "
+            "strict MCP clients will reject the call"
+        )
+    item = result["results"][0]
+    for key in (
+        "continue_debate",
+        "evidence_verification_failures",
+        "terse_retry_attempted",
+        "section_repair_attempted",
+        "is_ranking_round",
+    ):
+        assert key in item, f"{key} missing from structured_results"
+        assert key in declared, f"{key} not declared in outputSchema"
 
 
 def test_council_run_output_schema_advertises_typed_fields():
