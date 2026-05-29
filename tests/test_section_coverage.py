@@ -68,6 +68,21 @@ def test_regex_tolerates_hyphen_dash_variants():
         assert len(matches) == 1, f"separator {sep!r} should match"
 
 
+def test_regex_matches_separator_without_trailing_space():
+    """Regression: a separator that abuts the title (`—OVERVIEW`, `:OVERVIEW`)
+    must still be detected — otherwise the validator silently no-ops for that
+    common typo and the section goes unchecked."""
+    for line in (
+        "PART 1 —OVERVIEW (REQUIRED)",
+        "PART 1:OVERVIEW (REQUIRED)",
+        "PART 1 -OVERVIEW (REQUIRED)",
+    ):
+        matches = list(REQUIRED_SECTION_HEADER_RE.finditer(line))
+        assert len(matches) == 1, f"{line!r} should match"
+        assert matches[0].group("num") == "1"
+        assert "OVERVIEW" in matches[0].group("title").upper()
+
+
 # --- Salient-token extraction --------------------------------------------
 
 def test_salient_tokens_keep_4plus_caps_words():
@@ -131,6 +146,44 @@ def test_section_present_no_tokens_requires_header_shaped_part_n():
 def test_returns_empty_when_prompt_has_no_required_markers():
     """No (REQUIRED) headers = no-op. The validator stays silent."""
     assert required_sections_missing("just a question", "any response") == []
+
+
+def test_shared_leading_token_does_not_falsely_satisfy_sibling():
+    """Regression: two REQUIRED sections sharing a salient token (SECURITY).
+    A response delivering only PART 1 but mentioning the sibling's distinctive
+    word ("hardening") in nearby prose must NOT falsely satisfy PART 2."""
+    prompt = (
+        "PART 1 — SECURITY ANALYSIS (REQUIRED)\n"
+        "PART 2 — SECURITY HARDENING (REQUIRED)\n"
+    )
+    only_part1 = "## SECURITY ANALYSIS\nWe should consider hardening later.\n"
+    missing = required_sections_missing(prompt, only_part1)
+    assert missing == ["PART 2 — SECURITY HARDENING"]
+
+
+def test_shared_leading_token_accepts_both_real_sections():
+    """The phrase route still accepts both sections when both are delivered
+    (as paraphrased headers), so the collision fix doesn't over-reject."""
+    prompt = (
+        "PART 1 — SECURITY ANALYSIS (REQUIRED)\n"
+        "PART 2 — SECURITY HARDENING (REQUIRED)\n"
+    )
+    both = "## Security Analysis\nfindings...\n## Security Hardening\nsteps...\n"
+    assert required_sections_missing(prompt, both) == []
+
+
+def test_shared_token_section_satisfied_by_literal_part_marker():
+    """A collision-prone section is still satisfied by the explicit PART N
+    header even if its title isn't paraphrased contiguously."""
+    prompt = (
+        "PART 1 — SECURITY ANALYSIS (REQUIRED)\n"
+        "PART 2 — SECURITY HARDENING (REQUIRED)\n"
+    )
+    response = (
+        "## SECURITY ANALYSIS\nfindings...\n"
+        "## PART 2\nhere is how we harden the system\n"
+    )
+    assert required_sections_missing(prompt, response) == []
 
 
 def test_skips_part6_recommendation():

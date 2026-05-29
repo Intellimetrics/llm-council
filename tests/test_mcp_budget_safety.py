@@ -182,6 +182,121 @@ participants:
         )
 
 
+def test_summarize_preflight_caps_extracts_cost_tokens_unpriced():
+    """Shared run-cap reduction (CLI + MCP): prefers the retry-safety total,
+    sums tokens, and flags only hosted peers with unknown price (CLI/local
+    $0 rows are not 'unpriced-paid')."""
+    from llm_council.budget import summarize_preflight_caps
+
+    preflight = {
+        "known_total_with_retry_safety_usd": 0.42,
+        "known_total_usd": 0.30,
+        "rows": [
+            {"name": "claude", "type": "cli",
+             "estimated_input_tokens": 100, "estimated_output_tokens": 50,
+             "estimated_total_cost_usd": None},
+            {"name": "hosted", "type": "openrouter",
+             "estimated_input_tokens": 200, "estimated_output_tokens": 100,
+             "estimated_total_cost_usd": None},
+            {"name": "priced", "type": "openrouter",
+             "estimated_input_tokens": 10, "estimated_output_tokens": 5,
+             "estimated_total_cost_usd": 0.01},
+        ],
+    }
+    cost, tokens, unpriced = summarize_preflight_caps(preflight)
+    assert cost == 0.42  # retry-safety total preferred over known_total
+    assert tokens == 100 + 50 + 200 + 100 + 10 + 5
+    assert unpriced == ["hosted"]  # cli row = $0; priced row has a price
+
+
+def test_summarize_preflight_caps_falls_back_to_known_total():
+    from llm_council.budget import summarize_preflight_caps
+
+    cost, tokens, unpriced = summarize_preflight_caps(
+        {"known_total_usd": 0.30, "rows": []}
+    )
+    assert cost == 0.30
+    assert tokens == 0
+    assert unpriced == []
+
+
+def test_mcp_budget_report_counts_cross_rank_extra_round():
+    """cross_rank runs an extra ranking pass per peer; the pre-flight estimate
+    must count it (~+1 round) so a hosted run that should be blocked isn't
+    under-counted into passing."""
+    from llm_council.budget import mcp_budget_report
+
+    config = {
+        "participants": {
+            "p": {"type": "openrouter", "model": "m", "input_per_million": 1.0}
+        },
+        "defaults": {},
+    }
+    base = mcp_budget_report(
+        config=config, participants=["p"], prompt_chars=1000,
+        deliberate=False, max_rounds=1,
+    )
+    ranked = mcp_budget_report(
+        config=config, participants=["p"], prompt_chars=1000,
+        deliberate=False, max_rounds=1, cross_rank=True,
+    )
+    assert ranked["estimated_billable_prompt_chars"] == (
+        2 * base["estimated_billable_prompt_chars"]
+    )
+    assert ranked["estimated_input_cost_usd"] > base["estimated_input_cost_usd"]
+
+
+def test_mcp_budget_report_counts_synthesize_chair_call():
+    """A paid-hosted synthesis chair adds one extra call to the estimate."""
+    from llm_council.budget import mcp_budget_report
+
+    config = {
+        "participants": {
+            "p": {"type": "openrouter", "model": "m", "input_per_million": 1.0}
+        },
+        "defaults": {"synthesizer": "p"},
+    }
+    base = mcp_budget_report(
+        config=config, participants=["p"], prompt_chars=1000,
+        deliberate=False, max_rounds=1,
+    )
+    synth = mcp_budget_report(
+        config=config, participants=["p"], prompt_chars=1000,
+        deliberate=False, max_rounds=1, synthesize=True,
+    )
+    assert synth["synthesize_billable"] is True
+    assert synth["estimated_billable_prompt_chars"] == (
+        base["estimated_billable_prompt_chars"] + 1000
+    )
+    assert synth["estimated_input_cost_usd"] > base["estimated_input_cost_usd"]
+
+
+def test_mcp_budget_report_synthesize_noop_when_chair_is_free_local():
+    """synthesize must NOT inflate the estimate when the chair is a free/local
+    (non-paid-hosted) peer."""
+    from llm_council.budget import mcp_budget_report
+
+    config = {
+        "participants": {
+            "p": {"type": "openrouter", "model": "m", "input_per_million": 1.0},
+            "local": {"type": "ollama", "model": "llama3"},
+        },
+        "defaults": {"synthesizer": "local"},
+    }
+    base = mcp_budget_report(
+        config=config, participants=["p"], prompt_chars=1000,
+        deliberate=False, max_rounds=1,
+    )
+    synth = mcp_budget_report(
+        config=config, participants=["p"], prompt_chars=1000,
+        deliberate=False, max_rounds=1, synthesize=True,
+    )
+    assert synth["synthesize_billable"] is False
+    assert synth["estimated_billable_prompt_chars"] == (
+        base["estimated_billable_prompt_chars"]
+    )
+
+
 @pytest.mark.asyncio
 async def test_mcp_dry_run_reports_budget_without_enforcing(
     tmp_path: Path, monkeypatch

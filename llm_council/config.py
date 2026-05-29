@@ -143,6 +143,15 @@ def validate_config(config: dict[str, Any]) -> None:
                 "cli_retry_stderr_patterns",
                 f"CLI participant '{name}'",
             )
+            # fallback_chain is an ordered list of model ids walked on quota
+            # errors. A bare string here (e.g. `fallback_chain: gpt-5.4`) is a
+            # common mistake that previously sailed through load and was then
+            # character-sliced into bogus single-char model ids on the quota
+            # path — fail fast instead.
+            if "fallback_chain" in participant and participant["fallback_chain"] is not None:
+                _validate_string_list(
+                    participant, "fallback_chain", f"CLI participant '{name}'"
+                )
         if ptype in {"openrouter", "openai_compatible", "ollama"} and not participant.get("model"):
             raise ValueError(f"Participant '{name}' must define model")
         if ptype == "openai_compatible":
@@ -154,6 +163,17 @@ def validate_config(config: dict[str, Any]) -> None:
         )
         _validate_positive_number(
             participant, "slow_warn_after_seconds", f"participant '{name}'"
+        )
+        # idle_timeout switches _run_cli_once into a streamed-read loop and is
+        # consumed as a float in asyncio deadline arithmetic; timeout_per_kb_chars
+        # scales the base timeout by prompt size. Both were previously unvalidated
+        # and would crash at runtime (after subprocesses may have launched) on a
+        # non-numeric value. timeout_per_kb_chars: 0 is a documented "disable
+        # scaling" sentinel, so it is validated as non-negative rather than
+        # strictly positive.
+        _validate_positive_number(participant, "idle_timeout", f"participant '{name}'")
+        _validate_nonnegative_number(
+            participant, "timeout_per_kb_chars", f"participant '{name}'"
         )
         if "vision" in participant and not isinstance(participant["vision"], bool):
             raise ValueError(f"Participant '{name}' vision must be a boolean")
@@ -228,6 +248,11 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(f"Mode '{name}' origin_policy must be 'any' or 'us'")
         _validate_positive_int(mode, "max_rounds", f"mode '{name}'")
         _validate_positive_int(mode, "min_quorum", f"mode '{name}'")
+        # timeout_multiplier is layered onto the per-participant base timeout in
+        # _resolve_effective_timeout. A non-numeric value (e.g. "fast") used to
+        # pass load and then raise an uncaught ValueError mid-run, after
+        # selection + prompt-build; reject it at load time instead.
+        _validate_positive_number(mode, "timeout_multiplier", f"mode '{name}'")
         stances = mode.get("stances")
         if stances is not None:
             if not isinstance(stances, dict):
@@ -650,6 +675,14 @@ def _validate_positive_number(mapping: dict[str, Any], key: str, label: str) -> 
         raise ValueError(f"{label}.{key} must be a positive number")
 
 
+def _validate_nonnegative_number(mapping: dict[str, Any], key: str, label: str) -> None:
+    if key not in mapping or mapping[key] is None:
+        return
+    value = mapping[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(f"{label}.{key} must be a non-negative number")
+
+
 def detect_current_agent() -> str | None:
     """Best-effort detection of the CLI we are currently running under."""
 
@@ -684,7 +717,14 @@ def detect_current_agent() -> str | None:
                 ):
                     return "antigravity"
             stat = stat_path.read_text(errors="ignore")
-            pid = int(stat.split()[3])
+            # /proc/<pid>/stat is: "pid (comm) state ppid ...". `comm` can
+            # contain spaces and parentheses (e.g. "(tmux: server)"), so a
+            # naive split()[3] mis-indexes and ppid parsing blows up — the
+            # broad except then silently aborts the walk and the host CLI is
+            # never excluded. Parse the fields AFTER the final ')': they are
+            # [state, ppid, ...], so ppid is index 1.
+            rest = stat[stat.rindex(")") + 1:].split()
+            pid = int(rest[1])
     except Exception:
         return None
     return None

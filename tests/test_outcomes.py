@@ -244,6 +244,21 @@ def test_resolve_run_id_exact_stem_when_ambiguous(tmp_path):
     assert resolve_run_id(tmp_path, "20260517_120000") == "20260517_120000"
 
 
+def test_resolve_run_id_honors_custom_transcripts_dir(tmp_path):
+    """With a relocated transcripts_dir the default cwd/.llm-council/runs is
+    empty, so prefix resolution must use the passed-in dir or it silently
+    fails (the outcome-marking bug)."""
+    custom = tmp_path / "somewhere" / "else" / "runs"
+    _make_transcript(custom, "20260517_120000_relocated")
+    # Without the dir, the default location has nothing -> None.
+    assert resolve_run_id(tmp_path, "20260517_120000") is None
+    # With it, the prefix resolves.
+    assert (
+        resolve_run_id(tmp_path, "20260517_120000", transcripts_dir=custom)
+        == "20260517_120000_relocated"
+    )
+
+
 # --- outcomes_dir creates the directory ----------------------------------
 
 

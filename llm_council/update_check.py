@@ -84,6 +84,12 @@ def _latest_tag_version(tags: Any) -> tuple[str, str]:
         version = _version_from_tag(name)
         if version is None:
             continue
+        if _is_prerelease(version):
+            # Never surface a prerelease (rc/beta/build-metadata) tag as an
+            # upgrade target: a stable user would be nagged onto an unstable
+            # build, and `_version_parts` strips the suffix so a prerelease
+            # otherwise compares EQUAL to its eventual release.
+            continue
         if best_version is None or _compare_versions(best_version, version) < 0:
             best_version = version
             best_tag = name
@@ -95,6 +101,13 @@ def _latest_tag_version(tags: Any) -> tuple[str, str]:
 def _version_from_tag(tag: str) -> str | None:
     match = re.fullmatch(r"v?(\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?)", tag)
     return match.group(1) if match else None
+
+
+def _is_prerelease(version: str) -> bool:
+    """True for versions carrying a `-prerelease` or `+build` suffix, e.g.
+    `0.13.0-rc1`. `_version_parts` discards these, so they must be filtered
+    out as upgrade targets rather than compared."""
+    return "-" in version or "+" in version
 
 
 def _install_command(tag: str | None) -> str:

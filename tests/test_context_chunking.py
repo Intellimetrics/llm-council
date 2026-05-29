@@ -65,6 +65,19 @@ def test_chunk_context_files_drops_oversize_file_entirely():
     assert "small.py" in result.sections[0]
 
 
+def test_chunk_context_files_zero_budget_marks_all_oversize():
+    """When framing alone exhausts the budget (budget <= 0), every file is by
+    definition oversize and must appear in oversize_files, not just
+    dropped_files — otherwise the operator-visible warning goes silently
+    empty."""
+    files = [("a.py", "aaa"), ("b.py", "bbb")]
+    result = chunk_context_files(files, budget=0, question="review")
+    assert result.sections == []
+    assert set(result.oversize_files) == {"a.py", "b.py"}
+    assert set(result.dropped_files) == {"a.py", "b.py"}
+    assert result.triggered is True
+
+
 def test_chunk_context_files_prioritizes_mentioned_files():
     # Three files of equal size; only two fit at chosen budget. Mentioned
     # file must survive.

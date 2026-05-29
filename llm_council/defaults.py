@@ -92,9 +92,12 @@ DEFAULT_CONFIG: dict = {
         "synthesizer": None,
         "synthesizer_max_prompt_chars": 60_000,
         # Tier-2 secret scanner. "warn" (default) counts likely credentials
-        # in the prompt body and emits a progress event; "block" raises
-        # before any participant runs; "off" skips entirely. Allowlist
-        # (default .llm-council-secrets-allow) covers test fixtures.
+        # in the prompt body and emits a progress event but ships the prompt
+        # UNCHANGED (no mitigation); "block" raises before any participant
+        # runs; "redact" masks each match with [REDACTED:<kind>] in the
+        # prompt sent to peers AND persisted to the transcript (the only
+        # policy with transcript-level protection); "off" skips entirely.
+        # Allowlist (default .llm-council-secrets-allow) covers test fixtures.
         "secret_scan": "warn",
         "secret_scan_allowlist": ".llm-council-secrets-allow",
         # Section-coverage validator. When the user prompt contains
@@ -361,10 +364,28 @@ DEFAULT_CONFIG: dict = {
             "family": "antigravity",
             "origin": "US / Google",
             "command": "agy",
+            # READ-ONLY ENFORCEMENT IS SOFT (prompt-enforced), not hard.
+            # `agy` has NO --approval-mode / --tools allowlist / read-only flag
+            # like claude/codex/gemini, so there is no way to physically disable
+            # its file-write tool from the CLI. `--sandbox` only restricts the
+            # TERMINAL (shell commands); it does NOT block the model's native
+            # write tool — empirically agy can and will write files (even
+            # outside cwd) when a prompt explicitly orders it with no read-only
+            # framing. What actually keeps agy read-only is the council prompt's
+            # read-only directive (see context.build_prompt: "Do not edit files.
+            # Do not run write operations."), which agy reliably honors
+            # (verified 4/4: refuses an explicit write request when the directive
+            # is present). We still OMIT --dangerously-skip-permissions: with it,
+            # any stray write the model attempts is auto-approved; without it the
+            # directive governs. CAVEAT: this is a SOFTER guarantee than the
+            # flag-enforced peers — a prompt-injection embedded in reviewed
+            # content could in principle override the directive with no hard
+            # backstop. The live canary test/tests/test_live_agy_readonly.py
+            # guards that agy still honors the directive. Do NOT re-add
+            # --dangerously-skip-permissions.
             "args": [
                 "--print",
                 "--sandbox",
-                "--dangerously-skip-permissions",
                 "-",
             ],
             "model": None,

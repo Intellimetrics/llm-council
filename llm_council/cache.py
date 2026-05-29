@@ -157,6 +157,7 @@ def build_payload(
     recovered_after_timeout: bool = False,
     prompt_chars: int | None = None,
     section_repair_attempted: bool = False,
+    terse_retry_attempted: bool = False,
     evidence_verification_failures: list[str] | None = None,
     continue_debate: str | None = None,
     tool_call_status: str | None = None,
@@ -197,6 +198,13 @@ def build_payload(
         # strict-evidence wrapper's guard correct across cache hits.
         "section_repair_attempted": bool(section_repair_attempted),
     }
+    # A timeout-recovered result is merged with BOTH recovered_after_timeout
+    # AND terse_retry_attempted set. Persisting recovered_after_timeout but
+    # not terse_retry_attempted made a cache hit rehydrate to a contradictory
+    # state (recovered but "no retry attempted"). Persist it too; omit-when-
+    # False keeps the common payload tight and old payloads default to False.
+    if terse_retry_attempted:
+        payload["terse_retry_attempted"] = True
     # v4: only include the key when there's something to record so payloads
     # stay tight for the overwhelming majority of runs (no VERIFIED tags
     # cited, or all VERIFIED refs verified). Readers default to `[]` on

@@ -225,3 +225,46 @@ def test_promotion_result_to_dict_roundtrips_json():
     assert len(decoded["reasons"]) == 2
 
 
+# --- cross_rank_correlation_floor gate (was untested) -------------------
+
+
+def test_cross_rank_floor_missing_correlation_blocks():
+    """Floor set but no correlation supplied -> blocked with a 'missing' reason,
+    even when recall + SNR both pass."""
+    baseline = _suite("review", recall=0.50, snr=2.0)
+    candidate = _suite("review-with-tools", recall=0.60, snr=1.9)
+    result = check_promotion_gate(
+        baseline, candidate, cross_rank_correlation_floor=0.5
+    )
+    assert result.promoted is False
+    assert any("cross_rank_correlation_missing" in r for r in result.reasons)
+
+
+def test_cross_rank_floor_met_allows_promotion():
+    """Correlation >= floor -> gate is satisfied; promotion rides on recall+SNR."""
+    baseline = _suite("review", recall=0.50, snr=2.0)
+    candidate = _suite("review-with-tools", recall=0.60, snr=1.9)
+    result = check_promotion_gate(
+        baseline,
+        candidate,
+        cross_rank_correlation_floor=0.5,
+        cross_rank_correlation=0.6,
+    )
+    assert result.promoted is True
+    assert any("cross_rank_correlation_met" in r for r in result.reasons)
+
+
+def test_cross_rank_floor_low_blocks_despite_recall_and_snr():
+    """Correlation below floor blocks promotion even when recall+SNR pass."""
+    baseline = _suite("review", recall=0.50, snr=2.0)
+    candidate = _suite("review-with-tools", recall=0.60, snr=1.9)
+    result = check_promotion_gate(
+        baseline,
+        candidate,
+        cross_rank_correlation_floor=0.5,
+        cross_rank_correlation=0.3,
+    )
+    assert result.promoted is False
+    assert any("cross_rank_correlation_low" in r for r in result.reasons)
+
+

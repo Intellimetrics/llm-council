@@ -195,6 +195,36 @@ def test_with_envelope_rehydrate_from_cache_preserves_recovered_after_timeout(
     assert out.ok is True
 
 
+def test_cache_round_trip_preserves_terse_retry_attempted(tmp_path: Path):
+    """A timeout-recovered result carries BOTH recovered_after_timeout AND
+    terse_retry_attempted. The cache previously persisted only the former, so a
+    cache hit rehydrated to a self-contradictory state (recovered but "no retry
+    attempted"). Both must survive the round-trip."""
+    output = "RECOMMENDATION: tradeoff - terse recovered\nEFFORT: full"
+    r = ParticipantResult(
+        "peer",
+        True,
+        output,
+        "",
+        1.0,
+        recovered_after_timeout=True,
+        terse_retry_attempted=True,
+    )
+    cache_ctx = CacheContext(cwd=tmp_path, cache_mode="on", cache_disabled=False)
+    _maybe_persist_cache("peer", "the prompt", "fake-key", r, cache_ctx)
+    cached_files = list((tmp_path / ".llm-council" / "cache").glob("*.json"))
+    assert len(cached_files) == 1
+
+    from llm_council.adapters import _result_from_cache_payload
+    from llm_council.cache import read_cache
+
+    payload = read_cache(cached_files[0], expected_key="fake-key")
+    assert payload is not None
+    rehydrated = _result_from_cache_payload("peer", payload)
+    assert rehydrated.recovered_after_timeout is True
+    assert rehydrated.terse_retry_attempted is True
+
+
 def test_result_from_cache_payload_defaults_missing_recovered_after_timeout():
     """A payload written before v0.7.0's receipt field landed (or a
     hand-rolled fixture without the key) must rehydrate with

@@ -392,15 +392,18 @@ def chunk_context_files(
     )
 
     if budget <= 0:
-        # Defensive — caller should have raised before this; return everything
-        # dropped so the operator sees the budget exhaustion.
+        # Prompt framing alone has consumed the entire budget, so NO file can
+        # fit — by definition every file is oversize. Populate oversize_files
+        # (not just dropped_files) so the operator-visible "oversize" warning
+        # names the files instead of going silently empty.
+        all_paths = [path or "<unknown>" for path, _ in items]
         return ContextChunkResult(
             sections=[],
             original_chars=original_chars,
             chunked_chars=0,
             dropped_chars=original_chars,
-            dropped_files=[path or "<unknown>" for path, _ in items],
-            oversize_files=[],
+            dropped_files=all_paths,
+            oversize_files=all_paths,
             triggered=original_chars > 0,
         )
 

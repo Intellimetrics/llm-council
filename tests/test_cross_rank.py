@@ -476,6 +476,71 @@ def test_cross_rank_results_tagged_is_ranking_round():
     assert {r.name for r in ranking_results} == {"a:rank", "b:rank", "c:rank"}
 
 
+def test_cross_rank_one_ranking_failure_does_not_abort_council():
+    """A ranking-pass task that RAISES must not abort the whole council. The
+    gather uses return_exceptions=True, so: round-1 results survive, the
+    failed ranker is dropped, the surviving rankers still produce scores, and
+    a `cross_rank_peer_error` progress event is emitted. Guards the fault path
+    of the semaphore+return_exceptions cross-rank fix."""
+    import llm_council.orchestrator as orch_module
+
+    participants = ["a", "b", "c"]
+    labels = {"a": "yes", "b": "no", "c": "tradeoff"}
+
+    async def fake_run_participants(selected, *args, **kwargs):
+        return [_round1_result(name, label=labels[name]) for name in selected]
+
+    async def fake_preflight(*args, **kwargs):
+        return {}
+
+    async def fake_run_participant(name, cfg, prompt, cwd, **kwargs):
+        if name == "a":
+            raise RuntimeError("ranking subprocess blew up")
+        return ParticipantResult(
+            name=name,
+            ok=True,
+            output=_ranking_response_for(name),
+            error="",
+            elapsed_seconds=0.5,
+        )
+
+    with patch.object(
+        orch_module, "run_participants", side_effect=fake_run_participants
+    ), patch.object(
+        orch_module, "preflight_local_participants", side_effect=fake_preflight
+    ), patch(
+        "llm_council.adapters.run_participant", side_effect=fake_run_participant
+    ):
+        results, metadata = asyncio.run(
+            orch_module.execute_council(
+                participants=participants,
+                participant_cfg={n: {"type": "cli"} for n in participants},
+                prompt="orig prompt",
+                cwd=Path("."),
+                config={"defaults": {}},
+                cross_rank=True,
+                question="Should we ship the change?",
+            )
+        )
+
+    # The council did NOT abort: all three primary (round-1) results survive.
+    primary = [r for r in results if not getattr(r, "is_ranking_round", False)]
+    assert {r.name for r in primary} == {"a", "b", "c"}
+    # The raising ranker ('a') is dropped; the two survivors remain.
+    rank_rows = [r for r in results if getattr(r, "is_ranking_round", False)]
+    assert {r.name for r in rank_rows} == {"b:rank", "c:rank"}
+    # Scores are still computed from the surviving rankers.
+    assert metadata.get("cross_rank_scores")
+    # The new per-failure progress event names the error.
+    errs = [
+        e
+        for e in metadata.get("progress_events", [])
+        if e.get("event") == "cross_rank_peer_error"
+    ]
+    assert len(errs) == 1
+    assert "RuntimeError" in errs[0]["error"]
+
+
 def test_cross_rank_ranking_prompt_anonymizes_peer_names():
     """The ranking prompt sent to peer 'a' should not name 'b' or 'c' directly."""
     results, metadata, captured_prompts = _run_orchestrator_with_cross_rank(

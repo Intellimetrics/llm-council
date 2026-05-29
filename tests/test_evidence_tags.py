@@ -248,6 +248,32 @@ def test_strict_evidence_empty_list_passes():
     assert _response_validation_error(output, cfg) == ""
 
 
+def test_strict_evidence_accepts_verified_tag():
+    """Invariant: ``[VERIFIED:path:start-end]`` is the fifth evidence tag and
+    SATISFIES strict_evidence — the tag is present. Tag-presence and mechanical
+    verification are deliberately separate axes."""
+    output = (
+        "RECOMMENDATION: yes - ok\n"
+        "EVIDENCE:\n"
+        "- [VERIFIED:llm_council/adapters.py:1-3] bug here\n"
+    )
+    cfg = {"strict_evidence": True}
+    assert _response_validation_error(output, cfg) == ""
+
+
+def test_strict_evidence_verified_tag_passes_even_when_unverifiable():
+    """A ``[VERIFIED:...]`` cite to a nonexistent path is still 'tagged' for the
+    strict-evidence FORMAT gate; verification failure is surfaced separately via
+    ``evidence_verification_failures``, not by failing this gate."""
+    output = (
+        "RECOMMENDATION: yes - ok\n"
+        "EVIDENCE:\n"
+        "- [VERIFIED:does/not/exist.py:999-1000] claim\n"
+    )
+    cfg = {"strict_evidence": True}
+    assert _response_validation_error(output, cfg) == ""
+
+
 def test_classify_error_routes_untagged_evidence():
     assert classify_error("UntaggedEvidence: 2 entries") == "untagged_evidence"
 

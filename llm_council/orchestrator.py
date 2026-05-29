@@ -771,9 +771,35 @@ async def execute_council(
                     is_ranking_round=True,
                 )
 
-            ranking_results = await asyncio.gather(
-                *[_rank_one(name) for name in labeled_names]
+            # The ranking pass launches one run_participant (subprocess / HTTP
+            # call) per labeled peer. Cap it with the same max_concurrency the
+            # primary rounds use so a wide council doesn't fan out N unbounded
+            # subprocesses (each of which can itself walk the quota fallback
+            # chain). return_exceptions keeps a single ranking failure from
+            # aborting the whole council run — cross-rank is post-deliberation
+            # telemetry, so a peer that errors here simply casts no ranking vote.
+            rank_semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+            async def _rank_one_guarded(peer_name: str) -> ParticipantResult:
+                async with rank_semaphore:
+                    return await _rank_one(peer_name)
+
+            ranking_results_raw = await asyncio.gather(
+                *[_rank_one_guarded(name) for name in labeled_names],
+                return_exceptions=True,
             )
+            ranking_results = [
+                r for r in ranking_results_raw if isinstance(r, ParticipantResult)
+            ]
+            for raw in ranking_results_raw:
+                if isinstance(raw, BaseException):
+                    emit(
+                        {
+                            "event": "cross_rank_peer_error",
+                            "round": round_number,
+                            "error": f"{type(raw).__name__}: {raw}",
+                        }
+                    )
             results.extend(ranking_results)
 
             rankings_by_peer: dict[str, list[str]] = {}

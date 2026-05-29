@@ -19,6 +19,7 @@ from llm_council.budget import (
     enforce_mcp_budget,
     image_attachment_violations,
     mcp_budget_report,
+    summarize_preflight_caps,
 )
 from llm_council.context import IMAGE_MIME_ALLOWLIST
 from llm_council.defaults import DEFAULT_CONFIG
@@ -40,8 +41,7 @@ from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
 from llm_council.stats import compute_stats
 from llm_council.transcript import (
-    DEFAULT_MAX_CONTINUATION_DEPTH,
-    count_continuation_depth,
+    continuation_depth_limit_error,
     find_transcript_by_id,
     format_prior_council_context,
     latest_transcript,
@@ -221,7 +221,7 @@ def council_run_schema() -> dict[str, Any]:
     }
 
 
-COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 5  # v5 = missing_key_peers (top-level), size-scaled timeouts (no schema change but new field semantics)
+COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 6  # v6 = per-result terse_retry_attempted, section_repair_attempted, is_ranking_round, continue_debate, evidence_verification_failures now surfaced
 COUNCIL_RUN_VALID_STANCES = ("for", "against", "neutral")
 COUNCIL_RUN_VALID_ERROR_KINDS = (
     "timeout",
@@ -383,14 +383,57 @@ def council_run_output_schema() -> dict[str, Any]:
                                 "'fallback succeeded'."
                             ),
                         },
+                        "terse_retry_attempted": {
+                            "type": "boolean",
+                            "description": (
+                                "True when the peer timed out and a terse-retry "
+                                "was attempted (set on both the recovered-success "
+                                "and the annotated-failure paths)."
+                            ),
+                        },
+                        "section_repair_attempted": {
+                            "type": "boolean",
+                            "description": (
+                                "True when a `(REQUIRED)` section was missing and "
+                                "a section-repair retry was attempted."
+                            ),
+                        },
+                        "is_ranking_round": {
+                            "type": "boolean",
+                            "description": (
+                                "True for `--cross-rank` ranking-pass results, "
+                                "which are post-deliberation telemetry and are not "
+                                "primary votes."
+                            ),
+                        },
+                        "continue_debate": {
+                            "type": ["string", "null"],
+                            "enum": ["yes", "no", None],
+                            "description": (
+                                "Per-peer round-1 vote on whether round-2 "
+                                "deliberation is worthwhile; `null` when the peer "
+                                "did not emit the optional `CONTINUE_DEBATE:` line."
+                            ),
+                        },
+                        "evidence_verification_failures": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "`path:start-end` references from `[VERIFIED:...]` "
+                                "evidence cites that failed mechanical verification. "
+                                "The entries are kept (coverage > filtering); this "
+                                "list records which ones could not be verified."
+                            ),
+                        },
                         "prompt_chars": {
                             "type": ["integer", "null"],
                             "description": (
-                                "Length of the assembled prompt for this peer, "
-                                "populated on timeout failures so stats can "
-                                "bucket timeouts by prompt size without "
-                                "re-parsing the error string. `null` on "
-                                "successful runs (the information is not needed)."
+                                "Length of the assembled prompt for this peer. "
+                                "Populated on every real adapter call (success or "
+                                "failure); `null` only for cache hits and the "
+                                "unsupported-type fallback. Lets stats bucket "
+                                "timeouts by prompt size without re-parsing the "
+                                "error string."
                             ),
                         },
                         "effort": {
@@ -935,22 +978,11 @@ async def run_council(
     continuation_id = arguments.get("continuation_id")
     if continuation_id:
         normalize_run_id(continuation_id)
-        max_depth = int(
-            config.get("defaults", {}).get(
-                "max_continuation_depth", DEFAULT_MAX_CONTINUATION_DEPTH
-            )
+        _depth_err = continuation_depth_limit_error(
+            config, transcripts_root, continuation_id
         )
-        depth = count_continuation_depth(
-            transcripts_root, continuation_id, max_depth=max_depth + 1
-        )
-        if depth >= max_depth:
-            raise ValueError(
-                f"Continuation chain depth ({depth} parents) reaches the "
-                f"configured limit of {max_depth}. Each link summarizes its "
-                "predecessor, so deep chains eat into MAX_PROMPT_CHARS "
-                "without adding new signal. Start a fresh run, or raise "
-                "`defaults.max_continuation_depth` in `.llm-council.yaml`."
-            )
+        if _depth_err:
+            raise ValueError(_depth_err)
         prior_transcript = find_transcript_by_id(transcripts_root, continuation_id)
         prior_path = prior_transcript.get("_path")
         parent_run_id = (
@@ -1033,6 +1065,12 @@ async def run_council(
         cwd=cwd,
         allowlist_filename=_scan_allowlist,
     )
+    # redact policy: swap in the masked prompt before it reaches peers OR the
+    # transcript. Pop it so the redacted prompt isn't duplicated into the
+    # metadata.secret_scan payload below.
+    _redacted_prompt = secret_scan_payload.pop("redacted_prompt", None)
+    if _redacted_prompt is not None:
+        prompt = _redacted_prompt
     transparent = bool(
         arguments.get("transparent") or config.get("defaults", {}).get("transparent")
     )
@@ -1066,6 +1104,8 @@ async def run_council(
         prompt_chars=len(prompt),
         deliberate=deliberate,
         max_rounds=max_rounds,
+        cross_rank=bool(arguments.get("cross_rank")),
+        synthesize=synthesize,
     )
 
     if arguments.get("dry_run"):
@@ -1153,23 +1193,7 @@ async def run_council(
             )
         except (OSError, ValueError) as exc:
             raise ValueError(f"failed to compute pre-flight estimate: {exc}") from exc
-        cost_total = float(
-            preflight.get("known_total_with_retry_safety_usd")
-            if preflight.get("known_total_with_retry_safety_usd") is not None
-            else (preflight.get("known_total_usd") or 0.0)
-        )
-        token_rows = preflight.get("rows") or []
-        token_total = sum(
-            int(row.get("estimated_input_tokens") or 0)
-            + int(row.get("estimated_output_tokens") or 0)
-            for row in token_rows
-        )
-        unpriced_paid = [
-            row.get("name")
-            for row in token_rows
-            if row.get("type") in {"openrouter", "openai_compatible"}
-            and row.get("estimated_total_cost_usd") is None
-        ]
+        cost_total, token_total, unpriced_paid = summarize_preflight_caps(preflight)
         if max_cost_usd is not None and unpriced_paid:
             raise ValueError(
                 "Pre-flight estimate cannot enforce max_cost_usd: hosted "
@@ -1225,7 +1249,7 @@ async def run_council(
         metadata["images"] = [
             _public_image_entry(entry, cwd) for entry in image_manifest
         ]
-    if secret_scan_payload.get("scrubbed_count") or _scan_policy != "off":
+    if secret_scan_payload.get("detected_count") or _scan_policy != "off":
         metadata["secret_scan"] = secret_scan_payload
     metadata["config_warnings"] = _pending_config_warnings
     write_transcript(
@@ -1291,6 +1315,17 @@ async def run_council(
                     getattr(result, "recovered_after_quota", False)
                 ),
                 "tool_call_status": getattr(result, "tool_call_status", None),
+                "terse_retry_attempted": bool(
+                    getattr(result, "terse_retry_attempted", False)
+                ),
+                "section_repair_attempted": bool(
+                    getattr(result, "section_repair_attempted", False)
+                ),
+                "is_ranking_round": bool(getattr(result, "is_ranking_round", False)),
+                "continue_debate": getattr(result, "continue_debate", None),
+                "evidence_verification_failures": list(
+                    getattr(result, "evidence_verification_failures", None) or []
+                ),
                 "prompt_chars": result.prompt_chars,
                 "effort": result.effort,
                 "confidence": result.confidence,
