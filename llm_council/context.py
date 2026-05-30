@@ -28,6 +28,20 @@ IMAGE_MIME_ALLOWLIST = frozenset(
 )
 
 
+def _relative_label(source: Path, cwd: Path) -> str:
+    """Return ``source`` relative to ``cwd`` when inside it, else the path itself.
+
+    Centralizes the "relative-to-cwd label, else absolute path" derivation used
+    when rendering context files and image manifests. The returned string is the
+    same one the prior inline f-string / ``str(...)`` call sites produced.
+    """
+
+    try:
+        return str(source.resolve().relative_to(cwd.resolve()))
+    except ValueError:
+        return str(source)
+
+
 def ensure_inside_cwd(path: Path, cwd: Path) -> None:
     try:
         path.resolve().relative_to(cwd.resolve())
@@ -53,11 +67,7 @@ def read_context_file(
     text = source.read_text(errors="replace")
     if len(text) > MAX_CONTEXT_FILE_CHARS:
         text = text[:MAX_CONTEXT_FILE_CHARS] + "\n\n[truncated]\n"
-    label = (
-        source.resolve().relative_to(cwd.resolve())
-        if source.resolve().is_relative_to(cwd.resolve())
-        else source
-    )
+    label = _relative_label(source, cwd)
     return f"## File: {label}\n\n```\n{text}\n```"
 
 
@@ -109,15 +119,12 @@ def build_image_manifest(
         source, mime, size = resolve_image_path(
             item, cwd=cwd, allow_outside_cwd=allow_outside_cwd
         )
-        try:
-            label = source.resolve().relative_to(cwd.resolve())
-        except ValueError:
-            label = source
+        label = _relative_label(source, cwd)
         sha256 = _hash_file_streaming(source)
         manifest.append(
             {
                 "path": str(source),
-                "relative_path": str(label),
+                "relative_path": label,
                 "mime": mime,
                 "size": size,
                 "sha256": sha256,
@@ -447,10 +454,7 @@ def build_prompt(
         source = Path(item)
         if not source.is_absolute():
             source = cwd / source
-        try:
-            label = str(source.resolve().relative_to(cwd.resolve()))
-        except ValueError:
-            label = str(source)
+        label = _relative_label(source, cwd)
         context_file_indices[len(context_sections)] = label
         context_sections.append(rendered)
     if stdin_text:
@@ -798,13 +802,11 @@ def build_ranking_prompt(
         if original_name == peer_name:
             continue
         body = other_peers.get(original_name, "")
-        bare_label = label.replace("Response ", "")
         lines.append(f"{label}:")
         lines.append("```")
         lines.append(body.strip() or "(empty response)")
         lines.append("```")
         lines.append("")
-        del bare_label
     lines.extend(
         [
             "Respond with exactly one line in this format (no preamble,",

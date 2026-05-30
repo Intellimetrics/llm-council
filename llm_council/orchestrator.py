@@ -236,6 +236,10 @@ def _base_name(name: str) -> str:
     return name.split(":round")[0]
 
 
+def _is_labeled_vote(r: ParticipantResult) -> bool:
+    return r.ok and recommendation_label(r.output) in {"yes", "no", "tradeoff"}
+
+
 def _index_by_base_name(
     results: list[ParticipantResult],
 ) -> dict[str, ParticipantResult]:
@@ -286,7 +290,7 @@ def _failed_for_deliberation(results: list[ParticipantResult]) -> set[str]:
         if result.ok:
             continue
         if is_timeout_error(result.error) or result.error.startswith("PromptTooLarge:"):
-            excluded.add(result.name.split(":round")[0])
+            excluded.add(_base_name(result.name))
     return excluded
 
 
@@ -310,7 +314,7 @@ def _detect_quota_throttled(
             continue
         if not is_quota_exhausted_error(result.error):
             continue
-        base = result.name.split(":round", 1)[0]
+        base = _base_name(result.name)
         if base in already_emitted:
             continue
         cfg = participant_cfg.get(base) or {}
@@ -411,9 +415,9 @@ def _detect_quota_recoveries(
     recovery event (round 1) and a throttle event (round 2)."""
     new_entries: list[dict[str, Any]] = []
     for result in results:
-        if not getattr(result, "recovered_after_quota", False):
+        if not result.recovered_after_quota:
             continue
-        base = result.name.split(":round", 1)[0]
+        base = _base_name(result.name)
         if base in already_emitted:
             continue
         cfg = participant_cfg.get(base) or {}
@@ -421,7 +425,7 @@ def _detect_quota_recoveries(
             {
                 "peer": base,
                 "family": cfg.get("family") or base,
-                "fallback_model": getattr(result, "model_fallback_used", None),
+                "fallback_model": result.model_fallback_used,
                 "model": result.model,
             }
         )
@@ -614,18 +618,32 @@ async def execute_council(
     # recovered round-1 and then re-failed round-2 emits BOTH events.
     quota_recoveries: list[dict[str, Any]] = []
     quota_recoveries_seen: set[str] = set()
-    for entry in _detect_quota_throttled(
-        results, participant_cfg, already_emitted=quota_throttled_seen
-    ):
-        quota_throttled.append(entry)
-        quota_throttled_seen.add(entry["peer"])
-        emit({"event": "peer_quota_throttled", "round": round_number, **entry})
-    for entry in _detect_quota_recoveries(
-        results, participant_cfg, already_emitted=quota_recoveries_seen
-    ):
-        quota_recoveries.append(entry)
-        quota_recoveries_seen.add(entry["peer"])
-        emit({"event": "peer_quota_recovered", "round": round_number, **entry})
+
+    def _detect_and_emit_quota(round_outputs: list[ParticipantResult]) -> None:
+        """Detect quota-throttled / recovered peers in ``round_outputs``,
+        append them to the run-level accumulators (with per-peer dedup via
+        the ``*_seen`` sets), and emit one progress event per new peer.
+
+        Closes over the run-level accumulators / seen-sets and the current
+        ``round_number`` so both the round-1 and round-2 sites stamp the
+        right round. Reads ``round_number`` at call time, matching the
+        original inline behavior (round 1 fires before the increment,
+        round 2 after).
+        """
+        for entry in _detect_quota_throttled(
+            round_outputs, participant_cfg, already_emitted=quota_throttled_seen
+        ):
+            quota_throttled.append(entry)
+            quota_throttled_seen.add(entry["peer"])
+            emit({"event": "peer_quota_throttled", "round": round_number, **entry})
+        for entry in _detect_quota_recoveries(
+            round_outputs, participant_cfg, already_emitted=quota_recoveries_seen
+        ):
+            quota_recoveries.append(entry)
+            quota_recoveries_seen.add(entry["peer"])
+            emit({"event": "peer_quota_recovered", "round": round_number, **entry})
+
+    _detect_and_emit_quota(results)
     initial_disagreement = has_disagreement(round_results)
     metadata = {
         "rounds": round_number,
@@ -699,10 +717,7 @@ async def execute_council(
             parse_final_ranking,
         )
 
-        labeled_results = [
-            r for r in round_results
-            if r.ok and recommendation_label(r.output) in {"yes", "no", "tradeoff"}
-        ]
+        labeled_results = [r for r in round_results if _is_labeled_vote(r)]
         if len(labeled_results) >= CROSS_RANK_MIN_PEERS:
             labeled_names = [r.name for r in labeled_results]
             anonymization_map = build_anonymization_map(labeled_names)
@@ -849,10 +864,7 @@ async def execute_council(
         and metadata.get("deliberation_status") == "pending"
         and not metadata.get("universal_abdication")
     ):
-        denominator = [
-            r for r in round_results
-            if r.ok and recommendation_label(r.output) in {"yes", "no", "tradeoff"}
-        ]
+        denominator = [r for r in round_results if _is_labeled_vote(r)]
         no_votes = sum(
             1 for r in denominator
             if (r.continue_debate or "").lower() == "no"
@@ -942,18 +954,7 @@ async def execute_council(
         # Round-2 quota detection. Skips peers already in
         # `quota_throttled_seen` from round 1, so a peer throttled once
         # doesn't emit a second event when round 2 hits the same wall.
-        for entry in _detect_quota_throttled(
-            round_results, participant_cfg, already_emitted=quota_throttled_seen
-        ):
-            quota_throttled.append(entry)
-            quota_throttled_seen.add(entry["peer"])
-            emit({"event": "peer_quota_throttled", "round": round_number, **entry})
-        for entry in _detect_quota_recoveries(
-            round_results, participant_cfg, already_emitted=quota_recoveries_seen
-        ):
-            quota_recoveries.append(entry)
-            quota_recoveries_seen.add(entry["peer"])
-            emit({"event": "peer_quota_recovered", "round": round_number, **entry})
+        _detect_and_emit_quota(round_results)
 
         round_convergence = _compute_round_convergence(
             prior_round_results, round_results, convergence_thresholds
@@ -1030,7 +1031,7 @@ async def execute_council(
     if stances:
         metadata["stances"] = dict(stances)
         for idx, result in enumerate(results):
-            base_name = result.name.split(":round", 1)[0]
+            base_name = _base_name(result.name)
             assigned = stances.get(base_name)
             if assigned is not None:
                 results[idx] = replace(result, stance=assigned)

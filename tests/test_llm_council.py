@@ -5525,6 +5525,39 @@ def test_prompt_sent_uses_longer_markdown_fence(tmp_path: Path):
     assert "````text\nContext:\n```text\ninside\n```\n````" in content
 
 
+def test_transcript_markdown_model_line_is_honest_for_cli_default(tmp_path: Path):
+    """A native CLI peer ships `model=None` by design (per-CLI model identity
+    is not observable). The markdown `Model:` line must render the honest
+    `cli default (unreported)` placeholder, not the old bare `cli default`
+    which implied a real recorded id."""
+    md_path = tmp_path / "run.md"
+    json_path = tmp_path / "run.json"
+    result = ParticipantResult(
+        name="claude",
+        ok=True,
+        output="RECOMMENDATION: yes - looks good.",
+        error="",
+        elapsed_seconds=1.0,
+        model=None,
+    )
+    write_transcript(
+        md_path,
+        json_path,
+        question="test",
+        mode="quick",
+        current="codex",
+        participants=["claude"],
+        prompt="prompt",
+        results=[result],
+        metadata={"rounds": 1},
+    )
+    content = md_path.read_text(encoding="utf-8")
+    assert "- Model: `cli default (unreported)`" in content
+    # The bare placeholder must not appear anywhere (it would be the old,
+    # misleading render).
+    assert "`cli default`" not in content
+
+
 def test_doctor_does_not_require_optional_ollama(monkeypatch):
     checks = [
         Check("cli:claude", True, "ok"),
@@ -11943,6 +11976,74 @@ def test_cmd_estimate_max_cost_allows_only_cli_peers_without_catalog(
     )
     rc = cli_module.cmd_estimate(args)
     assert rc == 0
+
+
+def test_cmd_estimate_table_renders_peer_name_for_cli_default_model(
+    monkeypatch, tmp_path: Path, capsys
+):
+    """Sentinel guard: a `model=None` CLI peer surfaces in the estimate row
+    as the load-bearing ``CLI_DEFAULT_MODEL_LABEL`` ("cli default"). The
+    NON-JSON table must compare against that same constant (estimate.py
+    PRODUCES it, cli.py COMPARES it) and render the peer NAME, not the
+    placeholder. Proves producer/comparator stay in sync via the constant."""
+    from llm_council.estimate import CLI_DEFAULT_MODEL_LABEL
+
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        cli_module,
+        "estimate_council",
+        lambda **_k: {
+            "known_total_usd": 0.0,
+            "rows": [
+                {
+                    "name": "claude",
+                    # Exactly what estimate.py produces for a model=None CLI peer.
+                    "model": CLI_DEFAULT_MODEL_LABEL,
+                    "type": "cli",
+                    "estimated_input_tokens": 100,
+                    "estimated_output_tokens": 50,
+                    "input_per_million": None,
+                    "output_per_million": None,
+                    "estimated_input_cost_usd": None,
+                    "estimated_output_cost_usd": None,
+                    "estimated_total_cost_usd": None,
+                }
+            ],
+            "mode": "quick",
+            "current": "claude",
+            "participants": ["claude"],
+            "extra_openrouter_models": [],
+            "prompt_chars": 100,
+            "estimated_prompt_tokens": 25,
+            "budgeted_rounds": 1,
+            "completion_tokens_assumed_each": 1500,
+            "unknown_cost_rows": [],
+            "notes": [],
+        },
+    )
+    config = _estimate_cap_config(tmp_path)
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "estimate",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "test",
+        ]
+    )
+    rc = cli_module.cmd_estimate(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The data row labels the peer by NAME, never the placeholder sentinel.
+    data_lines = [
+        ln for ln in out.splitlines() if ln.startswith("claude") and "cli" in ln
+    ]
+    assert data_lines, f"no claude data row in estimate table:\n{out}"
+    assert "cli default" not in data_lines[0]
 
 
 def test_cmd_estimate_refuses_when_max_tokens_exceeded(

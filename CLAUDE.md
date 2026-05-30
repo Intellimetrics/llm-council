@@ -172,7 +172,15 @@ Key modules:
   `deliberation.recommendation_line` follows the same fence-aware match
   but, when no out-of-fence label is found, returns the explicit placeholder
   string `(no RECOMMENDATION label emitted)` for round-2 prompt summaries
-  rather than falling back to arbitrary prose.
+  rather than falling back to arbitrary prose. The mandatory label costs one
+  repair-retry round-trip (an extra CLI invocation) when a peer's first
+  response omits it — even on trivial / non-vote prompts. Per-peer opt-outs:
+  `retry_on_missing_label: false` skips the label-repair retry;
+  `require_recommendation: false` bypasses the label gate entirely (for
+  genuinely non-vote uses). The label is the load-bearing universal vote
+  contract — quorum, consensus, and the finding matrix all depend on it — so
+  reserve these opt-outs for non-vote peers/prompts, not as a blanket
+  cost-trim on real council runs.
 - **Optional response envelope.** Peers may emit `EFFORT:`, `CONFIDENCE:`,
   `RISK:`, `BLOCKERS:`, `EVIDENCE:`, `TESTS_TO_RUN:`, `ASSUMPTIONS:`,
   `CONTINUE_DEBATE:` lines alongside the `RECOMMENDATION:` label. Parsed by
@@ -504,6 +512,17 @@ arg gets shipped as literal text. The read-only invariant lives in the
 host CLI's own permission flags (passed via `args`), not in the
 `read_only:` key — that key is documentation-only today.
 
+**Ambient-env bleed (documented behavior + remedy).** Default CLI peers
+use "sieve" env mode: non-secret-named host env vars pass straight through
+to the child. So an ambient host export like `GEMINI_MODEL`,
+`ANTHROPIC_MODEL`, `OPENAI_MODEL`, or any `*_BASE_URL` can silently steer a
+native CLI peer's model/endpoint with no llm-council visibility. The remedy
+is per-peer `env_strict: true`, which restricts the child to
+`_SAFE_ENV_NAMES` (PATH/HOME/LANG/…) plus the peer's `env_passthrough` list
+— so ambient routing vars are dropped unless explicitly forwarded. Use it
+when you want deterministic per-peer model/endpoint selection independent of
+the operator's shell environment.
+
 ## Continuation chain depth
 
 `continuation_id` (CLI `--continue`) prepends a summary of the prior
@@ -536,3 +555,20 @@ no-ops, and only the `model` field is touched (args, timeout, type,
 family, origin are untouched). Built-in modes ship without
 `model_overrides` on purpose — do NOT add vendor-affinity defaults until
 the eval harness shows real lift on the relevant fixture set.
+
+**Per-CLI model identity is not observable.** Native CLI peers
+(claude/codex/gemini/antigravity) ship `model: None` intentionally so each
+runs under the user's own account-default model. llm-council has no hook to
+read which concrete model the CLI actually executed, so `result.model` stays
+`None` — the transcript renders `cli default (unreported)` and the JSON shows
+`null`. To get a RECORDED model id, pin `participants.<peer>.model` (or use
+`--tier` / `modes.<name>.model_overrides`): `_build_cli_command` then injects
+`--model <id>` (or `exec -m <id>` for codex) and `result.model` carries the
+REQUESTED id — never a server-side confirmation that the CLI honored it. The
+estimate row substitutes the load-bearing `CLI_DEFAULT_MODEL_LABEL`
+(`"cli default"`) sentinel for `model: None` peers; `cli.py:cmd_estimate`
+compares against that same constant to render the peer NAME in the table.
+**Do NOT pin antigravity's model** — `agy` has no `--model` flag, so
+`_build_cli_command` skips `--model` injection for `family == "antigravity"`
+and any pinned id is silently ignored rather than producing a broken
+invocation.

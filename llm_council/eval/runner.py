@@ -163,6 +163,11 @@ def iter_fixture_dirs(fixtures_dir: Path) -> Iterable[Path]:
 # ---------- runner ---------------------------------------------------------
 
 
+def _mean(values: list[Any], default: Any = 0.0) -> Any:
+    """Arithmetic mean of `values`, or `default` for an empty list."""
+    return sum(values) / len(values) if values else default
+
+
 def _maybe_await(value: Any) -> Any:
     """If `value` is a coroutine, run it to completion. Otherwise return it.
 
@@ -217,12 +222,10 @@ def _aggregate_fixture(peers: list[PeerScore]) -> dict[str, Any]:
     ]
     return {
         "blocker_recall_max": max(recalls) if recalls else 0.0,
-        "false_blocker_rate_mean": sum(fbrs) / len(fbrs) if fbrs else 0.0,
-        "signal_to_noise_ratio_mean": sum(snrs) / len(snrs) if snrs else 0.0,
-        "evidence_density_mean": sum(densities) / len(densities) if densities else 0.0,
-        "citation_accuracy_mean": (
-            sum(citations) / len(citations) if citations else None
-        ),
+        "false_blocker_rate_mean": _mean(fbrs),
+        "signal_to_noise_ratio_mean": _mean(snrs),
+        "evidence_density_mean": _mean(densities),
+        "citation_accuracy_mean": _mean(citations, default=None),
         "peer_count": len(peers),
     }
 
@@ -279,13 +282,11 @@ def _aggregate_suite(scorecards: list[FixtureScorecard]) -> dict[str, Any]:
         if s.aggregate_metrics.get("citation_accuracy_mean") is not None
     ]
     return {
-        "blocker_recall": sum(recalls) / len(recalls) if recalls else 0.0,
-        "false_blocker_rate": sum(fbrs) / len(fbrs) if fbrs else 0.0,
-        "signal_to_noise_ratio": sum(snrs) / len(snrs) if snrs else 0.0,
-        "evidence_density": sum(densities) / len(densities) if densities else 0.0,
-        "citation_accuracy": (
-            sum(citations) / len(citations) if citations else None
-        ),
+        "blocker_recall": _mean(recalls),
+        "false_blocker_rate": _mean(fbrs),
+        "signal_to_noise_ratio": _mean(snrs),
+        "evidence_density": _mean(densities),
+        "citation_accuracy": _mean(citations, default=None),
         "fixture_count": len(scorecards),
     }
 

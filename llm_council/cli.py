@@ -25,12 +25,13 @@ from llm_council.config import (
     select_participants,
 )
 from llm_council.adapters import classify_error
-from llm_council.budget import image_attachment_violations, summarize_preflight_caps
+from llm_council import budget
+from llm_council.budget import image_attachment_violations
 from llm_council import display
 from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_prompt
 from llm_council.doctor import check_environment, checks_to_dict, probe_local_openai
 from llm_council.env import load_project_env
-from llm_council.estimate import estimate_council
+from llm_council.estimate import CLI_DEFAULT_MODEL_LABEL, estimate_council
 from llm_council.model_catalog import (
     fetch_openrouter_models,
     openrouter_cache_age_seconds,
@@ -47,6 +48,7 @@ from llm_council.transcript import (
     format_prior_council_context,
     latest_transcript,
     normalize_run_id,
+    transcript_dir,
     transcript_paths,
     transcript_records,
     write_transcript,
@@ -856,7 +858,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     _emit_config_warnings(config)
     print("Participants:")
     for name, cfg in config.get("participants", {}).items():
-        model = cfg.get("model") or "cli default"
+        model = cfg.get("model") or "cli default (unreported)"
         print(f"  {name:20} {cfg.get('type'):10} {model}")
     print("\nModes:")
     for name, cfg in config.get("modes", {}).items():
@@ -1118,23 +1120,43 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return 0
 
 
-def _auto_setup_preset() -> str:
-    has_claude = bool(shutil.which("claude"))
-    has_codex = bool(shutil.which("codex"))
-    has_neutral = bool(shutil.which("agy") or shutil.which("gemini"))
+def _make_which_cache():
+    """Per-setup-invocation memoizer for `shutil.which` lookups.
+
+    Setup route detection probes the same native binaries from several
+    helpers; without memoization each binary is re-resolved against PATH
+    multiple times per `setup` invocation. The cache lives only as long
+    as the caller holds it, so probe results never leak across invocations.
+    """
+    _cache: dict[str, str | None] = {}
+
+    def _which(binary: str) -> str | None:
+        if binary not in _cache:
+            _cache[binary] = shutil.which(binary)
+        return _cache[binary]
+
+    return _which
+
+
+def _auto_setup_preset(which=None) -> str:
+    if which is None:
+        which = _make_which_cache()
+    has_claude = bool(which("claude"))
+    has_codex = bool(which("codex"))
+    has_neutral = bool(which("agy") or which("gemini"))
     native_role_count = sum([has_claude, has_codex, has_neutral])
     if native_role_count >= 2:
         return "tri-cli"
     if os.environ.get("OPENROUTER_API_KEY"):
         return "openrouter"
-    
+
     found_list = []
     if has_claude: found_list.append("claude")
     if has_codex: found_list.append("codex")
-    if shutil.which("agy"): found_list.append("antigravity")
-    elif shutil.which("gemini"): found_list.append("gemini")
+    if which("agy"): found_list.append("antigravity")
+    elif which("gemini"): found_list.append("gemini")
     found = ", ".join(found_list) or "none"
-    
+
     raise SystemExit(
         "Auto setup could not find a usable default council route. "
         f"Found native CLIs: {found}. "
@@ -1146,26 +1168,27 @@ def _auto_setup_preset() -> str:
 
 
 def _detect_setup_routes() -> dict[str, object]:
+    which = _make_which_cache()
     native_names = ("claude", "codex", "gemini", "antigravity")
-    native_paths = {name: shutil.which("agy" if name == "antigravity" else name) for name in native_names}
+    native_paths = {name: which("agy" if name == "antigravity" else name) for name in native_names}
     has_claude = bool(native_paths.get("claude"))
     has_codex = bool(native_paths.get("codex"))
     has_neutral = bool(native_paths.get("antigravity") or native_paths.get("gemini"))
     native_count = sum([has_claude, has_codex, has_neutral])
     has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
-    ollama_path = shutil.which("ollama")
+    ollama_path = which("ollama")
     return {
         "native_paths": native_paths,
         "native_count": native_count,
         "has_openrouter": has_openrouter,
         "ollama_path": ollama_path,
-        "auto": _auto_setup_preset_or_none(),
+        "auto": _auto_setup_preset_or_none(which),
     }
 
 
-def _auto_setup_preset_or_none() -> str | None:
+def _auto_setup_preset_or_none(which=None) -> str | None:
     try:
-        return _auto_setup_preset()
+        return _auto_setup_preset(which)
     except SystemExit:
         return None
 
@@ -1529,30 +1552,19 @@ def cmd_estimate(args: argparse.Namespace) -> int:
     # sees per-peer costs along with the non-zero exit.
     max_cost_usd = getattr(args, "max_cost_usd", None)
     max_tokens = getattr(args, "max_tokens", None)
-    if max_cost_usd is not None or max_tokens is not None:
-        cost_total, token_total, unpriced_paid = summarize_preflight_caps(estimate)
-        if max_cost_usd is not None and unpriced_paid:
-            raise SystemExit(
-                "Pre-flight estimate cannot enforce --max-cost-usd: hosted "
-                f"peer(s) without a catalog price: {', '.join(unpriced_paid)}. "
-                "Run `llm-council models openrouter` to confirm the model id, "
-                "or drop these peers, before relying on the cost cap."
-            )
-        if max_cost_usd is not None and cost_total > float(max_cost_usd):
-            raise SystemExit(
-                f"Pre-flight estimate ${cost_total:.6f} (with worst-case "
-                f"repair-retry headroom) exceeds --max-cost-usd "
-                f"${float(max_cost_usd):.6f}. Free/local peers count as $0; "
+    try:
+        budget.enforce_preflight_caps(
+            estimate,
+            max_cost_usd=max_cost_usd,
+            max_tokens=max_tokens,
+            breakdown_hint=(
                 "drop expensive peers, raise the cap, or see the per-peer "
                 "breakdown above. To exclude the repair-retry margin, set "
                 "retry_on_missing_label: false on individual participants."
-            )
-        if max_tokens is not None and token_total > int(max_tokens):
-            raise SystemExit(
-                f"Pre-flight estimate {token_total} tokens exceeds --max-tokens "
-                f"{int(max_tokens)}. Drop --diff/--context, narrow the question, "
-                "or raise the cap."
-            )
+            ),
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     return 0
 
 
@@ -1578,7 +1590,7 @@ def _print_estimate(estimate: dict) -> None:
         f"{'out/1M':>9} {'input':>10} {'output':>10} {'total':>10}"
     )
     for row in estimate["rows"]:
-        label = row["name"] if row["model"] == "cli default" else row["model"]
+        label = row["name"] if row["model"] == CLI_DEFAULT_MODEL_LABEL else row["model"]
         print(
             f"{label[:44]:44} "
             f"{row['type'][:10]:10} "
@@ -1602,9 +1614,7 @@ def cmd_last(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).resolve()
     load_project_env(cwd)
     config = load_config(find_config(cwd), search=False)
-    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
-    if not out_dir.is_absolute():
-        out_dir = cwd / out_dir
+    out_dir = transcript_dir(cwd, config)
     path = latest_transcript(out_dir, suffix=".json" if args.json_file else ".md")
     if path is None:
         raise SystemExit(f"No council transcripts found in {out_dir}")
@@ -1616,8 +1626,7 @@ def cmd_last(args: argparse.Namespace) -> int:
 
 
 def _transcript_dir(cwd: Path, config: dict) -> Path:
-    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
-    return out_dir if out_dir.is_absolute() else cwd / out_dir
+    return transcript_dir(cwd, config)
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
@@ -2103,13 +2112,7 @@ def _fmt_cost(value: float | None) -> str:
 
 
 def _fmt_usd(value: float | None) -> str:
-    if value is None:
-        return "n/a"
-    if value == 0:
-        return "$0"
-    if value < 0.001:
-        return f"${value:.6f}"
-    return f"${value:.4f}"
+    return display.format_usd(value)
 
 
 def _make_progress_printer(ordered_peers: list[str] | tuple[str, ...] | None = None):
@@ -2378,9 +2381,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     stdin_text = sys.stdin.read() if args.stdin else None
-    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
-    if not out_dir.is_absolute():
-        out_dir = cwd / out_dir
+    out_dir = transcript_dir(cwd, config)
     parent_run_id: str | None = None
     prior_context: str | None = None
     continue_id = getattr(args, "continue_id", None)
@@ -2568,34 +2569,24 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             )
         except (OSError, ValueError) as exc:
             raise SystemExit(f"failed to compute pre-flight estimate: {exc}") from exc
-        # summarize_preflight_caps uses the retry-safety total so a worst-case
+        # enforce_preflight_caps uses the retry-safety total so a worst-case
         # repair retry can't silently push spend past the cap, and flags hosted
         # peers with unknown catalog price (which would otherwise slip past a
         # $-cap). Shared with cmd_estimate + the MCP run pipeline.
-        cost_total, token_total, unpriced_paid = summarize_preflight_caps(preflight)
-        if max_cost_usd is not None and unpriced_paid:
-            raise SystemExit(
-                "Pre-flight estimate cannot enforce --max-cost-usd: hosted "
-                f"peer(s) without a catalog price: {', '.join(unpriced_paid)}. "
-                "Run `llm-council models openrouter` to confirm the model id, "
-                "or drop these peers, before relying on the cost cap."
-            )
-        if max_cost_usd is not None and cost_total > float(max_cost_usd):
-            raise SystemExit(
-                f"Pre-flight estimate ${cost_total:.6f} (with worst-case "
-                f"repair-retry headroom) exceeds --max-cost-usd "
-                f"${float(max_cost_usd):.6f}. Free/local peers count as $0; "
+        try:
+            budget.enforce_preflight_caps(
+                preflight,
+                max_cost_usd=max_cost_usd,
+                max_tokens=max_tokens,
+                breakdown_hint=(
                 "drop expensive peers, raise the cap, or run `llm-council "
                 "estimate ...` for a per-peer breakdown. To exclude the "
                 "repair-retry margin, set retry_on_missing_label: false on "
                 "individual participants."
+            ),
             )
-        if max_tokens is not None and token_total > int(max_tokens):
-            raise SystemExit(
-                f"Pre-flight estimate {token_total} tokens exceeds --max-tokens "
-                f"{int(max_tokens)}. Drop --diff/--context, narrow the question, "
-                "or raise the cap."
-            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
 
     if args.dry_run:
         # Surface the resolved per-peer model so callers can verify a tier

@@ -282,10 +282,9 @@ def write_setup_files(
         existing_config = _read_yaml_mapping(config_path)
         merged_config = deep_merge(desired_config, existing_config)
     else:
+        existing_config = None
         merged_config = desired_config
-    if force or not config_path.exists() or merged_config != (
-        _read_yaml_mapping(config_path) if config_path.exists() else None
-    ):
+    if force or not config_path.exists() or merged_config != existing_config:
         config_path.write_text(
             yaml.safe_dump(merged_config, sort_keys=False),
             encoding="utf-8",

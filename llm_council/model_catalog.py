@@ -80,13 +80,26 @@ def fetch_openrouter_models(
             return cached
     if not allow_network:
         return []
+    models, _ = _live_fetch_and_cache(cache_path, timeout, write_cache=use_cache)
+    return models
+
+
+def _live_fetch_and_cache(
+    cache_path: Path, timeout: float, *, write_cache: bool
+) -> tuple[list[dict[str, Any]], Path]:
+    """Live HTTP fetch + normalize, optionally overwriting the disk cache.
+
+    Shared body for `fetch_openrouter_models` (cache write gated on
+    `use_cache`) and `refresh_openrouter_cache` (unconditional write).
+    Raises on network / HTTP failure.
+    """
     response = httpx.get(OPENROUTER_MODELS_URL, timeout=timeout)
     response.raise_for_status()
     data = response.json()
     models = [normalize_openrouter_model(model) for model in data.get("data", [])]
-    if use_cache:
+    if write_cache:
         _write_cache(cache_path, models)
-    return models
+    return models, cache_path
 
 
 def refresh_openrouter_cache(timeout: float = 30) -> dict[str, Any]:
@@ -96,12 +109,9 @@ def refresh_openrouter_cache(timeout: float = 30) -> dict[str, Any]:
     Raises on network failure — callers (the explicit `models refresh`
     subcommand) want a clear error, not silent silence.
     """
-    response = httpx.get(OPENROUTER_MODELS_URL, timeout=timeout)
-    response.raise_for_status()
-    data = response.json()
-    models = [normalize_openrouter_model(model) for model in data.get("data", [])]
-    cache_path = openrouter_cache_path()
-    _write_cache(cache_path, models)
+    models, cache_path = _live_fetch_and_cache(
+        openrouter_cache_path(), timeout, write_cache=True
+    )
     return {
         "model_count": len(models),
         "cache_path": str(cache_path),

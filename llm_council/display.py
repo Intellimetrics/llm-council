@@ -75,6 +75,21 @@ STATUS_COLORS = {
 }
 
 
+def format_usd(value: float | None) -> str:
+    """Precision-ladder USD formatter shared across CLI and stats surfaces.
+
+    `None` → "n/a", exact zero → "$0", sub-milli-dollar amounts use 6
+    decimals so they don't collapse to "$0.0000", everything else uses 4.
+    """
+    if value is None:
+        return "n/a"
+    if value == 0:
+        return "$0"
+    if value < 0.001:
+        return f"${value:.6f}"
+    return f"${value:.4f}"
+
+
 def wants_color(stream: IO | None = None) -> bool:
     """True iff color is appropriate. Honors NO_COLOR and TTY detection.
 
@@ -287,10 +302,7 @@ def format_progress_message(event: dict) -> str | None:
         body = f"{peer} {status} ({elapsed:.1f}s)"
     elif kind == "deliberation_pending":
         body = f"disagreement detected, deliberation round {round_no} starting"
-    elif kind == "deliberation_skip":
-        reason = event.get("reason") or "unspecified"
-        body = f"deliberation skipped ({reason})"
-    elif kind == "deliberation_skipped":
+    elif kind in ("deliberation_skip", "deliberation_skipped"):
         reason = event.get("reason") or "unspecified"
         body = f"deliberation skipped ({reason})"
     elif kind == "deliberation_round_start":

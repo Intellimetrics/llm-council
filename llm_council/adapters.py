@@ -10,7 +10,7 @@ import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -653,7 +653,11 @@ def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -
 
     model = cfg.get("model")
     family = cfg.get("family", name)
-    if model:
+    # antigravity (`agy`) has NO --model flag — model is session-state only,
+    # so injecting `--model <id>` would produce a broken invocation. A user
+    # who pins agy's model via --tier / modes.model_overrides is silently
+    # ignored here (the only safe behavior) rather than handed a broken CLI.
+    if model and family != "antigravity":
         if family == "codex":
             # Codex's exec subcommand takes the model via `-m`; the default
             # args list starts with `exec` so we drop the duplicate when we
@@ -721,8 +725,7 @@ async def run_cli_participant(
         )
         retry_budget = _terse_retry_budget(original_timeout)
         terse_prompt = _build_terse_retry_prompt(prompt)
-        max_prompt_chars = cfg.get("max_prompt_chars")
-        if max_prompt_chars is None or len(terse_prompt) <= int(max_prompt_chars):
+        if _within_prompt_cap(cfg, terse_prompt):
             terse_cfg = dict(cfg)
             terse_cfg["timeout"] = retry_budget
             # Disable size scaling for the retry — the budget already
@@ -836,8 +839,7 @@ async def run_cli_participant(
         and _is_label_only_failure(result.output, cfg)
     ):
         retry_prompt = _build_cli_retry_prompt(prompt, result.output)
-        max_prompt_chars = cfg.get("max_prompt_chars")
-        if max_prompt_chars is not None and len(retry_prompt) > int(max_prompt_chars):
+        if not _within_prompt_cap(cfg, retry_prompt):
             _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
             return result
         retry_result, _retry_meta = await _run_cli_once(
@@ -861,11 +863,7 @@ async def run_cli_participant(
             retry_prompt = _build_section_repair_prompt(
                 prompt, result.output, missing
             )
-            max_prompt_chars = cfg.get("max_prompt_chars")
-            if (
-                max_prompt_chars is None
-                or len(retry_prompt) <= int(max_prompt_chars)
-            ):
+            if _within_prompt_cap(cfg, retry_prompt):
                 retry_result, _retry_meta = await _run_cli_once(
                     name, cfg, retry_prompt, cwd, start=start,
                     mode_multiplier=mode_multiplier, mode=mode,
@@ -891,17 +889,8 @@ async def run_cli_participant(
         and not getattr(result, "recovered_after_timeout", False)
         and not getattr(result, "section_repair_attempted", False)
     ):
-        retry_prompt = (
-            f"{prompt}\n\n"
-            "--- Your previous response (first attempt) ---\n"
-            f"{result.output.strip()}\n\n"
-            f"{STRICT_EVIDENCE_REPAIR_RETRY_INSTRUCTION}"
-        )
-        max_prompt_chars = cfg.get("max_prompt_chars")
-        if (
-            max_prompt_chars is None
-            or len(retry_prompt) <= int(max_prompt_chars)
-        ):
+        retry_prompt = _build_strict_evidence_retry_prompt(prompt, result.output)
+        if _within_prompt_cap(cfg, retry_prompt):
             retry_result, _retry_meta = await _run_cli_once(
                 name, cfg, retry_prompt, cwd, start=start,
                 mode_multiplier=mode_multiplier, mode=mode,
@@ -1233,11 +1222,9 @@ def _build_strict_evidence_retry_prompt(
     original_prompt: str, prior_response: str
 ) -> str:
     """Compose the strict-evidence repair retry prompt for hosted/local
-    transports. Shape mirrors `_build_cli_retry_prompt`: original prompt +
-    prior response excerpt + repair directive. The CLI path constructs
-    the equivalent string inline at the retry site rather than calling
-    this helper because the section-repair branch wants the same
-    structure; both end up with the directive trailing the prior output.
+    AND CLI transports. Shape mirrors `_build_cli_retry_prompt`: original
+    prompt + prior response excerpt + repair directive, with the directive
+    trailing the prior output.
     """
     return (
         f"{original_prompt}\n\n"
@@ -1481,7 +1468,9 @@ async def _cleanup_timed_out_process(
         pass
 
 
-async def run_openai_compatible_participant(
+async def _run_hosted_participant(
+    inner: Callable[..., Awaitable[ParticipantResult]],
+    section_repair: Callable[..., Awaitable[ParticipantResult]],
     name: str,
     cfg: dict[str, Any],
     prompt: str,
@@ -1491,6 +1480,12 @@ async def run_openai_compatible_participant(
     mode_multiplier: float | None = None,
     mode: str | None = None,
 ) -> ParticipantResult:
+    """Shared overflow→cache→inner→terse-retry→section-repair→strict-evidence
+    pipeline for the hosted/local transports. `inner` is the transport's inner
+    runner (`_run_openai_compatible_inner` / `_run_ollama_inner`) and
+    `section_repair` its `_maybe_section_repair_*` wrapper; the
+    `run_openai_compatible_participant` / `run_ollama_participant` bodies were
+    byte-identical apart from these two callables."""
     overflow = _context_overflow_result(
         name, cfg, prompt, image_manifest=image_manifest
     )
@@ -1501,7 +1496,7 @@ async def run_openai_compatible_participant(
     )
     if cached is not None:
         return cached
-    result = await _run_openai_compatible_inner(
+    result = await inner(
         name, cfg, prompt, image_manifest=image_manifest,
         mode_multiplier=mode_multiplier, mode=mode,
     )
@@ -1519,12 +1514,11 @@ async def run_openai_compatible_participant(
         )
         retry_budget = _terse_retry_budget(original_timeout)
         terse_prompt = _build_terse_retry_prompt(prompt)
-        max_prompt_chars = cfg.get("max_prompt_chars")
-        if max_prompt_chars is None or len(terse_prompt) <= int(max_prompt_chars):
+        if _within_prompt_cap(cfg, terse_prompt):
             terse_cfg = dict(cfg)
             terse_cfg["timeout"] = retry_budget
             terse_cfg["timeout_per_kb_chars"] = 0
-            terse_result = await _run_openai_compatible_inner(
+            terse_result = await inner(
                 name, terse_cfg, terse_prompt,
                 image_manifest=image_manifest,
                 mode_multiplier=None, mode=mode,
@@ -1560,7 +1554,7 @@ async def run_openai_compatible_participant(
     # The retry runs through the SAME inner with `retry_on_missing_label:
     # False` so the inner's own label-repair branch can't fire a chained
     # third call.
-    result = await _maybe_section_repair_openai_compatible(
+    result = await section_repair(
         name=name,
         cfg=cfg,
         prompt=prompt,
@@ -1587,21 +1581,81 @@ async def run_openai_compatible_participant(
         and not getattr(result, "section_repair_attempted", False)
     ):
         retry_prompt = _build_strict_evidence_retry_prompt(prompt, result.output)
-        max_prompt_chars = cfg.get("max_prompt_chars")
-        if max_prompt_chars is None or len(retry_prompt) <= int(max_prompt_chars):
+        if _within_prompt_cap(cfg, retry_prompt):
             # Disable the inner's own label-repair retry for this call so a
             # strict-evidence retry response that drops the RECOMMENDATION
             # label cannot fire a chained third outer call. Mirrors the
             # section-repair pattern above.
             retry_cfg = dict(cfg)
             retry_cfg["retry_on_missing_label"] = False
-            retry_result = await _run_openai_compatible_inner(
+            retry_result = await inner(
                 name, retry_cfg, retry_prompt, image_manifest=image_manifest,
                 mode_multiplier=mode_multiplier, mode=mode,
             )
             result = _merge_hosted_strict_evidence_retry(result, retry_result)
     _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
     return result
+
+
+async def run_openai_compatible_participant(
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    *,
+    image_manifest: list[dict[str, Any]] | None = None,
+    cache_ctx: CacheContext | None = None,
+    mode_multiplier: float | None = None,
+    mode: str | None = None,
+) -> ParticipantResult:
+    return await _run_hosted_participant(
+        _run_openai_compatible_inner,
+        _maybe_section_repair_openai_compatible,
+        name,
+        cfg,
+        prompt,
+        image_manifest=image_manifest,
+        cache_ctx=cache_ctx,
+        mode_multiplier=mode_multiplier,
+        mode=mode,
+    )
+
+
+async def _maybe_section_repair_hosted(
+    *,
+    inner: Callable[..., Awaitable[ParticipantResult]],
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    result: ParticipantResult,
+    image_manifest: list[dict[str, Any]] | None,
+    mode_multiplier: float | None,
+    mode: str | None,
+) -> ParticipantResult:
+    """Unified hosted/local section-coverage repair retry. `inner` is the
+    transport's inner runner (`_run_openai_compatible_inner` /
+    `_run_ollama_inner`); the two former per-transport wrappers differed only
+    in which inner they invoked, so they're now thin delegators."""
+    if not _should_section_repair(result, cfg):
+        return result
+    from llm_council.sections import required_sections_missing
+    missing = required_sections_missing(prompt, result.output)
+    if not missing:
+        return result
+    retry_prompt = _build_section_repair_prompt(prompt, result.output, missing)
+    if not _within_prompt_cap(cfg, retry_prompt):
+        return result
+    # Disable the inner's own label-repair retry for this call. The
+    # section-repair prompt explicitly tells the peer to keep its
+    # existing reasoning and add the missing sections, so a label-only
+    # failure on the retry is terminal — no chained third call.
+    retry_cfg = dict(cfg)
+    retry_cfg["retry_on_missing_label"] = False
+    retry_result = await inner(
+        name, retry_cfg, retry_prompt,
+        image_manifest=image_manifest,
+        mode_multiplier=mode_multiplier, mode=mode,
+    )
+    return _merge_hosted_section_retry(result, retry_result)
 
 
 async def _maybe_section_repair_openai_compatible(
@@ -1614,28 +1668,16 @@ async def _maybe_section_repair_openai_compatible(
     mode_multiplier: float | None,
     mode: str | None,
 ) -> ParticipantResult:
-    if not _should_section_repair(result, cfg):
-        return result
-    from llm_council.sections import required_sections_missing
-    missing = required_sections_missing(prompt, result.output)
-    if not missing:
-        return result
-    retry_prompt = _build_section_repair_prompt(prompt, result.output, missing)
-    max_prompt_chars = cfg.get("max_prompt_chars")
-    if max_prompt_chars is not None and len(retry_prompt) > int(max_prompt_chars):
-        return result
-    # Disable the inner's own label-repair retry for this call. The
-    # section-repair prompt explicitly tells the peer to keep its
-    # existing reasoning and add the missing sections, so a label-only
-    # failure on the retry is terminal — no chained third call.
-    retry_cfg = dict(cfg)
-    retry_cfg["retry_on_missing_label"] = False
-    retry_result = await _run_openai_compatible_inner(
-        name, retry_cfg, retry_prompt,
+    return await _maybe_section_repair_hosted(
+        inner=_run_openai_compatible_inner,
+        name=name,
+        cfg=cfg,
+        prompt=prompt,
+        result=result,
         image_manifest=image_manifest,
-        mode_multiplier=mode_multiplier, mode=mode,
+        mode_multiplier=mode_multiplier,
+        mode=mode,
     )
-    return _merge_hosted_section_retry(result, retry_result)
 
 
 def _merge_hosted_section_retry(
@@ -2018,105 +2060,17 @@ async def run_ollama_participant(
     mode_multiplier: float | None = None,
     mode: str | None = None,
 ) -> ParticipantResult:
-    overflow = _context_overflow_result(
-        name, cfg, prompt, image_manifest=image_manifest
-    )
-    if overflow is not None:
-        return overflow
-    cache_key, cached = _cache_lookup(
-        name, cfg, prompt, cache_ctx, image_manifest=image_manifest
-    )
-    if cached is not None:
-        return cached
-    result = await _run_ollama_inner(
-        name, cfg, prompt, image_manifest=image_manifest,
-        mode_multiplier=mode_multiplier, mode=mode,
-    )
-    if (
-        not result.ok
-        and is_timeout_error(result.error)
-        and _terse_retry_enabled(cfg)
-    ):
-        original_timeout = _resolve_effective_timeout(
-            cfg, mode_multiplier, base_default=180, prompt_chars=len(prompt)
-        )
-        retry_budget = _terse_retry_budget(original_timeout)
-        terse_prompt = _build_terse_retry_prompt(prompt)
-        max_prompt_chars = cfg.get("max_prompt_chars")
-        if max_prompt_chars is None or len(terse_prompt) <= int(max_prompt_chars):
-            terse_cfg = dict(cfg)
-            terse_cfg["timeout"] = retry_budget
-            terse_cfg["timeout_per_kb_chars"] = 0
-            terse_result = await _run_ollama_inner(
-                name, terse_cfg, terse_prompt,
-                image_manifest=image_manifest,
-                mode_multiplier=None, mode=mode,
-            )
-            if terse_result.ok:
-                from dataclasses import replace as _replace
-                # `prompt_chars` reports the ORIGINAL prompt size (the one
-                # that tripped the timeout wall), not the terse retry's
-                # size. Keeps `timeout_recoveries` cross-tab-able with
-                # `timeout_by_prompt_size`.
-                result = _replace(
-                    terse_result,
-                    recovered_after_timeout=True,
-                    terse_retry_attempted=True,
-                    prompt_chars=len(prompt),
-                )
-            else:
-                # Annotate the original result so the retry attempt is
-                # visible in transcripts/stats (matches CLI path).
-                result = _annotate_timeout_retry_failure(
-                    result, terse_result, name, budget=retry_budget
-                )
-    # Retry layering invariant (see openai_compatible wrapper for full notes):
-    # terse-retry → section-repair → strict-evidence, each capped at one
-    # extra round per peer.
-    #
-    # Section-coverage repair retry. Same contract as the CLI and
-    # openai_compatible paths: label present + REQUIRED sections
-    # missing → one extra call with `SECTION_REPAIR_RETRY_INSTRUCTION`.
-    # `_should_section_repair` forbids chaining after terse-retry.
-    result = await _maybe_section_repair_ollama(
-        name=name,
-        cfg=cfg,
-        prompt=prompt,
-        result=result,
+    return await _run_hosted_participant(
+        _run_ollama_inner,
+        _maybe_section_repair_ollama,
+        name,
+        cfg,
+        prompt,
         image_manifest=image_manifest,
+        cache_ctx=cache_ctx,
         mode_multiplier=mode_multiplier,
         mode=mode,
     )
-    # Strict-evidence repair retry (parallels CLI + openai_compatible).
-    # The inner's label-retry path skips untagged_evidence failures, so we
-    # apply the retry here. One shot, no chaining with terse-retry. The
-    # `section_repair_attempted` guard is the pass-9 fix: when the
-    # section-repair retry already fired and surfaced new
-    # `UntaggedEvidence:`, chaining a strict-evidence retry on top would
-    # be the third outer-visible call per peer.
-    if (
-        not result.ok
-        and _retry_enabled(cfg)
-        and result.error.startswith(UNTAGGED_EVIDENCE_PREFIX)
-        and not getattr(result, "recovered_after_timeout", False)
-        and not getattr(result, "section_repair_attempted", False)
-    ):
-        retry_prompt = _build_strict_evidence_retry_prompt(prompt, result.output)
-        max_prompt_chars = cfg.get("max_prompt_chars")
-        if max_prompt_chars is None or len(retry_prompt) <= int(max_prompt_chars):
-            # Disable the inner's own label-repair retry for this call so a
-            # strict-evidence retry response that drops the RECOMMENDATION
-            # label cannot fire a chained third outer call. Mirrors the
-            # section-repair pattern above.
-            retry_cfg = dict(cfg)
-            retry_cfg["retry_on_missing_label"] = False
-            retry_result = await _run_ollama_inner(
-                name, retry_cfg, retry_prompt, image_manifest=image_manifest,
-                mode_multiplier=mode_multiplier, mode=mode,
-            )
-            result = _merge_hosted_strict_evidence_retry(result, retry_result)
-    _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
-    return result
 
 
 async def _maybe_section_repair_ollama(
@@ -2129,24 +2083,16 @@ async def _maybe_section_repair_ollama(
     mode_multiplier: float | None,
     mode: str | None,
 ) -> ParticipantResult:
-    if not _should_section_repair(result, cfg):
-        return result
-    from llm_council.sections import required_sections_missing
-    missing = required_sections_missing(prompt, result.output)
-    if not missing:
-        return result
-    retry_prompt = _build_section_repair_prompt(prompt, result.output, missing)
-    max_prompt_chars = cfg.get("max_prompt_chars")
-    if max_prompt_chars is not None and len(retry_prompt) > int(max_prompt_chars):
-        return result
-    retry_cfg = dict(cfg)
-    retry_cfg["retry_on_missing_label"] = False
-    retry_result = await _run_ollama_inner(
-        name, retry_cfg, retry_prompt,
+    return await _maybe_section_repair_hosted(
+        inner=_run_ollama_inner,
+        name=name,
+        cfg=cfg,
+        prompt=prompt,
+        result=result,
         image_manifest=image_manifest,
-        mode_multiplier=mode_multiplier, mode=mode,
+        mode_multiplier=mode_multiplier,
+        mode=mode,
     )
-    return _merge_hosted_section_retry(result, retry_result)
 
 
 async def _run_ollama_inner(
@@ -2636,13 +2582,25 @@ def _response_validation_error(
     return ""
 
 
-def _retry_enabled(cfg: dict[str, Any]) -> bool:
-    if cfg.get("retry_on_missing_label", True) is False:
-        return False
+def _within_prompt_cap(cfg: dict[str, Any], prompt: str) -> bool:
+    """True when `prompt` fits under the participant's `max_prompt_chars`
+    cap (or no cap is configured). Captures the per-retry prompt-cap
+    predicate open-coded at every repair-retry site."""
+    max_prompt_chars = cfg.get("max_prompt_chars")
+    return max_prompt_chars is None or len(prompt) <= int(max_prompt_chars)
+
+
+def _retries_zero_kill_switch(cfg: dict[str, Any]) -> bool:
     # An explicit `retries: 0` is the user saying "no extra calls of any
     # kind"; respect that for the application-level repair retry too,
     # otherwise the cost regression undoes commit 45b44ee.
-    if "retries" in cfg and _coerce_retries(cfg.get("retries"), default=1) == 0:
+    return "retries" in cfg and _coerce_retries(cfg.get("retries"), default=1) == 0
+
+
+def _retry_enabled(cfg: dict[str, Any]) -> bool:
+    if cfg.get("retry_on_missing_label", True) is False:
+        return False
+    if _retries_zero_kill_switch(cfg):
         return False
     return True
 
@@ -2657,7 +2615,7 @@ def _terse_retry_enabled(cfg: dict[str, Any]) -> bool:
     """
     if cfg.get("terse_retry_on_timeout", True) is False:
         return False
-    if "retries" in cfg and _coerce_retries(cfg.get("retries"), default=1) == 0:
+    if _retries_zero_kill_switch(cfg):
         return False
     return True
 

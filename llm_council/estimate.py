@@ -21,6 +21,16 @@ from llm_council.model_catalog import fetch_openrouter_models
 
 IMAGE_TOKEN_HEURISTIC = 1500
 
+# Load-bearing sentinel for the per-participant estimate row's `model` field.
+# Native CLI peers ship `model: None` (the engine cannot observe which concrete
+# model a CLI ran — the "Per-CLI model identity is not observable" invariant),
+# so the estimate row substitutes this constant. It is PRODUCED here and
+# COMPARED in cli.py (`cmd_estimate`) to decide whether to render the peer NAME
+# instead of a model id in the estimate table — keep the two in sync via this
+# single constant. Must never be None (the row's `.endswith(":free")` check and
+# the cli.py equality compare both depend on it being a real string).
+CLI_DEFAULT_MODEL_LABEL = "cli default"
+
 
 def estimate_tokens(text: str) -> int:
     """Approximate token count for a prompt string.
@@ -115,7 +125,7 @@ def estimate_council(
         or 2
     )
     budgeted_rounds = max(1, rounds) if deliberate else 1
-    prompt_tokens = math.ceil(len(prompt) / ESTIMATED_CHARS_PER_TOKEN)
+    prompt_tokens = estimate_tokens(prompt)
     completion_tokens = max(0, int(completion_tokens))
 
     participant_cfg = config.get("participants", {})
@@ -256,7 +266,7 @@ def _estimate_participant_row(
     rounds: int,
 ) -> dict[str, Any]:
     participant_type = cfg.get("type") or "unknown"
-    model = cfg.get("model") or "cli default"
+    model = cfg.get("model") or CLI_DEFAULT_MODEL_LABEL
     # Native CLI / Ollama / local openai_compatible all have no cash cost
     # to llm-council (the user pays for their own GPU / subscription / API
     # quota out-of-band). Treat them as $0 in the budget gate so the

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.14.0 - 2026-05-30
+
+v0.14.0 is a code-quality batch (a whole-codebase simplification pass — 39 adversarially-verified findings) plus an honesty fix for CLI-peer model reporting. No new features and no breaking changes; the one user-visible behavior change is the transcript/list model placeholder wording. This continues (and partially closes) the "CLI/MCP pipeline de-duplication" thread flagged as deferred in 0.13.0.
+
+**Code quality / de-duplication (behavior-preserving)**
+*   **Hosted-adapter consolidation.** `run_openai_compatible_participant` and `run_ollama_participant` were byte-identical (~120 lines of verbatim overflow→cache→inner→terse-retry→section-repair→strict-evidence pipeline); they now delegate to one shared `_run_hosted_participant(inner, section_repair, …)`, and the two `_maybe_section_repair_*` helpers collapse into `_maybe_section_repair_hosted`. Future fixes to the retry-layering invariant land in one place instead of drifting between transports.
+*   **New single-source helpers.** `transcript.transcript_dir(cwd, config)` (killed 6 inlined `transcripts_dir` resolutions across `cli`/`mcp_server`), `transcript.iter_run_json(base_dir)` (killed the duplicate glob+sort+JSON-read loop shared by `stats.load_transcript_files` and `transcript.transcript_records`), `display.format_usd` (one USD formatter for `cli` + `stats`), `budget.enforce_preflight_caps` (the two CLI budget-cap blocks), and `mcp_server._lift` (6 metadata pop-and-lift blocks → 1).
+*   **In-file collapses.** Reused `_build_strict_evidence_retry_prompt` on the CLI path; added `_within_prompt_cap` for ~10 repeated per-retry cap checks; a `_base_peer_name` helper in `stats`; `orchestrator` now reuses `_base_name`/`_is_labeled_vote` and a shared quota detect-emit helper (round 1 + round 2), and drops `getattr` guards on always-present dataclass fields; `transcript._select_final_round_records` uses `result_round`; plus dedup in `config` (loopback/local URL prefix), `context` (relative-label), `diff_chunking` (greedy-admit loop), `model_catalog` (fetch/refresh), `safety` (pattern-iter + kind tally), `setup_wizard` (read config once), `eval` (`jaccard_similarity` reuse + `_mean`), and `estimate`. All 39 fixes were adversarially verified to preserve behavior before applying.
+
+**CLI model reporting (honesty + hardening)**
+*   **Honest unreported-model placeholder.** Native CLI peers (claude/codex/gemini/antigravity) ship `model: None` by design so each uses the user's own account-default model, and llm-council cannot observe which concrete model actually answered (per the "Per-CLI model identity is not observable" invariant). The transcript/`list` views now render `cli default (unreported)` instead of the misleading `cli default`. Introduced `CLI_DEFAULT_MODEL_LABEL` so the estimate-table sentinel (producer in `estimate.py`, comparator in `cli.py`) can no longer drift apart; JSON `results[].model` stays `null`.
+*   **Antigravity `--model` footgun closed.** `_build_cli_command` no longer injects `--model` for the `antigravity` family (`agy` has no model flag); a model pinned via `--tier`/`modes.model_overrides` is now silently ignored rather than producing a broken invocation.
+*   **Verified, not changed:** `model:` IS already enforced for `type:cli` (the diagnosis that prompted this release was black-box and wrong on that point) — when set, `_build_cli_command` injects `--model <id>` (or `exec -m <id>` for codex) and `result.model` carries the requested id. Documented in CLAUDE.md + README.
+
+**Docs**
+*   Documented the ambient-environment bleed (sieve env mode passes non-secret host vars like `GEMINI_MODEL`/`ANTHROPIC_MODEL`/`*_BASE_URL` straight through, silently steering a native CLI's model/endpoint) and the existing per-peer `env_strict: true` remedy.
+*   Documented that the mandatory `RECOMMENDATION:` label costs one repair-retry round-trip on non-vote/trivial prompts, and the per-peer `retry_on_missing_label: false` / `require_recommendation: false` opt-outs (for genuinely non-vote peers only — the label is the load-bearing vote contract).
+
+**Tests**
+*   +3: an estimate-table sentinel guard (a `model=None` CLI peer renders the peer NAME, proving producer/comparator stay in sync), an honest-transcript model-line assertion, and an antigravity no-`--model` guard.
+
 ## 0.13.0 - 2026-05-28
 
 v0.13.0 lands a batch of fixes from a multi-dimension self-review (35 verified findings). Theme: close correctness/safety gaps where a field or config key was added to the data model but the validation, serialization, or concurrency discipline that should accompany it lagged behind.

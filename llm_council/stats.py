@@ -12,11 +12,17 @@ import time
 from pathlib import Path
 from typing import Any
 
+from llm_council import display
 from llm_council.deliberation import recommendation_label
-from llm_council.transcript import _existing_paths, result_round
+from llm_council.transcript import iter_run_json, result_round
 
 
 _LABELS = ("yes", "no", "tradeoff", "unknown")
+
+
+def _base_peer_name(name, *, fallback="unknown"):
+    base = (name or "").split(":round")[0].split(":rank")[0]
+    return (base or fallback) if fallback is not None else base
 # Subset of the response envelope we track presence-of for the optional→required
 # rollout decision. List fields count as "present" only when non-empty; scalars
 # count when non-null. Keep this in sync with the envelope contract in adapters.
@@ -60,16 +66,9 @@ def load_transcript_files(base_dir: Path) -> list[dict[str, Any]]:
     Records are sorted oldest-first. Unreadable / malformed files are skipped
     silently, mirroring `transcript.transcript_records`.
     """
-    records: list[dict[str, Any]] = []
-    for path, mtime in sorted(
-        _existing_paths(base_dir.glob("*.json")), key=lambda item: item[1]
-    ):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        records.append({"path": str(path), "mtime": mtime, "data": data})
-    return records
+    return [
+        {"path": str(p), "mtime": m, "data": d} for p, m, d in iter_run_json(base_dir)
+    ]
 
 
 def _final_round_only(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -208,7 +207,7 @@ def aggregate(
             # Strip both `:round\d+` (deliberation) and `:rank` (cross-rank)
             # so a peer's ranking-pass cost/tokens/latency fold into its own
             # row instead of a phantom `<peer>:rank` participant.
-            name = raw_name.split(":round")[0].split(":rank")[0] or "unknown"
+            name = _base_peer_name(raw_name)
             bucket = peers.setdefault(name, _new_peer_bucket())
             elapsed = result.get("elapsed_seconds")
             if elapsed is not None:
@@ -237,7 +236,7 @@ def aggregate(
         seen_in_transcript: set[str] = set()
         for result in final_results:
             raw_name = result.get("name") or ""
-            name = raw_name.split(":round")[0].split(":rank")[0] or "unknown"
+            name = _base_peer_name(raw_name)
             if name in seen_in_transcript:
                 continue
             seen_in_transcript.add(name)
@@ -590,7 +589,7 @@ def _final_round_record_for_peer(
     final = _final_round_only(results)
     for record in final:
         raw = record.get("name") or ""
-        name = raw.split(":round")[0].split(":rank")[0]
+        name = _base_peer_name(raw, fallback=None)
         if name == peer:
             return record
     return None
@@ -644,7 +643,7 @@ def aggregate_reliability(
             # Strip both `:round\d+` (deliberation) and `:rank`
             # (v0.9.0 cross-rank pass) suffixes so the bucket merges
             # by primary peer identity.
-            name = raw_name.split(":round")[0].split(":rank")[0] or "unknown"
+            name = _base_peer_name(raw_name)
             if not name:
                 continue
             bucket = peers.setdefault(name, _empty_reliability_bucket())
@@ -867,13 +866,7 @@ def _fmt_tokens(value: int | None) -> str:
 
 
 def _fmt_cost(value: float | None) -> str:
-    if value is None:
-        return "n/a"
-    if value == 0:
-        return "$0"
-    if value < 0.001:
-        return f"${value:.6f}"
-    return f"${value:.4f}"
+    return display.format_usd(value)
 
 
 def _fmt_last_used(epoch: float | None) -> str:

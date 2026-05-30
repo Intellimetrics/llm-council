@@ -454,6 +454,28 @@ def test_build_cli_command_codex_without_exec_in_args_still_emits_canonical_pair
     assert cmd[1:4] == ["exec", "-m", "gpt-5.1"]
 
 
+def test_build_cli_command_antigravity_never_injects_model_flag():
+    """antigravity (`agy`) has NO --model flag. A user who pins agy's model
+    via --tier / modes.model_overrides must NOT get a broken `--model <id>`
+    invocation — the flag is silently skipped for family='antigravity', but
+    the shipped agy args are still emitted intact."""
+    from llm_council.adapters import _build_cli_command
+
+    cfg = {
+        "command": "agy",
+        "family": "antigravity",
+        "args": ["--print", "--sandbox", "-"],
+        # A pinned model that would otherwise trigger `--model` injection.
+        "model": "gemini-3.0-pro",
+    }
+    cmd = _build_cli_command("antigravity", cfg, "p", Path("/tmp"))
+    # No --model token and no leaked model id anywhere in the command.
+    assert "--model" not in cmd
+    assert "gemini-3.0-pro" not in cmd
+    # The shipped antigravity args survive unchanged.
+    assert cmd == ["agy", "--print", "--sandbox", "-"]
+
+
 def test_image_mime_allowlist_covers_common_image_types():
     assert {"image/png", "image/jpeg", "image/webp", "image/gif"} <= IMAGE_MIME_ALLOWLIST
     assert "image/svg+xml" not in IMAGE_MIME_ALLOWLIST
