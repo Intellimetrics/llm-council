@@ -39,6 +39,19 @@ def transcript_paths(base_dir: Path, question: str) -> tuple[Path, Path]:
     return base_dir / f"{stem}.md", base_dir / f"{stem}.json"
 
 
+def transcript_dir(cwd: Path, config: dict) -> Path:
+    """Resolve the transcripts directory from config, anchored at ``cwd``.
+
+    Single source of truth for the previously-inlined copies across
+    ``mcp_server.py`` and ``cli.py`` (the
+    ``Path(config.get("transcripts_dir", ".llm-council/runs"))`` +
+    relative-to-cwd resolution pattern).
+    """
+
+    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
+    return out_dir if out_dir.is_absolute() else cwd / out_dir
+
+
 _RUN_ID_RE = re.compile(r"^\d{8}_\d{6}")
 
 
@@ -189,11 +202,8 @@ def _strip_recommendation_from_summary(summary: str) -> str:
 def _select_final_round_records(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not results:
         return []
-    rounds = []
-    for result in results:
-        match = ROUND_SUFFIX_RE.search(str(result.get("name") or ""))
-        rounds.append(int(match.group(1)) if match else 1)
-    final_round = max(rounds) if rounds else 1
+    rounds = [result_round(str(r.get("name") or "")) for r in results]
+    final_round = max(rounds)
     return [
         result
         for result, round_no in zip(results, rounds)
@@ -342,8 +352,18 @@ def _existing_paths(paths) -> list[tuple[Path, float]]:
     return existing
 
 
-def transcript_records(base_dir: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
+def iter_run_json(base_dir: Path) -> list[tuple[Path, float, dict]]:
+    """Mtime-sorted ``(path, mtime, data)`` for every readable run JSON.
+
+    Shared scan over ``base_dir/*.json`` (mirrors
+    ``stats.load_transcript_files``): each file is stat'd via
+    ``_existing_paths``, then read with ``json.loads``; unreadable or
+    malformed files are skipped. Unlike ``_load_transcript_json`` this
+    never raises and does not enforce ``dict`` shape or set ``_path`` —
+    those guarantees are intentionally reserved for the by-id loader.
+    """
+
+    rows: list[tuple[Path, float, dict]] = []
     for path, mtime in sorted(
         _existing_paths(base_dir.glob("*.json")), key=lambda item: item[1]
     ):
@@ -351,6 +371,14 @@ def transcript_records(base_dir: Path) -> list[dict[str, Any]]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
+        rows.append((path, mtime, data))
+    return rows
+
+
+def transcript_records(base_dir: Path) -> list[dict[str, Any]]:
+    # Mirrors stats.load_transcript_files's scan via the shared iter_run_json.
+    records: list[dict[str, Any]] = []
+    for path, mtime, data in iter_run_json(base_dir):
         results = data.get("results") or []
         records.append(
             {
@@ -771,7 +799,7 @@ def write_transcript(
             [
                 f"### {result.name} ({status}){cache_tag}",
                 "",
-                f"- Model: `{result.model or 'cli default'}`",
+                f"- Model: `{result.model or 'cli default (unreported)'}`",
                 f"- Elapsed: `{result.elapsed_seconds:.1f}s`",
             ]
         )
@@ -962,38 +990,25 @@ def write_transcript(
             )
     markdown_path.write_text("\n".join(lines), encoding="utf-8")
 
-    # `finding_matrix` lives at the TOP level of the JSON payload for
-    # downstream consumers (eval harness, dashboards). We extract it
-    # from `metadata` and remove it there to avoid double-serialization
-    # (the same dict appearing under both `metadata.finding_matrix` and
-    # `json_payload.finding_matrix`).
-    finding_matrix_payload = None
-    if isinstance(metadata, dict) and "finding_matrix" in metadata:
-        # Shallow copy so the in-memory `metadata` mutation does not
-        # surprise the caller (orchestrator continues to use its own
-        # reference after `write_transcript` returns).
-        metadata = dict(metadata)
-        finding_matrix_payload = metadata.pop("finding_matrix")
-    # v0.9.0 Feature 2: cross-rank scores and the anonymization map
-    # are lifted to the top level (mirroring finding_matrix). Omitted
-    # entirely when no `--cross-rank` pass ran. Both fields are
-    # popped from metadata to avoid double-serialization.
-    cross_rank_scores_payload = None
-    anonymization_map_payload = None
-    anonymization_map_reverse_payload = None
-    cross_rank_rankings_payload = None
-    if isinstance(metadata, dict) and "cross_rank_scores" in metadata:
-        metadata = dict(metadata)
-        cross_rank_scores_payload = metadata.pop("cross_rank_scores")
-    if isinstance(metadata, dict) and "anonymization_map" in metadata:
-        metadata = dict(metadata)
-        anonymization_map_payload = metadata.pop("anonymization_map")
-    if isinstance(metadata, dict) and "anonymization_map_reverse" in metadata:
-        metadata = dict(metadata)
-        anonymization_map_reverse_payload = metadata.pop("anonymization_map_reverse")
-    if isinstance(metadata, dict) and "cross_rank_rankings" in metadata:
-        metadata = dict(metadata)
-        cross_rank_rankings_payload = metadata.pop("cross_rank_rankings")
+    # These keys live at the TOP level of the JSON payload for downstream
+    # consumers (eval harness, dashboards). We extract them from `metadata`
+    # and remove them there to avoid double-serialization (the same dict
+    # appearing under both `metadata.<key>` and `json_payload.<key>`).
+    # v0.9.0 Feature 2: cross-rank scores and the anonymization map are
+    # lifted alongside finding_matrix; all are omitted entirely when the
+    # producing pass (findings / `--cross-rank`) did not run.
+    # Shallow copy so the in-memory `metadata` mutation does not surprise
+    # the caller (orchestrator continues to use its own reference after
+    # `write_transcript` returns).
+    metadata = dict(metadata)
+    LIFTED_KEYS = (
+        "finding_matrix",
+        "cross_rank_scores",
+        "anonymization_map",
+        "anonymization_map_reverse",
+        "cross_rank_rankings",
+    )
+    lifted = {k: metadata.pop(k) for k in LIFTED_KEYS if k in metadata}
 
     json_payload: dict[str, Any] = {
         "question": question,
@@ -1013,19 +1028,23 @@ def write_transcript(
     overflow_records = context_overflow_records(results)
     if overflow_records:
         json_payload["context_overflow_excluded"] = overflow_records
+    finding_matrix_payload = lifted.get("finding_matrix")
     if isinstance(finding_matrix_payload, dict) and (
         finding_matrix_payload.get("consensus_blockers")
         or finding_matrix_payload.get("single_peer_concerns")
     ):
         # Mirrors the shape used in MCP `structured_results`.
         json_payload["finding_matrix"] = finding_matrix_payload
+    cross_rank_scores_payload = lifted.get("cross_rank_scores")
     if isinstance(cross_rank_scores_payload, dict) and cross_rank_scores_payload:
         json_payload["cross_rank_scores"] = cross_rank_scores_payload
+    anonymization_map_payload = lifted.get("anonymization_map")
     if (
         isinstance(anonymization_map_payload, dict)
         and anonymization_map_payload
     ):
         json_payload["anonymization_map"] = anonymization_map_payload
+    anonymization_map_reverse_payload = lifted.get("anonymization_map_reverse")
     if (
         isinstance(anonymization_map_reverse_payload, dict)
         and anonymization_map_reverse_payload
@@ -1033,6 +1052,7 @@ def write_transcript(
         json_payload["anonymization_map_reverse"] = (
             anonymization_map_reverse_payload
         )
+    cross_rank_rankings_payload = lifted.get("cross_rank_rankings")
     if (
         isinstance(cross_rank_rankings_payload, dict)
         and cross_rank_rankings_payload

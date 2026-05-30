@@ -134,6 +134,40 @@ def _chunk_tail(diff: str, *, budget: int) -> ChunkResult:
     )
 
 
+def _greedy_admit(
+    items: list[tuple[int, str, object]],
+    *,
+    budget: int,
+    sep: str,
+) -> tuple[list[object], list[str], int]:
+    """Greedily admit pre-scored items while staying under ``budget`` chars.
+
+    ``items`` is an ordered (already sorted by relevance) list of
+    ``(length, drop_label, payload)`` tuples where ``length`` is the
+    character cost of the item, ``drop_label`` is the path-or-placeholder
+    recorded when the item is dropped, and ``payload`` is the opaque value
+    the caller wants back for admitted items. Returns
+    ``(accepted_payloads, dropped_labels, used)`` where ``used`` is the
+    running char total of everything admitted (including ``sep`` between
+    items). Behavior is identical to the inline loops it replaces: the
+    first admitted item costs ``length``; each subsequent admitted item
+    costs ``length + len(sep)``; an item that would push ``used`` over
+    ``budget`` is skipped (its label recorded) and the scan continues.
+    """
+
+    accepted: list[object] = []
+    dropped_labels: list[str] = []
+    used = 0
+    for length, drop_label, payload in items:
+        addition = length + (len(sep) if accepted else 0)
+        if used + addition > budget:
+            dropped_labels.append(drop_label)
+            continue
+        accepted.append(payload)
+        used += addition
+    return accepted, dropped_labels, used
+
+
 def _chunk_hash_aware(diff: str, *, budget: int, question: str) -> ChunkResult:
     """Split on per-file ``diff --git`` boundaries and keep highest-relevance hunks.
 
@@ -171,16 +205,14 @@ def _chunk_hash_aware(diff: str, *, budget: int, question: str) -> ChunkResult:
     scored.sort(key=lambda row: (row[0], row[1], row[2]))
 
     sep = "\n"
-    accepted: list[tuple[int, _Hunk]] = []
-    used = 0
-    dropped_files: list[str] = []
-    for _priority, length, _idx, original_index, hunk in scored:
-        addition = length + (len(sep) if accepted else 0)
-        if used + addition > budget:
-            dropped_files.append(hunk.path or "<unparsed>")
-            continue
-        accepted.append((original_index, hunk))
-        used += addition
+    admit_items: list[tuple[int, str, object]] = [
+        (length, hunk.path or "<unparsed>", (original_index, hunk))
+        for _priority, length, _idx, original_index, hunk in scored
+    ]
+    accepted_payloads, dropped_files, _used = _greedy_admit(
+        admit_items, budget=budget, sep=sep
+    )
+    accepted: list[tuple[int, _Hunk]] = list(accepted_payloads)  # type: ignore[arg-type]
 
     if not accepted:
         # Budget too small for even the smallest whole-file block: head-truncate
@@ -468,16 +500,15 @@ def chunk_context_files(
 
     scored.sort(key=lambda row: (row[0], row[1], row[2]))
 
-    accepted: list[tuple[int, str, str]] = []  # (original_index, path, text)
-    used = 0
-    dropped_files: list[str] = list(oversize_files)
-    for _priority, length, original_index, path, text in scored:
-        addition = length + (len(sep) if accepted else 0)
-        if used + addition > budget:
-            dropped_files.append(path or "<unknown>")
-            continue
-        accepted.append((original_index, path, text))
-        used += addition
+    admit_items: list[tuple[int, str, object]] = [
+        (length, path or "<unknown>", (original_index, path, text))
+        for _priority, length, original_index, path, text in scored
+    ]
+    accepted_payloads, admit_dropped, used = _greedy_admit(
+        admit_items, budget=budget, sep=sep
+    )
+    accepted: list[tuple[int, str, str]] = list(accepted_payloads)  # type: ignore[arg-type]
+    dropped_files: list[str] = list(oversize_files) + admit_dropped
 
     accepted.sort(key=lambda row: row[0])
     sections = [text for _idx, _path, text in accepted]

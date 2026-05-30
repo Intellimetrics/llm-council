@@ -46,7 +46,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
-from llm_council.convergence import tokenize
+from llm_council.convergence import jaccard_similarity, tokenize
 
 # Threshold for claim-text overlap. Tuned for the kind of short claim
 # strings fixtures carry (e.g. "missing tenant filter" vs "tenant filter
@@ -99,9 +99,7 @@ def _emitted_matches_expected(emitted: str, expected: dict[str, Any]) -> bool:
         emitted_tokens = tokenize(emitted_text)
         claim_tokens = tokenize(claim)
         if emitted_tokens and claim_tokens:
-            inter = len(emitted_tokens & claim_tokens)
-            union = len(emitted_tokens | claim_tokens)
-            if union > 0 and (inter / union) >= MATCH_JACCARD_THRESHOLD:
+            if jaccard_similarity(emitted_tokens, claim_tokens) >= MATCH_JACCARD_THRESHOLD:
                 return True
 
     return False

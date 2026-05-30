@@ -46,6 +46,7 @@ from llm_council.transcript import (
     format_prior_council_context,
     latest_transcript,
     normalize_run_id,
+    transcript_dir,
     transcript_paths,
     write_transcript,
 )
@@ -969,9 +970,7 @@ async def run_council(
         include=arguments.get("include"),
         origin_policy=arguments.get("origin_policy"),
     )
-    transcripts_root = Path(config.get("transcripts_dir", ".llm-council/runs"))
-    if not transcripts_root.is_absolute():
-        transcripts_root = cwd / transcripts_root
+    transcripts_root = transcript_dir(cwd, config)
     md_path, json_path = transcript_paths(transcripts_root, question)
     parent_run_id: str | None = None
     prior_context: str | None = None
@@ -1365,15 +1364,21 @@ async def run_council(
         deliberated=bool(metadata.get("deliberated")),
         rounds=int(metadata.get("rounds") or 1),
     )
+    # Shared "pop key from metadata and lift its value to the top-level
+    # payload" pattern. Returns the (possibly copied) metadata plus the
+    # lifted value, preserving the historical `metadata.pop(key) or default`
+    # fallback so a key whose value is falsy collapses to `default`.
+    def _lift(meta: Any, key: str, default: Any) -> tuple[Any, Any]:
+        if isinstance(meta, dict) and key in meta:
+            meta = dict(meta)
+            return meta, (meta.pop(key) or default)
+        return meta, default
+
     # `finding_matrix` is lifted to the top-level `consensus_blockers` /
     # `single_peer_concerns` keys below. Strip it from `metadata` before
     # surfacing the payload so the same data is not serialized in two
     # places (metadata.finding_matrix AND the top-level lists).
-    if isinstance(metadata, dict) and "finding_matrix" in metadata:
-        metadata = dict(metadata)
-        finding_matrix_payload = metadata.pop("finding_matrix") or {}
-    else:
-        finding_matrix_payload = {}
+    metadata, finding_matrix_payload = _lift(metadata, "finding_matrix", {})
     consensus_blockers = list(finding_matrix_payload.get("consensus_blockers") or [])
     single_peer_concerns = list(finding_matrix_payload.get("single_peer_concerns") or [])
     # Mirror the finding-matrix pattern for quota-throttled peers: lift
@@ -1381,28 +1386,16 @@ async def run_council(
     # top-level payload key so a calling agent (e.g. Claude Code) can
     # spot rate-limited peers without parsing per-result `error_kind`
     # fields. Strip from metadata to avoid double-serialization.
-    if isinstance(metadata, dict) and "quota_throttled_peers" in metadata:
-        metadata = dict(metadata)
-        quota_throttled_peers = list(metadata.pop("quota_throttled_peers") or [])
-    else:
-        quota_throttled_peers = []
+    metadata, quota_throttled_peers = _lift(metadata, "quota_throttled_peers", [])
     # Phase 2 parallel: quota recoveries. Lifted with the same pattern so
     # the operator can see "this peer hit quota but recovered via fallback
     # to <model>" without parsing per-result fields.
-    if isinstance(metadata, dict) and "quota_recoveries" in metadata:
-        metadata = dict(metadata)
-        quota_recoveries = list(metadata.pop("quota_recoveries") or [])
-    else:
-        quota_recoveries = []
+    metadata, quota_recoveries = _lift(metadata, "quota_recoveries", [])
     # v0.12.0: peers dropped before the run because their api_key_env was
     # unset. Lifted top-level so the operator gets a "you forgot to set
     # X env var" signal without parsing per-result errors (the peer
     # never produced a result — it was excluded pre-run).
-    if isinstance(metadata, dict) and "missing_key_peers" in metadata:
-        metadata = dict(metadata)
-        missing_key_peers = list(metadata.pop("missing_key_peers") or [])
-    else:
-        missing_key_peers = []
+    metadata, missing_key_peers = _lift(metadata, "missing_key_peers", [])
     payload: dict[str, Any] = {
         "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
         "recommendation": recommendation,
@@ -1432,36 +1425,21 @@ async def run_council(
     # empty array on every run.
     if quota_throttled_peers:
         payload["quota_throttled_peers"] = quota_throttled_peers
-        # Re-anchor `payload["metadata"]` only when the metadata-pop
-        # branch above actually mutated `metadata` (i.e., the key existed
-        # in the first place). The plain-dict assignment is safe even if
-        # this branch is a no-op for a given run.
-        payload["metadata"] = metadata
     if quota_recoveries:
         payload["quota_recoveries"] = quota_recoveries
-        payload["metadata"] = metadata
     if missing_key_peers:
         payload["missing_key_peers"] = missing_key_peers
-        payload["metadata"] = metadata
     # v0.9.0 Feature 2: lift cross-rank fields to the top-level payload
     # mirroring finding_matrix. Strip them from metadata to avoid
     # double-serialization (same data appearing under metadata.* AND
     # top-level keys).
-    if isinstance(metadata, dict) and "cross_rank_scores" in metadata:
-        metadata = dict(metadata)
-        cross_rank_scores_out = metadata.pop("cross_rank_scores") or {}
-    else:
-        cross_rank_scores_out = {}
-    if isinstance(metadata, dict) and "anonymization_map" in metadata:
-        metadata = dict(metadata)
-        anonymization_map_out = metadata.pop("anonymization_map") or {}
-    else:
-        anonymization_map_out = {}
-    # Re-anchor the payload's metadata reference if we just mutated it
-    # in this block — without this the popped keys still appear in
-    # `payload["metadata"]` (the original reference).
-    if cross_rank_scores_out or anonymization_map_out:
-        payload["metadata"] = metadata
+    metadata, cross_rank_scores_out = _lift(metadata, "cross_rank_scores", {})
+    metadata, anonymization_map_out = _lift(metadata, "anonymization_map", {})
+    # Anchor the payload's metadata reference to the fully-popped dict.
+    # `metadata` may have been copied/mutated by any of the lifts above
+    # (pre- and post-payload); a single assignment here keeps
+    # `payload["metadata"]` in sync without per-key re-anchors.
+    payload["metadata"] = metadata
     if cross_rank_scores_out:
         payload["cross_rank_scores"] = cross_rank_scores_out
     if anonymization_map_out:
@@ -1473,9 +1451,7 @@ def last_transcript(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
     config = load_config(find_config(cwd), search=False)
-    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
-    if not out_dir.is_absolute():
-        out_dir = cwd / out_dir
+    out_dir = transcript_dir(cwd, config)
     path = latest_transcript(out_dir, suffix=".json" if arguments.get("format") == "json" else ".md")
     if path is None:
         return {"found": False, "path": None, "content": ""}
@@ -1575,9 +1551,7 @@ def run_stats(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
     config = load_config(find_config(cwd), search=False)
-    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
-    if not out_dir.is_absolute():
-        out_dir = cwd / out_dir
+    out_dir = transcript_dir(cwd, config)
     since_days = arguments.get("since_days")
     if since_days is not None:
         since_days = int(since_days)
@@ -1615,9 +1589,7 @@ def query_transcripts(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
     load_project_env(cwd)
     config = load_config(find_config(cwd), search=False)
-    out_dir = Path(config.get("transcripts_dir", ".llm-council/runs"))
-    if not out_dir.is_absolute():
-        out_dir = cwd / out_dir
+    out_dir = transcript_dir(cwd, config)
     query_text = arguments.get("query")
     if not isinstance(query_text, str) or not query_text.strip():
         raise ValueError("query must be a non-empty string")

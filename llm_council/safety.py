@@ -66,6 +66,29 @@ def _is_allowlisted(value: str, allowlist: list[re.Pattern[str]]) -> bool:
     return any(pat.search(value) for pat in allowlist)
 
 
+def _iter_secret_matches(text: str, allowlist: list[re.Pattern[str]]):
+    """Yield ``(kind, match)`` for every non-allowlisted pattern hit in ``text``.
+
+    Iterates ``_PATTERNS`` in order and ``pattern.finditer`` in order, applying
+    the ``_is_allowlisted`` filter. Both :func:`scan_prompt_for_secrets` and
+    :func:`redact_secrets` consume this so the match set, ordering, and
+    allowlist filtering stay identical between them.
+    """
+    for kind, pattern in _PATTERNS:
+        for match in pattern.finditer(text):
+            if _is_allowlisted(match.group(0), allowlist):
+                continue
+            yield kind, match
+
+
+def _tally_kinds(findings: list[dict[str, Any]]) -> dict[str, int]:
+    """Tally findings by ``kind`` into a ``{kind: count}`` dict."""
+    kinds: dict[str, int] = {}
+    for f in findings:
+        kinds[f["kind"]] = kinds.get(f["kind"], 0) + 1
+    return kinds
+
+
 def scan_prompt_for_secrets(
     prompt: str,
     *,
@@ -84,22 +107,19 @@ def scan_prompt_for_secrets(
     allowlist = _load_allowlist(cwd or Path("."), allowlist_filename)
     findings: list[dict[str, Any]] = []
     lines = prompt.splitlines()
-    for kind, pattern in _PATTERNS:
-        for match in pattern.finditer(prompt):
-            value = match.group(0)
-            if _is_allowlisted(value, allowlist):
-                continue
-            line_number = prompt.count("\n", 0, match.start()) + 1
-            preview = value[:4] + "..." + value[-4:] if len(value) > 12 else "***"
-            findings.append(
-                {
-                    "kind": kind,
-                    "line": line_number,
-                    "preview": preview,
-                    # NEVER include the raw value; this dict is safe to log
-                    # and to embed in transcript metadata.
-                }
-            )
+    for kind, match in _iter_secret_matches(prompt, allowlist):
+        value = match.group(0)
+        line_number = prompt.count("\n", 0, match.start()) + 1
+        preview = value[:4] + "..." + value[-4:] if len(value) > 12 else "***"
+        findings.append(
+            {
+                "kind": kind,
+                "line": line_number,
+                "preview": preview,
+                # NEVER include the raw value; this dict is safe to log
+                # and to embed in transcript metadata.
+            }
+        )
     # Stable ordering: by line, then by kind so transcript diffs are clean.
     findings.sort(key=lambda f: (f["line"], f["kind"]))
     return findings
@@ -125,11 +145,8 @@ def redact_secrets(
         return prompt, []
     allowlist = _load_allowlist(cwd or Path("."), allowlist_filename)
     spans: list[tuple[int, int, str]] = []
-    for kind, pattern in _PATTERNS:
-        for match in pattern.finditer(prompt):
-            if _is_allowlisted(match.group(0), allowlist):
-                continue
-            spans.append((match.start(), match.end(), kind))
+    for kind, match in _iter_secret_matches(prompt, allowlist):
+        spans.append((match.start(), match.end(), kind))
     if not spans:
         return prompt, []
     # Earliest start first; on equal starts the longest match wins so a shorter
@@ -189,22 +206,17 @@ def apply_secret_scan_policy(
         redacted, findings = redact_secrets(
             prompt, cwd=cwd, allowlist_filename=allowlist_filename
         )
-        kinds_r: dict[str, int] = {}
-        for f in findings:
-            kinds_r[f["kind"]] = kinds_r.get(f["kind"], 0) + 1
         return {
             "findings": findings,
             "detected_count": len(findings),
             "policy": "redact",
-            "kinds": kinds_r,
+            "kinds": _tally_kinds(findings),
             "redacted_prompt": redacted,
         }
     findings = scan_prompt_for_secrets(
         prompt, cwd=cwd, allowlist_filename=allowlist_filename
     )
-    kinds: dict[str, int] = {}
-    for f in findings:
-        kinds[f["kind"]] = kinds.get(f["kind"], 0) + 1
+    kinds = _tally_kinds(findings)
     payload = {
         "findings": findings,
         "detected_count": len(findings),

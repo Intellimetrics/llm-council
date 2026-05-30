@@ -150,11 +150,7 @@ def iter_outcomes(cwd: Path) -> Iterator[OutcomeRecord]:
         return
     records: list[OutcomeRecord] = []
     for path in target.glob("*.json"):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        record = OutcomeRecord.from_payload(payload)
+        record = read_outcome(cwd, path.stem)
         if record is not None:
             records.append(record)
     records.sort(key=lambda r: r.marked_at, reverse=True)

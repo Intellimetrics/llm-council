@@ -474,6 +474,29 @@ def _is_private_ip(ip: ipaddress._BaseAddress) -> bool:
     )
 
 
+def _parse_base_url_host(
+    base_url: str,
+) -> tuple[str, ipaddress._BaseAddress | None] | None:
+    """Shared prefix of :func:`is_loopback_base_url` / :func:`is_local_base_url`.
+
+    Parses `base_url`, extracts and normalizes the host, and parses any IP
+    literal. Returns `(normalized_host, ip_literal_or_None)` or `None` when the
+    URL is not a non-empty string, fails to parse, or has no hostname. Callers
+    apply their own loopback-hostname and IP classification on the result.
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
+        return None
+    try:
+        parsed = urlparse(base_url.strip())
+    except ValueError:
+        return None
+    host = parsed.hostname
+    if not host:
+        return None
+    normalized = host.lower().rstrip(".")
+    return normalized, _parse_ip_literal(host)
+
+
 def is_loopback_base_url(base_url: str) -> bool:
     """True iff `base_url` points at the loopback interface.
 
@@ -483,19 +506,12 @@ def is_loopback_base_url(base_url: str) -> bool:
     pre-flight ping where a 1s timeout is reasonable for loopback but
     can false-fail homelab/VPN servers on a slower LAN link.
     """
-    if not isinstance(base_url, str) or not base_url.strip():
+    parsed = _parse_base_url_host(base_url)
+    if parsed is None:
         return False
-    try:
-        parsed = urlparse(base_url.strip())
-    except ValueError:
-        return False
-    host = parsed.hostname
-    if not host:
-        return False
-    normalized = host.lower().rstrip(".")
+    normalized, literal = parsed
     if normalized in _LOOPBACK_HOSTNAMES:
         return True
-    literal = _parse_ip_literal(host)
     if literal is None:
         return False
     # is_loopback covers 127.0.0.0/8 and ::1; is_unspecified covers 0.0.0.0
@@ -515,21 +531,14 @@ def is_local_base_url(base_url: str) -> bool:
     omit a participant from a local-only run than to silently include a peer
     we cannot prove is on-prem.
     """
-    if not isinstance(base_url, str) or not base_url.strip():
+    parsed = _parse_base_url_host(base_url)
+    if parsed is None:
         return False
-    try:
-        parsed = urlparse(base_url.strip())
-    except ValueError:
-        return False
-    host = parsed.hostname
-    if not host:
-        return False
-    normalized = host.lower().rstrip(".")
+    normalized, literal = parsed
     if not normalized:
         return False
     if normalized in _LOOPBACK_HOSTNAMES:
         return True
-    literal = _parse_ip_literal(host)
     if literal is not None:
         return _is_private_ip(literal)
     addresses, resolution_error = _resolve_host_addresses(normalized)

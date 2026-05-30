@@ -54,6 +54,53 @@ def summarize_preflight_caps(
     return cost_total, token_total, unpriced_paid
 
 
+def enforce_preflight_caps(
+    preflight: dict[str, Any],
+    *,
+    max_cost_usd: float | None,
+    max_tokens: int | None,
+    breakdown_hint: str,
+) -> None:
+    """Reproduce the three pre-flight budget-cap checks the CLI gates a run on.
+
+    Factored out of `cmd_estimate` / `cmd_run_async` (which inlined byte-for-byte
+    identical logic except for the cost-cap message's per-peer breakdown hint).
+    Reduces `preflight` via `summarize_preflight_caps` and raises `ValueError`
+    with the standard CLI message on the first violation:
+
+      1. `--max-cost-usd` requested but hosted peers have no catalog price,
+      2. estimated cost exceeds `--max-cost-usd`,
+      3. estimated tokens exceed `--max-tokens`.
+
+    `breakdown_hint` is interpolated into the cost-cap message — the only clause
+    that differed between the two call sites. Callers convert the raised
+    `ValueError` to `SystemExit`.
+    """
+    if max_cost_usd is None and max_tokens is None:
+        return
+    cost_total, token_total, unpriced_paid = summarize_preflight_caps(preflight)
+    if max_cost_usd is not None and unpriced_paid:
+        raise ValueError(
+            "Pre-flight estimate cannot enforce --max-cost-usd: hosted "
+            f"peer(s) without a catalog price: {', '.join(unpriced_paid)}. "
+            "Run `llm-council models openrouter` to confirm the model id, "
+            "or drop these peers, before relying on the cost cap."
+        )
+    if max_cost_usd is not None and cost_total > float(max_cost_usd):
+        raise ValueError(
+            f"Pre-flight estimate ${cost_total:.6f} (with worst-case "
+            f"repair-retry headroom) exceeds --max-cost-usd "
+            f"${float(max_cost_usd):.6f}. Free/local peers count as $0; "
+            f"{breakdown_hint}"
+        )
+    if max_tokens is not None and token_total > int(max_tokens):
+        raise ValueError(
+            f"Pre-flight estimate {token_total} tokens exceeds --max-tokens "
+            f"{int(max_tokens)}. Drop --diff/--context, narrow the question, "
+            "or raise the cap."
+        )
+
+
 def image_attachment_violations(
     manifest: list[dict[str, Any]],
     *,

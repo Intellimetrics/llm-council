@@ -5,7 +5,7 @@
 [![MCP](https://img.shields.io/badge/MCP-ready-2f855a)](docs/llm-council.md)
 [![Read-only](https://img.shields.io/badge/default-read--only-6b7280)](#read-only-safety)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.13.0-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.14.0-111827)](CHANGELOG.md)
 
 Your coding agent is incredibly fast, capable, and confident. 
 
@@ -122,6 +122,12 @@ LLM Council supports three classes of peer participants:
 1.  **Native CLIs**: Uses existing command-line interfaces installed on your machine (`claude`, `codex`, `agy`, or `gemini`).
 2.  **Hosted Models**: Integrates with remote APIs via **OpenRouter**.
 3.  **Local Models**: Communicates with local instances via **Ollama**.
+
+> **Native CLI model identity is not recorded.** Native CLI peers (`claude`, `codex`, `gemini`, `agy`) ship `model: None` by design so each runs under *your* account-default model. LLM Council cannot observe which concrete model the CLI actually ran, so the transcript shows `cli default (unreported)` and the JSON shows `null`. To record a model id, pin `participants.<peer>.model` (or use `--tier` / a mode's `model_overrides`) — LLM Council then passes `--model <id>` (or `exec -m <id>` for Codex) and `result.model` carries the *requested* id (not a server confirmation). **Do not pin `antigravity`'s model** — `agy` has no `--model` flag, so a pinned id is silently ignored.
+
+> **Ambient env can steer CLI peers.** By default non-secret host env vars pass through to native CLI peers, so an ambient export like `GEMINI_MODEL`, `ANTHROPIC_MODEL`, `OPENAI_MODEL`, or a `*_BASE_URL` can silently redirect a peer's model/endpoint. For deterministic, shell-independent peer routing, set `env_strict: true` on the peer — the child then sees only safe names (`PATH`/`HOME`/`LANG`/…) plus its own `env_passthrough` list.
+
+> **The `RECOMMENDATION:` label costs one retry.** Every peer response must carry a `RECOMMENDATION: yes|no|tradeoff` label; if the first response omits it, LLM Council does one repair-retry (an extra CLI round-trip), even on trivial prompts. The label is the vote contract that quorum, consensus, and findings depend on, so for a genuinely non-vote peer/prompt you can opt out per peer: `retry_on_missing_label: false` skips just the repair-retry, and `require_recommendation: false` drops the label requirement entirely.
 
 ### Dynamic Triad Resolution & Family Exclusions
 *   **The 3-CLI Triad**: The `tri-cli` preset dynamically selects exactly three active local CLIs. If both `antigravity` (`agy`) and `gemini` are installed, `llm-council` prioritizes `antigravity` as the active Gemini-family peer (it reaches the latest Gemini model — but note it is only *soft*, prompt-enforced read-only; see [Read-Only Safety](#read-only-safety), and pin `gemini` instead if you need the hard guarantee).
