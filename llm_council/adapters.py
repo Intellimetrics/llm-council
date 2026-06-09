@@ -653,11 +653,7 @@ def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -
 
     model = cfg.get("model")
     family = cfg.get("family", name)
-    # antigravity (`agy`) has NO --model flag — model is session-state only,
-    # so injecting `--model <id>` would produce a broken invocation. A user
-    # who pins agy's model via --tier / modes.model_overrides is silently
-    # ignored here (the only safe behavior) rather than handed a broken CLI.
-    if model and family != "antigravity":
+    if model:
         if family == "codex":
             # Codex's exec subcommand takes the model via `-m`; the default
             # args list starts with `exec` so we drop the duplicate when we
@@ -667,8 +663,15 @@ def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -
             if args and args[0] == "exec":
                 args = args[1:]
         else:
-            # claude, gemini, and any other family use the standard
-            # `--model <id>` flag.
+            # claude, gemini, antigravity, and any other family use the
+            # standard `--model <id>` flag. antigravity gained --model in
+            # agy 1.0.x ("Model for the current CLI session"), which also
+            # makes the quota fallback_chain walk effective for agy — the
+            # pre-1.0 "no --model flag" skip is retired. CAUTION: agy
+            # silently falls back to its session default on an unrecognized
+            # model string (no hard error), so config values must match
+            # `agy models` display names exactly (e.g.
+            # "Gemini 3.5 Flash (Medium)").
             command.extend(["--model", str(model)])
 
     # Claude's native `--fallback-model` flag: when the user-selected model

@@ -454,25 +454,41 @@ def test_build_cli_command_codex_without_exec_in_args_still_emits_canonical_pair
     assert cmd[1:4] == ["exec", "-m", "gpt-5.1"]
 
 
-def test_build_cli_command_antigravity_never_injects_model_flag():
-    """antigravity (`agy`) has NO --model flag. A user who pins agy's model
-    via --tier / modes.model_overrides must NOT get a broken `--model <id>`
-    invocation — the flag is silently skipped for family='antigravity', but
-    the shipped agy args are still emitted intact."""
+def test_build_cli_command_antigravity_injects_model_flag():
+    """antigravity (`agy`) gained `--model` in agy 1.0.x, so a pinned model
+    must be injected like any standard family — this is what makes both
+    model pinning AND the quota fallback_chain walk effective for agy.
+    (Inverts the pre-1.0 "never inject" regression test.) Model strings are
+    agy display names (e.g. "Gemini 3.5 Flash (Medium)") because agy
+    silently ignores unrecognized model ids."""
     from llm_council.adapters import _build_cli_command
 
     cfg = {
         "command": "agy",
         "family": "antigravity",
         "args": ["--print", "--sandbox", "-"],
-        # A pinned model that would otherwise trigger `--model` injection.
-        "model": "gemini-3.0-pro",
+        "model": "Gemini 3.5 Flash (Medium)",
     }
     cmd = _build_cli_command("antigravity", cfg, "p", Path("/tmp"))
-    # No --model token and no leaked model id anywhere in the command.
+    # The standard --model pair is injected ahead of the shipped args.
+    assert cmd[:3] == ["agy", "--model", "Gemini 3.5 Flash (Medium)"]
+    # The shipped antigravity args survive unchanged after the model pair.
+    assert cmd[3:] == ["--print", "--sandbox", "-"]
+
+
+def test_build_cli_command_antigravity_no_model_emits_bare_args():
+    """Without a pinned model the agy invocation stays exactly the shipped
+    args — no stray --model token."""
+    from llm_council.adapters import _build_cli_command
+
+    cfg = {
+        "command": "agy",
+        "family": "antigravity",
+        "args": ["--print", "--sandbox", "-"],
+        "model": None,
+    }
+    cmd = _build_cli_command("antigravity", cfg, "p", Path("/tmp"))
     assert "--model" not in cmd
-    assert "gemini-3.0-pro" not in cmd
-    # The shipped antigravity args survive unchanged.
     assert cmd == ["agy", "--print", "--sandbox", "-"]
 
 
