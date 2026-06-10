@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.14.1 - 2026-06-10
+
+*   **Antigravity `--model` injection restored.** `agy` 1.0.x gained a `--model <name>` flag, so the pre-1.0 `family=antigravity` skip in `_build_cli_command` is retired: a pinned model is injected like any standard family, which also makes the `fallback_chain` quota walk effective for agy (the walk rebuilds the command with the fallback model — previously a no-op because injection was skipped). Caveats documented in-code: agy model strings are `agy models` display names (e.g. `Gemini 3.5 Flash (Medium)`), and agy silently falls back to its session default on an unrecognized string (exit 0, no error).
+*   *(Release-hygiene note: this entry, the `__version__` bump in `llm_council/__init__.py`, and the README badge were back-filled post-tag — the v0.14.1 release commit only bumped `pyproject.toml`, which `test_package_version_matches_pyproject` caught.)*
+
 ## 0.14.0 - 2026-05-30
 
 v0.14.0 is a code-quality batch (a whole-codebase simplification pass — 39 adversarially-verified findings) plus an honesty fix for CLI-peer model reporting. No new features and no breaking changes; the one user-visible behavior change is the transcript/list model placeholder wording. This continues (and partially closes) the "CLI/MCP pipeline de-duplication" thread flagged as deferred in 0.13.0.
