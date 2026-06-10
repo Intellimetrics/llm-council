@@ -647,13 +647,21 @@ def test_preflight_synthesized_result_carries_model():
     assert result.model == "Qwen/Qwen3.6-27B"
 
 
-def test_mcp_error_kind_schema_includes_preflight_failed():
-    """v0.4.9: classify_error returns 'preflight_failed', so the MCP
-    schema must list it, otherwise schema-driven callers reject valid
-    output."""
+def test_mcp_error_kind_schema_matches_classifier_kinds():
+    """classify_error's full range must be advertised in the MCP output
+    schema, otherwise schema-driven callers reject valid output. Asserts
+    full parity rather than spot membership: v0.4.9 caught
+    'preflight_failed' missing, then 'quota_exhausted' (added v0.11.6)
+    slipped through because the old test only checked one member."""
+    from llm_council import adapters
     from llm_council.mcp_server import COUNCIL_RUN_VALID_ERROR_KINDS
 
-    assert "preflight_failed" in COUNCIL_RUN_VALID_ERROR_KINDS
+    classifier_kinds = {
+        value
+        for name, value in vars(adapters).items()
+        if name.startswith("ERROR_KIND_")
+    }
+    assert set(COUNCIL_RUN_VALID_ERROR_KINDS) == classifier_kinds
 
 
 def test_mcp_run_doctor_surfaces_config_warnings(tmp_path: Path, monkeypatch):

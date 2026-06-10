@@ -67,7 +67,10 @@ def council_run_schema() -> dict[str, Any]:
                 "type": "string",
                 "description": _mode_description(),
             },
-            "current": {"type": "string", "enum": ["claude", "codex", "gemini"]},
+            "current": {
+                "type": "string",
+                "enum": ["claude", "codex", "gemini", "antigravity"],
+            },
             "participants": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -235,6 +238,7 @@ COUNCIL_RUN_VALID_ERROR_KINDS = (
     "abdicated",
     "incomplete_response",
     "untagged_evidence",
+    "quota_exhausted",
     "unknown",
 )
 
@@ -738,7 +742,10 @@ def estimate_schema() -> dict[str, Any]:
                 "type": "string",
                 "description": _mode_description(),
             },
-            "current": {"type": "string", "enum": ["claude", "codex", "gemini"]},
+            "current": {
+                "type": "string",
+                "enum": ["claude", "codex", "gemini", "antigravity"],
+            },
             "participants": {
                 "type": "array",
                 "items": {"type": "string"},
