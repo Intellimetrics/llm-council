@@ -876,6 +876,23 @@ def write_transcript(
             )
             lines.append("")
 
+    # H2 independence warning (advisory-only). Rendered near the quorum /
+    # degraded summary; only present when the orchestrator fired it. Does
+    # NOT affect quorum/degraded — purely informational.
+    independence_warning = metadata.get("independence_warning")
+    if isinstance(independence_warning, dict):
+        distinct = independence_warning.get("distinct_vendors")
+        required = independence_warning.get("required")
+        families = independence_warning.get("families") or []
+        labeled = independence_warning.get("labeled_quorum")
+        lines.append(
+            f"- ⚠️ Independence warning: all {labeled} labeled vote(s) came "
+            f"from {distinct} vendor family/families "
+            f"(families: {', '.join(families) if families else '—'}); "
+            f"required ≥ {required} distinct. Same-vendor agreement may "
+            "overstate independent corroboration."
+        )
+
     finding_matrix_md = metadata.get("finding_matrix")
     if isinstance(finding_matrix_md, dict) and (
         finding_matrix_md.get("consensus_blockers")

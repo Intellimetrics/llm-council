@@ -248,6 +248,10 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(f"Mode '{name}' origin_policy must be 'any' or 'us'")
         _validate_positive_int(mode, "max_rounds", f"mode '{name}'")
         _validate_positive_int(mode, "min_quorum", f"mode '{name}'")
+        # H2 independence warning: optional per-mode override of the
+        # distinct-vendor floor. Advisory-only; must be a positive integer
+        # when present (absent = feature off for this mode).
+        _validate_positive_int(mode, "require_distinct_vendors", f"mode '{name}'")
         # timeout_multiplier is layered onto the per-participant base timeout in
         # _resolve_effective_timeout. A non-numeric value (e.g. "fast") used to
         # pass load and then raise an uncaught ValueError mid-run, after
@@ -310,6 +314,9 @@ def validate_config(config: dict[str, Any]) -> None:
     _validate_positive_int(defaults, "max_deliberation_rounds", "defaults")
     _validate_positive_int(defaults, "max_prompt_chars", "defaults")
     _validate_positive_int(defaults, "mcp_max_prompt_chars", "defaults")
+    # H2 independence warning: optional global distinct-vendor floor.
+    # Advisory-only; positive integer when present (absent = feature off).
+    _validate_positive_int(defaults, "min_distinct_vendors", "defaults")
     _validate_positive_number(defaults, "mcp_max_estimated_cost_usd", "defaults")
     _validate_convergence_thresholds(defaults, "defaults")
     for mode_name, mode in modes.items():

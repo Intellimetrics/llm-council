@@ -1463,6 +1463,13 @@ async def run_council(
         payload["cross_rank_scores"] = cross_rank_scores_out
     if anonymization_map_out:
         payload["anonymization_map"] = anonymization_map_out
+    # H2 independence warning (advisory-only): surfaced top-level so a
+    # calling agent can spot single-vendor quorums without parsing
+    # metadata. Mirrors the omit-when-absent convention — the common case
+    # has the feature off (key never set by the orchestrator). Left in
+    # metadata too (like `degraded`); never overloads quorum/degraded.
+    if isinstance(metadata, dict) and metadata.get("independence_warning"):
+        payload["independence_warning"] = metadata["independence_warning"]
 
     # Auto-open HTML transcript in browser if configured or requested
     auto_open = False

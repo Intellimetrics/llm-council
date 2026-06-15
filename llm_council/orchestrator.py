@@ -1098,6 +1098,51 @@ async def execute_council(
             }
         )
 
+    # --- Independence warning (H2) ----------------------------------------
+    # OPTIONAL, advisory-only signal: when every labeled vote in the final
+    # round comes from the same vendor family, correlated same-vendor
+    # agreement can masquerade as independent corroboration. We surface a
+    # warning; we do NOT drop a peer or touch quorum/degraded. Default OFF
+    # (threshold unset). NEVER overload `metadata["degraded"]`.
+    distinct_vendor_threshold = (
+        (config.get("modes", {}) or {}).get(mode or "", {}) or {}
+    ).get("require_distinct_vendors")
+    if distinct_vendor_threshold is None:
+        distinct_vendor_threshold = (config.get("defaults", {}) or {}).get(
+            "min_distinct_vendors"
+        )
+    if distinct_vendor_threshold is not None:
+        labeled = [r for r in round_results if _is_labeled_vote(r)]
+        families = sorted(
+            {
+                (participant_cfg.get(_base_name(r.name), {}) or {}).get("family")
+                or _base_name(r.name)
+                for r in labeled
+            }
+        )
+        distinct = len(families)
+        # Only warn when there is actual labeled agreement whose vendor
+        # diversity is in question. With zero labeled votes there is no
+        # consensus to mistake for independent corroboration (the run is
+        # already `degraded`), so a "single-vendor" warning there is a false
+        # signal — codex review, WU2.
+        if labeled and distinct < int(distinct_vendor_threshold):
+            metadata["independence_warning"] = {
+                "distinct_vendors": distinct,
+                "required": int(distinct_vendor_threshold),
+                "families": families,
+                "labeled_quorum": final_labeled,
+            }
+            emit(
+                {
+                    "event": "single_vendor_quorum",
+                    "distinct_vendors": distinct,
+                    "required": int(distinct_vendor_threshold),
+                    "families": families,
+                    "round": metadata["rounds"],
+                }
+            )
+
     if stances:
         metadata["stances"] = dict(stances)
         for idx, result in enumerate(results):
