@@ -43,8 +43,10 @@ from llm_council.env import load_project_env
 from llm_council.estimate import estimate_council
 from llm_council.model_catalog import fetch_openrouter_models
 from llm_council.orchestrator import execute_council
+from llm_council import policy
 from llm_council.policy import should_use_council
-from llm_council.stats import compute_stats
+from llm_council.recommend_judge import grade_difficulty
+from llm_council.stats import aggregate_reliability, compute_stats
 from llm_council.transcript import (
     continuation_depth_limit_error,
     find_transcript_by_id,
@@ -807,6 +809,7 @@ def recommend_schema() -> dict[str, Any]:
                 "enum": ["low", "medium", "high"],
                 "default": "medium",
             },
+            "working_directory": {"type": "string"},
         },
         "required": ["task"],
         "additionalProperties": False,
@@ -1699,6 +1702,68 @@ def run_doctor(arguments: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _peers_to_consider_dropping(cwd: Path, config: dict[str, Any]) -> list[str]:
+    """L6 advisory: peer names whose recorded reliability suggests they be
+    reconsidered. Defensive — never raises; returns [] on any failure or
+    when there is no data. Advisory only: does NOT change participant
+    selection or the run.
+    """
+    try:
+        reliability = aggregate_reliability(
+            cwd, transcripts_dir=transcript_dir(cwd, config)
+        )
+        return policy.peers_to_consider_dropping(reliability)
+    except Exception:
+        return []
+
+
+async def _run_recommend(arguments: dict[str, Any]) -> dict[str, Any]:
+    """`council_recommend` handler.
+
+    Primary verdict is always the mechanical, zero-cost `policy.recommend`
+    output (M10). Two advisory enrichments layer on top — both are loaded
+    from config but neither changes the council run or participant selection:
+
+      - L6: `peers_to_consider_dropping` from recorded reliability.
+      - M9: an optional LLM difficulty `judge` (default OFF, fail-open),
+        attached as `result["judge"]` only when `defaults.recommend_judge`
+        is set and the call succeeds. The mechanical verdict is NEVER
+        overridden by the judge.
+    """
+    task = arguments["task"]
+    result = policy.recommend(
+        task,
+        failed_attempts=int(arguments.get("failed_attempts") or 0),
+        files_touched=int(arguments.get("files_touched") or 0),
+        risk=arguments.get("risk") or "medium",
+    )
+    # Config is needed for both L6 and the optional M9 judge. A config-load
+    # failure must not break the always-on mechanical verdict.
+    config: dict[str, Any] | None = None
+    try:
+        cwd = _resolve_working_directory(arguments)
+        load_project_env(cwd)
+        config = load_config(find_config(cwd), search=False)
+    except Exception:
+        config = None
+
+    if config is not None:
+        result["peers_to_consider_dropping"] = _peers_to_consider_dropping(cwd, config)
+        # M9 judge: only when explicitly enabled via defaults.recommend_judge.
+        defaults_cfg = config.get("defaults") or {}
+        if defaults_cfg.get("recommend_judge"):
+            judge = await grade_difficulty(task, config)
+            if judge is not None:
+                result["judge"] = {
+                    "difficulty": judge.get("difficulty"),
+                    "rationale": judge.get("rationale"),
+                    "suggested_mode": judge.get("suggested_mode"),
+                }
+    else:
+        result["peers_to_consider_dropping"] = []
+    return result
+
+
 def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         cwd = _resolve_working_directory(arguments)
@@ -1747,7 +1812,12 @@ def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
         )
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    return {"ok": True, "config_warnings": warnings, **estimate}
+    return {
+        "ok": True,
+        "config_warnings": warnings,
+        "peers_to_consider_dropping": _peers_to_consider_dropping(cwd, config),
+        **estimate,
+    }
 
 
 def list_models(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -2029,13 +2099,7 @@ async def _serve() -> None:
                 progress_token=progress_token,
             )
         elif name == "council_recommend":
-            use, mode, reason = should_use_council(
-                arguments["task"],
-                failed_attempts=int(arguments.get("failed_attempts") or 0),
-                files_touched=int(arguments.get("files_touched") or 0),
-                risk=arguments.get("risk") or "medium",
-            )
-            result = {"use_council": use, "mode": mode, "reason": reason}
+            result = await _run_recommend(arguments)
         elif name == "council_estimate":
             result = estimate_run(arguments)
         elif name == "council_list_modes":

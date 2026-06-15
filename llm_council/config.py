@@ -324,6 +324,14 @@ def validate_config(config: dict[str, Any]) -> None:
         defaults["independent_review"], bool
     ):
         raise ValueError("defaults.independent_review must be a boolean")
+    # M9 optional LLM difficulty judge: peer NAME of a hosted participant to
+    # consult in `council_recommend`. String when present (absent = feature
+    # off). Existence / hosted-ness / key resolution is checked lazily at
+    # call time (recommend_judge.grade_difficulty), not here.
+    if "recommend_judge" in defaults and not isinstance(
+        defaults["recommend_judge"], str
+    ):
+        raise ValueError("defaults.recommend_judge must be a string")
     _validate_positive_int(defaults, "max_concurrency", "defaults")
     _validate_positive_int(defaults, "max_deliberation_rounds", "defaults")
     _validate_positive_int(defaults, "max_prompt_chars", "defaults")
