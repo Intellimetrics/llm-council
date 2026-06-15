@@ -255,6 +255,12 @@ def build_parser() -> argparse.ArgumentParser:
             "into round-2 deliberation."
         ),
     )
+    run.add_argument(
+        "--open",
+        action="store_true",
+        default=False,
+        help="Automatically open the HTML transcript dashboard in the default browser at the end of the run.",
+    )
 
     sub.add_parser("list", help="List participants and modes")
     init = sub.add_parser("init", help="Write an example project config")
@@ -312,6 +318,32 @@ def build_parser() -> argparse.ArgumentParser:
             "origin and family)."
         ),
     )
+
+    hook = sub.add_parser("install-hook", help="Install LLM Council git hooks")
+    hook.add_argument("--root", default=".", help="Project root (defaults to current dir)")
+    hook.add_argument(
+        "--hook-type",
+        choices=["pre-commit", "pre-push"],
+        default="pre-commit",
+        help="The git hook type to install (default: pre-commit)",
+    )
+    hook.add_argument(
+        "--mode",
+        default="consensus",
+        help="The mode to run the hook in (default: consensus)",
+    )
+
+    cfg_parser = sub.add_parser("config", help="Get or set configuration values in .llm-council.yaml")
+    cfg_sub = cfg_parser.add_subparsers(dest="config_command")
+    
+    cfg_get = cfg_sub.add_parser("get", help="Get a configuration value")
+    cfg_get.add_argument("key", help="The dot-notation key to retrieve (e.g., defaults.auto_open_browser)")
+    cfg_get.add_argument("--cwd", default=".", help="Working directory")
+    
+    cfg_set = cfg_sub.add_parser("set", help="Set a configuration value")
+    cfg_set.add_argument("key", help="The dot-notation key to set (e.g., defaults.auto_open_browser)")
+    cfg_set.add_argument("value", help="The value to set (automatically parsed as boolean, int, float, or string)")
+    cfg_set.add_argument("--cwd", default=".", help="Working directory")
 
     doctor = sub.add_parser("doctor", help="Check local council environment")
     doctor.add_argument("--config", help="Path to config YAML")
@@ -441,7 +473,9 @@ def build_parser() -> argparse.ArgumentParser:
     last = sub.add_parser("last", help="Print the latest council transcript path/content")
     last.add_argument("--cwd", default=".", help="Working directory")
     last.add_argument("--json-file", action="store_true", help="Use JSON transcript")
+    last.add_argument("--html-file", action="store_true", help="Use HTML transcript")
     last.add_argument("--path-only", action="store_true", help="Only print path")
+    last.add_argument("--open", action="store_true", help="Open transcript in browser")
 
     transcripts = sub.add_parser("transcripts", help="Inspect council transcripts")
     transcripts_sub = transcripts.add_subparsers(dest="transcripts_command")
@@ -453,6 +487,8 @@ def build_parser() -> argparse.ArgumentParser:
     transcripts_show.add_argument("path", nargs="?", help="Transcript path; defaults to latest")
     transcripts_show.add_argument("--cwd", default=".", help="Working directory")
     transcripts_show.add_argument("--json-file", action="store_true", help="Show JSON")
+    transcripts_show.add_argument("--html-file", action="store_true", help="Show HTML")
+    transcripts_show.add_argument("--open", action="store_true", help="Open in browser")
     transcripts_summary = transcripts_sub.add_parser(
         "summary", help="Summarize transcript totals"
     )
@@ -878,6 +914,124 @@ def cmd_init(args: argparse.Namespace) -> int:
         target.write_text("version: 1\n", encoding="utf-8")
     print(f"Wrote {target}")
     return 0
+
+
+def cmd_install_hook(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    git_dir = root / ".git"
+    if not git_dir.is_dir():
+        print(f"Error: {root} is not a git repository (missing .git directory).", file=sys.stderr)
+        return 1
+    
+    hooks_dir = git_dir / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    
+    hook_file = hooks_dir / args.hook_type
+    
+    script_content = f"""#!/bin/sh
+# Git hook installed by llm-council
+echo "Running LLM Council {args.hook_type} audit..."
+exec llm-council run --diff "Pre-commit validation." --mode {args.mode}
+"""
+    
+    try:
+        hook_file.write_text(script_content, encoding="utf-8")
+        import os
+        import stat
+        st = os.stat(hook_file)
+        os.chmod(hook_file, st.st_mode | stat.S_IEXEC)
+        print(f"Successfully installed LLM Council {args.hook_type} hook to {hook_file}")
+        return 0
+    except Exception as e:
+        print(f"Error: Failed to write git hook: {e}", file=sys.stderr)
+        return 1
+
+
+def _parse_config_value(value_str: str) -> Any:
+    # Boolean
+    if value_str.lower() in ("true", "yes", "on"):
+        return True
+    if value_str.lower() in ("false", "no", "off"):
+        return False
+    # None/null
+    if value_str.lower() in ("none", "null"):
+        return None
+    # Integer
+    try:
+        return int(value_str)
+    except ValueError:
+        pass
+    # Float
+    try:
+        return float(value_str)
+    except ValueError:
+        pass
+    # List (e.g., if it starts with [ and ends with ])
+    if value_str.startswith("[") and value_str.endswith("]"):
+        import ast
+        try:
+            return ast.literal_eval(value_str)
+        except Exception:
+            pass
+    # Fallback to string
+    return value_str
+
+
+def _get_nested_val(d: dict, key_path: str) -> Any:
+    parts = key_path.split(".")
+    curr = d
+    for part in parts:
+        if isinstance(curr, dict) and part in curr:
+            curr = curr[part]
+        else:
+            return None
+    return curr
+
+
+def _set_nested_val(d: dict, key_path: str, val: Any) -> None:
+    parts = key_path.split(".")
+    curr = d
+    for part in parts[:-1]:
+        if part not in curr or not isinstance(curr[part], dict):
+            curr[part] = {}
+        curr = curr[part]
+    curr[parts[-1]] = val
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    cwd = Path(args.cwd).resolve()
+    cfg_file = find_config(cwd)
+    if not cfg_file:
+        raise SystemExit("Configuration file not found. Run setup first.")
+    cfg_path = Path(cfg_file)
+        
+    import yaml
+    try:
+        config = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        raise SystemExit(f"Failed to read configuration: {e}")
+        
+    if args.config_command == "get":
+        val = _get_nested_val(config, args.key)
+        if val is None:
+            print("")
+        else:
+            print(val)
+        return 0
+        
+    elif args.config_command == "set":
+        parsed_val = _parse_config_value(args.value)
+        _set_nested_val(config, args.key, parsed_val)
+        
+        try:
+            cfg_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+            print(f"Successfully set {args.key} to {parsed_val}")
+        except Exception as e:
+            raise SystemExit(f"Failed to write configuration: {e}")
+        return 0
+        
+    else:
+        raise SystemExit("Subcommand required: get, set")
 
 
 def _confirm(prompt: str, default: bool = True) -> bool:
@@ -1615,9 +1769,34 @@ def cmd_last(args: argparse.Namespace) -> int:
     load_project_env(cwd)
     config = load_config(find_config(cwd), search=False)
     out_dir = transcript_dir(cwd, config)
-    path = latest_transcript(out_dir, suffix=".json" if args.json_file else ".md")
+    
+    if getattr(args, "html_file", False) and getattr(args, "json_file", False):
+        raise SystemExit("Error: --html-file and --json-file are mutually exclusive.")
+        
+    suffix = ".md"
+    if getattr(args, "html_file", False):
+        suffix = ".html"
+    elif getattr(args, "json_file", False):
+        suffix = ".json"
+    elif getattr(args, "open", False):
+        # By default, --open implies --html-file
+        suffix = ".html"
+        
+    path = latest_transcript(out_dir, suffix=suffix)
     if path is None:
+        if latest_transcript(out_dir, suffix=".md") is not None:
+            raise SystemExit(f"No transcripts with suffix '{suffix}' found in {out_dir}.")
         raise SystemExit(f"No council transcripts found in {out_dir}")
+        
+    if getattr(args, "open", False):
+        if not path.is_file():
+            raise SystemExit(f"Failed to read transcript {path}: file does not exist")
+        import webbrowser
+        print(f"Opening transcript: {path}")
+        if not webbrowser.open(path.as_uri()):
+            raise SystemExit(f"Failed to open browser for transcript {path}. You can view the path directly.")
+        return 0
+        
     if args.path_only:
         print(path)
     else:
@@ -1986,14 +2165,45 @@ def cmd_transcripts(args: argparse.Namespace) -> int:
         return 0
 
     if args.transcripts_command == "show":
+        if getattr(args, "html_file", False) and getattr(args, "json_file", False):
+            raise SystemExit("Error: --html-file and --json-file are mutually exclusive.")
+
+        suffix = ".md"
+        if getattr(args, "html_file", False):
+            suffix = ".html"
+        elif getattr(args, "json_file", False):
+            suffix = ".json"
+        elif getattr(args, "open", False) and not args.path:
+            # By default, --open without an explicit path implies --html-file
+            suffix = ".html"
+
         if args.path:
             path = Path(args.path)
             if not path.is_absolute():
                 path = cwd / path
+            if getattr(args, "open", False) and not getattr(args, "html_file", False) and not getattr(args, "json_file", False):
+                if path.suffix == ".md" and path.with_suffix(".html").is_file():
+                    path = path.with_suffix(".html")
+            else:
+                if getattr(args, "html_file", False) or getattr(args, "json_file", False):
+                    path = path.with_suffix(suffix)
         else:
-            path = latest_transcript(out_dir, suffix=".json" if args.json_file else ".md")
+            path = latest_transcript(out_dir, suffix=suffix)
             if path is None:
+                if latest_transcript(out_dir, suffix=".md") is not None:
+                    raise SystemExit(f"No transcripts with suffix '{suffix}' found in {out_dir}.")
                 raise SystemExit(f"No council transcripts found in {out_dir}")
+
+        if not path.is_file():
+            raise SystemExit(f"Failed to read transcript {path}: file does not exist")
+
+        if getattr(args, "open", False):
+            import webbrowser
+            print(f"Opening transcript: {path}")
+            if not webbrowser.open(path.as_uri()):
+                raise SystemExit(f"Failed to open browser for transcript {path}. You can view the path directly.")
+            return 0
+
         try:
             print(path.read_text(encoding="utf-8"))
         except OSError as exc:
@@ -2366,6 +2576,8 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                 flush=True,
             )
     mode = args.mode or config.get("defaults", {}).get("mode", "quick")
+    from llm_council.config import apply_smart_routing
+    apply_smart_routing(config, mode, cwd)
     current = args.current or detect_current_agent()
     explicit = parse_csv(args.participants)
     include = parse_csv(args.include)
@@ -2845,6 +3057,93 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             )
         )
         print(display.format_gutter("Transcript", str(md_path), color=color))
+
+    # Notification webhooks
+    notify_cfg = config.get("notifications")
+    if isinstance(notify_cfg, dict) and notify_cfg.get("webhook_url"):
+        webhook_url = notify_cfg.get("webhook_url")
+        from llm_council.deliberation import recommendation_counts
+        counts = recommendation_counts(results)
+        summary_text = (
+            f"LLM Council Run Finished!\n"
+            f"Question: {question[:150] if question else 'None'}...\n"
+            f"Recommendation: {metadata.get('recommendation', 'unknown')}\n"
+            f"Votes: {counts}\n"
+            f"Transcript: {md_path}\n"
+        )
+        import httpx
+        try:
+            httpx.post(webhook_url, json={"text": summary_text}, timeout=5.0)
+        except Exception as e:
+            print(f"Warning: Failed to send notification: {e}", file=sys.stderr)
+
+    # Quorum policy enforcement
+    policies = config.get("quorum_policies")
+    if isinstance(policies, dict):
+        from llm_council.deliberation import recommendation_counts
+        counts = recommendation_counts(results)
+        total_votes = counts["yes"] + counts["no"] + counts["tradeoff"]
+        
+        active_policy = policies.get("standard")
+        
+        # Scan files in git diff and --context to find if they match any key
+        changed_files = []
+        if args.diff:
+            from llm_council.context import _git_output
+            git_staged_files = _git_output(cwd, ["diff", "--cached", "--name-only"])
+            git_unstaged_files = _git_output(cwd, ["diff", "--name-only"])
+            for f_list in (git_staged_files, git_unstaged_files):
+                if f_list:
+                    changed_files.extend(f_list.splitlines())
+        for c_file in args.context:
+            changed_files.append(c_file)
+            
+        # Match file patterns
+        for pattern, pol in policies.items():
+            if pattern == "standard":
+                continue
+            for f in changed_files:
+                if pattern in f:
+                    active_policy = pol
+                    break
+                    
+        if isinstance(active_policy, dict):
+            threshold = active_policy.get("threshold", "majority")
+            if threshold == "unanimous":
+                if counts["no"] > 0 or counts["tradeoff"] > 0:
+                    print(
+                        f"\nQUORUM ERROR: Policy '{threshold}' failed. "
+                        f"Found {counts['no']} 'no' votes and {counts['tradeoff']} 'tradeoff' votes.",
+                        file=sys.stderr
+                    )
+                    return 1
+            elif threshold == "majority":
+                if total_votes > 0 and counts["yes"] <= total_votes / 2:
+                    print(
+                        f"\nQUORUM ERROR: Policy '{threshold}' failed. "
+                        f"Only {counts['yes']}/{total_votes} voted 'yes'.",
+                        file=sys.stderr
+                    )
+                    return 1
+
+    # Auto-open HTML transcript in browser if configured or requested
+    auto_open = False
+    if getattr(args, "open", False):
+        auto_open = True
+    else:
+        defaults_cfg = config.get("defaults", {})
+        if isinstance(defaults_cfg, dict) and defaults_cfg.get("auto_open_browser"):
+            auto_open = True
+            
+    if auto_open:
+        html_path = md_path.with_suffix(".html")
+        if html_path.is_file():
+            import webbrowser
+            if not getattr(args, "json", False):
+                print(f"[Auto-Open] Opening transcript: {html_path}")
+            if not webbrowser.open(html_path.resolve().as_uri()):
+                print(f"Warning: Failed to auto-open browser for transcript {html_path}", file=sys.stderr)
+
     return 0
 
 
@@ -2863,6 +3162,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_init(args)
     if args.command == "setup":
         return cmd_setup(args)
+    if args.command == "install-hook":
+        return cmd_install_hook(args)
+    if args.command == "config":
+        return cmd_config(args)
     if args.command == "doctor":
         return cmd_doctor(args)
     if args.command == "check-update":

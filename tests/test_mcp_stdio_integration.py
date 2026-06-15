@@ -123,3 +123,70 @@ async def test_mcp_server_stdio_round_trip_council_run(tmp_path: Path):
     for required in ("recommendation", "agreement_count", "degraded", "rounds", "results"):
         assert required in payload, f"missing {required!r} in stdio council_run payload"
     assert payload["metadata"]["dry_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_mcp_server_stdio_council_config(tmp_path: Path):
+    (tmp_path / ".llm-council.yaml").write_text(_LOCAL_CONFIG, encoding="utf-8")
+
+    import anyio
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    env = os.environ.copy()
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    env["LLM_COUNCIL_MCP_ROOT"] = str(tmp_path)
+
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "llm_council.mcp_server"],
+        env=env,
+    )
+
+    async def _exchange() -> tuple[dict, dict]:
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                
+                # Test council_config get
+                res_get = await session.call_tool(
+                    "council_config",
+                    {
+                        "action": "get",
+                        "key": "defaults.mode",
+                        "working_directory": str(tmp_path),
+                    },
+                )
+                payload_get = json.loads(res_get.content[0].text)
+                
+                # Test council_config set
+                res_set = await session.call_tool(
+                    "council_config",
+                    {
+                        "action": "set",
+                        "key": "defaults.auto_open_browser",
+                        "value": "true",
+                        "working_directory": str(tmp_path),
+                    },
+                )
+                payload_set = json.loads(res_set.content[0].text)
+                
+                return payload_get, payload_set
+
+    with anyio.fail_after(45):
+        payload_get, payload_set = await _exchange()
+
+    assert payload_get["key"] == "defaults.mode"
+    assert payload_get["value"] == "review-local"
+    assert payload_get["success"] is True
+
+    assert payload_set["key"] == "defaults.auto_open_browser"
+    assert payload_set["value"] is True
+    assert payload_set["success"] is True
+
+    # Verify YAML was actually written
+    import yaml
+    config = yaml.safe_load((tmp_path / ".llm-council.yaml").read_text(encoding="utf-8"))
+    assert config["defaults"]["auto_open_browser"] is True
+

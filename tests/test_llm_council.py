@@ -5212,6 +5212,10 @@ def test_tri_cli_setup_loaded_config_does_not_restore_defaults(tmp_path: Path):
         "us-only",
         "consensus",
         "opus-versions",
+        "single-llm",
+        "adversarial-red-team",
+        "test-gap-analysis",
+        "deep-audit",
         # Experimental `review-with-tools` (v0.8 Phase E) — CLI-peers-only,
         # so it survives tri-cli pruning. Still ships flagged
         # `experimental: true` until the eval harness gate promotes it.
@@ -5294,6 +5298,10 @@ def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path, monkeypatch
         "peer-only",
         "consensus",
         "opus-versions",
+        "single-llm",
+        "adversarial-red-team",
+        "test-gap-analysis",
+        "deep-audit",
         "review-with-tools",
     }
     assert config["defaults"]["origin_policy"] == "us"
@@ -5329,6 +5337,10 @@ def test_setup_yes_auto_selects_tri_cli_when_native_clis_exist(
         "us-only",
         "consensus",
         "opus-versions",
+        "single-llm",
+        "adversarial-red-team",
+        "test-gap-analysis",
+        "deep-audit",
         # `review-with-tools` (v0.8 Phase E, experimental) is CLI-only and
         # therefore retained in tri-cli setups.
         "review-with-tools",

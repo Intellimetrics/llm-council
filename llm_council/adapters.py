@@ -2376,6 +2376,9 @@ async def run_participants(
                 mode=mode,
                 family=cfg.get("family"),
                 tool_call_voting=tool_call_voting,
+                stance=cfg.get("stance"),
+                persona=cfg.get("persona"),
+                persona_prompt=cfg.get("persona_prompt"),
             )
             timeout = _resolve_effective_timeout(
                 cfg, mode_multiplier, prompt_chars=len(peer_prompt)

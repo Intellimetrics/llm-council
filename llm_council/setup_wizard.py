@@ -25,20 +25,24 @@ OPENROUTER_PARTICIPANTS = (
 )
 
 
-INSTRUCTION_TEXT = """# LLM Council
+INSTRUCTION_TEXT = r"""# LLM Council
 
 This project has LLM Council installed. Use it as a read-only second-opinion
 system when the user wants more than this single agent's judgment.
 
-Natural triggers:
+Natural triggers and commands:
 - "use council"
 - "go to council"
 - "ask council"
 - "take this to council"
+- "/council", "\council", "/ask-council", "\ask-council"
 - "get another model's opinion"
 - "have Claude/Gemini/Codex review this"
 
 When triggered, call the `llm-council` MCP tool `council_run`.
+
+If the user wants to view or change configuration options (e.g. "open html automatically", "set defaults.auto_open_browser true"), or uses commands like `/council config`, `\council config`, `/council-config`, or `\council-config`, call the `llm-council` MCP tool `council_config`.
+
 
 Routing rules:
 - Always pass `current` as `{current}` so transcripts show which host will
@@ -468,9 +472,13 @@ path for that.
 """
 
 
-_HOST_SKILL_BODY = """When the user asks for a "council" review — natural triggers include
+_HOST_SKILL_BODY = r"""When the user asks for a "council" review — natural triggers include
 "use council", "go to council", "ask council", "take this to council",
-or "get a second opinion" — call the `llm-council` MCP tool `council_run`.
+or commands like /council, \council, /ask-council, \ask-council — call the
+`llm-council` MCP tool `council_run`.
+
+If the user wants to view or change configuration options (e.g. "open html automatically", "set defaults.auto_open_browser true"), or uses commands like /council config, \council config, /council-config, \council-config — call the `llm-council` MCP tool `council_config`.
+
 
 Routing rules:
 - Pass `current` as `{current}` so transcripts record which host will

@@ -78,6 +78,15 @@ DEFAULT_STANCE_PROMPTS: dict[str, str] = {
     ),
 }
 
+DEFAULT_CHEAPER_MODELS: dict[str, str] = {
+    "anthropic/claude-sonnet-4-6": "anthropic/claude-haiku-4-5",
+    "openai/gpt-4o": "openai/gpt-4o-mini",
+    "google/gemini-1.5-pro": "google/gemini-1.5-flash",
+    "anthropic/claude-sonnet": "anthropic/claude-haiku",
+    "openai/gpt-4": "openai/gpt-4o-mini",
+}
+
+
 DEFAULT_CONFIG: dict = {
     "version": 1,
     "transcripts_dir": ".llm-council/runs",
@@ -127,6 +136,7 @@ DEFAULT_CONFIG: dict = {
         # failure falls through to the existing stale-warning Check so a
         # disconnected user still gets a usable diagnostic.
         "catalog_auto_refresh": True,
+        "auto_open_browser": False,
     },
     "participants": {
         "claude": {
@@ -542,6 +552,36 @@ DEFAULT_CONFIG: dict = {
                 "ethical-override clause keeps any peer from defending a "
                 "harmful proposal or contriving false objections."
             ),
+        },
+        "single-llm": {
+            "strategy": "other_cli_peers",
+            "include_current": True,
+            "single_llm_multiplex": True,
+            "description": "Orchestrates a 3-member virtual council using a single available model.",
+        },
+        "adversarial-red-team": {
+            "strategy": "other_cli_peers",
+            "include_current": True,
+            "stances": {
+                "claude": "against",
+                "codex": "for",
+                "gemini": "neutral",
+                "antigravity": "neutral",
+            },
+            "timeout_multiplier": 2.0,
+            "description": "Attack/Defend debate where Peer A is Attacker, Peer B is Defender, and others are Neutral.",
+        },
+        "test-gap-analysis": {
+            "strategy": "other_cli_peers",
+            "include_current": True,
+            "description": "Audit the git diff specifically for test coverage gaps or missing regression tests.",
+        },
+        "deep-audit": {
+            "strategy": "other_cli_peers",
+            "include_current": True,
+            "deliberate": True,
+            "max_rounds": 3,
+            "description": "Multi-phase deep audit mode running up to 3 rounds of peer review.",
         },
         # Temporary: head-to-head review using both Opus versions. Remove or
         # collapse once version drift between 4.6 and 4.7 is no longer notable.

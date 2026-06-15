@@ -109,6 +109,11 @@ def council_run_schema() -> dict[str, Any]:
                 "description": "Inline base64 images. llm-council writes them under .llm-council/inputs/<run-id>/ before participants run. Use only when the host cannot stage to disk; image_paths is preferred.",
             },
             "include_diff": {"type": "boolean", "default": False},
+            "open": {
+                "type": "boolean",
+                "default": False,
+                "description": "Automatically open the HTML transcript in the browser.",
+            },
             "working_directory": {"type": "string"},
             "dry_run": {"type": "boolean", "default": False},
             "transparent": {"type": "boolean", "default": False},
@@ -298,6 +303,10 @@ def council_run_output_schema() -> dict[str, Any]:
             "json": {
                 "type": "string",
                 "description": "Filesystem path to the JSON transcript.",
+            },
+            "html": {
+                "type": "string",
+                "description": "Filesystem path to the HTML transcript dashboard.",
             },
             "results": {
                 "type": "array",
@@ -966,8 +975,9 @@ async def run_council(
     tier = arguments.get("tier")
     if tier:
         apply_tier_override(config, str(tier))
-    question = arguments["question"]
     mode = arguments.get("mode") or config.get("defaults", {}).get("mode", "quick")
+    from llm_council.config import apply_smart_routing
+    apply_smart_routing(config, mode, cwd)
     current = arguments.get("current") or detect_current_agent()
     participants = select_participants(
         config,
@@ -977,6 +987,7 @@ async def run_council(
         include=arguments.get("include"),
         origin_policy=arguments.get("origin_policy"),
     )
+    question = arguments["question"]
     transcripts_root = transcript_dir(cwd, config)
     md_path, json_path = transcript_paths(transcripts_root, question)
     parent_run_id: str | None = None
@@ -1417,6 +1428,7 @@ async def run_council(
         "metadata": metadata,
         "transcript": str(md_path),
         "json": str(json_path),
+        "html": str(md_path.with_suffix(".html")),
         "results": structured_results,
         "summary_markdown": summary_markdown,
     }
@@ -1451,6 +1463,22 @@ async def run_council(
         payload["cross_rank_scores"] = cross_rank_scores_out
     if anonymization_map_out:
         payload["anonymization_map"] = anonymization_map_out
+
+    # Auto-open HTML transcript in browser if configured or requested
+    auto_open = False
+    if arguments.get("open"):
+        auto_open = True
+    else:
+        defaults_cfg = config.get("defaults", {})
+        if isinstance(defaults_cfg, dict) and defaults_cfg.get("auto_open_browser"):
+            auto_open = True
+
+    if auto_open:
+        html_path = md_path.with_suffix(".html")
+        if html_path.is_file():
+            import webbrowser
+            webbrowser.open(html_path.resolve().as_uri())
+
     return payload
 
 
@@ -1619,6 +1647,81 @@ def query_transcripts(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def config_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["get", "set"],
+                "description": "Whether to get or set a config option.",
+            },
+            "key": {
+                "type": "string",
+                "description": "The dot-notation key path to retrieve or update (e.g., defaults.auto_open_browser).",
+            },
+            "value": {
+                "type": "string",
+                "description": "The value to set (used only for action='set'). Strings like 'true'/'false' will be parsed appropriately.",
+            },
+            "working_directory": {
+                "type": "string",
+                "description": "Project root directory to look for the configuration file.",
+            },
+        },
+        "required": ["action", "key"],
+        "additionalProperties": False,
+    }
+
+
+def run_config(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Get or set configuration options programmatically via MCP."""
+    from llm_council.cli import _get_nested_val, _set_nested_val, _parse_config_value
+    import yaml
+
+    cwd = _resolve_working_directory(arguments)
+    load_project_env(cwd)
+    cfg_file = find_config(cwd)
+    if not cfg_file:
+        raise ValueError("Configuration file not found. Run setup first.")
+    cfg_path = Path(cfg_file)
+
+    try:
+        config = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        raise ValueError(f"Failed to read configuration: {e}")
+
+    action = arguments.get("action")
+    key = arguments.get("key")
+    if not key:
+        raise ValueError("Key path is required")
+
+    if action == "get":
+        val = _get_nested_val(config, key)
+        return {
+            "key": key,
+            "value": val,
+            "success": True
+        }
+    elif action == "set":
+        value_str = arguments.get("value")
+        if value_str is None:
+            raise ValueError("Value is required for set action")
+        parsed_val = _parse_config_value(value_str)
+        _set_nested_val(config, key, parsed_val)
+        try:
+            cfg_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        except Exception as e:
+            raise ValueError(f"Failed to write configuration: {e}")
+        return {
+            "key": key,
+            "value": parsed_val,
+            "success": True
+        }
+    else:
+        raise ValueError(f"Unknown action: {action}")
+
+
 async def _serve() -> None:
     try:
         from mcp.server import Server
@@ -1708,6 +1811,11 @@ async def _serve() -> None:
                 ),
                 inputSchema=query_transcripts_schema(),
             ),
+            Tool(
+                name="council_config",
+                description="Get or set configuration keys in the project's .llm-council.yaml config file.",
+                inputSchema=config_schema(),
+            ),
         ]
 
     @app.call_tool()
@@ -1756,6 +1864,8 @@ async def _serve() -> None:
             result = run_stats(arguments)
         elif name == "council_query_transcripts":
             result = query_transcripts(arguments)
+        elif name == "council_config":
+            result = run_config(arguments)
         else:
             raise ValueError(f"Unknown tool: {name}")
         text_blocks = [TextContent(type="text", text=json.dumps(result, indent=2))]

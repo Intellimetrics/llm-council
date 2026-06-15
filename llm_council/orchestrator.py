@@ -471,6 +471,76 @@ async def execute_council(
             if isinstance(_peer_cfg, dict) and _propagated_key not in _peer_cfg:
                 _peer_cfg[_propagated_key] = _propagated_val
 
+    if stances:
+        for _peer_name in participants:
+            _peer_cfg = participant_cfg.get(_peer_name)
+            if isinstance(_peer_cfg, dict) and _peer_name in stances:
+                _peer_cfg["stance"] = stances[_peer_name]
+
+    # Contextual Persona Recruitment
+    changed_files = []
+    from llm_council.context import _git_output
+    try:
+        git_staged = _git_output(cwd, ["diff", "--cached", "--name-only"])
+        if git_staged:
+            changed_files.extend(git_staged.splitlines())
+        git_unstaged = _git_output(cwd, ["diff", "--name-only"])
+        if git_unstaged:
+            changed_files.extend(git_unstaged.splitlines())
+    except Exception:
+        pass
+
+    persona = None
+    persona_prompt = None
+    for f in changed_files:
+        f_lower = f.lower()
+        if any(ext in f_lower for ext in (".sql", "db/", "migrations/", "models.py")):
+            persona = "database_architect"
+            persona_prompt = (
+                "Role: DATABASE ARCHITECT. Focus on schema design, query efficiency, indexes, migration safety, "
+                "race conditions, and transaction safety."
+            )
+            break
+        elif any(kwd in f_lower for kwd in ("auth", "login", "security", "perm", "crypt", ".env", "key")):
+            persona = "security_auditor"
+            persona_prompt = (
+                "Role: SECURITY AUDITOR. Focus on vulnerability detection, authentication, input validation, encryption, "
+                "secrets leakage, and authorization bypasses."
+            )
+            break
+        elif any(ext in f_lower for ext in (".css", ".html", ".scss", "styles/", "components/")):
+            persona = "frontend_specialist"
+            persona_prompt = (
+                "Role: FRONTEND & UX SPECIALIST. Focus on semantic HTML, accessibility (a11y), responsive styling, "
+                "layout shifts, bundle size, and browser compatibility."
+            )
+            break
+        elif any(kwd in f_lower for kwd in ("dockerfile", "workflow", ".github", "yaml", "yml", "toml")):
+            persona = "devops_engineer"
+            persona_prompt = (
+                "Role: DEVOPS & CI/CD ENGINEER. Focus on build pipelines, container safety, environment variable management, "
+                "dependencies, resource limits, and deployment sanity."
+            )
+            break
+
+    if persona and persona_prompt:
+        assigned = False
+        for _peer_name in participants:
+            _peer_cfg = participant_cfg.get(_peer_name)
+            if isinstance(_peer_cfg, dict):
+                stance = _peer_cfg.get("stance") or (stances.get(_peer_name) if stances else None)
+                if stance in ("for", "against"):
+                    _peer_cfg["persona"] = persona
+                    _peer_cfg["persona_prompt"] = persona_prompt
+                    assigned = True
+                    break
+        if not assigned and participants:
+            _peer_name = participants[0]
+            _peer_cfg = participant_cfg.get(_peer_name)
+            if isinstance(_peer_cfg, dict):
+                _peer_cfg["persona"] = persona
+                _peer_cfg["persona_prompt"] = persona_prompt
+
     cache_disabled_for_mode = is_caching_disabled_for_mode(mode)
     cache_ctx_round1 = CacheContext(
         cwd=cwd,

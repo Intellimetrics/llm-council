@@ -259,6 +259,7 @@ Core keys:
 - `defaults.max_prompt_chars`: global prompt construction cap, default 200000
 - `defaults.mcp_max_prompt_chars`: MCP budget guard for hosted paid calls
 - `defaults.mcp_max_estimated_cost_usd`: MCP estimated cost guard
+- `defaults.auto_open_browser`: automatically open HTML transcripts in the default web browser (boolean, default `false`)
 - `participants`: named CLI, OpenRouter, or Ollama participants
 - `modes`: named participant routing presets
 - `transcripts_dir`: local run transcript directory
@@ -513,6 +514,10 @@ MCP tools:
 - `council_last_transcript`: read the latest transcript
 - `council_doctor`: diagnose local readiness
 - `council_models`: list cached OpenRouter models
+- `council_stats`: show aggregate participant metrics across transcripts
+- `council_query_transcripts`: search prior transcript history semantically
+- `council_config`: get or set configuration keys in `.llm-council.yaml`
+
 
 `council_run` returns `metadata.progress_events`, including participant start,
 finish, skip, error, and deliberation events. With the stdio MCP server these

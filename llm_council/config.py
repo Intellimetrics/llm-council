@@ -971,6 +971,43 @@ def select_participants(
             )
         )
 
+    # Multiplex single participant if needed
+    mode_cfg = config.get("modes", {}).get(mode, {})
+    has_stances = isinstance(mode_cfg, dict) and mode_cfg.get("stances") is not None
+    is_debate_mode = mode in ("consensus", "adversarial-red-team", "deliberate", "deep-audit")
+    force_multiplex = isinstance(mode_cfg, dict) and mode_cfg.get("single_llm_multiplex") is True
+
+    if mode == "single-llm" or force_multiplex:
+        if deduped:
+            deduped = [deduped[0]]
+
+    if len(deduped) == 1 and (has_stances or is_debate_mode or force_multiplex or mode == "single-llm"):
+        base_name = deduped[0]
+        base_cfg = participants.get(base_name)
+        if isinstance(base_cfg, dict):
+            # Create three virtual peers
+            deduped = [f"{base_name}_for", f"{base_name}_against", f"{base_name}_neutral"]
+            
+            # Add them to participants config
+            for suffix, stance in [("_for", "for"), ("_against", "against"), ("_neutral", "neutral")]:
+                virtual_name = f"{base_name}{suffix}"
+                virtual_cfg = dict(base_cfg)
+                virtual_cfg["stance"] = stance
+                participants[virtual_name] = virtual_cfg
+            
+            # Seed stances in the mode config so balance_stances preserves them
+            if "modes" not in config:
+                config["modes"] = {}
+            if mode not in config["modes"]:
+                config["modes"][mode] = {}
+            config["modes"][mode]["stances"] = {
+                f"{base_name}_for": "for",
+                f"{base_name}_against": "against",
+                f"{base_name}_neutral": "neutral",
+            }
+            # Refresh mode_cfg reference
+            mode_cfg = config["modes"][mode]
+
     # Per-mode model overrides. Highest priority in the resolution chain
     # (base participants.<peer>.model -> tiers.<tier>.<peer> swap, already
     # applied by apply_tier_override before we get here -> this). Mutates
@@ -1038,4 +1075,78 @@ def balance_stances(active_participants: list[str], mode_stances: dict[str, str]
                 break
 
     return assigned
+
+
+def apply_smart_routing(config: dict[str, Any], mode: str, cwd: Path) -> None:
+    """Scan the git diff and context files to dynamically downgrade premium models to cheaper alternatives if changes are low-risk."""
+    smart_cfg = config.get("smart_routing", {})
+    if isinstance(smart_cfg, dict) and smart_cfg.get("enabled", True) is False:
+        return
+
+    # Get changed files
+    from llm_council.context import _git_output
+    changed_files = []
+    try:
+        git_staged = _git_output(cwd, ["diff", "--cached", "--name-only"])
+        if git_staged:
+            changed_files.extend(git_staged.splitlines())
+        git_unstaged = _git_output(cwd, ["diff", "--name-only"])
+        if git_unstaged:
+            changed_files.extend(git_unstaged.splitlines())
+    except Exception:
+        pass
+
+    if not changed_files:
+        return
+
+    # Count lines changed
+    lines_changed = 0
+    try:
+        diff_summary = _git_output(cwd, ["diff", "--shortstat"])
+        if diff_summary:
+            import re
+            m = re.search(r"(\d+) insertion", diff_summary)
+            if m:
+                lines_changed += int(m.group(1))
+            m = re.search(r"(\d+) deletion", diff_summary)
+            if m:
+                lines_changed += int(m.group(1))
+    except Exception:
+        pass
+
+    low_risk_extensions = smart_cfg.get("low_risk_extensions") or [".md", ".txt", ".png", ".jpg", ".css", ".html", ".scss"]
+    max_lines = smart_cfg.get("max_lines_changed", 30)
+
+    all_low_risk_ext = all(
+        any(f.endswith(ext) for ext in low_risk_extensions)
+        for f in changed_files
+    )
+    
+    is_low_risk = all_low_risk_ext or (0 < lines_changed <= max_lines)
+    
+    if is_low_risk:
+        from llm_council.defaults import DEFAULT_CHEAPER_MODELS
+        cheaper_mapping = dict(DEFAULT_CHEAPER_MODELS)
+        if isinstance(smart_cfg.get("cheaper_models"), dict):
+            cheaper_mapping.update(smart_cfg["cheaper_models"])
+            
+        participants = config.get("participants", {})
+        if isinstance(participants, dict):
+            swapped = []
+            for p_name, p_cfg in participants.items():
+                if isinstance(p_cfg, dict) and p_cfg.get("model"):
+                    orig_model = p_cfg["model"]
+                    if orig_model in cheaper_mapping:
+                        cheaper_model = cheaper_mapping[orig_model]
+                        p_cfg["model"] = cheaper_model
+                        swapped.append(f"{p_name} ({orig_model} -> {cheaper_model})")
+            if swapped:
+                import sys
+                print(
+                    f"[Smart Routing] Swapped premium models for cheaper alternatives (low-risk diff detected): "
+                    f"{', '.join(swapped)}",
+                    file=sys.stderr,
+                    flush=True
+                )
+
 

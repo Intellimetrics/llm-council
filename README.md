@@ -94,6 +94,12 @@ llm-council estimate --mode consensus --diff "Should we merge this?"
 
 # Inspect the last run's raw transcripts
 llm-council last
+
+# Get a configuration setting
+llm-council config get defaults.auto_open_browser
+
+# Set a configuration setting (e.g. automatically open HTML transcript)
+llm-council config set defaults.auto_open_browser true
 ```
 
 Additional capabilities not shown above — anonymized cross-ranking (`--cross-rank`), a synthesis-chair decision memo (`--synthesize`), continuation chains (`--continue`), outcome tracking (`llm-council outcome`), and the eval/scorecard harness (`llm-council eval`) — are documented in [`CHANGELOG.md`](CHANGELOG.md) and `llm-council <command> --help`.
@@ -190,13 +196,15 @@ The `consensus` mode is designed for critical decisions (e.g., database schema c
 
 The `llm-council` server exposes the following tools to your developer agents:
 
-*   `council_run`: Run a council query with custom modes and optional diffs.
+*   `council_run`: Run a council query with custom modes and optional diffs. Includes an optional `open` boolean parameter to automatically open the HTML transcript dashboard.
 *   `council_estimate`: Check sizes and estimated costs.
 *   `council_recommend`: Ask whether a council review is recommended for a given task.
 *   `council_doctor`: Diagnoses connection issues and CLI path status.
 *   `council_list_modes`: Lists configured presets, modes, and active peers.
 *   `council_last_transcript`: Returns the path/contents of the last run.
+*   `council_stats`: Aggregates participant metrics (run count, success, tokens, cost) across transcripts.
 *   `council_query_transcripts`: Searches past transcript history for similar reviews.
+*   `council_config`: Get or set configuration keys in `.llm-council.yaml` programmatically.
 
 ---
 

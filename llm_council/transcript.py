@@ -1063,6 +1063,363 @@ def write_transcript(
         encoding="utf-8",
     )
 
+    # Generate and write HTML transcript
+    html_path = markdown_path.with_suffix(".html")
+    html_content = _generate_html_dashboard(
+        question=question,
+        mode=mode,
+        current=current,
+        participants=participants,
+        results=results,
+        metadata=metadata,
+        parent_run_id=parent_run_id,
+        elapsed_total=elapsed_total,
+        token_total=token_total,
+        cost_total=cost_total,
+        recommendations=recommendations,
+        quorum=quorum,
+    )
+    try:
+        html_path.write_text(html_content, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _generate_html_dashboard(
+    question: str,
+    mode: str,
+    current: str | None,
+    participants: list[str],
+    results: list[ParticipantResult],
+    metadata: dict[str, Any],
+    parent_run_id: str | None,
+    elapsed_total: float,
+    token_total: int,
+    cost_total: float,
+    recommendations: dict[str, int],
+    quorum: dict[str, Any],
+) -> str:
+    import html
+    def esc(text: str) -> str:
+        return html.escape(text)
+
+    synthesis = metadata.get("synthesis") or {}
+    decision = synthesis.get("decision_label") or metadata.get("recommendation") or "unknown"
+    decision_badge_class = f"badge-{decision.lower()}" if decision.lower() in ("yes", "no", "tradeoff") else "badge-unknown"
+
+    peers_html = []
+    for r in results:
+        status = "ok" if r.ok else "error"
+        cache_tag = " [cached]" if r.from_cache else ""
+        from llm_council.deliberation import recommendation_label
+        rec = recommendation_label(r.output) if r.ok else "unknown"
+        rec_badge = f'<span class="badge badge-{rec.lower()}">{rec.upper()}</span>' if r.ok else ""
+        
+        stance = getattr(r, "stance", None)
+        stance_class = f"stance-{stance}" if stance in ("for", "against", "neutral") else ""
+        stance_label = f"Stance: {stance.upper()}" if stance else "Stance: GENERAL"
+
+        peers_html.append(f"""
+        <div class="card response-card {stance_class}">
+            <div class="card-title">
+                <div>
+                    <strong>{esc(r.name)}</strong> 
+                    <span style="font-size: 13px; color: var(--text-muted); margin-left: 8px;">
+                        ({status}){cache_tag} &bull; {r.elapsed_seconds:.1f}s &bull; {r.total_tokens or 0} tokens &bull; ${r.cost_usd or 0:.6f}
+                    </span>
+                </div>
+                <div>
+                    {rec_badge}
+                    <span class="badge" style="background-color: rgba(171, 125, 246, 0.15); color: #d3bcf6; border: 1px solid rgba(171, 125, 246, 0.4); margin-left: 8px;">
+                        {esc(stance_label)}
+                    </span>
+                </div>
+            </div>
+            <pre>{esc(r.output) if r.ok else esc(r.error)}</pre>
+        </div>
+        """)
+
+    synthesis_html = ""
+    if synthesis.get("ok") and (synthesis.get("output") or "").strip():
+        synthesis_html = f"""
+        <div class="card" style="border-left: 4px solid var(--accent-color);">
+            <div class="card-title">
+                <strong>Synthesis Chair Report (Chair: {esc(synthesis.get("chair") or "?")})</strong>
+                <span class="badge badge-{decision.lower()}">Decision: {esc(decision.upper())}</span>
+            </div>
+            <pre>{esc(synthesis["output"].strip())}</pre>
+        </div>
+        """
+
+    quorum_msg = f"{quorum['labeled_quorum']} of {len(results)} peers labeled (min: {quorum['min_quorum']})"
+    if quorum.get("degraded"):
+        quorum_msg += " — DEGRADED"
+
+    html_str = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Council Transcript Dashboard</title>
+    <style>
+        :root {{
+            --bg-color: #0d1117;
+            --card-bg: #161b22;
+            --border-color: #30363d;
+            --text-color: #c9d1d9;
+            --text-muted: #8b949e;
+            --primary-color: #58a6ff;
+            --success-color: #2ea44f;
+            --danger-color: #f85149;
+            --warning-color: #db6d28;
+            --accent-color: #ab7df6;
+        }}
+        body {{
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 24px;
+            line-height: 1.5;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+        }}
+        header {{
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 16px;
+            margin-bottom: 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+        }}
+        h1 {{
+            margin: 0;
+            font-size: 28px;
+            font-weight: 600;
+            background: linear-gradient(45deg, var(--primary-color), var(--accent-color));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }}
+        .badge {{
+            display: inline-block;
+            padding: 4px 10px;
+            font-size: 12px;
+            font-weight: 600;
+            border-radius: 2em;
+            text-transform: uppercase;
+        }}
+        .badge-yes {{ background-color: rgba(46, 164, 79, 0.15); color: #56d364; border: 1px solid rgba(46, 164, 79, 0.4); }}
+        .badge-no {{ background-color: rgba(248, 81, 73, 0.15); color: #ff7b72; border: 1px solid rgba(248, 81, 73, 0.4); }}
+        .badge-tradeoff {{ background-color: rgba(219, 109, 40, 0.15); color: #f0883e; border: 1px solid rgba(219, 109, 40, 0.4); }}
+        .badge-unknown {{ background-color: rgba(139, 148, 158, 0.15); color: #c9d1d9; border: 1px solid rgba(139, 148, 158, 0.4); }}
+        
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }}
+        .stat-card {{
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            text-align: center;
+        }}
+        .stat-val {{
+            font-size: 24px;
+            font-weight: 700;
+            margin-top: 8px;
+            color: var(--primary-color);
+        }}
+        .stat-label {{
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        
+        .tabs {{
+            display: flex;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 20px;
+        }}
+        .tab {{
+            padding: 10px 20px;
+            cursor: pointer;
+            font-weight: 600;
+            color: var(--text-muted);
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }}
+        .tab:hover {{
+            color: var(--text-color);
+        }}
+        .tab.active {{
+            color: var(--primary-color);
+            border-bottom-color: var(--primary-color);
+        }}
+        
+        .tab-content {{
+            display: none;
+        }}
+        .tab-content.active {{
+            display: block;
+        }}
+        
+        .card {{
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }}
+        .card-title {{
+            margin-top: 0;
+            margin-bottom: 12px;
+            font-size: 16px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        
+        pre {{
+            background-color: #0d1117;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 16px;
+            overflow-x: auto;
+            font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, Liberation Mono, monospace;
+            font-size: 13px;
+            white-space: pre-wrap;
+            margin: 0;
+        }}
+        
+        .response-card {{
+            border-left: 4px solid var(--border-color);
+        }}
+        .response-card.stance-for {{ border-left-color: var(--success-color); }}
+        .response-card.stance-against {{ border-left-color: var(--danger-color); }}
+        .response-card.stance-neutral {{ border-left-color: var(--accent-color); }}
+        
+        .search-box {{
+            width: 100%;
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            color: var(--text-color);
+            padding: 10px 16px;
+            border-radius: 6px;
+            font-size: 14px;
+            margin-bottom: 20px;
+            box-sizing: border-box;
+        }}
+        .search-box:focus {{
+            border-color: var(--primary-color);
+            outline: none;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div>
+                <h1>LLM Council Dashboard</h1>
+                <div style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">
+                    Mode: <code>{esc(mode)}</code> &bull; Current Agent: <code>{esc(current or 'unknown')}</code>
+                </div>
+            </div>
+            <div>
+                <span class="badge {decision_badge_class}" style="font-size: 16px; padding: 6px 16px;">
+                    Decision: {esc(decision.upper())}
+                </span>
+            </div>
+        </header>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Elapsed Total</div>
+                <div class="stat-val">{elapsed_total:.1f}s</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Tokens Used</div>
+                <div class="stat-val">{token_total}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Cost (USD)</div>
+                <div class="stat-val">${cost_total:.5f}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Quorum</div>
+                <div class="stat-val" style="font-size: 16px; margin-top: 16px;">{esc(quorum_msg)}</div>
+            </div>
+        </div>
+
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('debate')">Debate Timeline</div>
+            <div class="tab" onclick="switchTab('summary')">Executive Report</div>
+            <div class="tab" onclick="switchTab('prompt')">Prompt & Context</div>
+        </div>
+
+        <div id="debate-content" class="tab-content active">
+            <input type="text" class="search-box" id="search-input" placeholder="Search responses..." onkeyup="filterResponses()">
+            <div id="responses-container">
+                {"".join(peers_html)}
+            </div>
+        </div>
+
+        <div id="summary-content" class="tab-content">
+            {synthesis_html}
+            <div class="card">
+                <h3 style="margin-top: 0;">Vote Summary</h3>
+                <p>Yes: <strong>{recommendations.get('yes', 0)}</strong></p>
+                <p>No: <strong>{recommendations.get('no', 0)}</strong></p>
+                <p>Tradeoff: <strong>{recommendations.get('tradeoff', 0)}</strong></p>
+                <p>Unknown: <strong>{recommendations.get('unknown', 0)}</strong></p>
+            </div>
+        </div>
+
+        <div id="prompt-content" class="tab-content">
+            <div class="card">
+                <div class="card-title"><strong>Original Prompt</strong></div>
+                <pre>{esc(question)}</pre>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function switchTab(tabId) {{
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            
+            const tabEl = Array.from(document.querySelectorAll('.tab')).find(t => t.textContent.toLowerCase().includes(tabId === 'prompt' ? 'prompt' : tabId === 'summary' ? 'executive' : 'debate'));
+            if (tabEl) tabEl.classList.add('active');
+            
+            document.getElementById(tabId + '-content').classList.add('active');
+        }}
+
+        function filterResponses() {{
+            const query = document.getElementById('search-input').value.toLowerCase();
+            document.querySelectorAll('.response-card').forEach(card => {{
+                const text = card.textContent.toLowerCase();
+                if (text.includes(query)) {{
+                    card.style.display = 'block';
+                }} else {{
+                    card.style.display = 'none';
+                }}
+            }});
+        }}
+    </script>
+</body>
+</html>
+"""
+    return html_str
+
+
 
 def markdown_fence(text: str) -> str:
     longest = 0

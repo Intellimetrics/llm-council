@@ -162,6 +162,36 @@ def read_git_diff(cwd: Path) -> str:
     return "\n".join(sections)
 
 
+def _filter_semantic_diff(diff_text: str | None) -> str:
+    """Filter out lockfiles and binary/asset files from the diff to save tokens."""
+    if not diff_text:
+        return ""
+    ignored_extensions = (
+        ".lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
+        ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3"
+    )
+    blocks = diff_text.split("diff --git ")
+    filtered_blocks = []
+    # The first block might be empty or preamble
+    if blocks[0].strip():
+        filtered_blocks.append(blocks[0])
+        
+    for block in blocks[1:]:
+        lines = block.splitlines()
+        header_line = lines[0] if lines else ""
+        # Check if the block refers to an ignored file
+        should_ignore = False
+        for pattern in ignored_extensions:
+            if pattern in header_line:
+                should_ignore = True
+                break
+        if not should_ignore:
+            filtered_blocks.append("diff --git " + block)
+            
+    return "".join(filtered_blocks)
+
+
 def _read_git_diff_sections(cwd: Path) -> tuple[list[str], str]:
     """Return (markdown sections, raw concatenated diff text).
 
@@ -177,6 +207,9 @@ def _read_git_diff_sections(cwd: Path) -> tuple[list[str], str]:
     unstaged = _git_output(cwd, ["diff", "--"])
     if staged is None or unstaged is None:
         return [_git_diff_unavailable("git diff failed")], ""
+
+    staged = _filter_semantic_diff(staged)
+    unstaged = _filter_semantic_diff(unstaged)
 
     sections = ["## Git Diff"]
     if staged.strip():
@@ -261,7 +294,7 @@ def _resolve_stance_inputs(
 
 
 def resolve_stance_prompt(
-    stance: str, *, override: str | None = None
+    stance: str, *, override: str | None = None, mode: str | None = None
 ) -> str:
     """Return the stance paragraph, preferring an explicit override."""
 
@@ -269,6 +302,22 @@ def resolve_stance_prompt(
         text = override.strip()
         if text:
             return text
+    if mode in ("adversarial-red-team", "deep-audit"):
+        if stance == "against":
+            return (
+                "Stance: ATTACKER (Red Team). Your sole objective is to find security vulnerabilities, "
+                "logic flaws, race conditions, edge-case crashes, performance regressions, or test gaps "
+                "in the proposed changes. Do not be agreeable. Act as a critical adversary trying to "
+                "break the code. You MUST emit `RECOMMENDATION: no` if you find any potential issues, "
+                "or `RECOMMENDATION: tradeoff` if the risks are present but manageable."
+            )
+        elif stance == "for":
+            return (
+                "Stance: DEFENDER (Blue Team). Your objective is to defend the implementation. Explain "
+                "why the changes are robust, how they handle edge cases, and why the proposed approach "
+                "is correct and safe. However, do not blindly defend if there is a critical exploit "
+                "or safety issue — invariants always apply."
+            )
     if stance in DEFAULT_STANCE_PROMPTS:
         return DEFAULT_STANCE_PROMPTS[stance]
     raise ValueError(
@@ -293,6 +342,7 @@ def render_stance_section(
     stances: dict[str, str],
     *,
     participants: dict[str, dict[str, Any]] | None = None,
+    mode: str | None = None,
 ) -> str:
     """Render the per-participant Stance Assignments block."""
 
@@ -319,7 +369,7 @@ def render_stance_section(
         cfg = participants.get(name) or {}
         family = cfg.get("family") or name
         override = cfg.get("stance_prompt")
-        paragraph = resolve_stance_prompt(stance, override=override)
+        paragraph = resolve_stance_prompt(stance, override=override, mode=mode)
         safe_name = _sanitize_identifier(name)
         safe_family = _sanitize_identifier(family)
         lines.append(
@@ -406,6 +456,18 @@ def build_prompt(
         ]
     )
 
+    if mode == "test-gap-analysis":
+        head_sections.extend(
+            [
+                "",
+                "TEST GAP ANALYSIS INSTRUCTION:",
+                "Analyze the proposed changes and identify any missing test cases or gaps in test coverage.",
+                "If logic is modified but no tests are added or updated, you should point this out.",
+                "If the code change lacks tests, you MUST vote `RECOMMENDATION: no` or `RECOMMENDATION: tradeoff`",
+                "and list the missing tests under the `TESTS_TO_RUN:` section.",
+            ]
+        )
+
     # Surface REQUIRED section markers found in the question body so peers
     # know up-front that section coverage will be enforced. The validator
     # is no-op when no markers are present, so this block stays silent for
@@ -463,7 +525,7 @@ def build_prompt(
     stance_tail: list[str] = []
     if resolved_stances:
         stance_block = render_stance_section(
-            resolved_stances, participants=resolved_participants
+            resolved_stances, participants=resolved_participants, mode=mode
         )
         if stance_block:
             stance_tail = ["", stance_block]
@@ -672,37 +734,38 @@ def apply_per_peer_directives(
     mode: str | None,
     family: str | None,
     tool_call_voting: bool = False,
+    stance: str | None = None,
+    persona: str | None = None,
+    persona_prompt: str | None = None,
 ) -> str:
-    """Append per-peer prompt directives based on mode + peer family.
+    """Append per-peer prompt directives based on mode + peer family + stance + persona.
 
-    Returns the prompt unchanged when no directive applies (the default
-    path for `mode=None`, hosted/local peers, and every mode except
-    `review-with-tools`). Backward-compatible by design — callers that
-    do not need per-peer variation can ignore this function.
-
-    Currently the only directive is the `review-with-tools` tool-use
-    block, appended when:
-    - `mode == "review-with-tools"`, AND
-    - `family` is one of `_TOOL_CAPABLE_CLI_FAMILIES`.
-
-    Hosted/local participants get the unchanged base prompt even when
-    routed into a `review-with-tools` run (defensive — the mode SHOULD
-    only route to CLI peers per the mode config, but `--include` can
-    override).
-
-    When `tool_call_voting=True` (mode config opt-in, v0.9.0 Feature 3),
-    the additional `TOOL_CALL_VOTING_DIRECTIVE` describing the
-    `record_recommendation` schema is appended after the tool-use
-    directive. Same gate: only fires for `review-with-tools` + a
-    tool-capable CLI family.
+    Returns the prompt unchanged when no directive applies. Backward-compatible
+    by design.
     """
-    if mode != "review-with-tools":
-        return prompt
-    if family is None or family not in _TOOL_CAPABLE_CLI_FAMILIES:
-        return prompt
-    result = prompt + "\n\n" + REVIEW_WITH_TOOLS_DIRECTIVE
-    if tool_call_voting:
-        result = result + "\n\n" + TOOL_CALL_VOTING_DIRECTIVE
+    result = prompt
+    if mode == "review-with-tools" and family in _TOOL_CAPABLE_CLI_FAMILIES:
+        result = result + "\n\n" + REVIEW_WITH_TOOLS_DIRECTIVE
+        if tool_call_voting:
+            result = result + "\n\n" + TOOL_CALL_VOTING_DIRECTIVE
+            
+    if stance:
+        # Resolve the specific stance prompt
+        stance_desc = resolve_stance_prompt(stance, mode=mode)
+        result = (
+            result +
+            f"\n\n=== INDIVIDUAL ASSIGNMENT ===\n"
+            f"You are participating under the identity representing stance: {stance.upper()}.\n"
+            f"Your specific stance instructions for this run:\n{stance_desc}\n"
+        )
+        
+    if persona_prompt:
+        result = (
+            result +
+            f"\n\n=== CONTEXTUAL ROLE ASSIGNMENT ===\n"
+            f"You have been recruited for this run due to the nature of the files changed.\n"
+            f"{persona_prompt}\n"
+        )
     return result
 
 
