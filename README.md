@@ -15,21 +15,51 @@ That is highly valuable—until it confidently overwrites a critical database mi
 
 ---
 
-## Why Use LLM Council?
+## Architecture & Workflow
 
-Coding agents move fast. To prevent single-model blind spots from becoming production incidents, LLM Council lets you pause and request a peer review:
+LLM Council acts as an advisory layer between your primary developer agent (e.g. Claude Code, Codex CLI, Antigravity) and a pool of independent peer review models.
 
-> *"This diff looks plausible, but I want other models to try to break it."*
-
-When you ask the council, peers read the same context (e.g., prompt, codebase, or git diff) and independently evaluate it. To ensure actionable feedback, every peer response is strictly parsed and must resolve to one of three consensus labels:
-
-```text
-RECOMMENDATION: yes       # Safe to proceed
-RECOMMENDATION: no        # Stop; major issues detected
-RECOMMENDATION: tradeoff  # Plausible, but note critical trade-offs
+```mermaid
+graph TD
+    User([User Prompt]) --> Agent[Primary Developer Agent]
+    Agent -- "1. Trigger (natural language / command)" --> Server[LLM Council MCP Server]
+    Server -- "2. Parse prompt / git diff" --> Orchestrator[Orchestrator]
+    Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerA[Peer A: Claude]
+    Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerB[Peer B: Codex]
+    Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerC[Peer C: Gemini]
+    PeerA -- "4. YES/NO/TRADEOFF" --> Consensus[Consensus Evaluator]
+    PeerB -- "4. YES/NO/TRADEOFF" --> Consensus
+    PeerC -- "4. YES/NO/TRADEOFF" --> Consensus
+    Consensus -- "5. Compile stances" --> Synth[Synthesis Chair]
+    Synth -- "6. Generate Memo & Markdown/HTML dashboard" --> Out[Output Handler]
+    Out -- "7. Auto-open HTML Dashboard (webbrowser)" --> Browser([Default Browser])
+    Out -- "8. Structured JSON & Summary" --> Agent
 ```
 
-If a peer fails to supply one of these labels, the response is rejected as a failure. Vague essays are not permitted.
+---
+
+## Key Features & Capabilities
+
+*   **Consensus Gates & Vote Contracts**: Every peer response is strictly parsed and must resolve to one of three consensus labels. Vague essays are rejected:
+    *   `RECOMMENDATION: yes` — Safe to proceed.
+    *   `RECOMMENDATION: no` — Stop; major issues detected.
+    *   `RECOMMENDATION: tradeoff` — Plausible, but note critical trade-offs.
+*   **Assigned-Stance Debates**: Support for multi-round refutation and debates (`consensus` mode) where one peer defends, one opposes, and one remains neutral, followed by a compilation from the **Synthesis Chair**.
+*   **Family Exclusion Routing**: Automatically detects the active agent running the session and excludes models from the same family (e.g., Gemini-family) from the peer pool to maximize reviewer diversity.
+*   **Rigorous Sandboxing & Read-Only Safety**: Native CLI peers are invoked with binary-level flags disabling file writes (`--permission-mode default` for Claude, `--sandbox read-only` for Codex).
+*   **Cost Controls & Caching**: Pre-flight token and USD cost estimation (`llm-council estimate`) plus response caching prevents unexpected hosted API charges.
+*   **Credential Secret Scanning**: Scans all prompt content for API keys, tokens, or private keys, with configurable responses (`warn`, `block`, `redact`, or `off`).
+*   **Auto-Opening HTML Dashboard**: Automatically generates a beautifully formatted HTML dashboard of the run and opens it in your default web browser upon completion.
+
+---
+
+## Single-Model Peer Isolation
+
+Even if you only have access to a single LLM (due to offline constraints, local setup, or API key limits), running a council session provides substantial value:
+
+1.  **Fresh Eyes / Context Separation**: In a typical developer agent session, the context window accumulates tools, history, and reasoning, leading to confirmation bias. The council calls a fresh, isolated API process containing *only* the diff and prompt, forcing a clean evaluation.
+2.  **Persona & State Splitting**: By invoking multiple calls to the same model concurrently with different persona prompts (e.g., Peer A as the *Attacker*, Peer B as the *Defender*, Peer C as the *Judge*), you isolate their states. The model cannot see its own arguments from the other perspective until the synthesis phase.
+3.  **Adversarial Extraction**: Forcing the model to adopt contrarian stances (e.g. "Find 3 security flaws in this diff") bypasses its default cooperative/agreeable bias, extracting a deeper critique than a standard prompt.
 
 ---
 
@@ -54,7 +84,7 @@ pipx install --force git+https://github.com/Intellimetrics/llm-council.git
 
 ## Quickstart
 
-Once installed, navigate to your active project repository and run the setup wizard:
+Navigate to your active project repository and initialize the council:
 
 ```bash
 cd /path/to/your/project
@@ -79,30 +109,32 @@ Once configured, you can talk to your primary developer agent (e.g., Claude Code
 
 While most interaction happens transparently via the MCP server inside your agent, you can invoke the CLI directly:
 
-```bash
-# Get a fast second opinion on a question
-llm-council run --mode quick "Why is this test flaky?"
+| Command | Description / Example |
+| :--- | :--- |
+| **`llm-council run`** | Run a council query. <br>`llm-council run --mode quick "Why is this test flaky?"` |
+| **`llm-council run --diff`** | Review the current git diff. <br>`llm-council run --mode review --diff "Is this migration safe to run?"` |
+| **`llm-council estimate`** | Calculate prompt size and costs before running. <br>`llm-council estimate --mode consensus --diff "Should we merge this?"` |
+| **`llm-council last`** | Inspect the last run's raw transcripts. <br>`llm-council last` |
+| **`llm-council config get`** | Retrieve a configuration value. <br>`llm-council config get defaults.auto_open_browser` |
+| **`llm-council config set`** | Set a configuration value. <br>`llm-council config set defaults.auto_open_browser true` |
 
-# Review the current git diff
-llm-council run --mode review --diff "Is this migration safe to run?"
+---
 
-# Force a detailed debate with assigned stances
-llm-council run --mode consensus --diff "Should we merge this auth rewrite?"
+## MCP Server Integration
 
-# Estimate token sizes and costs before running a council
-llm-council estimate --mode consensus --diff "Should we merge this?"
+The `llm-council` server exposes the following tools to your developer agents:
 
-# Inspect the last run's raw transcripts
-llm-council last
-
-# Get a configuration setting
-llm-council config get defaults.auto_open_browser
-
-# Set a configuration setting (e.g. automatically open HTML transcript)
-llm-council config set defaults.auto_open_browser true
-```
-
-Additional capabilities not shown above — anonymized cross-ranking (`--cross-rank`), a synthesis-chair decision memo (`--synthesize`), continuation chains (`--continue`), outcome tracking (`llm-council outcome`), and the eval/scorecard harness (`llm-council eval`) — are documented in [`CHANGELOG.md`](CHANGELOG.md) and `llm-council <command> --help`.
+| MCP Tool Name | Description / Inputs |
+| :--- | :--- |
+| **`council_run`** | Run a council query with custom modes, context files, and optional diffs. Supports `open: true` to auto-launch the HTML dashboard. |
+| **`council_estimate`** | Check token sizes and estimated OpenRouter cost before launching. |
+| **`council_recommend`** | Evaluates a task, risk level, and files touched to recommend whether to consult the council. |
+| **`council_doctor`** | Diagnoses connection issues, API key status, and CLI path resolution. |
+| **`council_list_modes`** | Lists configured modes, presets, and active peers. |
+| **`council_last_transcript`** | Returns the path and content of the last recorded run. |
+| **`council_stats`** | Aggregates participant metrics (run count, success, tokens, cost) across recorded transcripts. |
+| **`council_query_transcripts`** | Searches past transcript history for similar reviews. |
+| **`council_config`** | Get or set configuration keys in `.llm-council.yaml` programmatically via the MCP connection. |
 
 ---
 
@@ -119,25 +151,7 @@ The setup wizard (`llm-council setup --plan`) automatically probes your environm
 | `local-private` | Strict offline-only review using local Ollama instances. |
 | `all` | Configures every discovered route on the host machine. |
 
----
-
-## Peers & Agent Integration
-
-LLM Council supports three classes of peer participants:
-
-1.  **Native CLIs**: Uses existing command-line interfaces installed on your machine (`claude`, `codex`, `agy`, or `gemini`).
-2.  **Hosted Models**: Integrates with remote APIs via **OpenRouter**.
-3.  **Local Models**: Communicates with local instances via **Ollama**.
-
-> **Native CLI model identity is not recorded.** Native CLI peers (`claude`, `codex`, `gemini`, `agy`) ship `model: None` by design so each runs under *your* account-default model. LLM Council cannot observe which concrete model the CLI actually ran, so the transcript shows `cli default (unreported)` and the JSON shows `null`. To record a model id, pin `participants.<peer>.model` (or use `--tier` / a mode's `model_overrides`) — LLM Council then passes `--model <id>` (or `exec -m <id>` for Codex) and `result.model` carries the *requested* id (not a server confirmation). **Do not pin `antigravity`'s model** — `agy` has no `--model` flag, so a pinned id is silently ignored.
-
-> **Ambient env can steer CLI peers.** By default non-secret host env vars pass through to native CLI peers, so an ambient export like `GEMINI_MODEL`, `ANTHROPIC_MODEL`, `OPENAI_MODEL`, or a `*_BASE_URL` can silently redirect a peer's model/endpoint. For deterministic, shell-independent peer routing, set `env_strict: true` on the peer — the child then sees only safe names (`PATH`/`HOME`/`LANG`/…) plus its own `env_passthrough` list.
-
-> **The `RECOMMENDATION:` label costs one retry.** Every peer response must carry a `RECOMMENDATION: yes|no|tradeoff` label; if the first response omits it, LLM Council does one repair-retry (an extra CLI round-trip), even on trivial prompts. The label is the vote contract that quorum, consensus, and findings depend on, so for a genuinely non-vote peer/prompt you can opt out per peer: `retry_on_missing_label: false` skips just the repair-retry, and `require_recommendation: false` drops the label requirement entirely.
-
-### Dynamic Triad Resolution & Family Exclusions
-*   **The 3-CLI Triad**: The `tri-cli` preset dynamically selects exactly three active local CLIs. If both `antigravity` (`agy`) and `gemini` are installed, `llm-council` prioritizes `antigravity` as the active Gemini-family peer (it reaches the latest Gemini model — but note it is only *soft*, prompt-enforced read-only; see [Read-Only Safety](#read-only-safety), and pin `gemini` instead if you need the hard guarantee).
-*   **Family Exclusions**: If the primary driver running your session is a Gemini-family agent (e.g., Antigravity CLI or Gemini CLI), `llm-council` automatically excludes other Gemini-family peers from the voting pool to avoid redundant reviews. It instead recruits independent peers (such as Claude Code and Codex CLI) for a balanced triad.
+Custom presets, modes, and default options can be configured directly in `.llm-council.yaml`.
 
 ---
 
@@ -149,62 +163,6 @@ Peers act strictly as advisors, not co-authors. How strongly that's enforced dif
 *   **Hosted & local models** (OpenRouter / Ollama): plain API calls with no filesystem access at all — inherently read-only.
 *   **Prompt-enforced (soft) — `antigravity` (`agy`)**: `agy` exposes no read-only / approval-mode / tools-allowlist flag, and its `--sandbox` only restricts the *terminal*, not the model's native file-write tool — so `agy` *can* write files. Its read-only behavior is carried by the council prompt's read-only directive, which `agy` reliably honors (it refuses write requests). `--dangerously-skip-permissions` is deliberately **omitted** so a stray write isn't auto-approved. This is a **softer** guarantee than the flag-enforced peers: a determined prompt-injection in reviewed content could in principle override the directive with no hard backstop. If you review untrusted code, prefer `gemini` (hard) over `antigravity`.
 *   **Stdin isolation**: peers receive the codebase or diff via standard input.
-
----
-
-## Configured Modes
-
-Modes determine the composition and behaviors of the council. You can customize them in `.llm-council.yaml`:
-
-| Mode | Purpose |
-| :--- | :--- |
-| `quick` | Fast, lightweight review. Perfect default for general troubleshooting. |
-| `peer-only` | Excludes the active driver CLI to hear solely from external peers. |
-| `plan` | Structural/architecture questions *before* starting implementation. |
-| `review` | Thorough diff evaluation before a merge or release. |
-| `review-with-tools` | Experimental mode where peers run file-read/grep tools before voting. |
-| `review-cheap` | Budget hosted review using smaller, cheaper models. |
-| `diverse` | Broad coverage across different companies and host architectures. |
-| `private-local` | Strict offline review pinned to local Ollama models. |
-| `consensus` | Multi-round structured debate with assigned stances (Pro, Con, Neutral). |
-| `deliberate` | Forces a secondary round of discussion even if peers initially agree. |
-
-### The Consensus Mode
-The `consensus` mode is designed for critical decisions (e.g., database schema changes, authentication logic). 
-1.  **Assigned Stances**: One peer is assigned to argue in favor of the proposal, one against, and one to remain neutral.
-2.  **Refutation Round**: If there is disagreement, a second round is run where peers receive the strongest opposing arguments and are given the opportunity to revise their stance.
-3.  **No Forced Unanimity**: If the peers still disagree, the final report outlines the conflicting arguments clearly.
-
----
-
-## Cost Controls & Data Boundaries
-
-*   **Cost Caps**: Enforce limits to prevent unexpected hosted API charges:
-    ```bash
-    llm-council run --mode consensus --diff --max-cost-usd 0.50 "Is this migration safe?"
-    ```
-*   **Pre-flight Estimation**: Run `llm-council estimate` to calculate prompt tokens and project costs before making API calls.
-*   **Secret Scanning**: Every prompt is scanned for likely credentials (API keys, tokens, private keys) before it leaves your machine. The `secret_scan` policy in `.llm-council.yaml` sets the response: `warn` (default — logs a count, ships the prompt unchanged), `block` (refuses the run), `redact` (masks each match as `[REDACTED:<kind>]` in both the peer-bound prompt **and** the saved transcript), or `off`. An allowlist (`.llm-council-secrets-allow`) covers test fixtures.
-*   **API Credentials**: Put keys in `.env`, `.env.local`, or `.llm-council.env`. Keys are never written directly into the shared `.mcp.json`.
-
-> [!CAUTION]
-> Do not use hosted council modes for classified, regulated, or credentialed codebases unless all configured models/providers are compliant with your security standards. For restricted codebases, use a local-only route — the `local-private` preset, or the `private-local` / `local-only` modes.
-
----
-
-## MCP Server Integration
-
-The `llm-council` server exposes the following tools to your developer agents:
-
-*   `council_run`: Run a council query with custom modes and optional diffs. Includes an optional `open` boolean parameter to automatically open the HTML transcript dashboard.
-*   `council_estimate`: Check sizes and estimated costs.
-*   `council_recommend`: Ask whether a council review is recommended for a given task.
-*   `council_doctor`: Diagnoses connection issues and CLI path status.
-*   `council_list_modes`: Lists configured presets, modes, and active peers.
-*   `council_last_transcript`: Returns the path/contents of the last run.
-*   `council_stats`: Aggregates participant metrics (run count, success, tokens, cost) across transcripts.
-*   `council_query_transcripts`: Searches past transcript history for similar reviews.
-*   `council_config`: Get or set configuration keys in `.llm-council.yaml` programmatically.
 
 ---
 
