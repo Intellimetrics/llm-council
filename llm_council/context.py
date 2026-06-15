@@ -737,11 +737,22 @@ def apply_per_peer_directives(
     stance: str | None = None,
     persona: str | None = None,
     persona_prompt: str | None = None,
+    focus_directive: str | None = None,
 ) -> str:
     """Append per-peer prompt directives based on mode + peer family + stance + persona.
 
     Returns the prompt unchanged when no directive applies. Backward-compatible
     by design.
+
+    ``focus_directive`` is the optional, operator-authored "review focus"
+    block (see ``review_skills.render_focus_directive``). It is INERT PROMPT
+    TEXT only — it shapes WHAT peers scrutinize and grants no tool or
+    write/exec capability. It composes additively with (does not replace)
+    every existing mode/stance/persona block and is appended LAST.
+
+    # TODO(focus): existing mode-specific branches (review-with-tools /
+    # stance / persona / the test-gap-analysis mode prose) could later
+    # migrate to bundles; leave them wired today to avoid regressing voting.
     """
     result = prompt
     if mode == "review-with-tools" and family in _TOOL_CAPABLE_CLI_FAMILIES:
@@ -766,6 +777,11 @@ def apply_per_peer_directives(
             f"You have been recruited for this run due to the nature of the files changed.\n"
             f"{persona_prompt}\n"
         )
+
+    # Operator-authored review focus, appended AFTER the existing
+    # review-with-tools / stance / persona blocks so it composes with them.
+    if focus_directive:
+        result = result + "\n\n" + focus_directive
     return result
 
 

@@ -472,6 +472,29 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
     return payload
 
 
+def _applied_focus_bullet(metadata: dict[str, Any]) -> list[str]:
+    """Render a one-line bullet naming applied review-focus bundles.
+
+    Lists each bundle's name + a short (8-char) sha prefix so the human
+    transcript records which inert focus directives shaped the run. Returns
+    an empty list when no focus was applied (the no-focus path).
+    """
+
+    applied = metadata.get("applied_focus")
+    if not isinstance(applied, list) or not applied:
+        return []
+    parts: list[str] = []
+    for entry in applied:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name") or "?"
+        sha = str(entry.get("sha256") or "")[:8]
+        parts.append(f"`{name}` ({sha})" if sha else f"`{name}`")
+    if not parts:
+        return []
+    return [f"- Applied review focus: {', '.join(parts)}"]
+
+
 def convergence_summary_lines(metadata: dict[str, Any]) -> list[str]:
     """Render per-round convergence tallies as bullet lines for the markdown header.
 
@@ -802,6 +825,7 @@ def write_transcript(
         f"{recommendations['tradeoff']} tradeoff / {recommendations['unknown']} unknown`",
         quorum_bullet,
         *overflow_bullet,
+        *_applied_focus_bullet(metadata),
         "",
         "## Question",
         "",

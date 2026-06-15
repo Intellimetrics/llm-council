@@ -2360,6 +2360,7 @@ async def run_participants(
     mode_multiplier: float | None = None,
     mode: str | None = None,
     tool_call_voting: bool = False,
+    focus_directive: str | None = None,
 ) -> list[ParticipantResult]:
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
@@ -2379,6 +2380,7 @@ async def run_participants(
                 stance=cfg.get("stance"),
                 persona=cfg.get("persona"),
                 persona_prompt=cfg.get("persona_prompt"),
+                focus_directive=focus_directive,
             )
             timeout = _resolve_effective_timeout(
                 cfg, mode_multiplier, prompt_chars=len(peer_prompt)

@@ -224,6 +224,20 @@ def council_run_schema() -> dict[str, Any]:
                     "into round-2 deliberation."
                 ),
             },
+            "focus": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Review-focus bundle names to compose onto the selected "
+                    "mode. Bundles live at "
+                    ".llm-council/review-skills/<name>/SKILL.md and are INERT "
+                    "prompt text only (advisory, read-only — they grant no "
+                    "tool or write capability). They shape WHAT peers "
+                    "scrutinize, compose with any mode, and persist across "
+                    "rounds. Unknown names fail the call before any peer is "
+                    "launched."
+                ),
+            },
         },
         "required": ["question"],
         "additionalProperties": False,
@@ -682,6 +696,25 @@ def council_run_output_schema() -> dict[str, Any]:
                         "api_key_env": {"type": "string"},
                     },
                     "required": ["peer", "family", "api_key_env"],
+                },
+            },
+            "applied_focus": {
+                "type": "array",
+                "description": (
+                    "Operator-authored review-focus bundles applied to this "
+                    "run (M11 provenance). Each entry is the bundle name + "
+                    "the hex sha256 of its (inert, advisory-only) directive "
+                    "body. Bundles compose with any mode and grant no tool "
+                    "or write capability. Omitted entirely when no focus "
+                    "was applied (the common no-focus path)."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "sha256": {"type": "string"},
+                    },
+                    "required": ["name", "sha256"],
                 },
             },
             "metadata": {"type": "object"},
@@ -1244,6 +1277,19 @@ async def run_council(
     _progress_cb = _build_mcp_progress_callback(
         mcp_session, progress_token, planned_total=_planned_total
     )
+    # Resolve operator-authored review-focus bundles. Fail fast (raise
+    # ValueError, mirroring this handler's other input-validation errors)
+    # on an unknown bundle name BEFORE execute_council launches any peer.
+    resolved_focus = None
+    _focus_arg = arguments.get("focus")
+    if _focus_arg:
+        from llm_council import review_skills as _review_skills
+
+        _focus_names = [str(name) for name in _focus_arg]
+        try:
+            resolved_focus, _ = _review_skills.resolve_focus(_focus_names, cwd)
+        except _review_skills.FocusNotFound as exc:
+            raise ValueError(str(exc)) from exc
     results, metadata = await execute_council(
         participants,
         cfg,
@@ -1261,6 +1307,7 @@ async def run_council(
         current=current,
         question=question,
         cross_rank=bool(arguments.get("cross_rank")),
+        focus=resolved_focus,
     )
     if image_manifest:
         metadata["images"] = [
@@ -1414,6 +1461,11 @@ async def run_council(
     # X env var" signal without parsing per-result errors (the peer
     # never produced a result — it was excluded pre-run).
     metadata, missing_key_peers = _lift(metadata, "missing_key_peers", [])
+    # M11 provenance: lift applied review-focus bundles top-level (name +
+    # short content hash) so a calling agent sees which inert focus
+    # directives shaped the run without parsing metadata. Absent entirely
+    # when no --focus / focus was applied (default no-focus path).
+    metadata, applied_focus = _lift(metadata, "applied_focus", [])
     payload: dict[str, Any] = {
         "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
         "recommendation": recommendation,
@@ -1448,6 +1500,8 @@ async def run_council(
         payload["quota_recoveries"] = quota_recoveries
     if missing_key_peers:
         payload["missing_key_peers"] = missing_key_peers
+    if applied_focus:
+        payload["applied_focus"] = applied_focus
     # v0.9.0 Feature 2: lift cross-rank fields to the top-level payload
     # mirroring finding_matrix. Strip them from metadata to avoid
     # double-serialization (same data appearing under metadata.* AND

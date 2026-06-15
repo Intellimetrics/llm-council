@@ -451,8 +451,20 @@ async def execute_council(
     current: str | None = None,
     question: str | None = None,
     cross_rank: bool = False,
+    focus: list[Any] | None = None,
 ) -> tuple[list[ParticipantResult], dict[str, Any]]:
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
+
+    # Operator-authored review-focus bundles (review_skills.ReviewSkill).
+    # Rendered once into an inert prompt directive appended to EVERY round
+    # (round 1, the ranking pass, round-2 deliberation) so the focus
+    # persists across rounds. When ``focus`` is None the directive is ""
+    # and behavior is unchanged. Imported lazily to avoid an import cycle.
+    focus_directive = ""
+    if focus:
+        from llm_council.review_skills import render_focus_directive
+
+        focus_directive = render_focus_directive(focus)
     convergence_thresholds = _resolve_convergence_thresholds(config, mode)
 
     # Push run-wide validation toggles from config["defaults"] into each
@@ -656,6 +668,7 @@ async def execute_council(
             mode_multiplier=mode_multiplier,
             mode=mode,
             tool_call_voting=tool_call_voting,
+            focus_directive=focus_directive,
         )
         verify_evidence_citations(run_results, cwd)
     else:
@@ -725,6 +738,12 @@ async def execute_council(
         "deliberation_status": "not_requested",
         "progress_events": progress_events,
     }
+    # M11 provenance: record which focus bundles shaped this run (name +
+    # short content hash). Omitted entirely when no focus was applied.
+    if focus:
+        metadata["applied_focus"] = [
+            {"name": s.name, "sha256": s.sha256} for s in focus
+        ]
     if deliberate:
         if not initial_disagreement:
             metadata["deliberation_status"] = "skipped_no_labeled_disagreement"
@@ -823,6 +842,13 @@ async def execute_council(
                     anonymization_map=anonymization_map,
                     question=ranking_question,
                 )
+                # Carry the operator's review focus into the ranking pass so
+                # the scrutiny lens persists across rounds. The ranking pass
+                # uses run_participant (singular) with a freshly-built prompt
+                # rather than run_participants, so we append the inert focus
+                # directive directly. No-op when focus is unset.
+                if focus_directive:
+                    ranking_prompt = ranking_prompt + "\n\n" + focus_directive
                 from llm_council.adapters import run_participant
 
                 # Ranking pass intentionally bypasses tool-call voting:
@@ -1010,6 +1036,7 @@ async def execute_council(
             mode_multiplier=mode_multiplier,
             mode=mode,
             tool_call_voting=tool_call_voting,
+            focus_directive=focus_directive,
         )
         verify_evidence_citations(next_results, cwd)
         prior_round_results = list(round_results)
