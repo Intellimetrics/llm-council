@@ -442,6 +442,28 @@ Key modules:
   from hosted OpenAI to no-auth local vLLM — we defer to the
   adapter rather than guess). With explicit `api_key_env` set, both
   types pre-drop normally.
+- **Independence warning is advisory-only (H2).** The optional
+  `defaults.min_distinct_vendors` (global) and per-mode
+  `modes.<name>.require_distinct_vendors` (override; resolution: mode
+  override first, then global default, else feature OFF) set a floor on
+  how many DISTINCT vendor families the final-round labeled votes must
+  span. When the resolved threshold is set AND the count of distinct
+  families among labeled final-round votes is below it, the orchestrator
+  (`execute_council`, immediately after the degraded block) sets a NEW
+  `metadata["independence_warning"]` dict (`distinct_vendors`, `required`,
+  `families`, `labeled_quorum`) and emits a `single_vendor_quorum`
+  progress event. It NEVER drops a peer and must NEVER overload
+  `metadata["degraded"]` / `min_quorum` / `labeled_quorum` — `degraded`
+  means below-quorum-COUNT only; independence is an orthogonal correlated-
+  agreement signal. Both keys validate as positive integers at config-load
+  (`config._validate_positive_int`); built-in modes ship WITHOUT either key
+  (feature OFF by default — when the threshold is unset OR met, the
+  `independence_warning` key is omitted entirely and no event fires).
+  Surfaced top-level in MCP `council_run` `structured_results`
+  (omit-when-absent, like `quota_throttled_peers`; also left in
+  `metadata` like `degraded`), persisted in the transcript JSON via the
+  whole-`metadata` serialization, and rendered as a one-line ⚠️ note in
+  the markdown transcript near the quorum/degraded summary.
 - **`.mcp.json` stays local.** Setup adds it to `.gitignore`. It contains
   absolute paths and must not be committed.
 - **Version bumps.** `__version__` in `llm_council/__init__.py` and the
