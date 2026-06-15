@@ -207,6 +207,17 @@ def council_run_schema() -> dict[str, Any]:
                     "across all participants and budgeted rounds."
                 ),
             },
+            "cost_warn_usd": {
+                "type": "number",
+                "minimum": 0,
+                "description": (
+                    "Soft, advisory-only cost-warning threshold in USD. When "
+                    "the pre-flight estimate is at or above this value the run "
+                    "still proceeds, but a non-fatal `cost_warning` is surfaced "
+                    "top-level and in metadata. Never blocks — use max_cost_usd "
+                    "for a hard ceiling. Overrides defaults.cost_warn_usd."
+                ),
+            },
             "tier": {
                 "type": "string",
                 "description": (
@@ -1275,28 +1286,49 @@ async def run_council(
 
     max_cost_usd = arguments.get("max_cost_usd")
     max_tokens = arguments.get("max_tokens")
-    if max_cost_usd is not None or max_tokens is not None:
-        try:
-            preflight = estimate_council(
-                config=config,
-                cwd=cwd,
-                question=question,
-                mode=mode,
-                current=current,
-                explicit=arguments.get("participants"),
-                include=arguments.get("include"),
-                origin_policy=arguments.get("origin_policy"),
-                context_paths=arguments.get("context_files") or [],
-                include_diff=bool(arguments.get("include_diff")),
-                allow_outside_cwd=False,
-                deliberate=deliberate,
-                max_rounds=max_rounds,
-                use_cache=True,
-                allow_network=False,
-                image_paths=image_path_inputs or None,
-            )
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"failed to compute pre-flight estimate: {exc}") from exc
+    # M6 soft cost-warning threshold. None-aware precedence (NOT an `or`
+    # chain, so an explicit 0 at either layer is respected): MCP arg >
+    # defaults.cost_warn_usd.
+    cost_warn_usd = arguments.get("cost_warn_usd")
+    if cost_warn_usd is None:
+        cost_warn_usd = config.get("defaults", {}).get("cost_warn_usd")
+    # Compute the pre-flight estimate once and reuse it for the hard budget
+    # gate (when a cap is set), the M6 soft warning, and the L7 compact echo.
+    # allow_network=False keeps it cheap (cached catalog only) so the
+    # always-on L7 echo adds no meaningful latency.
+    preflight: dict[str, Any] | None = None
+    cost_warning_payload: dict[str, Any] | None = None
+    cost_estimate_block: dict[str, Any] | None = None
+    try:
+        preflight = estimate_council(
+            config=config,
+            cwd=cwd,
+            question=question,
+            mode=mode,
+            current=current,
+            explicit=arguments.get("participants"),
+            include=arguments.get("include"),
+            origin_policy=arguments.get("origin_policy"),
+            context_paths=arguments.get("context_files") or [],
+            include_diff=bool(arguments.get("include_diff")),
+            allow_outside_cwd=False,
+            deliberate=deliberate,
+            max_rounds=max_rounds,
+            use_cache=True,
+            allow_network=False,
+            image_paths=image_path_inputs or None,
+        )
+    except (OSError, ValueError) as exc:
+        # Hard caps fail closed if the estimate can't be computed; the soft
+        # warning / echo are best-effort and degrade silently.
+        if max_cost_usd is not None or max_tokens is not None:
+            raise ValueError(
+                f"failed to compute pre-flight estimate: {exc}"
+            ) from exc
+    if preflight is not None:
+        from llm_council.estimate import compact_cost_estimate
+
+        cost_estimate_block = compact_cost_estimate(preflight)
         cost_total, token_total, unpriced_paid = summarize_preflight_caps(preflight)
         if max_cost_usd is not None and unpriced_paid:
             raise ValueError(
@@ -1317,6 +1349,14 @@ async def run_council(
                 f"Pre-flight estimate {token_total} tokens exceeds max_tokens "
                 f"{int(max_tokens)}; refused before any participant was invoked."
             )
+        # M6: soft warning off the SAME reduction the hard gate uses, so soft
+        # and hard numbers can never drift. Only reached when the run proceeds
+        # (a tripped hard gate above raises before this point).
+        if cost_warn_usd is not None and cost_total >= float(cost_warn_usd):
+            cost_warning_payload = {
+                "estimated_usd": cost_total,
+                "threshold_usd": float(cost_warn_usd),
+            }
     cfg = config.get("participants", {})
     # Stash warnings now so they survive into the post-run response. We
     # populate the metadata field once execute_council has returned its
@@ -1375,6 +1415,13 @@ async def run_council(
     if prior_context_suppressed:
         metadata["prior_context_suppressed_for_independence"] = True
     metadata["config_warnings"] = _pending_config_warnings
+    # L7: compact cost-estimate echo so a caller who skipped `council_estimate`
+    # still sees the cost signal. M6: non-fatal soft cost-warning (omitted when
+    # not triggered).
+    if cost_estimate_block is not None:
+        metadata["cost_estimate"] = cost_estimate_block
+    if cost_warning_payload is not None:
+        metadata["cost_warning"] = cost_warning_payload
     write_transcript(
         md_path,
         json_path,
@@ -1567,6 +1614,12 @@ async def run_council(
     # top-level keys).
     metadata, cross_rank_scores_out = _lift(metadata, "cross_rank_scores", {})
     metadata, anonymization_map_out = _lift(metadata, "anonymization_map", {})
+    # L7 / M6: lift the compact cost-estimate echo and the soft cost-warning
+    # to top-level so a calling agent sees the cost signal without parsing
+    # metadata. Omit-when-absent (the common no-cap-no-warn path leaves both
+    # unset). `cost_estimate` is left in metadata too (mirrors `degraded`),
+    # so re-anchor below picks it up; `cost_warning` is lifted out.
+    metadata, cost_warning_out = _lift(metadata, "cost_warning", {})
     # Anchor the payload's metadata reference to the fully-popped dict.
     # `metadata` may have been copied/mutated by any of the lifts above
     # (pre- and post-payload); a single assignment here keeps
@@ -1576,6 +1629,12 @@ async def run_council(
         payload["cross_rank_scores"] = cross_rank_scores_out
     if anonymization_map_out:
         payload["anonymization_map"] = anonymization_map_out
+    # L7: surface the compact cost-estimate block top-level (still present in
+    # metadata too). M6: surface the soft cost-warning top-level when triggered.
+    if isinstance(metadata, dict) and metadata.get("cost_estimate"):
+        payload["cost_estimate"] = metadata["cost_estimate"]
+    if cost_warning_out:
+        payload["cost_warning"] = cost_warning_out
     # H2 independence warning (advisory-only): surfaced top-level so a
     # calling agent can spot single-vendor quorums without parsing
     # metadata. Mirrors the omit-when-absent convention — the common case

@@ -224,6 +224,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--cost-warn-usd",
+        type=float,
+        default=None,
+        help=(
+            "Soft, advisory-only cost-warning threshold in USD. When the "
+            "pre-flight estimate is at or above this value the run still "
+            "proceeds, but a non-fatal warning is printed to stderr and "
+            "stamped into the transcript metadata. Never blocks — use "
+            "--max-cost-usd for a hard ceiling. Overrides defaults.cost_warn_usd."
+        ),
+    )
+    run.add_argument(
         "--chunk-strategy",
         dest="chunk_strategy",
         choices=["fail", "head", "tail", "hash-aware"],
@@ -2844,47 +2856,88 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     # their cap is configured correctly without spending real-call dollars.
     max_cost_usd = getattr(args, "max_cost_usd", None)
     max_tokens = getattr(args, "max_tokens", None)
-    if max_cost_usd is not None or max_tokens is not None:
-        try:
-            preflight = estimate_council(
-                config=config,
-                cwd=cwd,
-                question=question,
-                mode=mode,
-                current=current,
-                explicit=parse_csv(args.participants),
-                include=parse_csv(args.include),
-                origin_policy=args.origin_policy,
-                context_paths=args.context,
-                include_diff=args.diff,
-                stdin_text=stdin_text,
-                allow_outside_cwd=args.allow_outside_cwd,
-                deliberate=deliberate,
-                max_rounds=max_rounds,
-                use_cache=True,
-                allow_network=False,
-                image_paths=args.image,
+    # M6 soft cost-warning threshold. None-aware precedence (NOT an `or`
+    # chain, so an explicit 0 at either layer is respected): CLI flag >
+    # defaults.cost_warn_usd.
+    cost_warn_usd = getattr(args, "cost_warn_usd", None)
+    if cost_warn_usd is None:
+        cost_warn_usd = config.get("defaults", {}).get("cost_warn_usd")
+    # Compute the pre-flight estimate once and reuse it for: the hard
+    # budget gate (when a cap is set), the M6 soft warning, and the L7
+    # compact metadata echo. allow_network=False keeps it cheap (cached
+    # catalog only) so the always-on L7 echo adds no meaningful latency.
+    preflight: dict[str, Any] | None = None
+    cost_warning_payload: dict[str, Any] | None = None
+    cost_estimate_block: dict[str, Any] | None = None
+    try:
+        preflight = estimate_council(
+            config=config,
+            cwd=cwd,
+            question=question,
+            mode=mode,
+            current=current,
+            explicit=parse_csv(args.participants),
+            include=parse_csv(args.include),
+            origin_policy=args.origin_policy,
+            context_paths=args.context,
+            include_diff=args.diff,
+            stdin_text=stdin_text,
+            allow_outside_cwd=args.allow_outside_cwd,
+            deliberate=deliberate,
+            max_rounds=max_rounds,
+            use_cache=True,
+            allow_network=False,
+            image_paths=args.image,
+        )
+    except (OSError, ValueError) as exc:
+        # The hard caps MUST fail closed if the estimate can't be computed;
+        # the soft warning / echo are best-effort and degrade silently.
+        if max_cost_usd is not None or max_tokens is not None:
+            raise SystemExit(
+                f"failed to compute pre-flight estimate: {exc}"
+            ) from exc
+    if preflight is not None:
+        from llm_council.estimate import compact_cost_estimate
+
+        cost_estimate_block = compact_cost_estimate(preflight)
+        if max_cost_usd is not None or max_tokens is not None:
+            # enforce_preflight_caps uses the retry-safety total so a worst-case
+            # repair retry can't silently push spend past the cap, and flags
+            # hosted peers with unknown catalog price (which would otherwise slip
+            # past a $-cap). Shared with cmd_estimate + the MCP run pipeline.
+            try:
+                budget.enforce_preflight_caps(
+                    preflight,
+                    max_cost_usd=max_cost_usd,
+                    max_tokens=max_tokens,
+                    breakdown_hint=(
+                        "drop expensive peers, raise the cap, or run `llm-council "
+                        "estimate ...` for a per-peer breakdown. To exclude the "
+                        "repair-retry margin, set retry_on_missing_label: false on "
+                        "individual participants."
+                    ),
+                )
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+        # M6: soft warning off the SAME reduction the hard gate uses, so soft
+        # and hard numbers can never drift. Only fires when the run proceeds
+        # (the hard gate above would have refused first if both tripped).
+        if cost_warn_usd is not None:
+            soft_cost_total, _soft_tokens, _soft_unpriced = (
+                budget.summarize_preflight_caps(preflight)
             )
-        except (OSError, ValueError) as exc:
-            raise SystemExit(f"failed to compute pre-flight estimate: {exc}") from exc
-        # enforce_preflight_caps uses the retry-safety total so a worst-case
-        # repair retry can't silently push spend past the cap, and flags hosted
-        # peers with unknown catalog price (which would otherwise slip past a
-        # $-cap). Shared with cmd_estimate + the MCP run pipeline.
-        try:
-            budget.enforce_preflight_caps(
-                preflight,
-                max_cost_usd=max_cost_usd,
-                max_tokens=max_tokens,
-                breakdown_hint=(
-                "drop expensive peers, raise the cap, or run `llm-council "
-                "estimate ...` for a per-peer breakdown. To exclude the "
-                "repair-retry margin, set retry_on_missing_label: false on "
-                "individual participants."
-            ),
-            )
-        except ValueError as exc:
-            raise SystemExit(str(exc)) from exc
+            if soft_cost_total >= float(cost_warn_usd):
+                cost_warning_payload = {
+                    "estimated_usd": soft_cost_total,
+                    "threshold_usd": float(cost_warn_usd),
+                }
+                if not args.json:
+                    print(
+                        f"warning: estimated ${soft_cost_total:.6f} exceeds "
+                        f"cost_warn_usd ${float(cost_warn_usd):.6f}; proceeding.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
     if args.dry_run:
         # Surface the resolved per-peer model so callers can verify a tier
@@ -3038,6 +3091,13 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         progress_events = metadata.setdefault("progress_events", [])
         if isinstance(progress_events, list):
             progress_events.append(latest)
+    # L7: compact cost-estimate echo so a caller who skipped `estimate`
+    # still sees the cost signal in the transcript metadata.
+    if cost_estimate_block is not None:
+        metadata["cost_estimate"] = cost_estimate_block
+    # M6: non-fatal soft cost-warning (omitted when not triggered).
+    if cost_warning_payload is not None:
+        metadata["cost_warning"] = cost_warning_payload
 
     md_path, json_path = transcript_paths(out_dir, question)
     write_transcript(
