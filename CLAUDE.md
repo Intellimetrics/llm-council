@@ -419,19 +419,43 @@ Key modules:
   `quota_recoveries`. On failure, `model_fallback_used` is stamped
   with the LAST attempted model so the transcript shows where the
   walker stopped.
-- **Per-CLI token usage is not observable.** CLI participants
-  (claude, codex, gemini, antigravity) authenticate as the user and
-  burn the user's own account quota. llm-council has no metering hook
-  into those CLIs — no way to read "X tokens consumed", "Y quota
-  remaining", or "Z requests this hour" from the outside. The only
-  observable usage signal for CLI peers is *failures we caught*:
-  `quota_incidents` (how many times the peer hit a quota wall) and
-  `quota_recoveries` (how many of those the fallback rescued),
-  surfaced per-peer via `llm-council stats --reliability`. Real
-  token-level usage is only available for hosted OpenRouter peers
-  (the `usage` field on API responses populates `prompt_tokens` /
-  `completion_tokens` / `cost_usd` on `ParticipantResult`). Don't
-  promise observability we don't have.
+- **Per-CLI token usage is not observable in the default text-mode
+  invocation.** CLI participants (claude, codex, gemini, antigravity)
+  authenticate as the user and burn the user's own account quota. In the
+  default invocation we run them in TEXT mode, where there is no metering
+  hook — no way to read "X tokens consumed", "Y quota remaining", or "Z
+  requests this hour" from the outside. The only observable usage signal
+  for text-mode CLI peers is *failures we caught*: `quota_incidents` (how
+  many times the peer hit a quota wall) and `quota_recoveries` (how many
+  of those the fallback rescued), surfaced per-peer via `llm-council
+  stats --reliability`. Hosted OpenRouter peers always report real
+  token-level usage (the `usage` field on API responses populates
+  `prompt_tokens` / `completion_tokens` / `cost_usd` on
+  `ParticipantResult`).
+  **Opt-in exception (M7): `usage_from_json: true`.** Per-peer config
+  that switches the invocation to the CLI's own JSON output mode and
+  parses REAL usage/cost into the same `ParticipantResult` fields
+  (`prompt_tokens` / `completion_tokens` / `total_tokens` / `cost_usd`,
+  plus the CLI-reported `model` id, preferred over the requested one).
+  Implemented for **claude** (`-p --output-format json`, single JSON
+  object: `result` text + `usage` + `total_cost_usd` + `modelUsage`) and
+  **codex** (`exec --json`, JSONL stream: last `agent_message` text +
+  `turn.completed` usage; billable `prompt_tokens = max(0, input_tokens -
+  cached_input_tokens)`; codex reports no cost so `cost_usd` stays None).
+  Default OFF for every built-in peer → byte-identical text-mode command
+  and parsing. The JSON flag is PURELY ADDITIVE: it never removes the
+  read-only flags (`--permission-mode default` / `--sandbox read-only`),
+  so peers still cannot write. Flag + parser ship together per family —
+  `usage_from_json` is a NO-OP for any family without a JSON parser
+  (`_USAGE_JSON_FAMILIES = {claude, codex}`; gemini/others add no flag).
+  Parsing is fail-soft: `_parse_cli_usage_json` returns None on malformed
+  / changed JSON shapes and the adapter falls back to treating raw stdout
+  as text (the `RECOMMENDATION:` label check still runs, token fields stay
+  None) — a CLI version bump can never crash or silently drop the peer.
+  The JSON shapes are version-sensitive; the parser probes key variants
+  with `.get()`. Don't promise observability we don't have: even with the
+  opt-in, the reported model is what the CLI says, not a server-side
+  confirmation, and text mode remains unobservable.
 - **Size-scaled timeouts.** `_resolve_effective_timeout` now adds a
   prompt-size bonus on top of the per-participant base: 5s per KB above
   a 4KB threshold by default, capped at +600s. The mode multiplier
