@@ -464,6 +464,38 @@ Key modules:
   `metadata` like `degraded`), persisted in the transcript JSON via the
   whole-`metadata` serialization, and rendered as a one-line ⚠️ note in
   the markdown transcript near the quorum/degraded summary.
+- **Review-focus bundles are advisory-only, compose (not fuse), and
+  carry provenance.** Operator-authored focus bundles live at
+  `.llm-council/review-skills/<name>/SKILL.md` (frontmatter `name:` +
+  `description:`, markdown body) and are discovered by
+  `review_skills.discover_review_skills` (walks up from cwd, first
+  `.llm-council/review-skills/` wins — mirrors `config.find_config`).
+  The bundle body is **INERT PROMPT TEXT only** — it shapes WHAT peers
+  scrutinize and grants NO tool / write / exec capability; it rides on
+  top of the existing read-only invariant, never weakening it.
+  `--focus a,b` (CLI) / `focus: [...]` (MCP `council_run`) resolves via
+  `resolve_focus`, which raises `FocusNotFound` (listing available
+  names) BEFORE any subprocess launches; discovery itself is LENIENT
+  (a malformed bundle is skipped with a reason, never raised). Name
+  validation is STRICT (M12): `^[a-z0-9-]+$`, ≤ 64 chars, equal to the
+  dir name. Focus **composes additively** with any mode — it is
+  appended LAST in `context.apply_per_peer_directives` (after the
+  review-with-tools / stance / persona blocks; those are deliberately
+  NOT collapsed into bundles) via a new `focus_directive` kwarg threaded
+  through `adapters.run_participants` and rendered once in
+  `orchestrator.execute_council` (passed to round 1, the ranking pass,
+  and round-2 deliberation so it persists across rounds). Provenance
+  (M11): `metadata["applied_focus"] = [{name, sha256}]` is stamped only
+  when focus is applied (omitted otherwise), serialized wholesale into
+  the transcript JSON, rendered as a markdown summary line, and lifted
+  top-level in the `council_run` MCP response. With no `--focus`/`focus`,
+  every path behaves EXACTLY as before (the directive resolves to `""`).
+  Interaction to know (codex WU4 review): the rendered directive is part of
+  the peer prompt, and the section-coverage validator scans that combined
+  prompt — so a bundle body containing a `PART N — TITLE (REQUIRED)` header
+  WILL be enforced as a required section on every peer response. That is
+  opt-in by the author, not incidental; shipped example bundles are guarded
+  against it (`test_shipped_example_bundles_do_not_trip_required_section_validator`).
 - **`.mcp.json` stays local.** Setup adds it to `.gitignore`. It contains
   absolute paths and must not be committed.
 - **Version bumps.** `__version__` in `llm_council/__init__.py` and the

@@ -256,6 +256,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--focus",
+        dest="focus",
+        default=None,
+        help=(
+            "Comma-separated review-focus bundle names to compose onto the "
+            "selected mode. Bundles live at "
+            ".llm-council/review-skills/<name>/SKILL.md and are INERT prompt "
+            "text only (advisory, read-only — no tools granted). Composes "
+            "with any mode and persists across rounds. Unknown names fail "
+            "fast before any peer is launched."
+        ),
+    )
+    run.add_argument(
         "--open",
         action="store_true",
         default=False,
@@ -2863,6 +2876,27 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         config.setdefault("defaults", {})["require_sections"] = bool(_cli_require_sections)
     if _cli_strict_evidence is not None:
         config.setdefault("defaults", {})["strict_evidence"] = bool(_cli_strict_evidence)
+    # Resolve operator-authored review-focus bundles. Fail fast on an
+    # unknown bundle name BEFORE execute_council launches any peer.
+    resolved_focus: list[Any] | None = None
+    _focus_arg = getattr(args, "focus", None)
+    if _focus_arg:
+        from llm_council import review_skills as _review_skills
+
+        _focus_names = parse_csv(_focus_arg)
+        try:
+            resolved_focus, _focus_skipped = _review_skills.resolve_focus(
+                _focus_names, cwd
+            )
+        except _review_skills.FocusNotFound as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if _focus_skipped:
+            _skipped_names = ", ".join(s["name"] for s in _focus_skipped)
+            print(
+                f"warning: skipped malformed review-focus bundle(s): {_skipped_names}",
+                file=sys.stderr,
+            )
     results, metadata = await execute_council(
         participants,
         participant_cfg,
@@ -2881,6 +2915,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         current=current,
         question=question,
         cross_rank=bool(getattr(args, "cross_rank", False)),
+        focus=resolved_focus,
     )
     # Record the secret-scan result in metadata for transcript-based
     # audit tooling. The stderr warning above is for the live terminal;
