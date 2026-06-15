@@ -160,6 +160,11 @@ DEFAULT_CONFIG: dict = {
                 "Read,Grep,Glob,LS",
                 "--no-session-persistence",
             ],
+            # Opt-in: set `usage_from_json: true` (per-peer, in
+            # .llm-council.yaml) to invoke claude as `-p --output-format json`
+            # and parse REAL token usage + cost into the result. Default off →
+            # text-mode invocation, usage unobservable. Read-only flags above
+            # are preserved either way (the JSON flag is purely additive).
             "model": None,
             "timeout": 240,
             "max_prompt_chars": 120_000,
@@ -242,6 +247,11 @@ DEFAULT_CONFIG: dict = {
                 "{cwd}",
                 "-",
             ],
+            # Opt-in: set `usage_from_json: true` (per-peer) to invoke codex as
+            # `exec --json` (JSONL stream) and parse REAL prompt/completion
+            # tokens (cache-adjusted) into the result. codex reports no cost, so
+            # cost_usd stays None. Default off → text-mode, usage unobservable.
+            # The read-only `--sandbox read-only` flag above is preserved.
             "model": None,
             "timeout": 240,
             "max_prompt_chars": 120_000,
