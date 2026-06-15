@@ -291,18 +291,25 @@ def build_synthesis_prompt(
         "is recorded as metadata; the council's headline recommendation comes",
         "from the peers' majority label, not from you.",
         "",
-        "Cite peers by name. Aggregate the structured envelope fields below",
-        "instead of paraphrasing — do not invent blockers, evidence, or risks",
-        "that peers did not name.",
+        "Be even-handed: you are the moderator, not a third debater. Do not",
+        "introduce a new position or favor any peer — including yourself if you",
+        "also voted. Cite peers by name and aggregate the structured envelope",
+        "fields below instead of paraphrasing — your memo synthesizes the",
+        "council, it is not a fresh opinion, and you must not invent blockers,",
+        "evidence, or risks that peers did not name.",
         "",
-        "Output exactly these sections, each prefixed by the heading shown:",
+        "Output the following sections, each prefixed by the heading shown:",
         "",
         "### Decision",
         "One paragraph: yes / no / tradeoff, plus the operational implication.",
+        "If the peers did not converge, state the verdict AND explicitly name",
+        "the genuine remaining disagreement (which peers held the minority view",
+        "and on what) rather than papering over it.",
         "",
         "### Consensus blockers",
-        "Bullet list of blockers named by 2+ peers (deduplicate). Empty list",
-        "if peers blocked on disjoint things.",
+        "Bullet list of blockers named by 2+ peers (deduplicate). Prefix each",
+        "bullet with the peers who raised it, e.g. `claude, gemini: <blocker>`.",
+        "Empty list if peers blocked on disjoint things.",
         "",
         "### Single-peer concerns",
         "Bullet list of one-peer findings worth surfacing but not blocking.",
@@ -311,17 +318,34 @@ def build_synthesis_prompt(
         "### Dissent",
         "Per-peer line: `peer-name: label - one-sentence position`. Skip",
         "peers without a usable label.",
-        "",
-        "### Verification plan",
-        "Numbered list. Pull from peers' TESTS_TO_RUN: where present.",
-        "",
-        "## Original question",
-        "",
-        question.strip(),
-        "",
-        "## Peer responses (final round)",
-        "",
     ]
+    if convergence:
+        lines.extend(
+            [
+                "",
+                "### How positions moved",
+                "For each peer that changed across rounds, one line: what they",
+                "conceded or held and why, grounded ONLY in the per-peer",
+                "Convergence states (converging / diverging / stable) and",
+                "similarity values in the Convergence block below. Do not invent",
+                "concessions or reference round-1 text you were not given; if a",
+                "peer did not move, say so or omit it.",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "### Verification plan",
+            "Numbered list. Pull from peers' TESTS_TO_RUN: where present.",
+            "",
+            "## Original question",
+            "",
+            question.strip(),
+            "",
+            "## Peer responses (final round)",
+            "",
+        ]
+    )
     for result in results:
         if not result.ok or not result.output:
             continue

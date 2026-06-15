@@ -592,6 +592,49 @@ def remaining_disagreement_payload(
     }
 
 
+def _minority_callout(remaining: dict[str, Any]) -> str | None:
+    """Scannable minority note for the remaining-disagreement count line.
+
+    Returns a string like ``minority: codex, gemini held no`` when there is a
+    single CLEAR majority trinary label and a non-empty minority of OTHER
+    trinary labels. Returns ``None`` (skip the callout) when:
+
+    - there is no clear majority (two or more trinary labels tie for the top),
+    - the council is unanimous (no minority), or
+    - no trinary label was emitted at all.
+
+    ``unknown`` / ``None`` labels are intentionally excluded from both the
+    majority computation and the minority callout — they're already shown in
+    the per-peer label list, and surfacing them here would be noise.
+    """
+    counts = remaining["counts"]
+    trinary = {label: counts[label] for label in ("yes", "no", "tradeoff")}
+    top = max(trinary.values())
+    if top == 0:
+        return None
+    leaders = [label for label, n in trinary.items() if n == top]
+    if len(leaders) != 1:
+        # Ambiguous tie among top labels → no single majority.
+        return None
+    majority = leaders[0]
+    minority: list[tuple[str, str]] = []
+    for entry in remaining["participants"]:
+        label = entry.get("label")
+        if label in ("yes", "no", "tradeoff") and label != majority:
+            minority.append((entry["name"], label))
+    if not minority:
+        return None
+    # Group minority peers by the label they held so the callout reads
+    # naturally even when the minority itself is split across labels.
+    by_label: dict[str, list[str]] = {}
+    for name, label in minority:
+        by_label.setdefault(label, []).append(name)
+    parts = [
+        f"{', '.join(names)} held {label}" for label, names in by_label.items()
+    ]
+    return "minority: " + "; ".join(parts)
+
+
 def _missing_label_reason(result: ParticipantResult) -> str:
     if result.ok:
         if recommendation_label(result.output) == "unknown":
@@ -821,11 +864,15 @@ def write_transcript(
     if remaining is not None:
         counts = remaining["counts"]
         lines.extend(["## Remaining disagreement", ""])
-        lines.append(
+        count_line = (
             "Recommendations (final round): "
             f"{counts['yes']} yes / {counts['no']} no / "
             f"{counts['tradeoff']} tradeoff / {counts['unknown']} unknown"
         )
+        minority = _minority_callout(remaining)
+        if minority:
+            count_line += f" — {minority}"
+        lines.append(count_line)
         lines.append("")
         for entry in remaining["participants"]:
             label = entry["label"] or "—"
