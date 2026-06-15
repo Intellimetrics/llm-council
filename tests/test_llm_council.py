@@ -1253,6 +1253,93 @@ def test_build_prompt_contains_read_only_rules(tmp_path: Path):
     assert "What should we do?" in prompt
 
 
+def test_build_prompt_acceptance_contract_injects_gate_block(tmp_path: Path):
+    prompt = build_prompt(
+        "Review this change",
+        mode="review",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=False,
+        stdin_text=None,
+        acceptance_contract="1. Must not break the public API.",
+    )
+    assert "ACCEPTANCE CONTRACT" in prompt
+    # The gate-blockers-on-criteria wording must be present.
+    assert "ONLY against the numbered criteria" in prompt
+    assert "only when it violates one of these criteria" in prompt
+    assert "1. Must not break the public API." in prompt
+    # Block is positioned AFTER the user question and BEFORE Response format.
+    q_idx = prompt.index("Review this change")
+    contract_idx = prompt.index("ACCEPTANCE CONTRACT")
+    fmt_idx = prompt.index("Response format:")
+    assert q_idx < contract_idx < fmt_idx
+
+
+def test_build_prompt_without_acceptance_contract_unchanged(tmp_path: Path):
+    base = build_prompt(
+        "Review this change",
+        mode="review",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=False,
+        stdin_text=None,
+    )
+    explicit_none = build_prompt(
+        "Review this change",
+        mode="review",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=False,
+        stdin_text=None,
+        acceptance_contract=None,
+    )
+    assert base == explicit_none
+    assert "ACCEPTANCE CONTRACT" not in base
+    # An empty/whitespace contract is also a no-op.
+    blank = build_prompt(
+        "Review this change",
+        mode="review",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=False,
+        stdin_text=None,
+        acceptance_contract="   ",
+    )
+    assert blank == base
+
+
+def test_resolve_acceptance_contract_text_path_and_safety(tmp_path: Path):
+    from llm_council.context import resolve_acceptance_contract
+
+    # None / blank -> None.
+    assert resolve_acceptance_contract(None, cwd=tmp_path) is None
+    assert resolve_acceptance_contract("   ", cwd=tmp_path) is None
+    # A literal sentence (no matching file) -> literal text.
+    assert (
+        resolve_acceptance_contract("1. ship safely", cwd=tmp_path)
+        == "1. ship safely"
+    )
+    # An existing in-cwd file -> file contents.
+    contract_file = tmp_path / "contract.md"
+    contract_file.write_text("1. no API break\n2. tests pass\n", encoding="utf-8")
+    assert (
+        resolve_acceptance_contract("contract.md", cwd=tmp_path)
+        == "1. no API break\n2. tests pass"
+    )
+    # A path that resolves to an existing file OUTSIDE cwd raises unless allowed.
+    outside_dir = tmp_path.parent / "outside_contract_dir"
+    outside_dir.mkdir(exist_ok=True)
+    outside_file = outside_dir / "c.md"
+    outside_file.write_text("secret", encoding="utf-8")
+    rel = Path("..") / "outside_contract_dir" / "c.md"
+    with pytest.raises(ValueError, match="outside working directory"):
+        resolve_acceptance_contract(str(rel), cwd=tmp_path)
+    assert (
+        resolve_acceptance_contract(str(rel), cwd=tmp_path, allow_outside_cwd=True)
+        == "secret"
+    )
+
+
 def test_consensus_mode_default_assigns_for_against_neutral():
     config = load_config(None, search=False)
     assert "consensus" in config["modes"]
@@ -7706,6 +7793,223 @@ def test_council_run_schema_advertises_continuation_id():
     schema = council_run_schema()
     assert "continuation_id" in schema["properties"]
     assert schema["properties"]["continuation_id"]["type"] == "string"
+
+
+def test_council_run_schema_advertises_independent_and_contract():
+    schema = council_run_schema()
+    assert schema["properties"]["acceptance_contract"]["type"] == "string"
+    assert schema["properties"]["independent_review"]["type"] == "boolean"
+
+
+def _independent_review_run_config(out_dir: Path) -> dict:
+    return {
+        "version": 1,
+        "transcripts_dir": str(out_dir),
+        "defaults": {"mode": "review"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {
+            "review": {
+                "strategy": "other_cli_peers",
+                "participants": ["claude"],
+                "min_quorum": 1,
+            }
+        },
+    }
+
+
+def test_cli_independent_review_suppresses_prior_context(monkeypatch, tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    parent_id = "20260909_120000"
+    _write_prior_transcript(out_dir, run_id=parent_id, question="prior question")
+
+    captured: dict = {}
+
+    async def fake_execute_council(*args, **kwargs):
+        captured["prompt"] = args[2] if len(args) >= 3 else kwargs.get("prompt")
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    config = _independent_review_run_config(out_dir)
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "review",
+            "--current",
+            "claude",
+            "--continue",
+            parent_id,
+            "--independent-review",
+            "--json",
+            "follow up",
+        ]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0
+    # Prior council context must NOT be injected.
+    assert "Prior council context (run " not in captured["prompt"]
+    # The new transcript records the suppression flag.
+    chained = [
+        json.loads(p.read_text(encoding="utf-8"))
+        for p in out_dir.glob("*.json")
+        if "parent_run_id" in json.loads(p.read_text(encoding="utf-8"))
+    ]
+    assert len(chained) == 1
+    assert (
+        chained[0]["metadata"].get("prior_context_suppressed_for_independence")
+        is True
+    )
+
+
+def test_cli_continue_without_independent_review_keeps_prior(monkeypatch, tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    parent_id = "20260909_130000"
+    _write_prior_transcript(out_dir, run_id=parent_id, question="prior question")
+
+    captured: dict = {}
+
+    async def fake_execute_council(*args, **kwargs):
+        captured["prompt"] = args[2] if len(args) >= 3 else kwargs.get("prompt")
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    config = _independent_review_run_config(out_dir)
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "review",
+            "--current",
+            "claude",
+            "--continue",
+            parent_id,
+            "--json",
+            "follow up",
+        ]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0
+    # Prior context flows exactly as today; no suppression flag.
+    assert "Prior council context (run " in captured["prompt"]
+    chained = [
+        json.loads(p.read_text(encoding="utf-8"))
+        for p in out_dir.glob("*.json")
+        if "parent_run_id" in json.loads(p.read_text(encoding="utf-8"))
+    ]
+    assert len(chained) == 1
+    assert (
+        "prior_context_suppressed_for_independence"
+        not in chained[0]["metadata"]
+    )
+
+
+def test_cli_mode_false_overrides_default_true_independent_review(
+    monkeypatch, tmp_path: Path
+):
+    """Precedence regression (codex WU5): a mode's explicit
+    `independent_review: false` must override a `true` global default — the
+    old `or` chain wrongly kept it on. No CLI flag passed, so the mode value
+    wins; prior context is KEPT and no suppression flag is set."""
+    out_dir = tmp_path / "runs"
+    parent_id = "20260909_140000"
+    _write_prior_transcript(out_dir, run_id=parent_id, question="prior question")
+
+    captured: dict = {}
+
+    async def fake_execute_council(*args, **kwargs):
+        captured["prompt"] = args[2] if len(args) >= 3 else kwargs.get("prompt")
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    config = _independent_review_run_config(out_dir)
+    # Global default ON, but the active mode explicitly opts OUT.
+    config["defaults"]["independent_review"] = True
+    config["modes"]["review"]["independent_review"] = False
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run", "--cwd", str(tmp_path), "--mode", "review",
+            "--current", "claude", "--continue", parent_id, "--json", "follow up",
+        ]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0
+    # mode false beats default true → prior context preserved, no flag.
+    assert "Prior council context (run " in captured["prompt"]
+    chained = [
+        json.loads(p.read_text(encoding="utf-8"))
+        for p in out_dir.glob("*.json")
+        if "parent_run_id" in json.loads(p.read_text(encoding="utf-8"))
+    ]
+    assert len(chained) == 1
+    assert (
+        "prior_context_suppressed_for_independence" not in chained[0]["metadata"]
+    )
+
+
+def test_mcp_independent_review_suppresses_and_surfaces(monkeypatch, tmp_path: Path):
+    from llm_council import mcp_server as mcp_module
+
+    out_dir = tmp_path / "runs"
+    parent_id = "20261010_120000"
+    _write_prior_transcript(out_dir, run_id=parent_id, question="prior mcp question")
+
+    captured: dict = {}
+
+    async def fake_execute_council(*args, **kwargs):
+        captured["prompt"] = args[2] if len(args) >= 3 else kwargs.get("prompt")
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    config = _independent_review_run_config(out_dir)
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    monkeypatch.setattr(mcp_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(mcp_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(mcp_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(mcp_module, "find_config", lambda *_a, **_k: None)
+    monkeypatch.setattr(mcp_module, "select_participants", lambda *_a, **_k: ["claude"])
+    monkeypatch.setattr(mcp_module, "enforce_mcp_budget", lambda *_a, **_k: None)
+
+    result = asyncio.run(
+        mcp_module.run_council(
+            {
+                "question": "follow up question",
+                "continuation_id": parent_id,
+                "independent_review": True,
+                "working_directory": str(tmp_path),
+            }
+        )
+    )
+    assert "Prior council context (run " not in captured["prompt"]
+    assert result.get("prior_context_suppressed_for_independence") is True
+    assert (
+        result["metadata"].get("prior_context_suppressed_for_independence") is True
+    )
 
 
 def test_mcp_run_council_threads_continuation_id(monkeypatch, tmp_path: Path):

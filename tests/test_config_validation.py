@@ -116,6 +116,48 @@ def test_load_config_rejects_invalid_budget_defaults(tmp_path: Path):
         load_config(path)
 
 
+def test_load_config_rejects_bad_defaults_independent_review(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump({"defaults": {"independent_review": "yes"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match="defaults.independent_review must be a boolean"
+    ):
+        load_config(path)
+
+
+def test_load_config_rejects_bad_mode_independent_review(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump({"modes": {"review": {"independent_review": 1}}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match="independent_review must be a boolean"
+    ):
+        load_config(path)
+
+
+def test_load_config_accepts_independent_review_booleans(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "defaults": {"independent_review": True},
+                "modes": {"review": {"independent_review": False}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config["defaults"]["independent_review"] is True
+    assert config["modes"]["review"]["independent_review"] is False
+
+
 def test_load_config_missing_explicit_path_is_clear(tmp_path: Path):
     with pytest.raises(ValueError, match="Config file does not exist"):
         load_config(tmp_path / "missing.yaml")

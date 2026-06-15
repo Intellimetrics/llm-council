@@ -28,7 +28,12 @@ from llm_council.adapters import classify_error
 from llm_council import budget
 from llm_council.budget import image_attachment_violations
 from llm_council import display
-from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_prompt
+from llm_council.context import (
+    MAX_PROMPT_CHARS,
+    build_image_manifest,
+    build_prompt,
+    resolve_acceptance_contract,
+)
 from llm_council.doctor import check_environment, checks_to_dict, probe_local_openai
 from llm_council.env import load_project_env
 from llm_council.estimate import CLI_DEFAULT_MODEL_LABEL, estimate_council
@@ -266,6 +271,31 @@ def build_parser() -> argparse.ArgumentParser:
             "text only (advisory, read-only — no tools granted). Composes "
             "with any mode and persists across rounds. Unknown names fail "
             "fast before any peer is launched."
+        ),
+    )
+    run.add_argument(
+        "--acceptance-contract",
+        dest="acceptance_contract",
+        default=None,
+        help=(
+            "Acceptance criteria to anchor the review (advisory-only). "
+            "Either literal text or a path to a file inside the working "
+            "directory (or anywhere with --allow-outside-cwd). Peers treat a "
+            "finding as a blocker (RECOMMENDATION: no) only when it violates "
+            "one of the numbered criteria; everything else is a non-blocking "
+            "concern. Composes with any mode."
+        ),
+    )
+    run.add_argument(
+        "--independent-review",
+        dest="independent_review",
+        action="store_true",
+        default=False,
+        help=(
+            "On a --continue run, suppress the prior council's per-peer "
+            "labels/rationales so this round forms its verdict independently "
+            "(advisory; prior_context is simply not injected). No effect "
+            "without --continue or when no prior context was produced."
         ),
     )
     run.add_argument(
@@ -2628,6 +2658,48 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             )
         except (FileNotFoundError, ValueError) as exc:
             raise SystemExit(str(exc)) from exc
+    # Independent-review isolation (advisory). Resolution order:
+    # CLI flag > per-mode independent_review > defaults.independent_review.
+    # Default OFF. When ON and a prior_context WOULD have been injected from a
+    # continuation, drop it so this round forms its verdict without anchoring
+    # on prior verdicts. Suppression is recorded post-run as a metadata flag.
+    _independent_mode_cfg = config.get("modes", {}).get(mode, {})
+    if not isinstance(_independent_mode_cfg, dict):
+        _independent_mode_cfg = {}
+    # None-aware precedence (NOT an `or` chain): a higher-priority layer's
+    # explicit `false` must override a lower layer's `true` — e.g. a mode that
+    # opts out of a globally-defaulted-on independent_review. The CLI flag is
+    # store_true, so it can only force ON; when unset it defers to the mode
+    # value (if set, including explicit false), then the global default.
+    # (codex WU5 review.)
+    if getattr(args, "independent_review", False):
+        independent_review = True
+    else:
+        _iv = _independent_mode_cfg.get("independent_review")
+        if _iv is None:
+            _iv = config.get("defaults", {}).get("independent_review")
+        independent_review = bool(_iv)
+    prior_context_suppressed = False
+    if independent_review and prior_context:
+        prior_context = None
+        prior_context_suppressed = True
+        print(
+            "note: --independent-review active; prior council context "
+            "suppressed for this run.",
+            file=sys.stderr,
+            flush=True,
+        )
+    # Acceptance contract (advisory). Resolve <text|path>: read the file only
+    # when the value names an existing regular file inside cwd (or anywhere
+    # with --allow-outside-cwd); otherwise treat it as literal contract text.
+    try:
+        acceptance_contract = resolve_acceptance_contract(
+            getattr(args, "acceptance_contract", None),
+            cwd=cwd,
+            allow_outside_cwd=args.allow_outside_cwd,
+        )
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
     try:
         image_manifest = (
             build_image_manifest(
@@ -2704,6 +2776,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             stances=mode_stances if isinstance(mode_stances, dict) else None,
             participants=participant_cfg or None,
             prior_context=prior_context,
+            acceptance_contract=acceptance_contract,
             chunk_strategy=getattr(args, "chunk_strategy", "fail"),
             chunk_progress=_record_chunk_event,
         )
@@ -2924,6 +2997,11 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     # same field.
     if scan_result.get("detected_count") or scan_policy != "off":
         metadata["secret_scan"] = scan_result
+    # Record the pre-run independent-review suppression (only when it actually
+    # occurred — see resolution above). Surfaced as a metadata flag rather than
+    # a mid-run progress event because the decision precedes execute_council.
+    if prior_context_suppressed:
+        metadata["prior_context_suppressed_for_independence"] = True
     # Surface a synthesis configuration error inline. The orchestrator
     # catches ValueError from the chair-resolution path and stamps it as
     # metadata so peer votes still flow through; rendering it here gives

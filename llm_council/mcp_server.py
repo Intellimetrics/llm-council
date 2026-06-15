@@ -31,7 +31,12 @@ from llm_council.config import (
     load_config,
     select_participants,
 )
-from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_prompt
+from llm_council.context import (
+    MAX_PROMPT_CHARS,
+    build_image_manifest,
+    build_prompt,
+    resolve_acceptance_contract,
+)
 from llm_council import display
 from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env
@@ -236,6 +241,28 @@ def council_run_schema() -> dict[str, Any]:
                     "scrutinize, compose with any mode, and persist across "
                     "rounds. Unknown names fail the call before any peer is "
                     "launched."
+                ),
+            },
+            "acceptance_contract": {
+                "type": "string",
+                "description": (
+                    "Acceptance criteria to anchor the review (advisory-only). "
+                    "Either literal text or a path to a file inside the working "
+                    "directory. Peers treat a finding as a blocker "
+                    "(RECOMMENDATION: no) only when it violates one of the "
+                    "numbered criteria; everything else is surfaced as a "
+                    "non-blocking concern. Composes with any mode."
+                ),
+            },
+            "independent_review": {
+                "type": "boolean",
+                "description": (
+                    "On a continuation run (continuation_id set), suppress the "
+                    "prior council's per-peer labels/rationales so this round "
+                    "forms its verdict independently. Advisory: prior_context "
+                    "is simply not injected. No effect without a continuation "
+                    "or when no prior context was produced. Default False; can "
+                    "also be set per-mode or via defaults.independent_review."
                 ),
             },
         },
@@ -1066,6 +1093,32 @@ async def run_council(
     mode_cfg = config.get("modes", {}).get(mode, {})
     if not isinstance(mode_cfg, dict):
         mode_cfg = {}
+    # Independent-review isolation (advisory). Resolution order:
+    # MCP arg > per-mode independent_review > defaults.independent_review.
+    # Default OFF. When ON and a prior_context WOULD have been injected from a
+    # continuation, drop it so this round forms its verdict without anchoring
+    # on prior verdicts. Surfaced post-run as a metadata flag (and top-level).
+    # None-aware precedence (NOT an `or` chain): an explicit per-call
+    # `independent_review: false` must override a true mode/default, and a
+    # mode's explicit false must override a true global default. Walk
+    # highest-priority first, taking the first non-None layer. (codex WU5
+    # review.)
+    _iv = arguments.get("independent_review")
+    if _iv is None:
+        _iv = mode_cfg.get("independent_review")
+    if _iv is None:
+        _iv = config.get("defaults", {}).get("independent_review")
+    independent_review = bool(_iv)
+    prior_context_suppressed = False
+    if independent_review and prior_context:
+        prior_context = None
+        prior_context_suppressed = True
+    # Acceptance contract (advisory). Resolve <text|path>: read the file only
+    # when the value names an existing regular file inside cwd; otherwise treat
+    # it as literal contract text. A failed in-cwd path check raises.
+    acceptance_contract = resolve_acceptance_contract(
+        arguments.get("acceptance_contract"), cwd=cwd, allow_outside_cwd=False
+    )
     mode_stances = mode_cfg.get("stances")
     arg_stances = arguments.get("stances")
     if isinstance(arg_stances, dict) and arg_stances:
@@ -1100,6 +1153,7 @@ async def run_council(
         stances=mode_stances if isinstance(mode_stances, dict) else None,
         participants=participant_cfg_for_prompt or None,
         prior_context=prior_context,
+        acceptance_contract=acceptance_contract,
     )
     from llm_council.safety import apply_secret_scan_policy
 
@@ -1315,6 +1369,11 @@ async def run_council(
         ]
     if secret_scan_payload.get("detected_count") or _scan_policy != "off":
         metadata["secret_scan"] = secret_scan_payload
+    # Record the pre-run independent-review suppression (only when it actually
+    # occurred). Surfaced as a metadata flag rather than a mid-run progress
+    # event because the decision precedes execute_council.
+    if prior_context_suppressed:
+        metadata["prior_context_suppressed_for_independence"] = True
     metadata["config_warnings"] = _pending_config_warnings
     write_transcript(
         md_path,
@@ -1524,6 +1583,13 @@ async def run_council(
     # metadata too (like `degraded`); never overloads quorum/degraded.
     if isinstance(metadata, dict) and metadata.get("independence_warning"):
         payload["independence_warning"] = metadata["independence_warning"]
+    # Independent-review suppression flag (advisory): mirror the
+    # omit-when-absent convention so a calling agent can see that the prior
+    # council context was intentionally withheld. Left in metadata too.
+    if isinstance(metadata, dict) and metadata.get(
+        "prior_context_suppressed_for_independence"
+    ):
+        payload["prior_context_suppressed_for_independence"] = True
 
     # Auto-open HTML transcript in browser if configured or requested
     auto_open = False

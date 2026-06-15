@@ -114,6 +114,8 @@ While most interaction happens transparently via the MCP server inside your agen
 | **`llm-council run`** | Run a council query. <br>`llm-council run --mode quick "Why is this test flaky?"` |
 | **`llm-council run --diff`** | Review the current git diff. <br>`llm-council run --mode review --diff "Is this migration safe to run?"` |
 | **`llm-council run --focus`** | Compose operator-authored review-focus bundles onto any mode (comma-separated). <br>`llm-council run --mode review --focus security-review,test-gaps --diff "Safe to merge?"` |
+| **`llm-council run --acceptance-contract`** | Anchor review on stated acceptance criteria (advisory). Pass literal text or a file path inside cwd; a finding blocks only when it violates a numbered criterion. <br>`llm-council run --mode review --acceptance-contract ./CRITERIA.md --diff "Does this meet the contract?"` |
+| **`llm-council run --independent-review`** | On a `--continue` run, suppress the prior council's verdicts/rationales so the round forms its opinion independently. <br>`llm-council run --mode review --continue 20260101_120000 --independent-review --diff "Re-review"` |
 | **`llm-council estimate`** | Calculate prompt size and costs before running. <br>`llm-council estimate --mode consensus --diff "Should we merge this?"` |
 | **`llm-council last`** | Inspect the last run's raw transcripts. <br>`llm-council last` |
 | **`llm-council config get`** | Retrieve a configuration value. <br>`llm-council config get defaults.auto_open_browser` |
@@ -127,7 +129,7 @@ The `llm-council` server exposes the following tools to your developer agents:
 
 | MCP Tool Name | Description / Inputs |
 | :--- | :--- |
-| **`council_run`** | Run a council query with custom modes, context files, and optional diffs. Supports `open: true` to auto-launch the HTML dashboard, and `focus: ["security-review", ...]` to compose review-focus bundles onto any mode. |
+| **`council_run`** | Run a council query with custom modes, context files, and optional diffs. Supports `open: true` to auto-launch the HTML dashboard, `focus: ["security-review", ...]` to compose review-focus bundles, `acceptance_contract: "<text or path>"` to gate blockers on numbered criteria, and `independent_review: true` to suppress prior-council context on a continuation run. |
 | **`council_estimate`** | Check token sizes and estimated OpenRouter cost before launching. |
 | **`council_recommend`** | Evaluates a task, risk level, and files touched to recommend whether to consult the council. |
 | **`council_doctor`** | Diagnoses connection issues, API key status, and CLI path resolution. |

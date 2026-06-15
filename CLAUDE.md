@@ -304,6 +304,41 @@ Key modules:
   `is_ranking_round`) — same MAD-literature invariant as the finding
   matrix. Promotion gate keeps an optional `cross_rank_correlation_floor`
   slot for the eventual default flip.
+- **Acceptance-contract gate + independent-review isolation are
+  advisory-only flags.** Both default OFF, compose with any mode, and
+  change nothing when unused.
+  - `--acceptance-contract <text|path>` (CLI) /
+    `acceptance_contract` (MCP `council_run`): when non-empty,
+    `context.build_prompt(acceptance_contract=...)` injects an
+    "ACCEPTANCE CONTRACT" block immediately AFTER the user-question
+    block and BEFORE "Response format:". The directive instructs peers
+    to treat a finding as a blocker (`RECOMMENDATION: no`) ONLY when it
+    violates one of the numbered criteria; everything else is a
+    non-blocking concern (cuts drive-by nitpicks). It is advisory text
+    only — no control flow, no execution. The contract text is counted
+    toward `max_prompt_chars` like the rest of `head_sections` (same
+    length guard); it's expected to be small, so there is NO separate
+    chunking path. Resolution is text-or-path via
+    `context.resolve_acceptance_contract`: a file is read only when the
+    value names an existing regular file inside cwd (or anywhere with
+    `--allow-outside-cwd`) — reusing `ensure_inside_cwd` so an
+    out-of-cwd path raises rather than being reinterpreted as literal
+    text; an arbitrary sentence (no matching file) is treated as the
+    literal contract.
+  - `--independent-review` (CLI) / `independent_review` (MCP boolean),
+    resolved flag > per-mode `modes.<name>.independent_review` >
+    `defaults.independent_review` (validated as booleans in
+    `config.validate_config`). For continuation runs only: when ON AND a
+    `continuation_id` produced a `prior_context`, that `prior_context`
+    is set to `None` so the "independent" round is NOT anchored to the
+    prior council's per-peer labels/rationales. Because suppression is a
+    pre-run decision (before `execute_council`), it is recorded as
+    `metadata["prior_context_suppressed_for_independence"] = True`
+    (only when suppression actually occurred) rather than a mid-run
+    progress event; the CLI also prints a one-line stderr note and MCP
+    mirrors the flag top-level in the response. OFF, or no prior_context
+    to suppress, sets nothing and changes nothing — `prior_context`
+    flows exactly as before.
 - **Tool-call voting is opt-in even within `review-with-tools`.**
   `tool_call_voting: false` by default on the `review-with-tools` mode
   (`DEFAULT_CONFIG["modes"]["review-with-tools"]` in `defaults.py`).
