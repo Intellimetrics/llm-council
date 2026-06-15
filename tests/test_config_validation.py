@@ -158,6 +158,56 @@ def test_load_config_accepts_independent_review_booleans(tmp_path: Path):
     assert config["modes"]["review"]["independent_review"] is False
 
 
+def test_load_config_rejects_bad_defaults_deliberation_early_stop(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump({"defaults": {"deliberation_early_stop": "yes"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match="defaults.deliberation_early_stop must be a boolean"
+    ):
+        load_config(path)
+
+
+def test_load_config_rejects_bad_mode_deliberation_early_stop(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump({"modes": {"review": {"deliberation_early_stop": 1}}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match="deliberation_early_stop must be a boolean"
+    ):
+        load_config(path)
+
+
+def test_load_config_accepts_deliberation_early_stop_booleans(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "defaults": {"deliberation_early_stop": True},
+                "modes": {"review": {"deliberation_early_stop": False}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config["defaults"]["deliberation_early_stop"] is True
+    assert config["modes"]["review"]["deliberation_early_stop"] is False
+
+
+def test_load_config_deliberation_early_stop_absent_is_skipped(tmp_path: Path):
+    """Absent (the default) validates cleanly and leaves the key unset."""
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(yaml.safe_dump({"defaults": {}}), encoding="utf-8")
+    config = load_config(path)
+    assert "deliberation_early_stop" not in config["defaults"]
+
+
 def test_load_config_missing_explicit_path_is_clear(tmp_path: Path):
     with pytest.raises(ValueError, match="Config file does not exist"):
         load_config(tmp_path / "missing.yaml")

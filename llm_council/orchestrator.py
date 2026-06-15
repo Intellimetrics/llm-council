@@ -38,6 +38,7 @@ from llm_council.deliberation import (
     default_min_quorum,
     has_disagreement,
     labeled_quorum_count,
+    recommendation_counts,
     recommendation_label,
 )
 
@@ -979,8 +980,19 @@ async def execute_council(
 
     cumulative_excluded: set[str] = set()
     aborted_all_excluded = False
+    early_stopped = False
     convergence_by_round: dict[int, list[dict[str, Any]]] = {}
     deliberation_prompts: dict[int, str] = {}
+    # No-new-movement early-stop (opt-in, default OFF). A mode-explicit value
+    # overrides the default with None-aware precedence (so an explicit `false`
+    # on a mode can disable a `true` default — not an `or` chain).
+    early_stop_enabled = (
+        (config.get("modes", {}) or {}).get(mode or "", {}) or {}
+    ).get("deliberation_early_stop")
+    if early_stop_enabled is None:
+        early_stop_enabled = (config.get("defaults", {}) or {}).get(
+            "deliberation_early_stop"
+        )
     while (
         deliberate
         and max_rounds > round_number
@@ -1069,14 +1081,49 @@ async def execute_council(
                     }
                 )
 
+        # No-new-movement early-stop. Requires BOTH a non-diverging
+        # convergence signal AND an unchanged vote tally — a "converged"
+        # similarity can co-exist with a still-split vote, so the tally
+        # comparison is the required corroboration of the Jaccard signal.
+        # Only meaningful when a FURTHER round would actually run — i.e.
+        # `round_number < max_rounds`. On a `max_rounds=2` run the loop is
+        # about to exit anyway after this single deliberation round, so
+        # firing here would relabel a normally-completed run as
+        # `stopped_no_new_movement` without skipping anything (codex WU9
+        # review). Gating on a remaining round keeps the "deep-audit
+        # (max_rounds>=3) only" contract honest.
+        if early_stop_enabled and round_number < max_rounds:
+            no_divergence = not any(
+                (rec.get("state") == "diverging")
+                for rec in (round_convergence or [])
+            )
+            curr_counts = recommendation_counts(round_results)
+            tally_unchanged = (
+                recommendation_counts(prior_round_results) == curr_counts
+            )
+            if no_divergence and tally_unchanged:
+                early_stopped = True
+                emit(
+                    {
+                        "event": "deliberation_early_stop",
+                        "round": round_number,
+                        "reason": "no_new_movement",
+                        "counts": curr_counts,
+                    }
+                )
+                break
+
     if metadata["deliberated"] and not aborted_all_excluded:
         final_disagreement = has_disagreement(round_results)
         metadata["final_disagreement_detected"] = final_disagreement
-        metadata["deliberation_status"] = (
-            "ran_max_rounds_unresolved"
-            if final_disagreement
-            else "ran_no_labeled_disagreement"
-        )
+        if early_stopped:
+            metadata["deliberation_status"] = "stopped_no_new_movement"
+        else:
+            metadata["deliberation_status"] = (
+                "ran_max_rounds_unresolved"
+                if final_disagreement
+                else "ran_no_labeled_disagreement"
+            )
         emit(
             {
                 "event": "deliberation_finish",

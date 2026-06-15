@@ -251,6 +251,14 @@ def validate_config(config: dict[str, Any]) -> None:
             mode["independent_review"], bool
         ):
             raise ValueError(f"Mode '{name}' independent_review must be a boolean")
+        # No-new-movement early-stop (advisory, opt-in). Boolean when present;
+        # a mode-explicit value overrides the global default (absent = inherit).
+        if "deliberation_early_stop" in mode and not isinstance(
+            mode["deliberation_early_stop"], bool
+        ):
+            raise ValueError(
+                f"Mode '{name}' deliberation_early_stop must be a boolean"
+            )
         if mode.get("origin_policy") not in (None, "any", "us"):
             raise ValueError(f"Mode '{name}' origin_policy must be 'any' or 'us'")
         _validate_positive_int(mode, "max_rounds", f"mode '{name}'")
@@ -332,6 +340,13 @@ def validate_config(config: dict[str, Any]) -> None:
         defaults["recommend_judge"], str
     ):
         raise ValueError("defaults.recommend_judge must be a string")
+    # No-new-movement early-stop for deliberation (advisory, opt-in). Boolean
+    # when present (absent = feature off). Only meaningful for modes with
+    # max_rounds >= 3; with the default max_rounds=2 it never triggers.
+    if "deliberation_early_stop" in defaults and not isinstance(
+        defaults["deliberation_early_stop"], bool
+    ):
+        raise ValueError("defaults.deliberation_early_stop must be a boolean")
     _validate_positive_int(defaults, "max_concurrency", "defaults")
     _validate_positive_int(defaults, "max_deliberation_rounds", "defaults")
     _validate_positive_int(defaults, "max_prompt_chars", "defaults")
