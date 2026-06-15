@@ -137,6 +137,14 @@ DEFAULT_CONFIG: dict = {
         # disconnected user still gets a usable diagnostic.
         "catalog_auto_refresh": True,
         "auto_open_browser": False,
+        # M6 soft cost-warning threshold (USD). ADVISORY ONLY — never gates a
+        # run. When set and the pre-flight estimate (the same retry-safety
+        # reduction the hard --max-cost-usd gate uses) is >= this value, a
+        # non-fatal `cost_warning` is stamped into run metadata (and a one-line
+        # stderr note on the CLI). Complements the hard --max-cost-usd gate,
+        # which still runs first and unchanged. None = feature off. An explicit
+        # 0 warns on any estimated spend. CLI: --cost-warn-usd; MCP: cost_warn_usd.
+        "cost_warn_usd": None,
     },
     "participants": {
         "claude": {

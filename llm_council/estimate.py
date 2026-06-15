@@ -18,8 +18,25 @@ from llm_council.context import (
 )
 from llm_council.model_catalog import fetch_openrouter_models
 
+# litellm is an OPTIONAL pricing fallback for hosted peers whose model id
+# is missing from the OpenRouter catalog. It is NOT a hard dependency — when
+# it isn't installed (the default), `_litellm_price_per_million` returns
+# (None, None) and the hosted peer stays unpriced exactly as before. No
+# network is ever hit: only litellm's bundled local `model_cost` map is read.
+try:  # pragma: no cover - import guard exercised by absence in default env
+    import litellm
+except ImportError:  # pragma: no cover - the default env has no litellm
+    litellm = None
+
 
 IMAGE_TOKEN_HEURISTIC = 1500
+
+# L7 cost_class heuristic thresholds (USD). Derived from
+# `known_total_with_retry_safety_usd` so the class reflects worst-case spend.
+# Advisory only — never gates a run. Thresholds are deliberately coarse:
+# sub-nickel runs are "low", sub-50-cents "moderate", anything more "high".
+COST_CLASS_LOW_MAX_USD = 0.05
+COST_CLASS_MODERATE_MAX_USD = 0.50
 
 # Load-bearing sentinel for the per-participant estimate row's `model` field.
 # Native CLI peers ship `model: None` (the engine cannot observe which concrete
@@ -208,6 +225,27 @@ def estimate_council(
             "tokens per image to vision-capable participants only; non-vision "
             "participants see images as text references."
         )
+    # L7: derived advisory signals. `cost_class` buckets the retry-safety
+    # total; `paid_peer_count` / `free_peer_count` partition the roster.
+    # A peer is PAID iff it is a hosted (openrouter/openai_compatible) peer
+    # that is NOT a `:free` model AND NOT local. A catalog miss does NOT make
+    # a hosted peer free (it counts as paid even when unpriced), but a LOCAL
+    # `openai_compatible` peer (loopback / RFC1918 base_url) runs on the
+    # user's box at $0 and must count as free — codex WU6 review.
+    from llm_council.config import is_local_participant
+
+    def _row_is_paid(row: dict[str, Any]) -> bool:
+        cfg = participant_cfg.get(row["name"], {}) or {}
+        if cfg.get("type") not in ("openrouter", "openai_compatible"):
+            return False
+        if str(cfg.get("model") or "").endswith(":free"):
+            return False
+        return not is_local_participant(cfg)
+
+    safety_rounded = round(safety_total, 6)
+    cost_class = _cost_class(safety_rounded)
+    paid_peer_count = sum(1 for row in rows if _row_is_paid(row))
+    free_peer_count = len(rows) - paid_peer_count
     return {
         "mode": mode,
         "current": current,
@@ -220,11 +258,41 @@ def estimate_council(
         "completion_tokens_assumed_each": completion_tokens,
         "image_paths": list(image_paths or []),
         "known_total_usd": round(known_total, 6),
-        "known_total_with_retry_safety_usd": round(safety_total, 6),
+        "known_total_with_retry_safety_usd": safety_rounded,
         "unknown_cost_rows": unknown_cost_rows,
+        "cost_class": cost_class,
+        "paid_peer_count": paid_peer_count,
+        "free_peer_count": free_peer_count,
         "catalog_error": catalog_error,
         "rows": rows,
         "notes": notes,
+    }
+
+
+def _cost_class(known_total_with_retry_safety_usd: float) -> str:
+    """Bucket a worst-case USD total into a coarse advisory class."""
+    if known_total_with_retry_safety_usd < COST_CLASS_LOW_MAX_USD:
+        return "low"
+    if known_total_with_retry_safety_usd < COST_CLASS_MODERATE_MAX_USD:
+        return "moderate"
+    return "high"
+
+
+def compact_cost_estimate(estimate: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a full `estimate_council` result to the compact advisory block
+    echoed into run metadata as `cost_estimate` (L7).
+
+    Pure projection — never raises, only reads keys already present on the
+    estimate dict. Used by both the CLI and MCP run paths so a caller who
+    skipped `council_estimate` still sees the cost signal without the full
+    per-peer breakdown landing in metadata.
+    """
+    return {
+        "known_total_usd": estimate.get("known_total_usd"),
+        "retry_safety_usd": estimate.get("known_total_with_retry_safety_usd"),
+        "cost_class": estimate.get("cost_class"),
+        "paid_peer_count": estimate.get("paid_peer_count"),
+        "free_peer_count": estimate.get("free_peer_count"),
     }
 
 
@@ -339,8 +407,33 @@ def _estimate_participant_row(
         if input_per_million is not None or output_per_million is not None:
             pricing_source = "catalog"
 
+    # M8 litellm fallback (estimation only, hosted peers only). When the
+    # OpenRouter catalog still yields no price, consult litellm's bundled
+    # local cost map before leaving the row unpriced. No-op when litellm is
+    # absent (the default) — the helper returns (None, None) and the peer
+    # stays in unknown_cost_rows / unpriced_paid exactly as before.
+    litellm_priced = False
+    if (
+        (input_per_million is None or output_per_million is None)
+        and cfg.get("type") in ("openrouter", "openai_compatible")
+    ):
+        lit_in, lit_out = _litellm_price_per_million(str(model))
+        if input_per_million is None and lit_in is not None:
+            input_per_million = lit_in
+            litellm_priced = True
+        if output_per_million is None and lit_out is not None:
+            output_per_million = lit_out
+            litellm_priced = True
+        if litellm_priced:
+            pricing_source = "litellm"
+
     note = None
-    if input_per_million is None or output_per_million is None:
+    if litellm_priced and input_per_million is not None and output_per_million is not None:
+        note = (
+            f"Pricing for {name} ({model}) came from litellm's local cost "
+            "map, not the OpenRouter catalog."
+        )
+    elif input_per_million is None or output_per_million is None:
         if _is_openrouter_cfg(cfg):
             note = "OpenRouter pricing unavailable; refresh catalog or configure prices."
         else:
@@ -451,6 +544,14 @@ def _estimate_notes(rows: list[dict[str, Any]], catalog_error: str | None) -> li
         notes.append(
             "OpenRouter prices come from config or the live cached catalog; rerun with --no-cache before expensive work."
         )
+    # M8: surface every litellm-sourced price top-level so it's operator-
+    # visible that the price wasn't from OpenRouter.
+    for row in rows:
+        if row.get("pricing_source") == "litellm":
+            notes.append(
+                f"Pricing for {row['name']} ({row['model']}) came from "
+                "litellm's local cost map, not the OpenRouter catalog."
+            )
     return notes
 
 
@@ -468,3 +569,41 @@ def _float_or_none(value: Any) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _litellm_price_per_million(model: str) -> tuple[float | None, float | None]:
+    """Best-effort (input_per_million, output_per_million) USD from litellm.
+
+    Returns (None, None) when litellm is absent or the model id isn't in
+    litellm's bundled local cost map. NO network is performed — only the
+    in-process `model_cost` map (or `get_model_info`, which also reads the
+    same local map) is consulted. litellm stores cost PER TOKEN, so we
+    multiply by 1_000_000 to match the per-million units used everywhere
+    else in this module.
+    """
+    if litellm is None or not model:
+        return None, None
+    info: dict[str, Any] | None = None
+    # Prefer the public accessor; fall back to the raw map. Both are local.
+    try:
+        get_info = getattr(litellm, "get_model_info", None)
+        if callable(get_info):
+            info = get_info(model)
+    except Exception:  # pragma: no cover - litellm raises on unknown ids
+        info = None
+    if not isinstance(info, dict):
+        model_cost = getattr(litellm, "model_cost", None)
+        if isinstance(model_cost, dict):
+            entry = model_cost.get(model)
+            info = entry if isinstance(entry, dict) else None
+    if not isinstance(info, dict):
+        return None, None
+    input_per_token = info.get("input_cost_per_token")
+    output_per_token = info.get("output_cost_per_token")
+    input_per_million = (
+        float(input_per_token) * 1_000_000 if input_per_token is not None else None
+    )
+    output_per_million = (
+        float(output_per_token) * 1_000_000 if output_per_token is not None else None
+    )
+    return input_per_million, output_per_million

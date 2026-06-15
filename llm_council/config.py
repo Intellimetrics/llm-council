@@ -332,6 +332,10 @@ def validate_config(config: dict[str, Any]) -> None:
     # Advisory-only; positive integer when present (absent = feature off).
     _validate_positive_int(defaults, "min_distinct_vendors", "defaults")
     _validate_positive_number(defaults, "mcp_max_estimated_cost_usd", "defaults")
+    # M6 soft cost-warning threshold (advisory only — never gates a run).
+    # Non-negative number when present (an explicit 0 means "warn on any
+    # estimated spend"); absent = feature off.
+    _validate_nonnegative_number(defaults, "cost_warn_usd", "defaults")
     _validate_convergence_thresholds(defaults, "defaults")
     for mode_name, mode in modes.items():
         if isinstance(mode, dict):
