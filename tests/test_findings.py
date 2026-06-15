@@ -360,6 +360,72 @@ def test_matrix_to_dict_unverified_flag_for_failed_verification():
     assert entry.get("unverified") is True
 
 
+# --- matrix_to_dict three-tier gating partition (L4) --------------------
+
+
+def test_matrix_to_dict_gating_partitions_by_severity():
+    """Consensus clusters partition by severity: blocker -> blocking,
+    medium -> non_blocking, nit -> suggestion. All single-peer concerns
+    are suggestion-tier, alongside the nit consensus cluster."""
+    findings_by_peer = {
+        # blocker consensus cluster (auth.py)
+        "claude": [
+            _make_finding("claude", "B1", "blocker", "auth.py", 40, 60),
+            _make_finding("claude", "M1", "medium", "db.py", 5, 15),
+            _make_finding("claude", "N1", "nit", "fmt.py", 1, 3),
+        ],
+        "codex": [
+            _make_finding("codex", "B1", "blocker", "auth.py", 50, 70),
+            _make_finding("codex", "M1", "medium", "db.py", 8, 20),
+            _make_finding("codex", "N1", "nit", "fmt.py", 2, 4),
+        ],
+        # single-peer concern (no corroboration)
+        "gemini": [_make_finding("gemini", "S1", "blocker", "lonely.py", 1, 9)],
+    }
+    matrix = cluster_findings(findings_by_peer)
+    payload = matrix_to_dict(matrix)
+
+    gating = payload["gating"]
+    # Severity of each cluster, indexed by the partition it lands in.
+    assert [e["severity"] for e in gating["blocking"]] == ["blocker"]
+    assert [e["severity"] for e in gating["non_blocking"]] == ["medium"]
+
+    # suggestion holds the nit consensus cluster PLUS the single-peer concern.
+    suggestion_severities = [e["severity"] for e in gating["suggestion"]]
+    assert "nit" in suggestion_severities
+    assert len(gating["suggestion"]) == 2  # nit cluster + single-peer concern
+    # The single-peer concern (by peer key) is present in suggestion.
+    assert any(e.get("peer") == "gemini" for e in gating["suggestion"])
+
+    # Partition is exhaustive: every consensus blocker landed in exactly
+    # one of blocking/non_blocking/suggestion, and the single-peer concern
+    # landed in suggestion only.
+    total = (
+        len(gating["blocking"])
+        + len(gating["non_blocking"])
+        + len(gating["suggestion"])
+    )
+    assert total == len(payload["consensus_blockers"]) + len(
+        payload["single_peer_concerns"]
+    )
+
+    # Entries are referenced, not copied — same object identity.
+    assert gating["blocking"][0] is payload["consensus_blockers"][0]
+
+
+def test_matrix_to_dict_gating_always_present_and_empty():
+    """An empty matrix still yields a gating block with three empty lists,
+    mirroring the always-present-keys design of the consensus fields."""
+    payload = matrix_to_dict(FindingMatrix())
+    assert payload["gating"] == {
+        "blocking": [],
+        "non_blocking": [],
+        "suggestion": [],
+    }
+    assert payload["consensus_blockers"] == []
+    assert payload["single_peer_concerns"] == []
+
+
 # --- build_matrix_from_results integration ------------------------------
 
 
