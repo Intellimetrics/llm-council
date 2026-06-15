@@ -244,6 +244,13 @@ def validate_config(config: dict[str, Any]) -> None:
                 )
         if "include_current" in mode and not isinstance(mode["include_current"], bool):
             raise ValueError(f"Mode '{name}' include_current must be a boolean")
+        # Independent-review isolation (advisory). Optional per-mode override
+        # of the prior-context suppression on continuation runs; boolean when
+        # present (absent = inherit defaults/off).
+        if "independent_review" in mode and not isinstance(
+            mode["independent_review"], bool
+        ):
+            raise ValueError(f"Mode '{name}' independent_review must be a boolean")
         if mode.get("origin_policy") not in (None, "any", "us"):
             raise ValueError(f"Mode '{name}' origin_policy must be 'any' or 'us'")
         _validate_positive_int(mode, "max_rounds", f"mode '{name}'")
@@ -310,6 +317,13 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("defaults.origin_policy must be 'any' or 'us'")
     if defaults.get("mode") and defaults["mode"] not in modes:
         raise ValueError(f"defaults.mode references unknown mode '{defaults['mode']}'")
+    # Independent-review isolation (advisory). Optional global default for the
+    # prior-context suppression on continuation runs; boolean when present
+    # (absent = feature off).
+    if "independent_review" in defaults and not isinstance(
+        defaults["independent_review"], bool
+    ):
+        raise ValueError("defaults.independent_review must be a boolean")
     _validate_positive_int(defaults, "max_concurrency", "defaults")
     _validate_positive_int(defaults, "max_deliberation_rounds", "defaults")
     _validate_positive_int(defaults, "max_prompt_chars", "defaults")
