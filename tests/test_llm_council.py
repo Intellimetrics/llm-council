@@ -5787,6 +5787,83 @@ def test_write_transcript_emits_remaining_disagreement_section(tmp_path: Path):
     assert all(entry["ok"] is True for entry in remaining["participants"])
 
 
+def _write_remaining_disagreement_transcript(tmp_path: Path, results, stem: str):
+    """Helper: emit a transcript whose ## Remaining disagreement section fires,
+    returning the rendered markdown. Used by the minority-callout tests."""
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / f"{stem}.md"
+    json_path = out_dir / f"{stem}.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="split",
+        mode="deliberate",
+        current="codex",
+        participants=["a", "b", "c"],
+        prompt="prompt",
+        results=results,
+        metadata={
+            "rounds": 2,
+            "deliberation_status": "ran_max_rounds_unresolved",
+            "final_disagreement_detected": True,
+        },
+    )
+    return md_path.read_text(encoding="utf-8")
+
+
+def test_remaining_disagreement_count_line_names_minority(tmp_path: Path):
+    """L3: with a clear majority and a non-empty minority, the count line
+    gets a scannable minority callout naming the minority peers."""
+    results = [
+        ParticipantResult("claude", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        ParticipantResult("codex", True, "RECOMMENDATION: yes - ship too", "", 1.0),
+        ParticipantResult("gemini", True, "RECOMMENDATION: no - wait", "", 1.0),
+    ]
+    md = _write_remaining_disagreement_transcript(tmp_path, results, "minority")
+    # The callout is appended to the EXISTING count line (no second count line).
+    assert (
+        "Recommendations (final round): 2 yes / 1 no / 0 tradeoff / 0 unknown"
+        " — minority: gemini held no" in md
+    )
+    # Exactly one count line in the section (no duplicate).
+    section = md.split("## Remaining disagreement")[1]
+    assert section.count("Recommendations (final round):") == 1
+
+
+def test_remaining_disagreement_count_line_no_callout_when_unanimous(
+    tmp_path: Path,
+):
+    """L3: unanimous final round (no minority) → no callout. The section
+    still fires because final_disagreement_detected is set (e.g. round-1
+    disagreement that later resolved)."""
+    results = [
+        ParticipantResult("claude", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        ParticipantResult("codex", True, "RECOMMENDATION: yes - ship too", "", 1.0),
+        ParticipantResult("gemini", True, "RECOMMENDATION: yes - agreed", "", 1.0),
+    ]
+    md = _write_remaining_disagreement_transcript(tmp_path, results, "unanimous")
+    assert (
+        "Recommendations (final round): 3 yes / 0 no / 0 tradeoff / 0 unknown" in md
+    )
+    section = md.split("## Remaining disagreement")[1]
+    assert "minority:" not in section
+
+
+def test_remaining_disagreement_count_line_no_callout_on_tie(tmp_path: Path):
+    """L3: an ambiguous tie among top labels has no single majority → no
+    minority callout."""
+    results = [
+        ParticipantResult("claude", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        ParticipantResult("codex", True, "RECOMMENDATION: no - wait", "", 1.0),
+    ]
+    md = _write_remaining_disagreement_transcript(tmp_path, results, "tie")
+    assert (
+        "Recommendations (final round): 1 yes / 1 no / 0 tradeoff / 0 unknown" in md
+    )
+    section = md.split("## Remaining disagreement")[1]
+    assert "minority:" not in section
+
+
 def test_write_transcript_renders_synthesis_section(tmp_path: Path):
     """The opt-in (paid) synthesis chair memo must appear in the human-facing
     markdown transcript, not only the JSON."""
