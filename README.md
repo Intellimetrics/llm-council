@@ -5,7 +5,7 @@
 [![MCP](https://img.shields.io/badge/MCP-ready-2f855a)](docs/llm-council.md)
 [![Read-only](https://img.shields.io/badge/default-read--only-6b7280)](#read-only-safety)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.14.1-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.15.0-111827)](CHANGELOG.md)
 
 Your coding agent is incredibly fast, capable, and confident. 
 
