@@ -137,6 +137,14 @@ DEFAULT_CONFIG: dict = {
         # disconnected user still gets a usable diagnostic.
         "catalog_auto_refresh": True,
         "auto_open_browser": False,
+        # M6 soft cost-warning threshold (USD). ADVISORY ONLY — never gates a
+        # run. When set and the pre-flight estimate (the same retry-safety
+        # reduction the hard --max-cost-usd gate uses) is >= this value, a
+        # non-fatal `cost_warning` is stamped into run metadata (and a one-line
+        # stderr note on the CLI). Complements the hard --max-cost-usd gate,
+        # which still runs first and unchanged. None = feature off. An explicit
+        # 0 warns on any estimated spend. CLI: --cost-warn-usd; MCP: cost_warn_usd.
+        "cost_warn_usd": None,
     },
     "participants": {
         "claude": {
@@ -152,6 +160,11 @@ DEFAULT_CONFIG: dict = {
                 "Read,Grep,Glob,LS",
                 "--no-session-persistence",
             ],
+            # Opt-in: set `usage_from_json: true` (per-peer, in
+            # .llm-council.yaml) to invoke claude as `-p --output-format json`
+            # and parse REAL token usage + cost into the result. Default off →
+            # text-mode invocation, usage unobservable. Read-only flags above
+            # are preserved either way (the JSON flag is purely additive).
             "model": None,
             "timeout": 240,
             "max_prompt_chars": 120_000,
@@ -234,6 +247,11 @@ DEFAULT_CONFIG: dict = {
                 "{cwd}",
                 "-",
             ],
+            # Opt-in: set `usage_from_json: true` (per-peer) to invoke codex as
+            # `exec --json` (JSONL stream) and parse REAL prompt/completion
+            # tokens (cache-adjusted) into the result. codex reports no cost, so
+            # cost_usd stays None. Default off → text-mode, usage unobservable.
+            # The read-only `--sandbox read-only` flag above is preserved.
             "model": None,
             "timeout": 240,
             "max_prompt_chars": 120_000,

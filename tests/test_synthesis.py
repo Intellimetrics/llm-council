@@ -186,6 +186,50 @@ def test_build_synthesis_prompt_includes_convergence_when_provided():
     assert "0.92" in prompt
 
 
+def test_build_synthesis_prompt_how_positions_moved_only_when_deliberated():
+    """The chair-narrated '### How positions moved' section is conditional:
+    request it only on a multi-round (convergence-bearing) run, never on a
+    single-round run where there is no movement to narrate."""
+    results = [
+        ParticipantResult("a", True, "RECOMMENDATION: yes - ok", "", 1.0),
+    ]
+    # Single-round run: no convergence data → section absent.
+    single = build_synthesis_prompt("Q?", results, None)
+    assert "### How positions moved" not in single
+
+    # Deliberated run: convergence present → section requested.
+    convergence = {
+        "2": [{"participant": "a", "state": "converged", "similarity": 0.92}],
+    }
+    multi = build_synthesis_prompt("Q?", results, convergence)
+    assert "### How positions moved" in multi
+
+
+def test_build_synthesis_prompt_decision_preserves_dissent_directive():
+    """L1: the Decision directive must instruct the chair to name genuine
+    remaining disagreement rather than paper over it."""
+    results = [ParticipantResult("a", True, "RECOMMENDATION: yes - ok", "", 1.0)]
+    prompt = build_synthesis_prompt("Q?", results, None)
+    assert "did not converge" in prompt
+    assert "papering over it" in prompt
+
+
+def test_build_synthesis_prompt_consensus_blockers_request_attribution():
+    """M2: each consensus blocker bullet should be attributed to the peers
+    who raised it."""
+    results = [ParticipantResult("a", True, "RECOMMENDATION: yes - ok", "", 1.0)]
+    prompt = build_synthesis_prompt("Q?", results, None)
+    assert "claude, gemini: <blocker>" in prompt
+
+
+def test_build_synthesis_prompt_even_handed_moderator_frame():
+    """L2: the chair preamble must frame the chair as an even-handed
+    moderator, not a third debater."""
+    results = [ParticipantResult("a", True, "RECOMMENDATION: yes - ok", "", 1.0)]
+    prompt = build_synthesis_prompt("Q?", results, None)
+    assert "moderator, not a third debater" in prompt
+
+
 def test_build_synthesis_prompt_renders_structured_evidence_readably():
     """Evidence entries are ``list[{text, tag}]`` since v0.7.0
     (``adapters._parse_tagged_entry``). The chair prompt must format

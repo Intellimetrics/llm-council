@@ -304,6 +304,41 @@ Key modules:
   `is_ranking_round`) — same MAD-literature invariant as the finding
   matrix. Promotion gate keeps an optional `cross_rank_correlation_floor`
   slot for the eventual default flip.
+- **Acceptance-contract gate + independent-review isolation are
+  advisory-only flags.** Both default OFF, compose with any mode, and
+  change nothing when unused.
+  - `--acceptance-contract <text|path>` (CLI) /
+    `acceptance_contract` (MCP `council_run`): when non-empty,
+    `context.build_prompt(acceptance_contract=...)` injects an
+    "ACCEPTANCE CONTRACT" block immediately AFTER the user-question
+    block and BEFORE "Response format:". The directive instructs peers
+    to treat a finding as a blocker (`RECOMMENDATION: no`) ONLY when it
+    violates one of the numbered criteria; everything else is a
+    non-blocking concern (cuts drive-by nitpicks). It is advisory text
+    only — no control flow, no execution. The contract text is counted
+    toward `max_prompt_chars` like the rest of `head_sections` (same
+    length guard); it's expected to be small, so there is NO separate
+    chunking path. Resolution is text-or-path via
+    `context.resolve_acceptance_contract`: a file is read only when the
+    value names an existing regular file inside cwd (or anywhere with
+    `--allow-outside-cwd`) — reusing `ensure_inside_cwd` so an
+    out-of-cwd path raises rather than being reinterpreted as literal
+    text; an arbitrary sentence (no matching file) is treated as the
+    literal contract.
+  - `--independent-review` (CLI) / `independent_review` (MCP boolean),
+    resolved flag > per-mode `modes.<name>.independent_review` >
+    `defaults.independent_review` (validated as booleans in
+    `config.validate_config`). For continuation runs only: when ON AND a
+    `continuation_id` produced a `prior_context`, that `prior_context`
+    is set to `None` so the "independent" round is NOT anchored to the
+    prior council's per-peer labels/rationales. Because suppression is a
+    pre-run decision (before `execute_council`), it is recorded as
+    `metadata["prior_context_suppressed_for_independence"] = True`
+    (only when suppression actually occurred) rather than a mid-run
+    progress event; the CLI also prints a one-line stderr note and MCP
+    mirrors the flag top-level in the response. OFF, or no prior_context
+    to suppress, sets nothing and changes nothing — `prior_context`
+    flows exactly as before.
 - **Tool-call voting is opt-in even within `review-with-tools`.**
   `tool_call_voting: false` by default on the `review-with-tools` mode
   (`DEFAULT_CONFIG["modes"]["review-with-tools"]` in `defaults.py`).
@@ -384,19 +419,43 @@ Key modules:
   `quota_recoveries`. On failure, `model_fallback_used` is stamped
   with the LAST attempted model so the transcript shows where the
   walker stopped.
-- **Per-CLI token usage is not observable.** CLI participants
-  (claude, codex, gemini, antigravity) authenticate as the user and
-  burn the user's own account quota. llm-council has no metering hook
-  into those CLIs — no way to read "X tokens consumed", "Y quota
-  remaining", or "Z requests this hour" from the outside. The only
-  observable usage signal for CLI peers is *failures we caught*:
-  `quota_incidents` (how many times the peer hit a quota wall) and
-  `quota_recoveries` (how many of those the fallback rescued),
-  surfaced per-peer via `llm-council stats --reliability`. Real
-  token-level usage is only available for hosted OpenRouter peers
-  (the `usage` field on API responses populates `prompt_tokens` /
-  `completion_tokens` / `cost_usd` on `ParticipantResult`). Don't
-  promise observability we don't have.
+- **Per-CLI token usage is not observable in the default text-mode
+  invocation.** CLI participants (claude, codex, gemini, antigravity)
+  authenticate as the user and burn the user's own account quota. In the
+  default invocation we run them in TEXT mode, where there is no metering
+  hook — no way to read "X tokens consumed", "Y quota remaining", or "Z
+  requests this hour" from the outside. The only observable usage signal
+  for text-mode CLI peers is *failures we caught*: `quota_incidents` (how
+  many times the peer hit a quota wall) and `quota_recoveries` (how many
+  of those the fallback rescued), surfaced per-peer via `llm-council
+  stats --reliability`. Hosted OpenRouter peers always report real
+  token-level usage (the `usage` field on API responses populates
+  `prompt_tokens` / `completion_tokens` / `cost_usd` on
+  `ParticipantResult`).
+  **Opt-in exception (M7): `usage_from_json: true`.** Per-peer config
+  that switches the invocation to the CLI's own JSON output mode and
+  parses REAL usage/cost into the same `ParticipantResult` fields
+  (`prompt_tokens` / `completion_tokens` / `total_tokens` / `cost_usd`,
+  plus the CLI-reported `model` id, preferred over the requested one).
+  Implemented for **claude** (`-p --output-format json`, single JSON
+  object: `result` text + `usage` + `total_cost_usd` + `modelUsage`) and
+  **codex** (`exec --json`, JSONL stream: last `agent_message` text +
+  `turn.completed` usage; billable `prompt_tokens = max(0, input_tokens -
+  cached_input_tokens)`; codex reports no cost so `cost_usd` stays None).
+  Default OFF for every built-in peer → byte-identical text-mode command
+  and parsing. The JSON flag is PURELY ADDITIVE: it never removes the
+  read-only flags (`--permission-mode default` / `--sandbox read-only`),
+  so peers still cannot write. Flag + parser ship together per family —
+  `usage_from_json` is a NO-OP for any family without a JSON parser
+  (`_USAGE_JSON_FAMILIES = {claude, codex}`; gemini/others add no flag).
+  Parsing is fail-soft: `_parse_cli_usage_json` returns None on malformed
+  / changed JSON shapes and the adapter falls back to treating raw stdout
+  as text (the `RECOMMENDATION:` label check still runs, token fields stay
+  None) — a CLI version bump can never crash or silently drop the peer.
+  The JSON shapes are version-sensitive; the parser probes key variants
+  with `.get()`. Don't promise observability we don't have: even with the
+  opt-in, the reported model is what the CLI says, not a server-side
+  confirmation, and text mode remains unobservable.
 - **Size-scaled timeouts.** `_resolve_effective_timeout` now adds a
   prompt-size bonus on top of the per-participant base: 5s per KB above
   a 4KB threshold by default, capped at +600s. The mode multiplier
@@ -442,6 +501,60 @@ Key modules:
   from hosted OpenAI to no-auth local vLLM — we defer to the
   adapter rather than guess). With explicit `api_key_env` set, both
   types pre-drop normally.
+- **Independence warning is advisory-only (H2).** The optional
+  `defaults.min_distinct_vendors` (global) and per-mode
+  `modes.<name>.require_distinct_vendors` (override; resolution: mode
+  override first, then global default, else feature OFF) set a floor on
+  how many DISTINCT vendor families the final-round labeled votes must
+  span. When the resolved threshold is set AND the count of distinct
+  families among labeled final-round votes is below it, the orchestrator
+  (`execute_council`, immediately after the degraded block) sets a NEW
+  `metadata["independence_warning"]` dict (`distinct_vendors`, `required`,
+  `families`, `labeled_quorum`) and emits a `single_vendor_quorum`
+  progress event. It NEVER drops a peer and must NEVER overload
+  `metadata["degraded"]` / `min_quorum` / `labeled_quorum` — `degraded`
+  means below-quorum-COUNT only; independence is an orthogonal correlated-
+  agreement signal. Both keys validate as positive integers at config-load
+  (`config._validate_positive_int`); built-in modes ship WITHOUT either key
+  (feature OFF by default — when the threshold is unset OR met, the
+  `independence_warning` key is omitted entirely and no event fires).
+  Surfaced top-level in MCP `council_run` `structured_results`
+  (omit-when-absent, like `quota_throttled_peers`; also left in
+  `metadata` like `degraded`), persisted in the transcript JSON via the
+  whole-`metadata` serialization, and rendered as a one-line ⚠️ note in
+  the markdown transcript near the quorum/degraded summary.
+- **Review-focus bundles are advisory-only, compose (not fuse), and
+  carry provenance.** Operator-authored focus bundles live at
+  `.llm-council/review-skills/<name>/SKILL.md` (frontmatter `name:` +
+  `description:`, markdown body) and are discovered by
+  `review_skills.discover_review_skills` (walks up from cwd, first
+  `.llm-council/review-skills/` wins — mirrors `config.find_config`).
+  The bundle body is **INERT PROMPT TEXT only** — it shapes WHAT peers
+  scrutinize and grants NO tool / write / exec capability; it rides on
+  top of the existing read-only invariant, never weakening it.
+  `--focus a,b` (CLI) / `focus: [...]` (MCP `council_run`) resolves via
+  `resolve_focus`, which raises `FocusNotFound` (listing available
+  names) BEFORE any subprocess launches; discovery itself is LENIENT
+  (a malformed bundle is skipped with a reason, never raised). Name
+  validation is STRICT (M12): `^[a-z0-9-]+$`, ≤ 64 chars, equal to the
+  dir name. Focus **composes additively** with any mode — it is
+  appended LAST in `context.apply_per_peer_directives` (after the
+  review-with-tools / stance / persona blocks; those are deliberately
+  NOT collapsed into bundles) via a new `focus_directive` kwarg threaded
+  through `adapters.run_participants` and rendered once in
+  `orchestrator.execute_council` (passed to round 1, the ranking pass,
+  and round-2 deliberation so it persists across rounds). Provenance
+  (M11): `metadata["applied_focus"] = [{name, sha256}]` is stamped only
+  when focus is applied (omitted otherwise), serialized wholesale into
+  the transcript JSON, rendered as a markdown summary line, and lifted
+  top-level in the `council_run` MCP response. With no `--focus`/`focus`,
+  every path behaves EXACTLY as before (the directive resolves to `""`).
+  Interaction to know (codex WU4 review): the rendered directive is part of
+  the peer prompt, and the section-coverage validator scans that combined
+  prompt — so a bundle body containing a `PART N — TITLE (REQUIRED)` header
+  WILL be enforced as a required section on every peer response. That is
+  opt-in by the author, not incidental; shipped example bundles are guarded
+  against it (`test_shipped_example_bundles_do_not_trip_required_section_validator`).
 - **`.mcp.json` stays local.** Setup adds it to `.gitignore`. It contains
   absolute paths and must not be committed.
 - **Version bumps.** `__version__` in `llm_council/__init__.py` and the

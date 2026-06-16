@@ -31,15 +31,22 @@ from llm_council.config import (
     load_config,
     select_participants,
 )
-from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_prompt
+from llm_council.context import (
+    MAX_PROMPT_CHARS,
+    build_image_manifest,
+    build_prompt,
+    resolve_acceptance_contract,
+)
 from llm_council import display
 from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env
 from llm_council.estimate import estimate_council
 from llm_council.model_catalog import fetch_openrouter_models
 from llm_council.orchestrator import execute_council
+from llm_council import policy
 from llm_council.policy import should_use_council
-from llm_council.stats import compute_stats
+from llm_council.recommend_judge import grade_difficulty
+from llm_council.stats import aggregate_reliability, compute_stats
 from llm_council.transcript import (
     continuation_depth_limit_error,
     find_transcript_by_id,
@@ -202,6 +209,17 @@ def council_run_schema() -> dict[str, Any]:
                     "across all participants and budgeted rounds."
                 ),
             },
+            "cost_warn_usd": {
+                "type": "number",
+                "minimum": 0,
+                "description": (
+                    "Soft, advisory-only cost-warning threshold in USD. When "
+                    "the pre-flight estimate is at or above this value the run "
+                    "still proceeds, but a non-fatal `cost_warning` is surfaced "
+                    "top-level and in metadata. Never blocks — use max_cost_usd "
+                    "for a hard ceiling. Overrides defaults.cost_warn_usd."
+                ),
+            },
             "tier": {
                 "type": "string",
                 "description": (
@@ -222,6 +240,42 @@ def council_run_schema() -> dict[str, Any]:
                     "position in `cross_rank_scores`. Composes with any "
                     "existing mode; ranking outputs are NEVER fed back "
                     "into round-2 deliberation."
+                ),
+            },
+            "focus": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Review-focus bundle names to compose onto the selected "
+                    "mode. Bundles live at "
+                    ".llm-council/review-skills/<name>/SKILL.md and are INERT "
+                    "prompt text only (advisory, read-only — they grant no "
+                    "tool or write capability). They shape WHAT peers "
+                    "scrutinize, compose with any mode, and persist across "
+                    "rounds. Unknown names fail the call before any peer is "
+                    "launched."
+                ),
+            },
+            "acceptance_contract": {
+                "type": "string",
+                "description": (
+                    "Acceptance criteria to anchor the review (advisory-only). "
+                    "Either literal text or a path to a file inside the working "
+                    "directory. Peers treat a finding as a blocker "
+                    "(RECOMMENDATION: no) only when it violates one of the "
+                    "numbered criteria; everything else is surfaced as a "
+                    "non-blocking concern. Composes with any mode."
+                ),
+            },
+            "independent_review": {
+                "type": "boolean",
+                "description": (
+                    "On a continuation run (continuation_id set), suppress the "
+                    "prior council's per-peer labels/rationales so this round "
+                    "forms its verdict independently. Advisory: prior_context "
+                    "is simply not injected. No effect without a continuation "
+                    "or when no prior context was produced. Default False; can "
+                    "also be set per-mode or via defaults.independent_review."
                 ),
             },
         },
@@ -684,6 +738,25 @@ def council_run_output_schema() -> dict[str, Any]:
                     "required": ["peer", "family", "api_key_env"],
                 },
             },
+            "applied_focus": {
+                "type": "array",
+                "description": (
+                    "Operator-authored review-focus bundles applied to this "
+                    "run (M11 provenance). Each entry is the bundle name + "
+                    "the hex sha256 of its (inert, advisory-only) directive "
+                    "body. Bundles compose with any mode and grant no tool "
+                    "or write capability. Omitted entirely when no focus "
+                    "was applied (the common no-focus path)."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "sha256": {"type": "string"},
+                    },
+                    "required": ["name", "sha256"],
+                },
+            },
             "metadata": {"type": "object"},
             "summary_markdown": {
                 "type": "string",
@@ -736,6 +809,7 @@ def recommend_schema() -> dict[str, Any]:
                 "enum": ["low", "medium", "high"],
                 "default": "medium",
             },
+            "working_directory": {"type": "string"},
         },
         "required": ["task"],
         "additionalProperties": False,
@@ -1033,6 +1107,32 @@ async def run_council(
     mode_cfg = config.get("modes", {}).get(mode, {})
     if not isinstance(mode_cfg, dict):
         mode_cfg = {}
+    # Independent-review isolation (advisory). Resolution order:
+    # MCP arg > per-mode independent_review > defaults.independent_review.
+    # Default OFF. When ON and a prior_context WOULD have been injected from a
+    # continuation, drop it so this round forms its verdict without anchoring
+    # on prior verdicts. Surfaced post-run as a metadata flag (and top-level).
+    # None-aware precedence (NOT an `or` chain): an explicit per-call
+    # `independent_review: false` must override a true mode/default, and a
+    # mode's explicit false must override a true global default. Walk
+    # highest-priority first, taking the first non-None layer. (codex WU5
+    # review.)
+    _iv = arguments.get("independent_review")
+    if _iv is None:
+        _iv = mode_cfg.get("independent_review")
+    if _iv is None:
+        _iv = config.get("defaults", {}).get("independent_review")
+    independent_review = bool(_iv)
+    prior_context_suppressed = False
+    if independent_review and prior_context:
+        prior_context = None
+        prior_context_suppressed = True
+    # Acceptance contract (advisory). Resolve <text|path>: read the file only
+    # when the value names an existing regular file inside cwd; otherwise treat
+    # it as literal contract text. A failed in-cwd path check raises.
+    acceptance_contract = resolve_acceptance_contract(
+        arguments.get("acceptance_contract"), cwd=cwd, allow_outside_cwd=False
+    )
     mode_stances = mode_cfg.get("stances")
     arg_stances = arguments.get("stances")
     if isinstance(arg_stances, dict) and arg_stances:
@@ -1067,6 +1167,7 @@ async def run_council(
         stances=mode_stances if isinstance(mode_stances, dict) else None,
         participants=participant_cfg_for_prompt or None,
         prior_context=prior_context,
+        acceptance_contract=acceptance_contract,
     )
     from llm_council.safety import apply_secret_scan_policy
 
@@ -1188,28 +1289,49 @@ async def run_council(
 
     max_cost_usd = arguments.get("max_cost_usd")
     max_tokens = arguments.get("max_tokens")
-    if max_cost_usd is not None or max_tokens is not None:
-        try:
-            preflight = estimate_council(
-                config=config,
-                cwd=cwd,
-                question=question,
-                mode=mode,
-                current=current,
-                explicit=arguments.get("participants"),
-                include=arguments.get("include"),
-                origin_policy=arguments.get("origin_policy"),
-                context_paths=arguments.get("context_files") or [],
-                include_diff=bool(arguments.get("include_diff")),
-                allow_outside_cwd=False,
-                deliberate=deliberate,
-                max_rounds=max_rounds,
-                use_cache=True,
-                allow_network=False,
-                image_paths=image_path_inputs or None,
-            )
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"failed to compute pre-flight estimate: {exc}") from exc
+    # M6 soft cost-warning threshold. None-aware precedence (NOT an `or`
+    # chain, so an explicit 0 at either layer is respected): MCP arg >
+    # defaults.cost_warn_usd.
+    cost_warn_usd = arguments.get("cost_warn_usd")
+    if cost_warn_usd is None:
+        cost_warn_usd = config.get("defaults", {}).get("cost_warn_usd")
+    # Compute the pre-flight estimate once and reuse it for the hard budget
+    # gate (when a cap is set), the M6 soft warning, and the L7 compact echo.
+    # allow_network=False keeps it cheap (cached catalog only) so the
+    # always-on L7 echo adds no meaningful latency.
+    preflight: dict[str, Any] | None = None
+    cost_warning_payload: dict[str, Any] | None = None
+    cost_estimate_block: dict[str, Any] | None = None
+    try:
+        preflight = estimate_council(
+            config=config,
+            cwd=cwd,
+            question=question,
+            mode=mode,
+            current=current,
+            explicit=arguments.get("participants"),
+            include=arguments.get("include"),
+            origin_policy=arguments.get("origin_policy"),
+            context_paths=arguments.get("context_files") or [],
+            include_diff=bool(arguments.get("include_diff")),
+            allow_outside_cwd=False,
+            deliberate=deliberate,
+            max_rounds=max_rounds,
+            use_cache=True,
+            allow_network=False,
+            image_paths=image_path_inputs or None,
+        )
+    except (OSError, ValueError) as exc:
+        # Hard caps fail closed if the estimate can't be computed; the soft
+        # warning / echo are best-effort and degrade silently.
+        if max_cost_usd is not None or max_tokens is not None:
+            raise ValueError(
+                f"failed to compute pre-flight estimate: {exc}"
+            ) from exc
+    if preflight is not None:
+        from llm_council.estimate import compact_cost_estimate
+
+        cost_estimate_block = compact_cost_estimate(preflight)
         cost_total, token_total, unpriced_paid = summarize_preflight_caps(preflight)
         if max_cost_usd is not None and unpriced_paid:
             raise ValueError(
@@ -1230,6 +1352,14 @@ async def run_council(
                 f"Pre-flight estimate {token_total} tokens exceeds max_tokens "
                 f"{int(max_tokens)}; refused before any participant was invoked."
             )
+        # M6: soft warning off the SAME reduction the hard gate uses, so soft
+        # and hard numbers can never drift. Only reached when the run proceeds
+        # (a tripped hard gate above raises before this point).
+        if cost_warn_usd is not None and cost_total >= float(cost_warn_usd):
+            cost_warning_payload = {
+                "estimated_usd": cost_total,
+                "threshold_usd": float(cost_warn_usd),
+            }
     cfg = config.get("participants", {})
     # Stash warnings now so they survive into the post-run response. We
     # populate the metadata field once execute_council has returned its
@@ -1244,6 +1374,19 @@ async def run_council(
     _progress_cb = _build_mcp_progress_callback(
         mcp_session, progress_token, planned_total=_planned_total
     )
+    # Resolve operator-authored review-focus bundles. Fail fast (raise
+    # ValueError, mirroring this handler's other input-validation errors)
+    # on an unknown bundle name BEFORE execute_council launches any peer.
+    resolved_focus = None
+    _focus_arg = arguments.get("focus")
+    if _focus_arg:
+        from llm_council import review_skills as _review_skills
+
+        _focus_names = [str(name) for name in _focus_arg]
+        try:
+            resolved_focus, _ = _review_skills.resolve_focus(_focus_names, cwd)
+        except _review_skills.FocusNotFound as exc:
+            raise ValueError(str(exc)) from exc
     results, metadata = await execute_council(
         participants,
         cfg,
@@ -1261,6 +1404,7 @@ async def run_council(
         current=current,
         question=question,
         cross_rank=bool(arguments.get("cross_rank")),
+        focus=resolved_focus,
     )
     if image_manifest:
         metadata["images"] = [
@@ -1268,7 +1412,19 @@ async def run_council(
         ]
     if secret_scan_payload.get("detected_count") or _scan_policy != "off":
         metadata["secret_scan"] = secret_scan_payload
+    # Record the pre-run independent-review suppression (only when it actually
+    # occurred). Surfaced as a metadata flag rather than a mid-run progress
+    # event because the decision precedes execute_council.
+    if prior_context_suppressed:
+        metadata["prior_context_suppressed_for_independence"] = True
     metadata["config_warnings"] = _pending_config_warnings
+    # L7: compact cost-estimate echo so a caller who skipped `council_estimate`
+    # still sees the cost signal. M6: non-fatal soft cost-warning (omitted when
+    # not triggered).
+    if cost_estimate_block is not None:
+        metadata["cost_estimate"] = cost_estimate_block
+    if cost_warning_payload is not None:
+        metadata["cost_warning"] = cost_warning_payload
     write_transcript(
         md_path,
         json_path,
@@ -1414,6 +1570,11 @@ async def run_council(
     # X env var" signal without parsing per-result errors (the peer
     # never produced a result — it was excluded pre-run).
     metadata, missing_key_peers = _lift(metadata, "missing_key_peers", [])
+    # M11 provenance: lift applied review-focus bundles top-level (name +
+    # short content hash) so a calling agent sees which inert focus
+    # directives shaped the run without parsing metadata. Absent entirely
+    # when no --focus / focus was applied (default no-focus path).
+    metadata, applied_focus = _lift(metadata, "applied_focus", [])
     payload: dict[str, Any] = {
         "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
         "recommendation": recommendation,
@@ -1448,12 +1609,20 @@ async def run_council(
         payload["quota_recoveries"] = quota_recoveries
     if missing_key_peers:
         payload["missing_key_peers"] = missing_key_peers
+    if applied_focus:
+        payload["applied_focus"] = applied_focus
     # v0.9.0 Feature 2: lift cross-rank fields to the top-level payload
     # mirroring finding_matrix. Strip them from metadata to avoid
     # double-serialization (same data appearing under metadata.* AND
     # top-level keys).
     metadata, cross_rank_scores_out = _lift(metadata, "cross_rank_scores", {})
     metadata, anonymization_map_out = _lift(metadata, "anonymization_map", {})
+    # L7 / M6: lift the compact cost-estimate echo and the soft cost-warning
+    # to top-level so a calling agent sees the cost signal without parsing
+    # metadata. Omit-when-absent (the common no-cap-no-warn path leaves both
+    # unset). `cost_estimate` is left in metadata too (mirrors `degraded`),
+    # so re-anchor below picks it up; `cost_warning` is lifted out.
+    metadata, cost_warning_out = _lift(metadata, "cost_warning", {})
     # Anchor the payload's metadata reference to the fully-popped dict.
     # `metadata` may have been copied/mutated by any of the lifts above
     # (pre- and post-payload); a single assignment here keeps
@@ -1463,6 +1632,26 @@ async def run_council(
         payload["cross_rank_scores"] = cross_rank_scores_out
     if anonymization_map_out:
         payload["anonymization_map"] = anonymization_map_out
+    # L7: surface the compact cost-estimate block top-level (still present in
+    # metadata too). M6: surface the soft cost-warning top-level when triggered.
+    if isinstance(metadata, dict) and metadata.get("cost_estimate"):
+        payload["cost_estimate"] = metadata["cost_estimate"]
+    if cost_warning_out:
+        payload["cost_warning"] = cost_warning_out
+    # H2 independence warning (advisory-only): surfaced top-level so a
+    # calling agent can spot single-vendor quorums without parsing
+    # metadata. Mirrors the omit-when-absent convention — the common case
+    # has the feature off (key never set by the orchestrator). Left in
+    # metadata too (like `degraded`); never overloads quorum/degraded.
+    if isinstance(metadata, dict) and metadata.get("independence_warning"):
+        payload["independence_warning"] = metadata["independence_warning"]
+    # Independent-review suppression flag (advisory): mirror the
+    # omit-when-absent convention so a calling agent can see that the prior
+    # council context was intentionally withheld. Left in metadata too.
+    if isinstance(metadata, dict) and metadata.get(
+        "prior_context_suppressed_for_independence"
+    ):
+        payload["prior_context_suppressed_for_independence"] = True
 
     # Auto-open HTML transcript in browser if configured or requested
     auto_open = False
@@ -1510,6 +1699,68 @@ def run_doctor(arguments: dict[str, Any]) -> dict[str, Any]:
     result["version"] = __version__
     if arguments.get("check_update"):
         result["update"] = check_for_update(__version__).to_dict()
+    return result
+
+
+def _peers_to_consider_dropping(cwd: Path, config: dict[str, Any]) -> list[str]:
+    """L6 advisory: peer names whose recorded reliability suggests they be
+    reconsidered. Defensive — never raises; returns [] on any failure or
+    when there is no data. Advisory only: does NOT change participant
+    selection or the run.
+    """
+    try:
+        reliability = aggregate_reliability(
+            cwd, transcripts_dir=transcript_dir(cwd, config)
+        )
+        return policy.peers_to_consider_dropping(reliability)
+    except Exception:
+        return []
+
+
+async def _run_recommend(arguments: dict[str, Any]) -> dict[str, Any]:
+    """`council_recommend` handler.
+
+    Primary verdict is always the mechanical, zero-cost `policy.recommend`
+    output (M10). Two advisory enrichments layer on top — both are loaded
+    from config but neither changes the council run or participant selection:
+
+      - L6: `peers_to_consider_dropping` from recorded reliability.
+      - M9: an optional LLM difficulty `judge` (default OFF, fail-open),
+        attached as `result["judge"]` only when `defaults.recommend_judge`
+        is set and the call succeeds. The mechanical verdict is NEVER
+        overridden by the judge.
+    """
+    task = arguments["task"]
+    result = policy.recommend(
+        task,
+        failed_attempts=int(arguments.get("failed_attempts") or 0),
+        files_touched=int(arguments.get("files_touched") or 0),
+        risk=arguments.get("risk") or "medium",
+    )
+    # Config is needed for both L6 and the optional M9 judge. A config-load
+    # failure must not break the always-on mechanical verdict.
+    config: dict[str, Any] | None = None
+    try:
+        cwd = _resolve_working_directory(arguments)
+        load_project_env(cwd)
+        config = load_config(find_config(cwd), search=False)
+    except Exception:
+        config = None
+
+    if config is not None:
+        result["peers_to_consider_dropping"] = _peers_to_consider_dropping(cwd, config)
+        # M9 judge: only when explicitly enabled via defaults.recommend_judge.
+        defaults_cfg = config.get("defaults") or {}
+        if defaults_cfg.get("recommend_judge"):
+            judge = await grade_difficulty(task, config)
+            if judge is not None:
+                result["judge"] = {
+                    "difficulty": judge.get("difficulty"),
+                    "rationale": judge.get("rationale"),
+                    "suggested_mode": judge.get("suggested_mode"),
+                }
+    else:
+        result["peers_to_consider_dropping"] = []
     return result
 
 
@@ -1561,7 +1812,12 @@ def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
         )
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    return {"ok": True, "config_warnings": warnings, **estimate}
+    return {
+        "ok": True,
+        "config_warnings": warnings,
+        "peers_to_consider_dropping": _peers_to_consider_dropping(cwd, config),
+        **estimate,
+    }
 
 
 def list_models(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1843,13 +2099,7 @@ async def _serve() -> None:
                 progress_token=progress_token,
             )
         elif name == "council_recommend":
-            use, mode, reason = should_use_council(
-                arguments["task"],
-                failed_attempts=int(arguments.get("failed_attempts") or 0),
-                files_touched=int(arguments.get("files_touched") or 0),
-                risk=arguments.get("risk") or "medium",
-            )
-            result = {"use_council": use, "mode": mode, "reason": reason}
+            result = await _run_recommend(arguments)
         elif name == "council_estimate":
             result = estimate_run(arguments)
         elif name == "council_list_modes":

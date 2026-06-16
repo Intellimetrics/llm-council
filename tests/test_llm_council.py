@@ -1253,6 +1253,93 @@ def test_build_prompt_contains_read_only_rules(tmp_path: Path):
     assert "What should we do?" in prompt
 
 
+def test_build_prompt_acceptance_contract_injects_gate_block(tmp_path: Path):
+    prompt = build_prompt(
+        "Review this change",
+        mode="review",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=False,
+        stdin_text=None,
+        acceptance_contract="1. Must not break the public API.",
+    )
+    assert "ACCEPTANCE CONTRACT" in prompt
+    # The gate-blockers-on-criteria wording must be present.
+    assert "ONLY against the numbered criteria" in prompt
+    assert "only when it violates one of these criteria" in prompt
+    assert "1. Must not break the public API." in prompt
+    # Block is positioned AFTER the user question and BEFORE Response format.
+    q_idx = prompt.index("Review this change")
+    contract_idx = prompt.index("ACCEPTANCE CONTRACT")
+    fmt_idx = prompt.index("Response format:")
+    assert q_idx < contract_idx < fmt_idx
+
+
+def test_build_prompt_without_acceptance_contract_unchanged(tmp_path: Path):
+    base = build_prompt(
+        "Review this change",
+        mode="review",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=False,
+        stdin_text=None,
+    )
+    explicit_none = build_prompt(
+        "Review this change",
+        mode="review",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=False,
+        stdin_text=None,
+        acceptance_contract=None,
+    )
+    assert base == explicit_none
+    assert "ACCEPTANCE CONTRACT" not in base
+    # An empty/whitespace contract is also a no-op.
+    blank = build_prompt(
+        "Review this change",
+        mode="review",
+        cwd=tmp_path,
+        context_paths=[],
+        include_diff=False,
+        stdin_text=None,
+        acceptance_contract="   ",
+    )
+    assert blank == base
+
+
+def test_resolve_acceptance_contract_text_path_and_safety(tmp_path: Path):
+    from llm_council.context import resolve_acceptance_contract
+
+    # None / blank -> None.
+    assert resolve_acceptance_contract(None, cwd=tmp_path) is None
+    assert resolve_acceptance_contract("   ", cwd=tmp_path) is None
+    # A literal sentence (no matching file) -> literal text.
+    assert (
+        resolve_acceptance_contract("1. ship safely", cwd=tmp_path)
+        == "1. ship safely"
+    )
+    # An existing in-cwd file -> file contents.
+    contract_file = tmp_path / "contract.md"
+    contract_file.write_text("1. no API break\n2. tests pass\n", encoding="utf-8")
+    assert (
+        resolve_acceptance_contract("contract.md", cwd=tmp_path)
+        == "1. no API break\n2. tests pass"
+    )
+    # A path that resolves to an existing file OUTSIDE cwd raises unless allowed.
+    outside_dir = tmp_path.parent / "outside_contract_dir"
+    outside_dir.mkdir(exist_ok=True)
+    outside_file = outside_dir / "c.md"
+    outside_file.write_text("secret", encoding="utf-8")
+    rel = Path("..") / "outside_contract_dir" / "c.md"
+    with pytest.raises(ValueError, match="outside working directory"):
+        resolve_acceptance_contract(str(rel), cwd=tmp_path)
+    assert (
+        resolve_acceptance_contract(str(rel), cwd=tmp_path, allow_outside_cwd=True)
+        == "secret"
+    )
+
+
 def test_consensus_mode_default_assigns_for_against_neutral():
     config = load_config(None, search=False)
     assert "consensus" in config["modes"]
@@ -5787,6 +5874,83 @@ def test_write_transcript_emits_remaining_disagreement_section(tmp_path: Path):
     assert all(entry["ok"] is True for entry in remaining["participants"])
 
 
+def _write_remaining_disagreement_transcript(tmp_path: Path, results, stem: str):
+    """Helper: emit a transcript whose ## Remaining disagreement section fires,
+    returning the rendered markdown. Used by the minority-callout tests."""
+    out_dir = tmp_path / ".llm-council" / "runs"
+    md_path = out_dir / f"{stem}.md"
+    json_path = out_dir / f"{stem}.json"
+    write_transcript(
+        md_path,
+        json_path,
+        question="split",
+        mode="deliberate",
+        current="codex",
+        participants=["a", "b", "c"],
+        prompt="prompt",
+        results=results,
+        metadata={
+            "rounds": 2,
+            "deliberation_status": "ran_max_rounds_unresolved",
+            "final_disagreement_detected": True,
+        },
+    )
+    return md_path.read_text(encoding="utf-8")
+
+
+def test_remaining_disagreement_count_line_names_minority(tmp_path: Path):
+    """L3: with a clear majority and a non-empty minority, the count line
+    gets a scannable minority callout naming the minority peers."""
+    results = [
+        ParticipantResult("claude", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        ParticipantResult("codex", True, "RECOMMENDATION: yes - ship too", "", 1.0),
+        ParticipantResult("gemini", True, "RECOMMENDATION: no - wait", "", 1.0),
+    ]
+    md = _write_remaining_disagreement_transcript(tmp_path, results, "minority")
+    # The callout is appended to the EXISTING count line (no second count line).
+    assert (
+        "Recommendations (final round): 2 yes / 1 no / 0 tradeoff / 0 unknown"
+        " — minority: gemini held no" in md
+    )
+    # Exactly one count line in the section (no duplicate).
+    section = md.split("## Remaining disagreement")[1]
+    assert section.count("Recommendations (final round):") == 1
+
+
+def test_remaining_disagreement_count_line_no_callout_when_unanimous(
+    tmp_path: Path,
+):
+    """L3: unanimous final round (no minority) → no callout. The section
+    still fires because final_disagreement_detected is set (e.g. round-1
+    disagreement that later resolved)."""
+    results = [
+        ParticipantResult("claude", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        ParticipantResult("codex", True, "RECOMMENDATION: yes - ship too", "", 1.0),
+        ParticipantResult("gemini", True, "RECOMMENDATION: yes - agreed", "", 1.0),
+    ]
+    md = _write_remaining_disagreement_transcript(tmp_path, results, "unanimous")
+    assert (
+        "Recommendations (final round): 3 yes / 0 no / 0 tradeoff / 0 unknown" in md
+    )
+    section = md.split("## Remaining disagreement")[1]
+    assert "minority:" not in section
+
+
+def test_remaining_disagreement_count_line_no_callout_on_tie(tmp_path: Path):
+    """L3: an ambiguous tie among top labels has no single majority → no
+    minority callout."""
+    results = [
+        ParticipantResult("claude", True, "RECOMMENDATION: yes - ship", "", 1.0),
+        ParticipantResult("codex", True, "RECOMMENDATION: no - wait", "", 1.0),
+    ]
+    md = _write_remaining_disagreement_transcript(tmp_path, results, "tie")
+    assert (
+        "Recommendations (final round): 1 yes / 1 no / 0 tradeoff / 0 unknown" in md
+    )
+    section = md.split("## Remaining disagreement")[1]
+    assert "minority:" not in section
+
+
 def test_write_transcript_renders_synthesis_section(tmp_path: Path):
     """The opt-in (paid) synthesis chair memo must appear in the human-facing
     markdown transcript, not only the JSON."""
@@ -7629,6 +7793,223 @@ def test_council_run_schema_advertises_continuation_id():
     schema = council_run_schema()
     assert "continuation_id" in schema["properties"]
     assert schema["properties"]["continuation_id"]["type"] == "string"
+
+
+def test_council_run_schema_advertises_independent_and_contract():
+    schema = council_run_schema()
+    assert schema["properties"]["acceptance_contract"]["type"] == "string"
+    assert schema["properties"]["independent_review"]["type"] == "boolean"
+
+
+def _independent_review_run_config(out_dir: Path) -> dict:
+    return {
+        "version": 1,
+        "transcripts_dir": str(out_dir),
+        "defaults": {"mode": "review"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {
+            "review": {
+                "strategy": "other_cli_peers",
+                "participants": ["claude"],
+                "min_quorum": 1,
+            }
+        },
+    }
+
+
+def test_cli_independent_review_suppresses_prior_context(monkeypatch, tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    parent_id = "20260909_120000"
+    _write_prior_transcript(out_dir, run_id=parent_id, question="prior question")
+
+    captured: dict = {}
+
+    async def fake_execute_council(*args, **kwargs):
+        captured["prompt"] = args[2] if len(args) >= 3 else kwargs.get("prompt")
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    config = _independent_review_run_config(out_dir)
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "review",
+            "--current",
+            "claude",
+            "--continue",
+            parent_id,
+            "--independent-review",
+            "--json",
+            "follow up",
+        ]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0
+    # Prior council context must NOT be injected.
+    assert "Prior council context (run " not in captured["prompt"]
+    # The new transcript records the suppression flag.
+    chained = [
+        json.loads(p.read_text(encoding="utf-8"))
+        for p in out_dir.glob("*.json")
+        if "parent_run_id" in json.loads(p.read_text(encoding="utf-8"))
+    ]
+    assert len(chained) == 1
+    assert (
+        chained[0]["metadata"].get("prior_context_suppressed_for_independence")
+        is True
+    )
+
+
+def test_cli_continue_without_independent_review_keeps_prior(monkeypatch, tmp_path: Path):
+    out_dir = tmp_path / "runs"
+    parent_id = "20260909_130000"
+    _write_prior_transcript(out_dir, run_id=parent_id, question="prior question")
+
+    captured: dict = {}
+
+    async def fake_execute_council(*args, **kwargs):
+        captured["prompt"] = args[2] if len(args) >= 3 else kwargs.get("prompt")
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    config = _independent_review_run_config(out_dir)
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "review",
+            "--current",
+            "claude",
+            "--continue",
+            parent_id,
+            "--json",
+            "follow up",
+        ]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0
+    # Prior context flows exactly as today; no suppression flag.
+    assert "Prior council context (run " in captured["prompt"]
+    chained = [
+        json.loads(p.read_text(encoding="utf-8"))
+        for p in out_dir.glob("*.json")
+        if "parent_run_id" in json.loads(p.read_text(encoding="utf-8"))
+    ]
+    assert len(chained) == 1
+    assert (
+        "prior_context_suppressed_for_independence"
+        not in chained[0]["metadata"]
+    )
+
+
+def test_cli_mode_false_overrides_default_true_independent_review(
+    monkeypatch, tmp_path: Path
+):
+    """Precedence regression (codex WU5): a mode's explicit
+    `independent_review: false` must override a `true` global default — the
+    old `or` chain wrongly kept it on. No CLI flag passed, so the mode value
+    wins; prior context is KEPT and no suppression flag is set."""
+    out_dir = tmp_path / "runs"
+    parent_id = "20260909_140000"
+    _write_prior_transcript(out_dir, run_id=parent_id, question="prior question")
+
+    captured: dict = {}
+
+    async def fake_execute_council(*args, **kwargs):
+        captured["prompt"] = args[2] if len(args) >= 3 else kwargs.get("prompt")
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(cli_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_module, "build_image_manifest", lambda *_a, **_k: [])
+    config = _independent_review_run_config(out_dir)
+    # Global default ON, but the active mode explicitly opts OUT.
+    config["defaults"]["independent_review"] = True
+    config["modes"]["review"]["independent_review"] = False
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run", "--cwd", str(tmp_path), "--mode", "review",
+            "--current", "claude", "--continue", parent_id, "--json", "follow up",
+        ]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0
+    # mode false beats default true → prior context preserved, no flag.
+    assert "Prior council context (run " in captured["prompt"]
+    chained = [
+        json.loads(p.read_text(encoding="utf-8"))
+        for p in out_dir.glob("*.json")
+        if "parent_run_id" in json.loads(p.read_text(encoding="utf-8"))
+    ]
+    assert len(chained) == 1
+    assert (
+        "prior_context_suppressed_for_independence" not in chained[0]["metadata"]
+    )
+
+
+def test_mcp_independent_review_suppresses_and_surfaces(monkeypatch, tmp_path: Path):
+    from llm_council import mcp_server as mcp_module
+
+    out_dir = tmp_path / "runs"
+    parent_id = "20261010_120000"
+    _write_prior_transcript(out_dir, run_id=parent_id, question="prior mcp question")
+
+    captured: dict = {}
+
+    async def fake_execute_council(*args, **kwargs):
+        captured["prompt"] = args[2] if len(args) >= 3 else kwargs.get("prompt")
+        return [
+            ParticipantResult("claude", True, "RECOMMENDATION: yes - ok", "", 1.0),
+        ], {"rounds": 1, "progress_events": []}
+
+    config = _independent_review_run_config(out_dir)
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    monkeypatch.setattr(mcp_module, "execute_council", fake_execute_council)
+    monkeypatch.setattr(mcp_module, "load_project_env", lambda *_a, **_k: [])
+    monkeypatch.setattr(mcp_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(mcp_module, "find_config", lambda *_a, **_k: None)
+    monkeypatch.setattr(mcp_module, "select_participants", lambda *_a, **_k: ["claude"])
+    monkeypatch.setattr(mcp_module, "enforce_mcp_budget", lambda *_a, **_k: None)
+
+    result = asyncio.run(
+        mcp_module.run_council(
+            {
+                "question": "follow up question",
+                "continuation_id": parent_id,
+                "independent_review": True,
+                "working_directory": str(tmp_path),
+            }
+        )
+    )
+    assert "Prior council context (run " not in captured["prompt"]
+    assert result.get("prior_context_suppressed_for_independence") is True
+    assert (
+        result["metadata"].get("prior_context_suppressed_for_independence") is True
+    )
 
 
 def test_mcp_run_council_threads_continuation_id(monkeypatch, tmp_path: Path):
@@ -12259,3 +12640,555 @@ def test_cmd_run_uses_min_per_participant_max_prompt_chars(
     rc = cli_module.cmd_run(args)
     assert rc == 0
     assert captured.get("max_prompt_chars") == 50_000
+
+
+# ---------------------------------------------------------------------------
+# M6 soft cost-warning threshold (advisory only — never blocks)
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_preflight(cost: float) -> dict:
+    """Minimal estimate-shaped dict for summarize_preflight_caps."""
+    return {
+        "known_total_usd": cost,
+        "known_total_with_retry_safety_usd": cost,
+        "rows": [
+            {
+                "name": "hosted",
+                "type": "openrouter",
+                "estimated_input_tokens": 100,
+                "estimated_output_tokens": 50,
+                "estimated_total_cost_usd": cost,
+            }
+        ],
+    }
+
+
+def test_cost_warn_logic_off_when_threshold_unset():
+    """No threshold -> no warning, never raises (synthetic preflight)."""
+    from llm_council.budget import summarize_preflight_caps
+
+    preflight = _synthetic_preflight(0.30)
+    cost_total, _tokens, _unpriced = summarize_preflight_caps(preflight)
+    cost_warn_usd = None
+    # Mirror the run-path guard: only fire when set AND over threshold.
+    warning = None
+    if cost_warn_usd is not None and cost_total >= float(cost_warn_usd):
+        warning = {"estimated_usd": cost_total, "threshold_usd": float(cost_warn_usd)}
+    assert warning is None
+
+
+def test_cost_warn_logic_fires_over_threshold_from_same_reduction():
+    """Over-threshold (but no hard cap) -> warning computed off the SAME
+    summarize_preflight_caps reduction the hard gate uses, so soft/hard
+    numbers can never drift."""
+    from llm_council.budget import summarize_preflight_caps
+
+    preflight = _synthetic_preflight(0.30)
+    cost_total, _tokens, _unpriced = summarize_preflight_caps(preflight)
+    cost_warn_usd = 0.10
+    warning = None
+    if cost_warn_usd is not None and cost_total >= float(cost_warn_usd):
+        warning = {"estimated_usd": cost_total, "threshold_usd": float(cost_warn_usd)}
+    assert warning == {"estimated_usd": 0.30, "threshold_usd": 0.10}
+
+
+def test_cost_warn_logic_under_threshold_absent():
+    from llm_council.budget import summarize_preflight_caps
+
+    preflight = _synthetic_preflight(0.05)
+    cost_total, _tokens, _unpriced = summarize_preflight_caps(preflight)
+    cost_warn_usd = 0.10
+    warning = None
+    if cost_warn_usd is not None and cost_total >= float(cost_warn_usd):
+        warning = {"estimated_usd": cost_total, "threshold_usd": float(cost_warn_usd)}
+    assert warning is None
+
+
+def test_cli_run_stamps_cost_warning_when_over_threshold(monkeypatch, tmp_path, capsys):
+    """CLI run path: --cost-warn-usd over the estimate stamps a non-fatal
+    `cost_warning` into metadata and does NOT refuse the run."""
+    captured: dict = {}
+
+    monkeypatch.setattr(
+        cli_module,
+        "estimate_council",
+        lambda **_k: {
+            "known_total_usd": 0.30,
+            "known_total_with_retry_safety_usd": 0.30,
+            "cost_class": "moderate",
+            "paid_peer_count": 1,
+            "free_peer_count": 0,
+            "rows": [
+                {
+                    "name": "hosted",
+                    "type": "openrouter",
+                    "estimated_input_tokens": 100,
+                    "estimated_output_tokens": 50,
+                    "estimated_total_cost_usd": 0.30,
+                }
+            ],
+        },
+    )
+
+    async def fake_execute_council(*args, **kwargs):
+        meta = {"rounds": 1, "deliberated": False, "progress_events": []}
+        captured["metadata"] = meta
+        return ([ParticipantResult("hosted", True, "RECOMMENDATION: yes - ok", "", 1.0)], meta)
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    config = {
+        "version": 1,
+        "transcripts_dir": str(tmp_path / "runs"),
+        "defaults": {"mode": "quick"},
+        "participants": {"hosted": {"type": "openrouter", "model": "x/y"}},
+        "modes": {"quick": {"participants": ["hosted"]}},
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "--current",
+            "claude",
+            "--cost-warn-usd",
+            "0.10",
+            "test",
+        ]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0  # never refused
+    assert captured["metadata"]["cost_warning"] == {
+        "estimated_usd": 0.30,
+        "threshold_usd": 0.10,
+    }
+    # L7 echo present on the same run.
+    assert captured["metadata"]["cost_estimate"]["cost_class"] == "moderate"
+    err = capsys.readouterr().err
+    assert "exceeds cost_warn_usd" in err
+
+
+def test_cli_run_no_cost_warning_when_under_threshold(monkeypatch, tmp_path):
+    captured: dict = {}
+
+    monkeypatch.setattr(
+        cli_module,
+        "estimate_council",
+        lambda **_k: {
+            "known_total_usd": 0.01,
+            "known_total_with_retry_safety_usd": 0.01,
+            "cost_class": "low",
+            "paid_peer_count": 1,
+            "free_peer_count": 0,
+            "rows": [
+                {
+                    "name": "hosted",
+                    "type": "openrouter",
+                    "estimated_input_tokens": 10,
+                    "estimated_output_tokens": 5,
+                    "estimated_total_cost_usd": 0.01,
+                }
+            ],
+        },
+    )
+
+    async def fake_execute_council(*args, **kwargs):
+        meta = {"rounds": 1, "deliberated": False, "progress_events": []}
+        captured["metadata"] = meta
+        return ([ParticipantResult("hosted", True, "RECOMMENDATION: yes - ok", "", 1.0)], meta)
+
+    monkeypatch.setattr(cli_module, "execute_council", fake_execute_council)
+    config = {
+        "version": 1,
+        "transcripts_dir": str(tmp_path / "runs"),
+        "defaults": {"mode": "quick"},
+        "participants": {"hosted": {"type": "openrouter", "model": "x/y"}},
+        "modes": {"quick": {"participants": ["hosted"]}},
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(cli_module, "find_config", lambda *_a, **_k: None)
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "quick",
+            "--current",
+            "claude",
+            "--cost-warn-usd",
+            "0.10",
+            "test",
+        ]
+    )
+    rc = cli_module.cmd_run(args)
+    assert rc == 0
+    assert "cost_warning" not in captured["metadata"]
+    # L7 echo still present even with no warning.
+    assert captured["metadata"]["cost_estimate"]["cost_class"] == "low"
+
+
+def test_mcp_run_surfaces_cost_warning_and_estimate_top_level(monkeypatch, tmp_path):
+    """MCP run path: cost_warn_usd over the estimate surfaces `cost_warning`
+    top-level (and in metadata) and never refuses; `cost_estimate` echoed too."""
+    import llm_council.mcp_server as mcp_module
+    from llm_council.mcp_server import run_council
+
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+    (tmp_path / ".llm-council.yaml").write_text(
+        """
+defaults:
+  mode: review-cheap
+participants:
+  cheap:
+    type: openrouter
+    model: openai/gpt-4o-mini
+    api_key_env: X
+    input_per_million: 0.15
+    output_per_million: 0.6
+modes:
+  review-cheap:
+    participants: [cheap]
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("X", "secret")
+
+    async def fake_execute_council(*args, **kwargs):
+        return (
+            [
+                ParticipantResult(
+                    name="cheap",
+                    ok=True,
+                    output="RECOMMENDATION: yes - looks fine",
+                    error="",
+                    elapsed_seconds=2.5,
+                    model="openai/gpt-4o-mini",
+                )
+            ],
+            {"rounds": 1, "deliberated": False, "min_quorum": 1, "degraded": False},
+        )
+
+    monkeypatch.setattr(mcp_module, "execute_council", fake_execute_council)
+
+    result = asyncio.run(
+        run_council(
+            {
+                "question": "ping",
+                "working_directory": str(tmp_path),
+                # Threshold of 0 warns on any estimated spend (explicit 0 honored).
+                "cost_warn_usd": 0,
+            }
+        )
+    )
+    assert "cost_warning" in result
+    assert result["cost_warning"]["threshold_usd"] == 0.0
+    assert result["cost_warning"]["estimated_usd"] >= 0.0
+    assert "cost_estimate" in result
+    assert result["cost_estimate"]["cost_class"] in {"low", "moderate", "high"}
+    # cost_warning is lifted out of metadata; cost_estimate stays in metadata too.
+    assert result["metadata"].get("cost_warning") is None
+    assert result["metadata"]["cost_estimate"]["cost_class"] in {
+        "low",
+        "moderate",
+        "high",
+    }
+
+
+# ---------------------------------------------------------------------------
+# M8 litellm pricing fallback for hosted catalog misses (estimation only)
+# ---------------------------------------------------------------------------
+
+
+def test_litellm_fallback_prices_hosted_peer_on_catalog_miss(monkeypatch, tmp_path):
+    """An openrouter peer absent from the (empty) catalog gets priced via the
+    litellm fallback and leaves unknown_cost_rows."""
+    # Empty catalog -> guaranteed catalog miss for any model.
+    monkeypatch.setattr(estimate_module, "fetch_openrouter_models", lambda **_k: [])
+    monkeypatch.setattr(
+        estimate_module,
+        "_litellm_price_per_million",
+        lambda model: (3.0, 15.0) if model == "vendor/known-by-litellm" else (None, None),
+    )
+    config = {
+        "version": 1,
+        "defaults": {"mode": "quick"},
+        "participants": {
+            "hosted": {
+                "type": "openrouter",
+                "model": "vendor/known-by-litellm",
+                "api_key_env": "OPENROUTER_API_KEY",
+            }
+        },
+        "modes": {"quick": {"participants": ["hosted"]}},
+    }
+    estimate = estimate_module.estimate_council(
+        config=config,
+        cwd=tmp_path,
+        question="test",
+        mode="quick",
+        current=None,
+        deliberate=False,
+        allow_network=False,
+    )
+    assert estimate["unknown_cost_rows"] == []
+    row = next(r for r in estimate["rows"] if r["name"] == "hosted")
+    assert row["pricing_source"] == "litellm"
+    assert row["input_per_million"] == 3.0
+    assert row["output_per_million"] == 15.0
+    assert row["estimated_total_cost_usd"] is not None
+    # Operator-visible note naming the peer/model.
+    assert any("litellm" in n and "hosted" in n for n in estimate["notes"])
+
+
+def test_litellm_fallback_absent_leaves_peer_unpriced(monkeypatch, tmp_path):
+    """With the helper returning (None, None) — the litellm-absent default —
+    the hosted peer stays unpriced exactly as before."""
+    monkeypatch.setattr(estimate_module, "fetch_openrouter_models", lambda **_k: [])
+    monkeypatch.setattr(
+        estimate_module, "_litellm_price_per_million", lambda model: (None, None)
+    )
+    config = {
+        "version": 1,
+        "defaults": {"mode": "quick"},
+        "participants": {
+            "hosted": {
+                "type": "openrouter",
+                "model": "vendor/unknown-everywhere",
+                "api_key_env": "OPENROUTER_API_KEY",
+            }
+        },
+        "modes": {"quick": {"participants": ["hosted"]}},
+    }
+    estimate = estimate_module.estimate_council(
+        config=config,
+        cwd=tmp_path,
+        question="test",
+        mode="quick",
+        current=None,
+        deliberate=False,
+        allow_network=False,
+    )
+    assert estimate["unknown_cost_rows"] == ["hosted"]
+    row = next(r for r in estimate["rows"] if r["name"] == "hosted")
+    assert row["estimated_total_cost_usd"] is None
+
+
+def test_litellm_fallback_never_prices_native_cli_peer(monkeypatch, tmp_path):
+    """The litellm fallback must NEVER price native CLI peers — they stay $0
+    by design and the helper is only consulted for hosted peers."""
+    calls: list[str] = []
+
+    def spy(model):
+        calls.append(model)
+        return (99.0, 99.0)  # would be wrong if ever applied to a CLI peer
+
+    monkeypatch.setattr(estimate_module, "_litellm_price_per_million", spy)
+    config = {
+        "version": 1,
+        "defaults": {"mode": "quick"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {"quick": {"participants": ["claude"]}},
+    }
+    estimate = estimate_module.estimate_council(
+        config=config,
+        cwd=tmp_path,
+        question="test",
+        mode="quick",
+        current=None,
+        deliberate=False,
+        allow_network=False,
+    )
+    assert calls == []  # helper never consulted for the CLI peer
+    row = next(r for r in estimate["rows"] if r["name"] == "claude")
+    assert row["pricing_source"] != "litellm"
+    # Native CLI peer stays $0 / None-priced (external subscription cost).
+    assert row["estimated_total_cost_usd"] is None
+
+
+# ---------------------------------------------------------------------------
+# L7 derived cost_class + compact echo
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_council_derives_cost_class_and_peer_counts(monkeypatch, tmp_path):
+    """Mixed roster: a priced hosted peer + a free CLI peer + an unpriced
+    hosted peer. cost_class derived from the retry-safety total; paid count
+    includes the unpriced hosted peer; free count = CLI peer only."""
+    # Catalog prices the first hosted peer; second hosted peer is a catalog
+    # miss; litellm absent so it stays unpriced (still counts as paid).
+    monkeypatch.setattr(
+        estimate_module,
+        "fetch_openrouter_models",
+        lambda **_k: [
+            {"id": "vendor/priced", "input_per_million": 1.0, "output_per_million": 2.0}
+        ],
+    )
+    monkeypatch.setattr(
+        estimate_module, "_litellm_price_per_million", lambda model: (None, None)
+    )
+    config = {
+        "version": 1,
+        "defaults": {"mode": "quick"},
+        "participants": {
+            "priced": {"type": "openrouter", "model": "vendor/priced", "api_key_env": "K"},
+            "unpriced": {"type": "openrouter", "model": "vendor/missing", "api_key_env": "K"},
+            "claude": {"type": "cli", "command": "claude"},
+        },
+        "modes": {"quick": {"participants": ["priced", "unpriced", "claude"]}},
+    }
+    estimate = estimate_module.estimate_council(
+        config=config,
+        cwd=tmp_path,
+        question="test",
+        mode="quick",
+        current=None,
+        deliberate=False,
+        allow_network=False,
+    )
+    assert estimate["paid_peer_count"] == 2  # both hosted, even the unpriced one
+    assert estimate["free_peer_count"] == 1  # the CLI peer
+    assert estimate["cost_class"] in {"low", "moderate", "high"}
+    # Tiny prompt -> sub-nickel -> low.
+    assert estimate["cost_class"] == "low"
+    assert estimate["known_total_with_retry_safety_usd"] < 0.05
+
+
+def test_local_openai_compatible_peer_counts_as_free(monkeypatch, tmp_path):
+    """A local `openai_compatible` peer (loopback base_url) runs at $0 and
+    must count as FREE, not paid — codex WU6 review. The hosted openrouter
+    peer in the same roster is the only paid peer."""
+    monkeypatch.setattr(
+        estimate_module,
+        "fetch_openrouter_models",
+        lambda **_k: [
+            {"id": "vendor/priced", "input_per_million": 1.0, "output_per_million": 2.0}
+        ],
+    )
+    monkeypatch.setattr(
+        estimate_module, "_litellm_price_per_million", lambda model: (None, None)
+    )
+    config = {
+        "version": 1,
+        "defaults": {"mode": "quick"},
+        "participants": {
+            "hosted": {"type": "openrouter", "model": "vendor/priced", "api_key_env": "K"},
+            "local_vllm": {
+                "type": "openai_compatible",
+                "model": "local/qwen",
+                "base_url": "http://127.0.0.1:8000/v1",
+            },
+        },
+        "modes": {"quick": {"participants": ["hosted", "local_vllm"]}},
+    }
+    estimate = estimate_module.estimate_council(
+        config=config,
+        cwd=tmp_path,
+        question="test",
+        mode="quick",
+        current=None,
+        deliberate=False,
+        allow_network=False,
+    )
+    assert estimate["paid_peer_count"] == 1  # only the hosted openrouter peer
+    assert estimate["free_peer_count"] == 1  # the loopback openai_compatible peer
+
+
+def test_cost_class_thresholds_boundaries():
+    from llm_council.estimate import (
+        COST_CLASS_LOW_MAX_USD,
+        COST_CLASS_MODERATE_MAX_USD,
+        _cost_class,
+    )
+
+    assert _cost_class(0.0) == "low"
+    assert _cost_class(COST_CLASS_LOW_MAX_USD - 0.0001) == "low"
+    assert _cost_class(COST_CLASS_LOW_MAX_USD) == "moderate"
+    assert _cost_class(COST_CLASS_MODERATE_MAX_USD - 0.0001) == "moderate"
+    assert _cost_class(COST_CLASS_MODERATE_MAX_USD) == "high"
+    assert _cost_class(5.0) == "high"
+
+
+def test_compact_cost_estimate_projection():
+    from llm_council.estimate import compact_cost_estimate
+
+    block = compact_cost_estimate(
+        {
+            "known_total_usd": 0.12,
+            "known_total_with_retry_safety_usd": 0.18,
+            "cost_class": "moderate",
+            "paid_peer_count": 2,
+            "free_peer_count": 1,
+            "rows": [],  # full breakdown must NOT leak into the compact block
+        }
+    )
+    assert block == {
+        "known_total_usd": 0.12,
+        "retry_safety_usd": 0.18,
+        "cost_class": "moderate",
+        "paid_peer_count": 2,
+        "free_peer_count": 1,
+    }
+    assert "rows" not in block
+
+
+# ---------------------------------------------------------------------------
+# config validation for cost_warn_usd
+# ---------------------------------------------------------------------------
+
+
+def test_validate_config_rejects_negative_cost_warn_usd():
+    from llm_council.config import validate_config
+
+    bad = {
+        "version": 1,
+        "participants": {"x": {"type": "cli", "command": "echo"}},
+        "modes": {"only": {"participants": ["x"]}},
+        "defaults": {"mode": "only", "cost_warn_usd": -1},
+    }
+    with pytest.raises(ValueError, match="cost_warn_usd"):
+        validate_config(bad)
+
+
+def test_validate_config_rejects_non_number_cost_warn_usd():
+    from llm_council.config import validate_config
+
+    bad = {
+        "version": 1,
+        "participants": {"x": {"type": "cli", "command": "echo"}},
+        "modes": {"only": {"participants": ["x"]}},
+        "defaults": {"mode": "only", "cost_warn_usd": "cheap"},
+    }
+    with pytest.raises(ValueError, match="cost_warn_usd"):
+        validate_config(bad)
+
+
+def test_validate_config_accepts_absent_and_zero_cost_warn_usd():
+    from llm_council.config import validate_config
+
+    base_participants = {"x": {"type": "cli", "command": "echo"}}
+    base_modes = {"only": {"participants": ["x"]}}
+    # Absent: fine.
+    validate_config(
+        {
+            "version": 1,
+            "participants": base_participants,
+            "modes": base_modes,
+            "defaults": {"mode": "only"},
+        }
+    )
+    # Explicit 0: fine (warn on any spend).
+    validate_config(
+        {
+            "version": 1,
+            "participants": base_participants,
+            "modes": base_modes,
+            "defaults": {"mode": "only", "cost_warn_usd": 0},
+        }
+    )

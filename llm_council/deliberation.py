@@ -194,9 +194,18 @@ def build_deliberation_prompt(
         "",
         task_capsule,
         "",
-        "Now read the peer responses below, identify what you still disagree "
-        "with, and try to converge on a practical recommendation. If consensus "
-        "is impossible, state the remaining split clearly. "
+        "Now read the peer responses below and identify what, if anything, "
+        "you still disagree with. Converge toward what is actually correct, "
+        "not toward agreement for its own sake. Do not change your "
+        "recommendation merely to side with the group, and do not hold your "
+        "position merely to stay consistent with your earlier answer — move "
+        "only toward the truth. If you change your recommendation, name the "
+        "specific peer point that convinced you; if you hold your position, "
+        "name the strongest peer argument against you and say why it does not "
+        "move you. "
+        "Focus your critique on the OTHER peers' responses rather than "
+        "re-justifying your own prior answer. If consensus is impossible, "
+        "state the remaining split clearly. "
         "Start your reply with `RECOMMENDATION: yes - ...`, "
         "`RECOMMENDATION: no - ...`, or `RECOMMENDATION: tradeoff - ...`. "
         "The optional envelope fields (`EFFORT:`, `CONFIDENCE:`, `RISK:`, "

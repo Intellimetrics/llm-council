@@ -244,10 +244,29 @@ def validate_config(config: dict[str, Any]) -> None:
                 )
         if "include_current" in mode and not isinstance(mode["include_current"], bool):
             raise ValueError(f"Mode '{name}' include_current must be a boolean")
+        # Independent-review isolation (advisory). Optional per-mode override
+        # of the prior-context suppression on continuation runs; boolean when
+        # present (absent = inherit defaults/off).
+        if "independent_review" in mode and not isinstance(
+            mode["independent_review"], bool
+        ):
+            raise ValueError(f"Mode '{name}' independent_review must be a boolean")
+        # No-new-movement early-stop (advisory, opt-in). Boolean when present;
+        # a mode-explicit value overrides the global default (absent = inherit).
+        if "deliberation_early_stop" in mode and not isinstance(
+            mode["deliberation_early_stop"], bool
+        ):
+            raise ValueError(
+                f"Mode '{name}' deliberation_early_stop must be a boolean"
+            )
         if mode.get("origin_policy") not in (None, "any", "us"):
             raise ValueError(f"Mode '{name}' origin_policy must be 'any' or 'us'")
         _validate_positive_int(mode, "max_rounds", f"mode '{name}'")
         _validate_positive_int(mode, "min_quorum", f"mode '{name}'")
+        # H2 independence warning: optional per-mode override of the
+        # distinct-vendor floor. Advisory-only; must be a positive integer
+        # when present (absent = feature off for this mode).
+        _validate_positive_int(mode, "require_distinct_vendors", f"mode '{name}'")
         # timeout_multiplier is layered onto the per-participant base timeout in
         # _resolve_effective_timeout. A non-numeric value (e.g. "fast") used to
         # pass load and then raise an uncaught ValueError mid-run, after
@@ -306,11 +325,40 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("defaults.origin_policy must be 'any' or 'us'")
     if defaults.get("mode") and defaults["mode"] not in modes:
         raise ValueError(f"defaults.mode references unknown mode '{defaults['mode']}'")
+    # Independent-review isolation (advisory). Optional global default for the
+    # prior-context suppression on continuation runs; boolean when present
+    # (absent = feature off).
+    if "independent_review" in defaults and not isinstance(
+        defaults["independent_review"], bool
+    ):
+        raise ValueError("defaults.independent_review must be a boolean")
+    # M9 optional LLM difficulty judge: peer NAME of a hosted participant to
+    # consult in `council_recommend`. String when present (absent = feature
+    # off). Existence / hosted-ness / key resolution is checked lazily at
+    # call time (recommend_judge.grade_difficulty), not here.
+    if "recommend_judge" in defaults and not isinstance(
+        defaults["recommend_judge"], str
+    ):
+        raise ValueError("defaults.recommend_judge must be a string")
+    # No-new-movement early-stop for deliberation (advisory, opt-in). Boolean
+    # when present (absent = feature off). Only meaningful for modes with
+    # max_rounds >= 3; with the default max_rounds=2 it never triggers.
+    if "deliberation_early_stop" in defaults and not isinstance(
+        defaults["deliberation_early_stop"], bool
+    ):
+        raise ValueError("defaults.deliberation_early_stop must be a boolean")
     _validate_positive_int(defaults, "max_concurrency", "defaults")
     _validate_positive_int(defaults, "max_deliberation_rounds", "defaults")
     _validate_positive_int(defaults, "max_prompt_chars", "defaults")
     _validate_positive_int(defaults, "mcp_max_prompt_chars", "defaults")
+    # H2 independence warning: optional global distinct-vendor floor.
+    # Advisory-only; positive integer when present (absent = feature off).
+    _validate_positive_int(defaults, "min_distinct_vendors", "defaults")
     _validate_positive_number(defaults, "mcp_max_estimated_cost_usd", "defaults")
+    # M6 soft cost-warning threshold (advisory only — never gates a run).
+    # Non-negative number when present (an explicit 0 means "warn on any
+    # estimated spend"); absent = feature off.
+    _validate_nonnegative_number(defaults, "cost_warn_usd", "defaults")
     _validate_convergence_thresholds(defaults, "defaults")
     for mode_name, mode in modes.items():
         if isinstance(mode, dict):

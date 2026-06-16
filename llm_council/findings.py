@@ -459,9 +459,33 @@ def matrix_to_dict(matrix: FindingMatrix) -> dict[str, Any]:
             entry["unverified"] = True
         single_peer_concerns.append(entry)
 
+    # Derived three-tier gating partition (advisory; no new parsing/severities).
+    # The severity ladder is exactly {"blocker", "medium", "nit"} (default
+    # "nit"); blocker -> blocking, medium -> non_blocking, nit -> suggestion.
+    # Any unexpected severity falls through to the safe `suggestion` default.
+    # All single-peer concerns are suggestion-tier by construction (no
+    # corroboration). Entry dicts are referenced, not copied.
+    blocking: list[dict[str, Any]] = []
+    non_blocking: list[dict[str, Any]] = []
+    suggestion: list[dict[str, Any]] = []
+    for entry in consensus_blockers:
+        severity = entry.get("severity")
+        if severity == "blocker":
+            blocking.append(entry)
+        elif severity == "medium":
+            non_blocking.append(entry)
+        else:
+            suggestion.append(entry)
+    suggestion.extend(single_peer_concerns)
+
     return {
         "consensus_blockers": consensus_blockers,
         "single_peer_concerns": single_peer_concerns,
+        "gating": {
+            "blocking": blocking,
+            "non_blocking": non_blocking,
+            "suggestion": suggestion,
+        },
     }
 
 
