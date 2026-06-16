@@ -47,9 +47,14 @@ graph TD
 *   **Assigned-Stance Debates**: Support for multi-round refutation and debates (`consensus` mode) where one peer defends, one opposes, and one remains neutral, followed by a compilation from the **Synthesis Chair**.
 *   **Family Exclusion Routing**: Automatically detects the active agent running the session and excludes models from the same family (e.g., Gemini-family) from the peer pool to maximize reviewer diversity.
 *   **Rigorous Sandboxing & Read-Only Safety**: Native CLI peers are invoked with binary-level flags disabling file writes (`--permission-mode default` for Claude, `--sandbox read-only` for Codex).
-*   **Cost Controls & Caching**: Pre-flight token and USD cost estimation (`llm-council estimate`) plus response caching prevents unexpected hosted API charges.
+*   **Cost Controls & Caching**: Pre-flight token and USD cost estimation (`llm-council estimate`) plus response caching prevents unexpected hosted API charges. A hard `--max-cost-usd` / `--max-tokens` gate refuses a run before launch; an optional soft `cost_warn_usd` tier warns (but never blocks) when an estimate gets pricey, and an optional `litellm` fallback prices hosted models missing from the OpenRouter catalog.
 *   **Credential Secret Scanning**: Scans all prompt content for API keys, tokens, or private keys, with configurable responses (`warn`, `block`, `redact`, or `off`).
 *   **Auto-Opening HTML Dashboard**: Automatically generates a beautifully formatted HTML dashboard of the run and opens it in your default web browser upon completion.
+*   **Anti-Herding Deliberation**: Round-2 deliberation asks peers to converge toward what is *correct* rather than toward agreement — no capitulating to the group, no digging in out of consistency bias — and to critique each other rather than re-defend their own prior answer (mitigating the multi-agent-debate herding failure mode).
+*   **Dissent-Preserving Synthesis**: The Synthesis Chair attributes consensus blockers to the peers who raised them, narrates how positions moved across rounds, and names genuine remaining disagreement instead of papering over it — minority signal is never silently merged away.
+*   **Cross-Vendor Independence Warning** *(opt-in)*: When every labeled vote comes from a single vendor family, the council flags it (`min_distinct_vendors`) so correlated same-vendor agreement isn't mistaken for independent corroboration.
+*   **Contract-Scoped & Independent Review** *(opt-in)*: Anchor a review on numbered acceptance criteria (`--acceptance-contract`) so only real violations block, and suppress prior-round verdicts on a continuation (`--independent-review`) so re-reviews aren't anchored to past opinions.
+*   **Observable Per-CLI Usage** *(opt-in)*: `usage_from_json` reads real token counts and cost from the Claude/Codex JSON output modes — recovering usage telemetry that is otherwise invisible for native CLI peers — while preserving the read-only invocation.
 
 ---
 
@@ -116,7 +121,8 @@ While most interaction happens transparently via the MCP server inside your agen
 | **`llm-council run --focus`** | Compose operator-authored review-focus bundles onto any mode (comma-separated). <br>`llm-council run --mode review --focus security-review,test-gaps --diff "Safe to merge?"` |
 | **`llm-council run --acceptance-contract`** | Anchor review on stated acceptance criteria (advisory). Pass literal text or a file path inside cwd; a finding blocks only when it violates a numbered criterion. <br>`llm-council run --mode review --acceptance-contract ./CRITERIA.md --diff "Does this meet the contract?"` |
 | **`llm-council run --independent-review`** | On a `--continue` run, suppress the prior council's verdicts/rationales so the round forms its opinion independently. <br>`llm-council run --mode review --continue 20260101_120000 --independent-review --diff "Re-review"` |
-| **`llm-council estimate`** | Calculate prompt size and costs before running. <br>`llm-council estimate --mode consensus --diff "Should we merge this?"` |
+| **`llm-council run --cost-warn-usd`** | Attach a non-fatal warning when the pre-flight estimate exceeds a threshold (complements, never replaces, the hard `--max-cost-usd` gate). <br>`llm-council run --mode consensus --cost-warn-usd 0.50 --diff "Worth a full debate?"` |
+| **`llm-council estimate`** | Calculate prompt size and costs before running; reports a `cost_class` (low/moderate/high) plus paid/free peer counts. <br>`llm-council estimate --mode consensus --diff "Should we merge this?"` |
 | **`llm-council last`** | Inspect the last run's raw transcripts. <br>`llm-council last` |
 | **`llm-council config get`** | Retrieve a configuration value. <br>`llm-council config get defaults.auto_open_browser` |
 | **`llm-council config set`** | Set a configuration value. <br>`llm-council config set defaults.auto_open_browser true` |
@@ -129,9 +135,9 @@ The `llm-council` server exposes the following tools to your developer agents:
 
 | MCP Tool Name | Description / Inputs |
 | :--- | :--- |
-| **`council_run`** | Run a council query with custom modes, context files, and optional diffs. Supports `open: true` to auto-launch the HTML dashboard, `focus: ["security-review", ...]` to compose review-focus bundles, `acceptance_contract: "<text or path>"` to gate blockers on numbered criteria, and `independent_review: true` to suppress prior-council context on a continuation run. |
+| **`council_run`** | Run a council query with custom modes, context files, and optional diffs. Supports `open: true` to auto-launch the HTML dashboard, `focus: ["security-review", ...]` to compose review-focus bundles, `acceptance_contract: "<text or path>"` to gate blockers on numbered criteria, `independent_review: true` to suppress prior-council context on a continuation run, and `cost_warn_usd` for a non-fatal cost heads-up. Surfaces advisory signals in the result when present (`independence_warning`, `cost_warning`, `cost_estimate`, `applied_focus`). |
 | **`council_estimate`** | Check token sizes and estimated OpenRouter cost before launching. |
-| **`council_recommend`** | Evaluates a task, risk level, and files touched to recommend whether to consult the council. |
+| **`council_recommend`** | Evaluates a task, risk level, and files touched to recommend whether to consult the council. Also returns a mechanical `difficulty_class` and the matched trigger keywords (`suggested_mode_reason_codes`), an optional LLM-graded `judge` verdict when `recommend_judge` is configured, and a reliability-based `peers_to_consider_dropping` advisory drawn from your recorded outcomes. |
 | **`council_doctor`** | Diagnoses connection issues, API key status, and CLI path resolution. |
 | **`council_list_modes`** | Lists configured modes, presets, and active peers. |
 | **`council_last_transcript`** | Returns the path and content of the last recorded run. |
@@ -155,6 +161,22 @@ The setup wizard (`llm-council setup --plan`) automatically probes your environm
 | `all` | Configures every discovered route on the host machine. |
 
 Custom presets, modes, and default options can be configured directly in `.llm-council.yaml`.
+
+### Advisory configuration knobs
+
+These optional keys are **off by default** and **advisory-only** — they sharpen the council's signal without changing the read-only guarantee or gating a run. Set them under `defaults:` (global) or, where noted, per-mode / per-peer.
+
+| Key | Scope | What it does |
+| :--- | :--- | :--- |
+| `min_distinct_vendors` / `require_distinct_vendors` | `defaults` / per-mode | Emit an `independence_warning` when fewer than N distinct vendor families produced a labeled vote (never affects quorum or `degraded`). |
+| `cost_warn_usd` | `defaults` (or `--cost-warn-usd`) | Attach a non-fatal `cost_warning` when the pre-flight estimate exceeds the threshold; complements the hard `--max-cost-usd` gate. |
+| `recommend_judge` | `defaults` | Name a hosted peer to add an LLM difficulty grade to `council_recommend`. Fail-open: any error falls back to the mechanical heuristic. |
+| `deliberation_early_stop` | `defaults` / per-mode | In multi-round modes (e.g. `deep-audit`, `max_rounds ≥ 3`), stop deliberating early once a round shows no divergence **and** an unchanged vote tally. |
+| `usage_from_json` | per-peer | Invoke `claude` / `codex` in their JSON output modes to record real token usage and cost; fails soft to raw text and keeps the read-only flags. |
+
+> `litellm` pricing fallback is automatic when the optional `litellm` package is installed — it prices hosted models absent from the OpenRouter catalog. It is never a hard dependency.
+
+See [Review Focus Bundles](#review-focus-bundles) for the `--focus` / `focus:` bundle system, and `CLAUDE.md` for the full invariant notes behind each knob.
 
 ---
 
