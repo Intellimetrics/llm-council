@@ -28,7 +28,12 @@ from llm_council.adapters import classify_error
 from llm_council import budget
 from llm_council.budget import image_attachment_violations
 from llm_council import display
-from llm_council.context import MAX_PROMPT_CHARS, build_image_manifest, build_prompt
+from llm_council.context import (
+    MAX_PROMPT_CHARS,
+    build_image_manifest,
+    build_prompt,
+    resolve_acceptance_contract,
+)
 from llm_council.doctor import check_environment, checks_to_dict, probe_local_openai
 from llm_council.env import load_project_env
 from llm_council.estimate import CLI_DEFAULT_MODEL_LABEL, estimate_council
@@ -219,6 +224,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--cost-warn-usd",
+        type=float,
+        default=None,
+        help=(
+            "Soft, advisory-only cost-warning threshold in USD. When the "
+            "pre-flight estimate is at or above this value the run still "
+            "proceeds, but a non-fatal warning is printed to stderr and "
+            "stamped into the transcript metadata. Never blocks — use "
+            "--max-cost-usd for a hard ceiling. Overrides defaults.cost_warn_usd."
+        ),
+    )
+    run.add_argument(
         "--chunk-strategy",
         dest="chunk_strategy",
         choices=["fail", "head", "tail", "hash-aware"],
@@ -253,6 +270,44 @@ def build_parser() -> argparse.ArgumentParser:
             "per-peer mean rank position in transcripts + stats. Composes "
             "with any existing mode; ranking outputs are NEVER fed back "
             "into round-2 deliberation."
+        ),
+    )
+    run.add_argument(
+        "--focus",
+        dest="focus",
+        default=None,
+        help=(
+            "Comma-separated review-focus bundle names to compose onto the "
+            "selected mode. Bundles live at "
+            ".llm-council/review-skills/<name>/SKILL.md and are INERT prompt "
+            "text only (advisory, read-only — no tools granted). Composes "
+            "with any mode and persists across rounds. Unknown names fail "
+            "fast before any peer is launched."
+        ),
+    )
+    run.add_argument(
+        "--acceptance-contract",
+        dest="acceptance_contract",
+        default=None,
+        help=(
+            "Acceptance criteria to anchor the review (advisory-only). "
+            "Either literal text or a path to a file inside the working "
+            "directory (or anywhere with --allow-outside-cwd). Peers treat a "
+            "finding as a blocker (RECOMMENDATION: no) only when it violates "
+            "one of the numbered criteria; everything else is a non-blocking "
+            "concern. Composes with any mode."
+        ),
+    )
+    run.add_argument(
+        "--independent-review",
+        dest="independent_review",
+        action="store_true",
+        default=False,
+        help=(
+            "On a --continue run, suppress the prior council's per-peer "
+            "labels/rationales so this round forms its verdict independently "
+            "(advisory; prior_context is simply not injected). No effect "
+            "without --continue or when no prior context was produced."
         ),
     )
     run.add_argument(
@@ -2615,6 +2670,48 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             )
         except (FileNotFoundError, ValueError) as exc:
             raise SystemExit(str(exc)) from exc
+    # Independent-review isolation (advisory). Resolution order:
+    # CLI flag > per-mode independent_review > defaults.independent_review.
+    # Default OFF. When ON and a prior_context WOULD have been injected from a
+    # continuation, drop it so this round forms its verdict without anchoring
+    # on prior verdicts. Suppression is recorded post-run as a metadata flag.
+    _independent_mode_cfg = config.get("modes", {}).get(mode, {})
+    if not isinstance(_independent_mode_cfg, dict):
+        _independent_mode_cfg = {}
+    # None-aware precedence (NOT an `or` chain): a higher-priority layer's
+    # explicit `false` must override a lower layer's `true` — e.g. a mode that
+    # opts out of a globally-defaulted-on independent_review. The CLI flag is
+    # store_true, so it can only force ON; when unset it defers to the mode
+    # value (if set, including explicit false), then the global default.
+    # (codex WU5 review.)
+    if getattr(args, "independent_review", False):
+        independent_review = True
+    else:
+        _iv = _independent_mode_cfg.get("independent_review")
+        if _iv is None:
+            _iv = config.get("defaults", {}).get("independent_review")
+        independent_review = bool(_iv)
+    prior_context_suppressed = False
+    if independent_review and prior_context:
+        prior_context = None
+        prior_context_suppressed = True
+        print(
+            "note: --independent-review active; prior council context "
+            "suppressed for this run.",
+            file=sys.stderr,
+            flush=True,
+        )
+    # Acceptance contract (advisory). Resolve <text|path>: read the file only
+    # when the value names an existing regular file inside cwd (or anywhere
+    # with --allow-outside-cwd); otherwise treat it as literal contract text.
+    try:
+        acceptance_contract = resolve_acceptance_contract(
+            getattr(args, "acceptance_contract", None),
+            cwd=cwd,
+            allow_outside_cwd=args.allow_outside_cwd,
+        )
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
     try:
         image_manifest = (
             build_image_manifest(
@@ -2691,6 +2788,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             stances=mode_stances if isinstance(mode_stances, dict) else None,
             participants=participant_cfg or None,
             prior_context=prior_context,
+            acceptance_contract=acceptance_contract,
             chunk_strategy=getattr(args, "chunk_strategy", "fail"),
             chunk_progress=_record_chunk_event,
         )
@@ -2758,47 +2856,88 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     # their cap is configured correctly without spending real-call dollars.
     max_cost_usd = getattr(args, "max_cost_usd", None)
     max_tokens = getattr(args, "max_tokens", None)
-    if max_cost_usd is not None or max_tokens is not None:
-        try:
-            preflight = estimate_council(
-                config=config,
-                cwd=cwd,
-                question=question,
-                mode=mode,
-                current=current,
-                explicit=parse_csv(args.participants),
-                include=parse_csv(args.include),
-                origin_policy=args.origin_policy,
-                context_paths=args.context,
-                include_diff=args.diff,
-                stdin_text=stdin_text,
-                allow_outside_cwd=args.allow_outside_cwd,
-                deliberate=deliberate,
-                max_rounds=max_rounds,
-                use_cache=True,
-                allow_network=False,
-                image_paths=args.image,
+    # M6 soft cost-warning threshold. None-aware precedence (NOT an `or`
+    # chain, so an explicit 0 at either layer is respected): CLI flag >
+    # defaults.cost_warn_usd.
+    cost_warn_usd = getattr(args, "cost_warn_usd", None)
+    if cost_warn_usd is None:
+        cost_warn_usd = config.get("defaults", {}).get("cost_warn_usd")
+    # Compute the pre-flight estimate once and reuse it for: the hard
+    # budget gate (when a cap is set), the M6 soft warning, and the L7
+    # compact metadata echo. allow_network=False keeps it cheap (cached
+    # catalog only) so the always-on L7 echo adds no meaningful latency.
+    preflight: dict[str, Any] | None = None
+    cost_warning_payload: dict[str, Any] | None = None
+    cost_estimate_block: dict[str, Any] | None = None
+    try:
+        preflight = estimate_council(
+            config=config,
+            cwd=cwd,
+            question=question,
+            mode=mode,
+            current=current,
+            explicit=parse_csv(args.participants),
+            include=parse_csv(args.include),
+            origin_policy=args.origin_policy,
+            context_paths=args.context,
+            include_diff=args.diff,
+            stdin_text=stdin_text,
+            allow_outside_cwd=args.allow_outside_cwd,
+            deliberate=deliberate,
+            max_rounds=max_rounds,
+            use_cache=True,
+            allow_network=False,
+            image_paths=args.image,
+        )
+    except (OSError, ValueError) as exc:
+        # The hard caps MUST fail closed if the estimate can't be computed;
+        # the soft warning / echo are best-effort and degrade silently.
+        if max_cost_usd is not None or max_tokens is not None:
+            raise SystemExit(
+                f"failed to compute pre-flight estimate: {exc}"
+            ) from exc
+    if preflight is not None:
+        from llm_council.estimate import compact_cost_estimate
+
+        cost_estimate_block = compact_cost_estimate(preflight)
+        if max_cost_usd is not None or max_tokens is not None:
+            # enforce_preflight_caps uses the retry-safety total so a worst-case
+            # repair retry can't silently push spend past the cap, and flags
+            # hosted peers with unknown catalog price (which would otherwise slip
+            # past a $-cap). Shared with cmd_estimate + the MCP run pipeline.
+            try:
+                budget.enforce_preflight_caps(
+                    preflight,
+                    max_cost_usd=max_cost_usd,
+                    max_tokens=max_tokens,
+                    breakdown_hint=(
+                        "drop expensive peers, raise the cap, or run `llm-council "
+                        "estimate ...` for a per-peer breakdown. To exclude the "
+                        "repair-retry margin, set retry_on_missing_label: false on "
+                        "individual participants."
+                    ),
+                )
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+        # M6: soft warning off the SAME reduction the hard gate uses, so soft
+        # and hard numbers can never drift. Only fires when the run proceeds
+        # (the hard gate above would have refused first if both tripped).
+        if cost_warn_usd is not None:
+            soft_cost_total, _soft_tokens, _soft_unpriced = (
+                budget.summarize_preflight_caps(preflight)
             )
-        except (OSError, ValueError) as exc:
-            raise SystemExit(f"failed to compute pre-flight estimate: {exc}") from exc
-        # enforce_preflight_caps uses the retry-safety total so a worst-case
-        # repair retry can't silently push spend past the cap, and flags hosted
-        # peers with unknown catalog price (which would otherwise slip past a
-        # $-cap). Shared with cmd_estimate + the MCP run pipeline.
-        try:
-            budget.enforce_preflight_caps(
-                preflight,
-                max_cost_usd=max_cost_usd,
-                max_tokens=max_tokens,
-                breakdown_hint=(
-                "drop expensive peers, raise the cap, or run `llm-council "
-                "estimate ...` for a per-peer breakdown. To exclude the "
-                "repair-retry margin, set retry_on_missing_label: false on "
-                "individual participants."
-            ),
-            )
-        except ValueError as exc:
-            raise SystemExit(str(exc)) from exc
+            if soft_cost_total >= float(cost_warn_usd):
+                cost_warning_payload = {
+                    "estimated_usd": soft_cost_total,
+                    "threshold_usd": float(cost_warn_usd),
+                }
+                if not args.json:
+                    print(
+                        f"warning: estimated ${soft_cost_total:.6f} exceeds "
+                        f"cost_warn_usd ${float(cost_warn_usd):.6f}; proceeding.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
     if args.dry_run:
         # Surface the resolved per-peer model so callers can verify a tier
@@ -2863,6 +3002,27 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         config.setdefault("defaults", {})["require_sections"] = bool(_cli_require_sections)
     if _cli_strict_evidence is not None:
         config.setdefault("defaults", {})["strict_evidence"] = bool(_cli_strict_evidence)
+    # Resolve operator-authored review-focus bundles. Fail fast on an
+    # unknown bundle name BEFORE execute_council launches any peer.
+    resolved_focus: list[Any] | None = None
+    _focus_arg = getattr(args, "focus", None)
+    if _focus_arg:
+        from llm_council import review_skills as _review_skills
+
+        _focus_names = parse_csv(_focus_arg)
+        try:
+            resolved_focus, _focus_skipped = _review_skills.resolve_focus(
+                _focus_names, cwd
+            )
+        except _review_skills.FocusNotFound as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if _focus_skipped:
+            _skipped_names = ", ".join(s["name"] for s in _focus_skipped)
+            print(
+                f"warning: skipped malformed review-focus bundle(s): {_skipped_names}",
+                file=sys.stderr,
+            )
     results, metadata = await execute_council(
         participants,
         participant_cfg,
@@ -2881,6 +3041,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         current=current,
         question=question,
         cross_rank=bool(getattr(args, "cross_rank", False)),
+        focus=resolved_focus,
     )
     # Record the secret-scan result in metadata for transcript-based
     # audit tooling. The stderr warning above is for the live terminal;
@@ -2889,6 +3050,11 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     # same field.
     if scan_result.get("detected_count") or scan_policy != "off":
         metadata["secret_scan"] = scan_result
+    # Record the pre-run independent-review suppression (only when it actually
+    # occurred — see resolution above). Surfaced as a metadata flag rather than
+    # a mid-run progress event because the decision precedes execute_council.
+    if prior_context_suppressed:
+        metadata["prior_context_suppressed_for_independence"] = True
     # Surface a synthesis configuration error inline. The orchestrator
     # catches ValueError from the chair-resolution path and stamps it as
     # metadata so peer votes still flow through; rendering it here gives
@@ -2925,6 +3091,13 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         progress_events = metadata.setdefault("progress_events", [])
         if isinstance(progress_events, list):
             progress_events.append(latest)
+    # L7: compact cost-estimate echo so a caller who skipped `estimate`
+    # still sees the cost signal in the transcript metadata.
+    if cost_estimate_block is not None:
+        metadata["cost_estimate"] = cost_estimate_block
+    # M6: non-fatal soft cost-warning (omitted when not triggered).
+    if cost_warning_payload is not None:
+        metadata["cost_warning"] = cost_warning_payload
 
     md_path, json_path = transcript_paths(out_dir, question)
     write_transcript(

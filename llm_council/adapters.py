@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import re
 import shlex
@@ -26,6 +27,13 @@ from llm_council.cache import (
 from llm_council.citations import parse_verified_tag, strip_verified_tag
 from llm_council.context import IMAGE_MIME_ALLOWLIST, apply_per_peer_directives
 
+
+# Families whose JSON output shape `_parse_cli_usage_json` actually parses.
+# The opt-in `usage_from_json` config only switches the invocation to JSON
+# mode for these families — never add a JSON output flag for a family without
+# a matching parser (it would break the RECOMMENDATION: label check on raw
+# JSON stdout). See `_build_cli_command` and `_parse_cli_usage_json`.
+_USAGE_JSON_FAMILIES = frozenset({"claude", "codex"})
 
 OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_HEADERS = {
@@ -653,6 +661,16 @@ def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -
 
     model = cfg.get("model")
     family = cfg.get("family", name)
+    # Opt-in structured-usage mode (M7). When enabled for a family whose JSON
+    # shape we actually parse (claude, codex), switch the invocation to that
+    # CLI's JSON output mode so real token/cost usage can be extracted. This
+    # is PURELY ADDITIVE — it never removes or alters the read-only flags that
+    # live in each peer's `args` (claude --permission-mode default, codex
+    # --sandbox read-only). For any other family the flag is a NO-OP: adding a
+    # JSON output flag without a matching parser would turn raw stdout into
+    # JSON and break the RECOMMENDATION: label check, so flag + parser ship
+    # together per family. Default-off → byte-identical command.
+    usage_from_json = bool(cfg.get("usage_from_json")) and family in _USAGE_JSON_FAMILIES
     if model:
         if family == "codex":
             # Codex's exec subcommand takes the model via `-m`; the default
@@ -688,6 +706,25 @@ def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -
                 if candidate and candidate != primary:
                     command.extend(["--fallback-model", str(candidate)])
                     break
+
+    if usage_from_json:
+        if family == "claude":
+            # `claude -p --output-format json` returns a single JSON object
+            # carrying `result` (the model text) plus `usage` / total_cost_usd.
+            # Appended to `command` so it lands among the other claude flags;
+            # the read-only flags stay untouched in `args`.
+            command.extend(["--output-format", "json"])
+        elif family == "codex":
+            # `codex exec --json` streams one JSON event per line (JSONL).
+            # The `--json` flag belongs to the `exec` subcommand, which may be
+            # in `command` (model pinned → `exec -m <model>`) or `args[0]`
+            # (no model). Insert `--json` immediately after the `exec` token in
+            # whichever list holds it so we never emit a malformed command or a
+            # double `--json`. Falls through (no-op) if `exec` is absent.
+            if "exec" in command:
+                command.insert(command.index("exec") + 1, "--json")
+            elif args and args[0] == "exec":
+                args = [args[0], "--json", *args[1:]]
 
     return command + args
 
@@ -1034,6 +1071,18 @@ async def _run_cli_once(
         out = stdout.decode(errors="replace").strip()
         err = stderr.decode(errors="replace").strip()
         ok = proc.returncode == 0
+        # Opt-in structured-usage parsing (M7). When usage_from_json is on for a
+        # parsed family and the call succeeded, extract the model text + real
+        # usage/cost from the CLI's JSON output. On ANY parse failure the helper
+        # returns None and we fall through to today's behavior: `out` stays the
+        # raw stdout (so the label check runs on it) and no token fields are set.
+        usage_fields: dict[str, Any] | None = None
+        family = cfg.get("family", name)
+        if ok and bool(cfg.get("usage_from_json")) and family in _USAGE_JSON_FAMILIES:
+            parsed = _parse_cli_usage_json(family, out)
+            if parsed is not None:
+                out = parsed["text"]
+                usage_fields = parsed
         validation_error = (
             _response_validation_error(out, cfg, prompt=prompt) if ok else ""
         )
@@ -1046,6 +1095,12 @@ async def _run_cli_once(
                 f"CliExitNonZero: `{name}` exited with status "
                 f"{proc.returncode} and no stderr output"
             )
+        # Prefer the model id the CLI actually reported (usage_fields["model"])
+        # over the requested cfg model — this is the REAL executed model. Falls
+        # back to cfg.get("model") when JSON parsing was off or absent.
+        resolved_model = cfg.get("model")
+        if usage_fields is not None and usage_fields.get("model"):
+            resolved_model = usage_fields["model"]
         return (
             ParticipantResult(
                 name=name,
@@ -1054,8 +1109,18 @@ async def _run_cli_once(
                 error=validation_error or (err if not ok else ""),
                 elapsed_seconds=elapsed,
                 command=redact_prompt_args(command, prompt),
-                model=cfg.get("model"),
+                model=resolved_model,
                 prompt_chars=len(prompt),
+                prompt_tokens=(
+                    usage_fields.get("prompt_tokens") if usage_fields else None
+                ),
+                completion_tokens=(
+                    usage_fields.get("completion_tokens") if usage_fields else None
+                ),
+                total_tokens=(
+                    usage_fields.get("total_tokens") if usage_fields else None
+                ),
+                cost_usd=usage_fields.get("cost_usd") if usage_fields else None,
             ),
             {"nonzero_exit": not ok, "stderr": err, "exited": True},
         )
@@ -2360,6 +2425,7 @@ async def run_participants(
     mode_multiplier: float | None = None,
     mode: str | None = None,
     tool_call_voting: bool = False,
+    focus_directive: str | None = None,
 ) -> list[ParticipantResult]:
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
@@ -2379,6 +2445,7 @@ async def run_participants(
                 stance=cfg.get("stance"),
                 persona=cfg.get("persona"),
                 persona_prompt=cfg.get("persona_prompt"),
+                focus_directive=focus_directive,
             )
             timeout = _resolve_effective_timeout(
                 cfg, mode_multiplier, prompt_chars=len(peer_prompt)
@@ -2515,6 +2582,201 @@ def _float_or_none(value: Any) -> float | None:
     if value in (None, ""):
         return None
     return float(value)
+
+
+def _parse_cli_usage_json(family: str, out: str) -> dict[str, Any] | None:
+    """Parse a CLI's JSON output mode into model text + usage/cost (M7).
+
+    Returns a dict with keys ``text`` / ``prompt_tokens`` /
+    ``completion_tokens`` / ``total_tokens`` / ``cost_usd`` / ``model`` on a
+    successful parse, or ``None`` on ANY failure (malformed JSON, missing
+    expected fields, no agent text). A ``None`` return is the fail-soft
+    contract: the caller falls back to treating ``out`` as raw text exactly as
+    in default text mode, so the RECOMMENDATION: label check still runs and no
+    token fields are stamped.
+
+    The JSON shapes below are VERSION-SENSITIVE across CLI releases, so we
+    probe defensively with ``.get()`` and tolerate missing keys / alternate
+    field names rather than raising.
+    """
+    if family not in _USAGE_JSON_FAMILIES:
+        return None
+    try:
+        if family == "claude":
+            return _parse_claude_usage_json(out)
+        if family == "codex":
+            return _parse_codex_usage_json(out)
+    except Exception:
+        # Defensive: any shape drift degrades to today's raw-text behavior.
+        return None
+    return None
+
+
+def _parse_claude_usage_json(out: str) -> dict[str, Any] | None:
+    """`claude -p --output-format json` → a single JSON object."""
+    obj = json.loads(out)
+    if not isinstance(obj, dict):
+        return None
+    text = obj.get("result")
+    if not isinstance(text, str):
+        # No model text → fail soft so the label check runs on raw stdout.
+        return None
+
+    usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+    prompt_tokens = _int_or_none(usage.get("input_tokens"))
+    completion_tokens = _int_or_none(usage.get("output_tokens"))
+    total_tokens = (
+        prompt_tokens + completion_tokens
+        if prompt_tokens is not None and completion_tokens is not None
+        else None
+    )
+    cost_usd = _float_or_none(obj.get("total_cost_usd"))
+
+    # Real model id: `modelUsage` is an object keyed by concrete model ids;
+    # take the primary (first) key. Fall back to a top-level `model` field.
+    model: str | None = None
+    model_usage = obj.get("modelUsage")
+    if isinstance(model_usage, dict) and model_usage:
+        first_key = next(iter(model_usage), None)
+        if isinstance(first_key, str) and first_key:
+            model = first_key
+    if model is None:
+        top_model = obj.get("model")
+        if isinstance(top_model, str) and top_model:
+            model = top_model
+
+    return {
+        "text": text,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "cost_usd": cost_usd,
+        "model": model,
+    }
+
+
+def _parse_codex_usage_json(out: str) -> dict[str, Any] | None:
+    """`codex exec --json` → a JSONL stream (one event per line)."""
+    text: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    model: str | None = None
+
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            # Non-JSON line (e.g. a stray log line) — skip, don't fail.
+            continue
+        if not isinstance(event, dict):
+            continue
+
+        event_type = _codex_event_type(event)
+
+        # Last completed agent message wins (the final assistant turn).
+        if event_type in {"agent_message", "item.completed", "agent_message.completed"}:
+            candidate = _codex_event_text(event)
+            if candidate:
+                text = candidate
+
+        # Turn-completion usage. Subtract cached input tokens so cache reads
+        # aren't double-counted against the billable prompt.
+        if event_type in {"turn.completed", "turn_completed"}:
+            usage = _codex_event_usage(event)
+            if usage:
+                raw_input = _int_or_none(usage.get("input_tokens"))
+                cached = _int_or_none(usage.get("cached_input_tokens")) or 0
+                if raw_input is not None:
+                    prompt_tokens = max(0, raw_input - cached)
+                completion_tokens = _int_or_none(usage.get("output_tokens"))
+
+        if model is None:
+            model = _codex_event_model(event)
+
+    if not text:
+        # No agent text found → fail soft so the label check runs on raw.
+        return None
+
+    total_tokens = (
+        prompt_tokens + completion_tokens
+        if prompt_tokens is not None and completion_tokens is not None
+        else None
+    )
+    return {
+        "text": text,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        # codex does not report a cost in its JSON stream.
+        "cost_usd": None,
+        "model": model,
+    }
+
+
+def _codex_event_type(event: dict[str, Any]) -> str | None:
+    """Codex events carry a type under varying keys across versions."""
+    for key in ("type", "msg_type", "event"):
+        val = event.get(key)
+        if isinstance(val, str) and val:
+            return val
+    msg = event.get("msg")
+    if isinstance(msg, dict):
+        val = msg.get("type")
+        if isinstance(val, str) and val:
+            return val
+    item = event.get("item")
+    if isinstance(item, dict):
+        val = item.get("type")
+        if isinstance(val, str) and val:
+            return val
+    return None
+
+
+def _codex_event_text(event: dict[str, Any]) -> str | None:
+    """Pull assistant text out of a codex agent-message event, defensively."""
+    # Direct text fields seen across versions.
+    for key in ("text", "message", "content"):
+        val = event.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    # Nested under `msg` / `item`.
+    for container_key in ("msg", "item"):
+        container = event.get(container_key)
+        if isinstance(container, dict):
+            for key in ("text", "message", "content"):
+                val = container.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val
+    return None
+
+
+def _codex_event_usage(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Locate the `usage` object on a codex turn.completed event."""
+    usage = event.get("usage")
+    if isinstance(usage, dict):
+        return usage
+    for container_key in ("msg", "item", "turn"):
+        container = event.get(container_key)
+        if isinstance(container, dict) and isinstance(container.get("usage"), dict):
+            return container["usage"]
+    return None
+
+
+def _codex_event_model(event: dict[str, Any]) -> str | None:
+    """Extract a model id from a codex event if present, defensively."""
+    val = event.get("model")
+    if isinstance(val, str) and val:
+        return val
+    for container_key in ("msg", "item", "turn"):
+        container = event.get(container_key)
+        if isinstance(container, dict):
+            inner = container.get("model")
+            if isinstance(inner, str) and inner:
+                return inner
+    return None
 
 
 def _message_content_text(content: Any) -> str:

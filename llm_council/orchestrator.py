@@ -38,6 +38,7 @@ from llm_council.deliberation import (
     default_min_quorum,
     has_disagreement,
     labeled_quorum_count,
+    recommendation_counts,
     recommendation_label,
 )
 
@@ -451,8 +452,20 @@ async def execute_council(
     current: str | None = None,
     question: str | None = None,
     cross_rank: bool = False,
+    focus: list[Any] | None = None,
 ) -> tuple[list[ParticipantResult], dict[str, Any]]:
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
+
+    # Operator-authored review-focus bundles (review_skills.ReviewSkill).
+    # Rendered once into an inert prompt directive appended to EVERY round
+    # (round 1, the ranking pass, round-2 deliberation) so the focus
+    # persists across rounds. When ``focus`` is None the directive is ""
+    # and behavior is unchanged. Imported lazily to avoid an import cycle.
+    focus_directive = ""
+    if focus:
+        from llm_council.review_skills import render_focus_directive
+
+        focus_directive = render_focus_directive(focus)
     convergence_thresholds = _resolve_convergence_thresholds(config, mode)
 
     # Push run-wide validation toggles from config["defaults"] into each
@@ -656,6 +669,7 @@ async def execute_council(
             mode_multiplier=mode_multiplier,
             mode=mode,
             tool_call_voting=tool_call_voting,
+            focus_directive=focus_directive,
         )
         verify_evidence_citations(run_results, cwd)
     else:
@@ -725,6 +739,12 @@ async def execute_council(
         "deliberation_status": "not_requested",
         "progress_events": progress_events,
     }
+    # M11 provenance: record which focus bundles shaped this run (name +
+    # short content hash). Omitted entirely when no focus was applied.
+    if focus:
+        metadata["applied_focus"] = [
+            {"name": s.name, "sha256": s.sha256} for s in focus
+        ]
     if deliberate:
         if not initial_disagreement:
             metadata["deliberation_status"] = "skipped_no_labeled_disagreement"
@@ -823,6 +843,13 @@ async def execute_council(
                     anonymization_map=anonymization_map,
                     question=ranking_question,
                 )
+                # Carry the operator's review focus into the ranking pass so
+                # the scrutiny lens persists across rounds. The ranking pass
+                # uses run_participant (singular) with a freshly-built prompt
+                # rather than run_participants, so we append the inert focus
+                # directive directly. No-op when focus is unset.
+                if focus_directive:
+                    ranking_prompt = ranking_prompt + "\n\n" + focus_directive
                 from llm_council.adapters import run_participant
 
                 # Ranking pass intentionally bypasses tool-call voting:
@@ -953,8 +980,19 @@ async def execute_council(
 
     cumulative_excluded: set[str] = set()
     aborted_all_excluded = False
+    early_stopped = False
     convergence_by_round: dict[int, list[dict[str, Any]]] = {}
     deliberation_prompts: dict[int, str] = {}
+    # No-new-movement early-stop (opt-in, default OFF). A mode-explicit value
+    # overrides the default with None-aware precedence (so an explicit `false`
+    # on a mode can disable a `true` default — not an `or` chain).
+    early_stop_enabled = (
+        (config.get("modes", {}) or {}).get(mode or "", {}) or {}
+    ).get("deliberation_early_stop")
+    if early_stop_enabled is None:
+        early_stop_enabled = (config.get("defaults", {}) or {}).get(
+            "deliberation_early_stop"
+        )
     while (
         deliberate
         and max_rounds > round_number
@@ -1010,6 +1048,7 @@ async def execute_council(
             mode_multiplier=mode_multiplier,
             mode=mode,
             tool_call_voting=tool_call_voting,
+            focus_directive=focus_directive,
         )
         verify_evidence_citations(next_results, cwd)
         prior_round_results = list(round_results)
@@ -1042,14 +1081,49 @@ async def execute_council(
                     }
                 )
 
+        # No-new-movement early-stop. Requires BOTH a non-diverging
+        # convergence signal AND an unchanged vote tally — a "converged"
+        # similarity can co-exist with a still-split vote, so the tally
+        # comparison is the required corroboration of the Jaccard signal.
+        # Only meaningful when a FURTHER round would actually run — i.e.
+        # `round_number < max_rounds`. On a `max_rounds=2` run the loop is
+        # about to exit anyway after this single deliberation round, so
+        # firing here would relabel a normally-completed run as
+        # `stopped_no_new_movement` without skipping anything (codex WU9
+        # review). Gating on a remaining round keeps the "deep-audit
+        # (max_rounds>=3) only" contract honest.
+        if early_stop_enabled and round_number < max_rounds:
+            no_divergence = not any(
+                (rec.get("state") == "diverging")
+                for rec in (round_convergence or [])
+            )
+            curr_counts = recommendation_counts(round_results)
+            tally_unchanged = (
+                recommendation_counts(prior_round_results) == curr_counts
+            )
+            if no_divergence and tally_unchanged:
+                early_stopped = True
+                emit(
+                    {
+                        "event": "deliberation_early_stop",
+                        "round": round_number,
+                        "reason": "no_new_movement",
+                        "counts": curr_counts,
+                    }
+                )
+                break
+
     if metadata["deliberated"] and not aborted_all_excluded:
         final_disagreement = has_disagreement(round_results)
         metadata["final_disagreement_detected"] = final_disagreement
-        metadata["deliberation_status"] = (
-            "ran_max_rounds_unresolved"
-            if final_disagreement
-            else "ran_no_labeled_disagreement"
-        )
+        if early_stopped:
+            metadata["deliberation_status"] = "stopped_no_new_movement"
+        else:
+            metadata["deliberation_status"] = (
+                "ran_max_rounds_unresolved"
+                if final_disagreement
+                else "ran_no_labeled_disagreement"
+            )
         emit(
             {
                 "event": "deliberation_finish",
@@ -1097,6 +1171,51 @@ async def execute_council(
                 "round": metadata["rounds"],
             }
         )
+
+    # --- Independence warning (H2) ----------------------------------------
+    # OPTIONAL, advisory-only signal: when every labeled vote in the final
+    # round comes from the same vendor family, correlated same-vendor
+    # agreement can masquerade as independent corroboration. We surface a
+    # warning; we do NOT drop a peer or touch quorum/degraded. Default OFF
+    # (threshold unset). NEVER overload `metadata["degraded"]`.
+    distinct_vendor_threshold = (
+        (config.get("modes", {}) or {}).get(mode or "", {}) or {}
+    ).get("require_distinct_vendors")
+    if distinct_vendor_threshold is None:
+        distinct_vendor_threshold = (config.get("defaults", {}) or {}).get(
+            "min_distinct_vendors"
+        )
+    if distinct_vendor_threshold is not None:
+        labeled = [r for r in round_results if _is_labeled_vote(r)]
+        families = sorted(
+            {
+                (participant_cfg.get(_base_name(r.name), {}) or {}).get("family")
+                or _base_name(r.name)
+                for r in labeled
+            }
+        )
+        distinct = len(families)
+        # Only warn when there is actual labeled agreement whose vendor
+        # diversity is in question. With zero labeled votes there is no
+        # consensus to mistake for independent corroboration (the run is
+        # already `degraded`), so a "single-vendor" warning there is a false
+        # signal — codex review, WU2.
+        if labeled and distinct < int(distinct_vendor_threshold):
+            metadata["independence_warning"] = {
+                "distinct_vendors": distinct,
+                "required": int(distinct_vendor_threshold),
+                "families": families,
+                "labeled_quorum": final_labeled,
+            }
+            emit(
+                {
+                    "event": "single_vendor_quorum",
+                    "distinct_vendors": distinct,
+                    "required": int(distinct_vendor_threshold),
+                    "families": families,
+                    "round": metadata["rounds"],
+                }
+            )
 
     if stances:
         metadata["stances"] = dict(stances)

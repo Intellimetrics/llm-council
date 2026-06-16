@@ -71,6 +71,39 @@ def read_context_file(
     return f"## File: {label}\n\n```\n{text}\n```"
 
 
+def resolve_acceptance_contract(
+    value: str | None, *, cwd: Path, allow_outside_cwd: bool = False
+) -> str | None:
+    """Resolve an acceptance-contract <text|path> value to its contract text.
+
+    Prefer file-read only when the value resolves to an existing regular file
+    (inside cwd unless ``allow_outside_cwd``); otherwise treat it as literal
+    contract text. So an arbitrary sentence is never misread as a path. A value
+    that looks like a path but fails the cwd safety check still raises (via
+    ``ensure_inside_cwd``) rather than being silently reinterpreted as text.
+    """
+
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    source = Path(value)
+    if not source.is_absolute():
+        source = cwd / source
+    # Only attempt a file-read when the value resolves to an existing regular
+    # file. A multi-line contract or an arbitrary sentence won't, so it falls
+    # through to literal text below.
+    if source.is_file():
+        if not allow_outside_cwd:
+            ensure_inside_cwd(source, cwd)
+        text = source.read_text(errors="replace")
+        if len(text) > MAX_CONTEXT_FILE_CHARS:
+            text = text[:MAX_CONTEXT_FILE_CHARS] + "\n\n[truncated]\n"
+        return text.strip() or None
+    return stripped
+
+
 def resolve_image_path(
     path: str | Path, *, cwd: Path, allow_outside_cwd: bool = False
 ) -> tuple[Path, str, int]:
@@ -398,6 +431,7 @@ def build_prompt(
     stances: dict[str, str] | None = None,
     participants: dict[str, dict[str, Any]] | None = None,
     prior_context: str | None = None,
+    acceptance_contract: str | None = None,
     chunk_strategy: str = "fail",
     chunk_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
@@ -429,6 +463,30 @@ def build_prompt(
             "",
             "User question:",
             question.strip(),
+        ]
+    )
+    # Acceptance-contract gate (advisory-only). When present, peers review
+    # the change ONLY against the numbered criteria below: a finding blocks
+    # (RECOMMENDATION: no) only when it violates a criterion; everything else
+    # is surfaced as a non-blocking concern. Counted toward max_prompt_chars
+    # like the rest of head_sections (same length guard); kept small by
+    # design, so no separate chunking path. Placed after the user question
+    # and before the response-format block.
+    if acceptance_contract and acceptance_contract.strip():
+        head_sections.extend(
+            [
+                "",
+                "ACCEPTANCE CONTRACT — Review the change ONLY against the "
+                "numbered criteria below. Treat a finding as a blocker (and "
+                "vote `RECOMMENDATION: no`) only when it violates one of these "
+                "criteria; surface anything else as a non-blocking concern or "
+                "suggestion, not a blocker.",
+                "Criteria:",
+                acceptance_contract.strip(),
+            ]
+        )
+    head_sections.extend(
+        [
             "",
             "Response format:",
             "- Start with `RECOMMENDATION: yes - ...`, `RECOMMENDATION: no - ...`, or `RECOMMENDATION: tradeoff - ...`.",
@@ -737,11 +795,22 @@ def apply_per_peer_directives(
     stance: str | None = None,
     persona: str | None = None,
     persona_prompt: str | None = None,
+    focus_directive: str | None = None,
 ) -> str:
     """Append per-peer prompt directives based on mode + peer family + stance + persona.
 
     Returns the prompt unchanged when no directive applies. Backward-compatible
     by design.
+
+    ``focus_directive`` is the optional, operator-authored "review focus"
+    block (see ``review_skills.render_focus_directive``). It is INERT PROMPT
+    TEXT only — it shapes WHAT peers scrutinize and grants no tool or
+    write/exec capability. It composes additively with (does not replace)
+    every existing mode/stance/persona block and is appended LAST.
+
+    # TODO(focus): existing mode-specific branches (review-with-tools /
+    # stance / persona / the test-gap-analysis mode prose) could later
+    # migrate to bundles; leave them wired today to avoid regressing voting.
     """
     result = prompt
     if mode == "review-with-tools" and family in _TOOL_CAPABLE_CLI_FAMILIES:
@@ -766,6 +835,11 @@ def apply_per_peer_directives(
             f"You have been recruited for this run due to the nature of the files changed.\n"
             f"{persona_prompt}\n"
         )
+
+    # Operator-authored review focus, appended AFTER the existing
+    # review-with-tools / stance / persona blocks so it composes with them.
+    if focus_directive:
+        result = result + "\n\n" + focus_directive
     return result
 
 
