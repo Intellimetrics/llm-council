@@ -183,6 +183,21 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(
                 f"Participant '{name}' retry_on_missing_label must be a boolean"
             )
+        # Both flags feed the pinned-model substitution guard; a quoted
+        # "false" would silently ENABLE them via truthiness, so fail loud
+        # like the sibling boolean keys above.
+        if "usage_from_json" in participant and not isinstance(
+            participant["usage_from_json"], bool
+        ):
+            raise ValueError(
+                f"Participant '{name}' usage_from_json must be a boolean"
+            )
+        if "require_pinned_model" in participant and not isinstance(
+            participant["require_pinned_model"], bool
+        ):
+            raise ValueError(
+                f"Participant '{name}' require_pinned_model must be a boolean"
+            )
         if "stance" in participant and participant["stance"] is not None:
             stance_value = participant["stance"]
             if not isinstance(stance_value, str) or stance_value not in VALID_STANCES:
@@ -259,6 +274,11 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(
                 f"Mode '{name}' deliberation_early_stop must be a boolean"
             )
+        # Defensive-review framing opt-in (v0.16.0). Boolean when present —
+        # the call sites use bool() truthiness, so a quoted "false" would
+        # silently ENABLE the framing without this check.
+        if "safe_context" in mode and not isinstance(mode["safe_context"], bool):
+            raise ValueError(f"Mode '{name}' safe_context must be a boolean")
         if mode.get("origin_policy") not in (None, "any", "us"):
             raise ValueError(f"Mode '{name}' origin_policy must be 'any' or 'us'")
         _validate_positive_int(mode, "max_rounds", f"mode '{name}'")

@@ -792,6 +792,20 @@ async def run_cli_participant(
                 )
                 _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
                 return merged
+            # Substituted terse retry: the retry request tripped the pinned
+            # peer's refusal fallback. Prefer the ModelSubstituted result over
+            # timeout annotation — the swap is terminal either way, and
+            # keeping the original timeout kind would hide the substitution
+            # from `classify_error` and the orchestrator's surfacing.
+            if terse_result.error.startswith(MODEL_SUBSTITUTED_PREFIX):
+                from dataclasses import replace as _replace
+                merged = _replace(
+                    terse_result,
+                    terse_retry_attempted=True,
+                    prompt_chars=len(prompt),
+                )
+                _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
+                return merged
             # Terse retry also failed (re-timed, label-missing, abdication).
             # Annotate the original result so the retry attempt is visible
             # in transcripts/stats — without `terse_retry_attempted=True`
@@ -942,6 +956,24 @@ async def run_cli_participant(
             return merged
     _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
     return result
+
+
+def _model_pin_satisfied(requested: str | None, served: str | None) -> bool:
+    """True when the CLI-served model matches the pinned/requested model.
+
+    Lenient containment match so a dated or minor-version variant of the
+    requested id (e.g. `claude-fable-5` vs `claude-fable-5-20260601`) still
+    counts as satisfied, while a different model family (e.g. a Fable->Opus
+    refusal fallback reporting `claude-opus-4-8`) does not. When either id is
+    missing we cannot decide, so we do NOT flag a mismatch — this only fires on
+    a positive, observed disagreement (requires `usage_from_json` to surface the
+    served id).
+    """
+    if not requested or not served:
+        return True
+    r = requested.strip().lower()
+    s = served.strip().lower()
+    return r in s or s in r
 
 
 async def _run_cli_once(
@@ -1101,12 +1133,39 @@ async def _run_cli_once(
         resolved_model = cfg.get("model")
         if usage_fields is not None and usage_fields.get("model"):
             resolved_model = usage_fields["model"]
+        # Pinned-model guard (M-fable). When a peer sets `require_pinned_model`
+        # and JSON usage surfaced the model that ACTUALLY served the turn, drop
+        # the peer if that served model doesn't match the pinned request — e.g.
+        # Claude Fable 5 refused and the Claude Code surface silently fell back
+        # to Opus 4.8. This keeps a substituted model's answer from being
+        # recorded as the requested model's opinion. `resolved_model` still
+        # reports the REAL served model so the transcript shows what happened.
+        # Only fires on a positive, observed mismatch (needs usage_from_json);
+        # a peer with no JSON usage never trips this.
+        substitution_error = ""
+        if (
+            ok
+            and cfg.get("require_pinned_model")
+            and cfg.get("model")
+            and not _model_pin_satisfied(cfg.get("model"), resolved_model)
+        ):
+            substitution_error = (
+                f"{MODEL_SUBSTITUTED_PREFIX} `{name}` requested "
+                f"{cfg.get('model')} but the CLI served {resolved_model} "
+                f"(likely a safety-refusal fallback); dropping so the "
+                f"substituted model is not recorded as a "
+                f"{cfg.get('model')} vote"
+            )
         return (
             ParticipantResult(
                 name=name,
-                ok=ok and not validation_error,
+                ok=ok and not validation_error and not substitution_error,
                 output=out,
-                error=validation_error or (err if not ok else ""),
+                error=(
+                    substitution_error
+                    or validation_error
+                    or (err if not ok else "")
+                ),
                 elapsed_seconds=elapsed,
                 command=redact_prompt_args(command, prompt),
                 model=resolved_model,
@@ -1380,6 +1439,16 @@ def _merge_cli_retry(
             model=retry.model,
             prompt_chars=merged_prompt_chars,
         )
+    # A substituted retry is terminal AND operationally more important than
+    # the original validation failure: the retry request tripped the pinned
+    # peer's refusal fallback and a different model served it. Falling
+    # through to `return original` here would reclassify the run as
+    # invalid_response and silently lose the swap signal the
+    # `require_pinned_model` guard exists to surface.
+    if retry.error.startswith(MODEL_SUBSTITUTED_PREFIX):
+        from dataclasses import replace as _replace
+
+        return _replace(retry, prompt_chars=merged_prompt_chars)
     return original
 
 
@@ -1467,6 +1536,21 @@ def _merge_section_retry(
                 retry_output=retry.output,
                 recovered=False,
                 header_kind="sections_then_evidence",
+            ),
+            error=retry.error,
+        )
+    # Substituted retry: keep the swap signal (see the same branch in
+    # `_merge_cli_retry`) rather than reporting the original section failure.
+    # `_merged` stamps `section_repair_attempted=True`, holding the
+    # one-extra-call ceiling.
+    if retry.error.startswith(MODEL_SUBSTITUTED_PREFIX):
+        return _merged(
+            ok=False,
+            output=_format_retry_transcript(
+                original_output=original.output,
+                retry_output=retry.output,
+                recovered=False,
+                header_kind="sections",
             ),
             error=retry.error,
         )
@@ -2632,14 +2716,33 @@ def _parse_claude_usage_json(out: str) -> dict[str, Any] | None:
     )
     cost_usd = _float_or_none(obj.get("total_cost_usd"))
 
-    # Real model id: `modelUsage` is an object keyed by concrete model ids;
-    # take the primary (first) key. Fall back to a top-level `model` field.
+    # Real model id: `modelUsage` is an object keyed by concrete model ids.
+    # A turn can log usage for MORE than one model (a refusal fallback lists
+    # both the refusing and the serving model; helper models like haiku can
+    # appear for auxiliary work), and JSON key order carries no contract — so
+    # "first key" is wrong exactly when it matters most. Pick the key with the
+    # most outputTokens instead: the model that AUTHORED the answer wrote the
+    # output. Ties / missing counts keep insertion order (first key wins), so
+    # single-entry and count-less payloads behave as before. This value is
+    # load-bearing for the `require_pinned_model` substitution guard.
+    # Fall back to a top-level `model` field.
     model: str | None = None
     model_usage = obj.get("modelUsage")
     if isinstance(model_usage, dict) and model_usage:
-        first_key = next(iter(model_usage), None)
-        if isinstance(first_key, str) and first_key:
-            model = first_key
+        best_key: str | None = None
+        best_tokens = -1
+        for key, usage_entry in model_usage.items():
+            if not isinstance(key, str) or not key:
+                continue
+            tokens = 0
+            if isinstance(usage_entry, dict):
+                raw = usage_entry.get("outputTokens")
+                if isinstance(raw, (int, float)):
+                    tokens = int(raw)
+            if tokens > best_tokens:
+                best_key = key
+                best_tokens = tokens
+        model = best_key
     if model is None:
         top_model = obj.get("model")
         if isinstance(top_model, str) and top_model:
@@ -3521,6 +3624,12 @@ ERROR_KIND_ABDICATED = "abdicated"
 ERROR_KIND_INCOMPLETE_RESPONSE = "incomplete_response"
 ERROR_KIND_UNTAGGED_EVIDENCE = "untagged_evidence"
 ERROR_KIND_QUOTA_EXHAUSTED = "quota_exhausted"
+# A CLI peer with `require_pinned_model: true` was served by a model other than
+# the one it pinned via `model` — e.g. Claude Fable 5 refused and the Claude
+# Code surface silently fell back to Opus 4.8. The peer drops (ok=False) so the
+# substituted model's answer is never recorded as the requested model's opinion.
+# Only observable when `usage_from_json: true` surfaces the served model id.
+ERROR_KIND_MODEL_SUBSTITUTED = "model_substituted"
 ERROR_KIND_UNKNOWN = "unknown"
 
 KNOWN_ERROR_KINDS = frozenset(
@@ -3536,6 +3645,7 @@ KNOWN_ERROR_KINDS = frozenset(
         ERROR_KIND_INCOMPLETE_RESPONSE,
         ERROR_KIND_UNTAGGED_EVIDENCE,
         ERROR_KIND_QUOTA_EXHAUSTED,
+        ERROR_KIND_MODEL_SUBSTITUTED,
         ERROR_KIND_UNKNOWN,
     }
 )
@@ -3544,6 +3654,7 @@ PREFLIGHT_FAILED_PREFIX = "PreflightFailed:"
 ABDICATED_ERROR_PREFIX = "AbdicatedResponse:"
 INCOMPLETE_RESPONSE_PREFIX = "IncompleteResponse:"
 UNTAGGED_EVIDENCE_PREFIX = "UntaggedEvidence:"
+MODEL_SUBSTITUTED_PREFIX = "ModelSubstituted:"
 
 # Quota-exhaustion / rate-limit detection. CLI peers expose this through
 # stderr; hosted APIs through httpx exception messages. The signal is
@@ -3636,6 +3747,8 @@ def classify_error(error: str) -> str | None:
         return ERROR_KIND_INCOMPLETE_RESPONSE
     if error.startswith(UNTAGGED_EVIDENCE_PREFIX):
         return ERROR_KIND_UNTAGGED_EVIDENCE
+    if error.startswith(MODEL_SUBSTITUTED_PREFIX):
+        return ERROR_KIND_MODEL_SUBSTITUTED
     # Quota check runs BEFORE the downstream_markers fallthrough so an
     # httpx 429 (which would otherwise match "HTTPStatusError") gets the
     # more specific `quota_exhausted` classification. Also runs after the

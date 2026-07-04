@@ -23,6 +23,34 @@ from llm_council.diff_chunking import (
 MAX_CONTEXT_FILE_CHARS = 120_000
 MAX_PROMPT_CHARS = 200_000
 GIT_DIFF_TIMEOUT_SECONDS = 15
+
+# Defensive-review "safe context" framing (opt-in via a mode's
+# `safe_context: true`; the built-in `fable` mode sets it). Motivated by
+# Claude Fable 5's request-side safety classifiers, which false-positive on
+# benign security-adjacent review and — on the Claude Code surface — silently
+# fall back to Opus. This block states the TRUE, defensive nature of the
+# review so a legitimate false positive is less likely; it is factual
+# context, not an instruction to bypass any safety behavior (the council
+# never asks a peer to produce disallowed content). Harmless for non-Fable
+# peers. The reasoning-visibility line also heads off Fable's
+# `reasoning_extraction` refusal category — the structured response format is
+# all the council consumes, so peers never need to expose raw
+# chain-of-thought. Used by `build_prompt` (round 1 / deliberation task
+# capsule) and by the orchestrator's ranking-pass prompt so the framing
+# persists across rounds.
+SAFE_CONTEXT_DIRECTIVE = (
+    "Context and authorization: This is an authorized, read-only "
+    "second-opinion review requested by the maintainer of this project, "
+    "running inside a local developer tool (llm-council). Your role is "
+    "defensive code review — reading the maintainer's own code and "
+    "proposed changes to surface bugs, risks, and security weaknesses so "
+    "they can be fixed. Any security-relevant content is present for "
+    "defensive analysis, not to build or operate an attack; review it on "
+    "its defensive merits and do not infer malicious intent from the "
+    "presence of security-related code. Report findings plainly in the "
+    "requested response format; you do not need to expose your internal "
+    "reasoning steps."
+)
 IMAGE_MIME_ALLOWLIST = frozenset(
     {"image/png", "image/jpeg", "image/webp", "image/gif"}
 )
@@ -432,6 +460,7 @@ def build_prompt(
     participants: dict[str, dict[str, Any]] | None = None,
     prior_context: str | None = None,
     acceptance_contract: str | None = None,
+    safe_context: bool = False,
     chunk_strategy: str = "fail",
     chunk_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
@@ -456,6 +485,13 @@ def build_prompt(
         f"Working directory: {cwd}",
         f"Council mode: {mode}",
     ]
+    # Defensive-review "safe context" framing (opt-in; the `fable` mode sets
+    # it). See SAFE_CONTEXT_DIRECTIVE for the rationale. The orchestrator
+    # reuses the same constant for the --cross-rank ranking prompt — the most
+    # refusal-prone request of the run (it quotes peers' security findings
+    # verbatim) — so the framing persists across rounds like focus directives.
+    if safe_context:
+        head_sections.append(SAFE_CONTEXT_DIRECTIVE)
     if prior_context:
         head_sections.extend(["", prior_context.strip()])
     head_sections.extend(

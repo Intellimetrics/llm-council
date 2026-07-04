@@ -14,8 +14,10 @@ import httpx
 
 from llm_council.adapters import (
     CacheContext,
+    ERROR_KIND_MODEL_SUBSTITUTED,
     ParticipantResult,
     PREFLIGHT_FAILED_PREFIX,
+    classify_error,
     is_quota_exhausted_error,
     is_timeout_error,
     run_participants,
@@ -453,6 +455,7 @@ async def execute_council(
     question: str | None = None,
     cross_rank: bool = False,
     focus: list[Any] | None = None,
+    safe_context: bool = False,
 ) -> tuple[list[ParticipantResult], dict[str, Any]]:
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
 
@@ -850,6 +853,18 @@ async def execute_council(
                 # directive directly. No-op when focus is unset.
                 if focus_directive:
                     ranking_prompt = ranking_prompt + "\n\n" + focus_directive
+                # Same persistence rule for the defensive-review framing: the
+                # ranking prompt quotes other peers' (possibly security-heavy)
+                # findings verbatim, making it the most refusal-prone request
+                # of the run — without the framing, a safe_context mode's
+                # ranking turn would be MORE likely to trip the pinned peer's
+                # refusal fallback than round 1 was. No-op when unset.
+                if safe_context:
+                    from llm_council.context import SAFE_CONTEXT_DIRECTIVE
+
+                    ranking_prompt = (
+                        SAFE_CONTEXT_DIRECTIVE + "\n\n" + ranking_prompt
+                    )
                 from llm_council.adapters import run_participant
 
                 # Ranking pass intentionally bypasses tool-call voting:
@@ -1256,7 +1271,20 @@ async def execute_council(
     # finding-matrix pass and the synthesis chair below. Both consumers
     # want the same view: only the latest-round entries per peer.
     final_results = final_round_results(results)
-    finding_matrix = build_matrix_from_results(final_results)
+    # Exclude model-substituted results from the matrix input: their `output`
+    # is the SUBSTITUTED model's full response (only ok/error were flipped by
+    # the guard), so a FINDINGS block in it would be attributed to the pinned
+    # peer — exactly the "substituted answer counted as the requested model's
+    # opinion" failure `require_pinned_model` exists to prevent. Deliberation
+    # and synthesis already skip not-ok results; the matrix builder does not,
+    # hence the explicit filter here.
+    finding_matrix = build_matrix_from_results(
+        [
+            r
+            for r in final_results
+            if classify_error(r.error) != ERROR_KIND_MODEL_SUBSTITUTED
+        ]
+    )
     if not finding_matrix.is_empty():
         metadata["finding_matrix"] = matrix_to_dict(finding_matrix)
 
@@ -1270,6 +1298,42 @@ async def execute_council(
         metadata["quota_recoveries"] = list(quota_recoveries)
     if missing_key_records:
         metadata["missing_key_peers"] = list(missing_key_records)
+
+    # Surface pinned-model substitutions (M-fable) top-level, mirroring
+    # `quota_throttled_peers`. A `require_pinned_model` peer that was served by
+    # a different model (e.g. Claude Fable 5 refused -> Claude Code silently
+    # fell back to Opus) drops with `error_kind=model_substituted`; lift those
+    # out of the per-result error strings so the transcript JSON / MCP
+    # `structured_results` show the swap plainly. Scan ALL results — not just
+    # the final round — so a round-1 substitution in a deliberating run and a
+    # swap during the --cross-rank ranking pass (is_ranking_round results are
+    # filtered out of `final_round_results`) are surfaced too; dedup on
+    # (peer, served_by) like the per-round quota dedup. `served_by` is the
+    # REAL model the CLI reported. Omit the key entirely when empty so the
+    # common case leaves the schema unchanged.
+    model_substituted_peers: list[dict[str, Any]] = []
+    _substitution_seen: set[tuple[str, str | None]] = set()
+    for r in results:
+        if classify_error(r.error) != ERROR_KIND_MODEL_SUBSTITUTED:
+            continue
+        # Strip both the ":roundN" deliberation suffix and the ":rank"
+        # ranking-pass suffix back to the configured peer name.
+        base = _base_name(r.name).split(":")[0]
+        key = (base, r.model)
+        if key in _substitution_seen:
+            continue
+        _substitution_seen.add(key)
+        entry = {
+            "peer": base,
+            "requested": (participant_cfg.get(base, {}) or {}).get("model"),
+            "served_by": r.model,
+        }
+        if getattr(r, "is_ranking_round", False):
+            entry["ranking_round"] = True
+        model_substituted_peers.append(entry)
+        emit({"event": "peer_model_substituted", "round": metadata["rounds"], **entry})
+    if model_substituted_peers:
+        metadata["model_substituted_peers"] = model_substituted_peers
 
     if synthesize_flag and should_synthesize(synthesize_flag, metadata):
         try:

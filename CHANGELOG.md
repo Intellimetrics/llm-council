@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.16.0 - 2026-07-03
+
+v0.16.0 wires **Claude Fable 5** in as a read-only council peer, with a "reduce + detect" design for the one hazard Fable adds: its request-side safety classifiers false-positive on benign security-adjacent review, and on the Claude Code surface a refused request is **silently re-served by Opus 4.8** — a model swap the default text-mode CLI invocation can't see. Left unaddressed, an Opus answer would be recorded as a "Fable" opinion. Everything here is **opt-in and default-OFF**; no existing mode's behavior changes.
+
+**New `fable` mode + `claude_fable` peer**
+*   **`claude_fable` participant** (`defaults.py`) — the host `claude` CLI pinned to `--model claude-fable-5`, with `usage_from_json: true` (so `_parse_claude_usage_json` surfaces the model that ACTUALLY served the turn) and `fallback_chain: []` (no `--fallback-model` injection — an overload swap would be a second silent-substitution path). Read-only flags unchanged.
+*   **`fable` mode** — consults `claude_fable` as a single read-only reviewer (the current host agent is the "orchestrator" seeking Fable's independent second opinion) and sets `safe_context: true`.
+
+**Reduce — defensive-review framing (`safe_context`)**
+*   `context.build_prompt(safe_context=True)` injects an authorized, read-only, defensive-review framing block (resolved from the mode config at the CLI/MCP call sites). It states the TRUE defensive nature of the review to lower Fable's false-positive refusal rate and heads off the `reasoning_extraction` category (peers never need to expose raw chain-of-thought — the structured format is all the council consumes). It is factual context, **not** an instruction to bypass any safety behavior, and is harmless for non-Fable peers. Absent unless the mode opts in.
+
+**Detect — pinned-model guard (`require_pinned_model`)**
+*   New per-peer `require_pinned_model: true` (`adapters._run_cli_once`): when `usage_from_json` surfaces a served model that doesn't match the pinned `model` (lenient variant-tolerant match via `_model_pin_satisfied`), the peer drops with `ok=False` and the new `error_kind=model_substituted` (`ModelSubstituted:` prefix), so a substituted Opus answer is **never counted as a Fable vote**. `result.model` still reports the REAL served model so the transcript shows the swap. Fires only on a positive, observed mismatch — a peer without JSON usage never trips it, and the guard is strictly opt-in.
+*   **Top-level surfacing** — the orchestrator lifts substitutions into `metadata['model_substituted_peers']` (`{peer, requested, served_by}`, omitted when empty) and emits a `peer_model_substituted` progress event, mirroring `quota_throttled_peers`. `model_substituted` is added to the failure taxonomy and the MCP `council_run` error-kind schema.
+
+**Hardening from the multi-agent review of this release** (33 candidates → 20 confirmed; all fixed)
+*   **Answer-author model selection.** `_parse_claude_usage_json` no longer takes `modelUsage`'s FIRST key (JSON key order carries no contract; a fallback turn can log BOTH models, and helper models like haiku can appear). It now picks the key with the most `outputTokens` — the model that authored the answer — with first-key tie-break, closing both a false-negative (Opus accepted as Fable) and a false-positive (healthy Fable turn dropped over a helper model) in the guard.
+*   **Substitution on a repair retry is no longer swallowed.** `_merge_cli_retry`, `_merge_section_retry`, and the terse-timeout-retry path all previously fell through to the ORIGINAL error when the retry itself was substituted, reclassifying the swap as `invalid_response`/`incomplete_response`/`timeout`. All three now propagate the `ModelSubstituted:` result.
+*   **All-rounds surfacing.** The orchestrator's substitution scan covers every round AND the `--cross-rank` ranking pass (dedup on peer+served_by; ranking-pass entries carry `ranking_round: true`) — previously only the final primary round was scanned, so a round-1 swap in a deliberating run vanished.
+*   **Substituted output excluded from the finding matrix.** `build_matrix_from_results` ingests raw outputs without an `ok` filter, so an Opus-served `FINDINGS:` block could be attributed to `claude_fable` in `consensus_blockers`. The orchestrator now filters `model_substituted` results out of the matrix input (deliberation and synthesis already skip not-ok results).
+*   **MCP top-level parity.** `model_substituted_peers` is now `_lift`-ed to the top-level `council_run` payload and declared in the output schema, matching the sibling signals it mirrors.
+*   **`safe_context` persists into the ranking pass** (the most refusal-prone request of the run — it quotes peers' security findings verbatim), matching the focus-directive persistence rule.
+*   **Estimate parity.** `estimate_council` builds the prompt with the mode's `safe_context` so an estimate that passes can't be rejected by the run's prompt-size guard.
+*   **Loud config validation.** `modes.<name>.safe_context`, `participants.<name>.require_pinned_model`, and `participants.<name>.usage_from_json` are validated as booleans at config load — a quoted `"false"` previously ENABLED them via truthiness.
+
 ## 0.15.0 - 2026-06-16
 
 v0.15.0 is a batch of advisory-scoped improvements to the council's deliberation, synthesis, independence, and cost/observability layers. Every change keeps llm-council strictly **advisory and read-only** — no peer gains write/exec capability — and is **default-OFF or purely additive**, so existing behavior is unchanged unless explicitly opted in. Each change was implemented and then reviewed by the council itself (cross-vendor `codex`/`gemini`/`antigravity`/`qwen`, excluding the authoring model — dogfooding the independence this release also adds); review-caught fixes are noted inline.

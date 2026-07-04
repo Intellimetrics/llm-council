@@ -182,6 +182,56 @@ DEFAULT_CONFIG: dict = {
             # progressively step down (opus→sonnet→haiku).
             "fallback_chain": ["claude-opus-4-6", "claude-sonnet-4-6"],
         },
+        # Claude Fable 5 as a read-only council peer. Fable runs its own
+        # safety classifiers on the INCOMING request (research-bio + most
+        # cybersecurity content); on a false-positive refusal the Claude Code
+        # surface transparently re-serves the request on Opus 4.8 — a SILENT
+        # model swap llm-council cannot disable from the CLI. Two settings make
+        # that swap safe here rather than invisible:
+        #   * usage_from_json: true  -> `_parse_claude_usage_json` reports the
+        #     model that ACTUALLY served the turn (Opus, if it fell back), so
+        #     `result.model` differs from the requested id whenever a swap
+        #     happened.
+        #   * require_pinned_model: true -> a served model that doesn't match
+        #     the pinned `model` drops the peer (ok=False,
+        #     error_kind=model_substituted) so an Opus answer is NEVER recorded
+        #     as a "Fable" opinion. See `adapters._run_cli_once`.
+        # `fallback_chain` is intentionally EMPTY so `_build_cli_command` does
+        # not inject `--fallback-model` — an overload swap would be a second
+        # silent-substitution path. Pair with the `fable` mode
+        # (`defaults.modes.fable`) for the defensive-review "safe context"
+        # framing that lowers the false-positive refusal rate in the first
+        # place. Not selected by any built-in mode except `fable`; opt in by
+        # naming it in a mode's participants or via `--participants`.
+        "claude_fable": {
+            "type": "cli",
+            "family": "claude",
+            "origin": "US / Anthropic",
+            "command": "claude",
+            "args": [
+                "-p",
+                "--permission-mode",
+                "default",
+                "--tools",
+                "Read,Grep,Glob,LS",
+                "--no-session-persistence",
+            ],
+            "model": "claude-fable-5",
+            # Observability + guard for the silent Fable->Opus refusal fallback.
+            "usage_from_json": True,
+            "require_pinned_model": True,
+            # Empty on purpose: no `--fallback-model` injection (see comment
+            # above). Do NOT add entries here without re-reading the swap risk.
+            "fallback_chain": [],
+            # Fable turns run longer than Opus at equivalent effort; give the
+            # base timeout headroom. The `fable` mode layers a 1.5x multiplier
+            # and size-scaling applies on top.
+            "timeout": 360,
+            "max_prompt_chars": 120_000,
+            "read_only": True,
+            "stdin_prompt": True,
+            "env_passthrough": ["ANTHROPIC_API_KEY"],
+        },
         # Temporary: pinned-version Claude participants for opt-in head-to-head
         # review when the user wants a specific Opus version's perspective.
         # Remove (or merge back into `claude`) once version-to-version drift is
@@ -475,6 +525,27 @@ DEFAULT_CONFIG: dict = {
             "include_current": True,
             "add": ["qwen_coder_plus"],
             "description": "Claude/Codex/Gemini plus Qwen coding model.",
+        },
+        # Consult Claude Fable 5 as a single read-only reviewer. `safe_context:
+        # true` injects the defensive-review framing (context.build_prompt) that
+        # lowers Fable's false-positive safety-classifier refusals — the refusals
+        # that otherwise trigger a silent fall-back to Opus. The `claude_fable`
+        # peer is pinned + observable: if a swap still slips through it is
+        # DETECTED via the CLI-reported model and the peer is dropped
+        # (error_kind=model_substituted), never recorded as a Fable vote.
+        # Fable-only by design — the current host agent (Opus or another model)
+        # is the "orchestrator" seeking Fable's independent second opinion; add
+        # cross-check peers in `.llm-council.yaml` if you want breadth.
+        "fable": {
+            "participants": ["claude_fable"],
+            "safe_context": True,
+            "timeout_multiplier": 1.5,
+            "description": (
+                "Read-only second opinion from Claude Fable 5, with "
+                "defensive-review framing to reduce false-positive refusals. A "
+                "silent fall-back to Opus is detected and dropped, not recorded "
+                "as a Fable vote."
+            ),
         },
         # Experimental: CLI peers only, with explicit directive to use their
         # file-read / grep / glob tools before voting. The CLIs already have
