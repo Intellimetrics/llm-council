@@ -3046,7 +3046,6 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         question=question,
         cross_rank=bool(getattr(args, "cross_rank", False)),
         focus=resolved_focus,
-        safe_context=safe_context,
     )
     # Record the secret-scan result in metadata for transcript-based
     # audit tooling. The stderr warning above is for the live terminal;

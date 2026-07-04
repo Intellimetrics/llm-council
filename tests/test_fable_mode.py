@@ -12,8 +12,9 @@ Covers the two moving parts of the "reduce + detect" design:
     back to Opus 4.8), so a substituted model's answer is never recorded as a
     Fable vote. The orchestrator surfaces the swap top-level.
 
-The subprocess-stub pattern mirrors tests/test_usage_from_json.py; the
-execute_council harness mirrors tests/test_independence_warning.py.
+Subprocess stubs are shared with tests/test_usage_from_json.py via
+tests/proc_stubs.py; the execute_council harness mirrors
+tests/test_independence_warning.py.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from llm_council.adapters import (
     ERROR_KIND_MODEL_SUBSTITUTED,
@@ -36,6 +37,7 @@ from llm_council.adapters import (
 from llm_council.config import validate_config
 from llm_council.context import build_prompt
 from llm_council.defaults import DEFAULT_CONFIG
+from proc_stubs import TimingOutProc, fake_proc_returning, fake_proc_sequence
 
 
 # --- unit: model-pin match --------------------------------------------------
@@ -118,7 +120,10 @@ def test_build_cli_command_claude_fable_pins_model_no_fallback(tmp_path):
 
 
 def _framing_present(prompt: str) -> bool:
-    return "authorized, read-only" in prompt and "defensive code review" in prompt
+    return (
+        "operator-invoked, read-only" in prompt
+        and "second-opinion code review" in prompt
+    )
 
 
 def test_safe_context_framing_present_when_on():
@@ -180,25 +185,9 @@ def _fable_cfg(**extra) -> dict:
     return cfg
 
 
-def _fake_proc_returning(stdout: str):
-    class _FakeProc:
-        returncode = 0
-
-        async def communicate(self, _data=None):
-            return (stdout.encode(), b"")
-
-        async def wait(self):
-            return 0
-
-    return patch(
-        "llm_council.adapters.asyncio.create_subprocess_exec",
-        new=AsyncMock(return_value=_FakeProc()),
-    )
-
-
 def _drive(cfg: dict, stdout: str, tmp_path: Path) -> ParticipantResult:
     async def _go():
-        with _fake_proc_returning(stdout):
+        with fake_proc_returning(stdout):
             return await run_cli_participant("claude_fable", cfg, "prompt", tmp_path)
 
     return asyncio.run(_go())
@@ -309,24 +298,9 @@ def test_label_retry_substitution_is_not_swallowed(tmp_path: Path):
         }
     )
     substituted = _claude_json("claude-opus-4-8-20260101")
-    outputs = iter([unlabeled, substituted])
-
-    class _FakeProc:
-        returncode = 0
-
-        async def communicate(self, _data=None):
-            return (next(outputs).encode(), b"")
-
-        async def wait(self):
-            return 0
-
-    from unittest.mock import AsyncMock
 
     async def _go():
-        with patch(
-            "llm_council.adapters.asyncio.create_subprocess_exec",
-            new=AsyncMock(return_value=_FakeProc()),
-        ):
+        with fake_proc_sequence(unlabeled, substituted):
             return await run_cli_participant(
                 "claude_fable",
                 _fable_cfg(require_pinned_model=True),
@@ -338,39 +312,160 @@ def test_label_retry_substitution_is_not_swallowed(tmp_path: Path):
     assert result.ok is False
     assert classify_error(result.error) == ERROR_KIND_MODEL_SUBSTITUTED
     assert result.model == "claude-opus-4-8-20260101"
+    # Combined transcript: the original Fable-authored attempt stays
+    # auditable next to the substituted retry (v0.16.0 re-review fix).
+    assert "Looks fine to me (no label)." in result.output
+
+
+def test_terse_timeout_retry_substitution_is_not_swallowed(tmp_path: Path):
+    # Round 1 times out; the terse retry trips the refusal fallback and is
+    # served by Opus. The result must classify model_substituted (not
+    # timeout) and record that the retry fired.
+    substituted = _claude_json("claude-opus-4-8-20260101")
+
+    async def _go():
+        with fake_proc_sequence(TimingOutProc(), substituted):
+            return await run_cli_participant(
+                "claude_fable",
+                _fable_cfg(
+                    require_pinned_model=True,
+                    timeout=0.2,
+                    max_prompt_chars=100_000,
+                ),
+                "prompt",
+                tmp_path,
+            )
+
+    result = asyncio.run(_go())
+    assert result.ok is False
+    assert classify_error(result.error) == ERROR_KIND_MODEL_SUBSTITUTED
+    assert result.terse_retry_attempted is True
+    assert result.model == "claude-opus-4-8-20260101"
+
+
+def test_section_retry_substitution_is_not_swallowed(tmp_path: Path):
+    # Round 1: labeled Fable response that misses a REQUIRED section →
+    # section-repair retry fires. The retry is served by Opus. The merged
+    # result must classify model_substituted (not incomplete_response) and
+    # keep the original Fable text auditable in the combined transcript.
+    prompt = "PART 1 — SECURITY ANALYSIS (REQUIRED)\n\nAssess the change."
+    labeled_missing_sections = json.dumps(
+        {
+            "result": "RECOMMENDATION: yes - fine but skipped the sections",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "modelUsage": {"claude-fable-5": {"outputTokens": 5}},
+        }
+    )
+    substituted = _claude_json("claude-opus-4-8-20260101")
+
+    async def _go():
+        with fake_proc_sequence(labeled_missing_sections, substituted):
+            return await run_cli_participant(
+                "claude_fable",
+                _fable_cfg(require_pinned_model=True, require_sections=True),
+                prompt,
+                tmp_path,
+            )
+
+    result = asyncio.run(_go())
+    assert result.ok is False
+    assert classify_error(result.error) == ERROR_KIND_MODEL_SUBSTITUTED
+    assert result.section_repair_attempted is True
+    assert "skipped the sections" in result.output
+
+
+_FINDINGS_OUTPUT = (
+    "RECOMMENDATION: no - blocker\n\n"
+    "FINDINGS:\n"
+    "- id: F1\n"
+    "  severity: blocker\n"
+    "  claim: bad thing in a.py\n"
+    "  evidence: [VERIFIED:a.py:1-2]\n"
+)
+
+
+def _run_council_with(results):
+    # Drive the REAL orchestrator (not a local re-implementation of its
+    # matrix filter) with a canned round-1 result set.
+    import llm_council.orchestrator as orch_module
+
+    async def fake_run_participants(selected, *args, **kwargs):
+        return list(results)
+
+    async def fake_preflight(*args, **kwargs):
+        return {}
+
+    with patch.object(
+        orch_module, "run_participants", side_effect=fake_run_participants
+    ), patch.object(
+        orch_module, "preflight_local_participants", side_effect=fake_preflight
+    ):
+        return asyncio.run(
+            orch_module.execute_council(
+                participants=[r.name for r in results],
+                participant_cfg={
+                    "claude_fable": {
+                        "type": "cli",
+                        "family": "claude",
+                        "model": "claude-fable-5",
+                    },
+                    "codex": {"type": "cli", "family": "codex"},
+                },
+                prompt="review this",
+                cwd=Path("."),
+                config={},
+                deliberate=False,
+                max_rounds=1,
+            )
+        )
 
 
 def test_substituted_output_excluded_from_finding_matrix():
-    from llm_council.findings import build_matrix_from_results
-
-    # The substituted (Opus-served) output carries a FINDINGS block. The
-    # orchestrator filters these before matrix build; emulate its filter.
     substituted = ParticipantResult(
         name="claude_fable",
         ok=False,
-        output=(
-            "RECOMMENDATION: no - blocker\n\n"
-            "FINDINGS:\n"
-            "- id: F1\n"
-            "  severity: blocker\n"
-            "  claim: bad thing in a.py\n"
-            "  evidence: [VERIFIED:a.py:1-2]\n"
-        ),
+        output=_FINDINGS_OUTPUT,
         error=f"{MODEL_SUBSTITUTED_PREFIX} served by opus",
         elapsed_seconds=1.0,
         model="claude-opus-4-8",
     )
-    filtered = [
-        r
-        for r in [substituted]
-        if classify_error(r.error) != ERROR_KIND_MODEL_SUBSTITUTED
+    healthy = ParticipantResult(
+        name="codex",
+        ok=True,
+        output="RECOMMENDATION: yes - fine",
+        error="",
+        elapsed_seconds=1.0,
+    )
+    _, metadata = _run_council_with([substituted, healthy])
+    # The substituted (Opus-served) FINDINGS block must NOT enter the matrix.
+    assert "finding_matrix" not in metadata
+    # ...and the swap is surfaced with the round it actually happened in.
+    peers = metadata.get("model_substituted_peers")
+    assert peers and peers[0]["peer"] == "claude_fable"
+    assert peers[0]["requested"] == "claude-fable-5"
+    assert peers[0]["served_by"] == "claude-opus-4-8"
+    events = [
+        e
+        for e in metadata["progress_events"]
+        if e.get("event") == "peer_model_substituted"
     ]
-    matrix = build_matrix_from_results(filtered)
-    assert matrix.is_empty()
-    # Control: unfiltered, the same output WOULD produce findings — proving
-    # the filter is load-bearing, not vacuous.
-    unfiltered_matrix = build_matrix_from_results([substituted])
-    assert not unfiltered_matrix.is_empty()
+    assert events and events[0]["round"] == 1
+
+
+def test_healthy_findings_block_does_enter_finding_matrix():
+    # Control for the exclusion test above: the same FINDINGS block from a
+    # healthy peer DOES surface — proving the exclusion is the substitution
+    # filter, not a parsing gap.
+    healthy_with_findings = ParticipantResult(
+        name="codex",
+        ok=True,
+        output=_FINDINGS_OUTPUT,
+        error="",
+        elapsed_seconds=1.0,
+    )
+    _, metadata = _run_council_with([healthy_with_findings])
+    assert "finding_matrix" in metadata
+    assert "model_substituted_peers" not in metadata
 
 
 def test_config_validation_rejects_non_bool_new_keys():
@@ -616,12 +711,15 @@ def test_ranking_prompt_carries_safe_context_framing():
                 participant_cfg=participant_cfg,
                 prompt="full prompt",
                 cwd=Path("."),
-                config={},
+                # safe_context is resolved inside execute_council from the
+                # mode config (same pattern as timeout_multiplier), not
+                # threaded in by callers.
+                config={"modes": {"fable": {"safe_context": True}}},
+                mode="fable",
                 deliberate=False,
                 max_rounds=1,
                 question="Is this safe?",
                 cross_rank=True,
-                safe_context=True,
             )
         )
 

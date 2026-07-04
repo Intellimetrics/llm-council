@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.16.0 - 2026-07-03
+## 0.16.0 - 2026-07-04
 
 v0.16.0 wires **Claude Fable 5** in as a read-only council peer, with a "reduce + detect" design for the one hazard Fable adds: its request-side safety classifiers false-positive on benign security-adjacent review, and on the Claude Code surface a refused request is **silently re-served by Opus 4.8** — a model swap the default text-mode CLI invocation can't see. Left unaddressed, an Opus answer would be recorded as a "Fable" opinion. Everything here is **opt-in and default-OFF**; no existing mode's behavior changes.
 
@@ -24,6 +24,17 @@ v0.16.0 wires **Claude Fable 5** in as a read-only council peer, with a "reduce 
 *   **`safe_context` persists into the ranking pass** (the most refusal-prone request of the run — it quotes peers' security findings verbatim), matching the focus-directive persistence rule.
 *   **Estimate parity.** `estimate_council` builds the prompt with the mode's `safe_context` so an estimate that passes can't be rejected by the run's prompt-size guard.
 *   **Loud config validation.** `modes.<name>.safe_context`, `participants.<name>.require_pinned_model`, and `participants.<name>.usage_from_json` are validated as booleans at config load — a quoted `"false"` previously ENABLED them via truthiness.
+
+**Hardening from the second review pass** (the first pass lost 11 verifier agents to a quota cap; this re-run pooled 22 candidates → 21 verified → 10 distinct defects, all addressed)
+*   **Synthesis-chair substitution is no longer invisible.** The chair turn never enters `results`, so the substitution scan couldn't see it: a Fable chair refused-and-served-by-Opus produced a memo stored as `metadata['synthesis']` attributed to `claude_fable` with NO `model_substituted_peers` entry. The orchestrator now scans the chair payload after synthesis, stamps `synthesis_payload['model_substituted'] = True`, and surfaces a `{peer, requested, served_by, synthesis: true}` entry + `peer_model_substituted` event.
+*   **Strictly factual `safe_context` wording.** The directive previously asserted facts the tool cannot verify ("requested by the maintainer", "the maintainer's own code", "do not infer malicious intent") — false framing when reviewing an untrusted third-party patch, and capable of suppressing a TRUE-positive refusal on genuinely malicious code. Rewritten to state only what llm-council can vouch for (operator-invoked, read-only, analysis-only) and to redirect rather than suppress suspicion: flagging malicious code as a finding IS the requested output.
+*   **`require_pinned_model` now suppresses `--fallback-model` injection.** On a claude-family peer with both a pinned model and a non-empty `fallback_chain`, the CLI's designed overload recovery would be dropped as `model_substituted` (with a misleading "safety-refusal fallback" message) after paying for the answer. The pin now wins — no injection — and `config.config_warnings` flags the contradictory combination as inert.
+*   **Live, correctly-attributed substitution events.** `peer_model_substituted` events previously fired only in an end-of-run scan stamped with the FINAL round count (a round-1 swap in a deliberating run reported `round: 2`, after the fact). Detection now runs per round via `_detect_and_emit_substitutions` (round 1 / ranking pass / round 2), mirroring the per-round quota events.
+*   **Substituted label-repair retries keep the original output.** `_merge_cli_retry`'s substituted branch returned the retry bare, dropping the original (genuinely Fable-authored) response from the transcript; it now combines both attempts via `_format_retry_transcript`, matching `_merge_section_retry`.
+*   **`safe_context` resolved inside `execute_council`.** Was a caller-threaded parameter both call sites had to compute; now derived from `config['modes'][mode]` like `timeout_multiplier` / `tool_call_voting`, so a future caller can't get a framed round-1 prompt but an unframed ranking pass.
+*   **MCP output schema version bumped to 7** for the `model_substituted_peers` top-level key (the analogous `missing_key_peers` addition bumped v4→v5).
+*   **Known residual risk documented (no mechanical fix available):** served-model attribution uses max cumulative `outputTokens` across the agentic turn, so a MID-turn refusal fallback (long Fable tool loop, shorter Opus-served final answer) can pass the pin check. Treat the guard as high-recall for whole-turn swaps, not proof of authorship.
+*   **Test gaps closed.** The terse-timeout-retry and `_merge_section_retry` substitution-propagation branches now have regression tests; the finding-matrix exclusion test drives the real `execute_council` (plus a healthy-peer control) instead of re-implementing the filter; the duplicated fake-subprocess stubs are lifted into a shared `tests/proc_stubs.py`.
 
 ## 0.15.0 - 2026-06-16
 

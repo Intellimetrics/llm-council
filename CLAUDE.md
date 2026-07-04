@@ -567,13 +567,20 @@ Key modules:
   - **Reduce** — the `fable` mode sets `safe_context: true`, which makes
     `context.build_prompt` inject a defensive-review framing block (resolved
     from the mode config at the CLI and MCP call sites via
-    `config["modes"][mode]["safe_context"]`). It states the TRUE authorized,
-    read-only, defensive nature of the review to lower the false-positive
-    refusal rate, and tells peers they need not expose raw chain-of-thought
-    (heading off the `reasoning_extraction` refusal category — the structured
-    format is all the council consumes). It is factual context, **NOT** an
-    instruction to bypass safety; harmless for non-Fable peers; absent unless
-    a mode opts in.
+    `config["modes"][mode]["safe_context"]` for `build_prompt`; inside
+    `execute_council` the flag is re-derived from the same mode config —
+    like `timeout_multiplier` — so a caller can't desync the round-1 and
+    ranking-pass framings). The block states ONLY facts the tool can vouch
+    for: the review is operator-invoked, read-only, and analysis-only. It
+    deliberately does NOT claim the reviewed content is the operator's own
+    work or benign — the content may be an untrusted third-party patch, and
+    a true-positive refusal on genuinely malicious material must stay
+    possible. Instead it redirects suspicion: flagging malicious code as a
+    finding IS the requested output. It also tells peers they need not
+    expose raw chain-of-thought (heading off the `reasoning_extraction`
+    refusal category — the structured format is all the council consumes).
+    Factual context, **NOT** an instruction to bypass safety; harmless for
+    non-Fable peers; absent unless a mode opts in.
   - **Detect** — `claude_fable` pins `model: claude-fable-5` with
     `usage_from_json: true` (so `_parse_claude_usage_json` reports the model
     that ACTUALLY served the turn — selected as the `modelUsage` key with the
@@ -587,26 +594,47 @@ Key modules:
     still reports the REAL served model. The guard's signal is preserved
     end-to-end: the repair-retry merges (`_merge_cli_retry`,
     `_merge_section_retry`, terse-timeout retry) propagate a substituted
-    retry instead of falling through to the original error; the
-    orchestrator's scan covers ALL rounds plus the --cross-rank ranking pass
-    (dedup on peer+served_by) and lifts entries into
-    `metadata['model_substituted_peers']` + a `peer_model_substituted`
-    progress event, mirroring `quota_throttled_peers` — including the MCP
-    top-level `council_run` payload key + output-schema declaration; and
-    substituted results are EXCLUDED from `build_matrix_from_results` input
-    so an Opus-served FINDINGS block can't enter consensus blockers
-    (deliberation + synthesis already skip not-ok results).
-    `modes.<name>.safe_context`, `require_pinned_model`, and
+    retry instead of falling through to the original error, and combine
+    both attempts' outputs so the original pinned-model response stays
+    auditable; detection runs live per round via
+    `_detect_and_emit_substitutions` (round 1, the --cross-rank ranking
+    pass, round-2 deliberation — dedup on peer+served_by, each
+    `peer_model_substituted` event stamped with the round the swap actually
+    happened in) plus a post-synthesis scan of the chair payload (the chair
+    turn never enters `results`; a substituted chair memo gets
+    `synthesis_payload["model_substituted"] = True` and a
+    `{... synthesis: true}` entry so an Opus-authored memo is never consumed
+    as the pinned chair's). Entries land in
+    `metadata['model_substituted_peers']`, mirroring `quota_throttled_peers`
+    — including the MCP top-level `council_run` payload key + output-schema
+    declaration (schema v7); and substituted results are EXCLUDED from
+    `build_matrix_from_results` input so an Opus-served FINDINGS block can't
+    enter consensus blockers (deliberation + synthesis already skip not-ok
+    results). `modes.<name>.safe_context`, `require_pinned_model`, and
     `usage_from_json` validate as booleans at config load (quoted "false"
     would otherwise silently enable them), and `estimate_council` builds the
     prompt with the mode's `safe_context` so estimates keep prompt-size
     parity with the real run.
+  - **Known residual risk (documented, not mechanically closable):** the
+    served-model attribution picks the `modelUsage` key with the most
+    cumulative `outputTokens` across the whole agentic turn. A MID-TURN
+    refusal fallback — Fable emits a long tool-use loop, then the final
+    answer is served by Opus with fewer total output tokens — can pass the
+    pin check, and there is nothing in the CLI's JSON that distinguishes
+    the answer's author from a helper model. Treat `model_substituted`
+    detection as high-recall for whole-turn swaps, not a proof of
+    authorship; text mode remains fully unobservable.
   - `fallback_chain` is intentionally EMPTY on `claude_fable` so
     `_build_cli_command` does not inject `--fallback-model` — an overload swap
     would be a SECOND silent-substitution path. Do not add entries without
-    re-reading this risk. The whole feature is opt-in/default-OFF: no built-in
-    mode except `fable` selects the peer, and a peer without
-    `require_pinned_model` (or without JSON usage) never trips the guard.
+    re-reading this risk. More generally, `require_pinned_model` SUPPRESSES
+    `--fallback-model` injection for any claude-family peer (the flag's
+    whole purpose is serving the answer from a different model — the swap
+    the guard rejects), and `config.config_warnings` flags the contradictory
+    require_pinned_model + fallback_chain combination as inert. The whole
+    feature is opt-in/default-OFF: no built-in mode except `fable` selects
+    the peer, and a peer without `require_pinned_model` (or without JSON
+    usage) never trips the guard.
 - **`.mcp.json` stays local.** Setup adds it to `.gitignore`. It contains
   absolute paths and must not be committed.
 - **Version bumps.** `__version__` in `llm_council/__init__.py` and the
@@ -633,7 +661,7 @@ failure path; do not let strings drift.
 | `incomplete_response` | Response had the `RECOMMENDATION:` label but missed one or more `(REQUIRED)` sections from the prompt after one repair-retry. Prefix: `IncompleteResponse:` |
 | `untagged_evidence`  | `defaults.strict_evidence: true` AND one or more EVIDENCE bullets lacked a `[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]` tag after one repair-retry. Prefix: `UntaggedEvidence:` |
 | `quota_exhausted`    | Peer hit a known quota / rate-limit signal (`RESOURCE_EXHAUSTED`, `quota_exceeded`, `rate_limit_exceeded`, `insufficient_quota`, `insufficient credits`, `usage limit`, `5-hour limit`, HTTP 429 with quota-adjacent text). Detected by `adapters.is_quota_exhausted_error` over the raw error string — no prefix synthesized. Surfaced top-level in transcripts and MCP `structured_results` as `quota_throttled_peers: [{peer, family, model, message}]`; orchestrator emits a `peer_quota_throttled` progress event per peer (deduped across rounds). Phase 2 (v0.11.6): a peer with non-empty `cfg.fallback_chain` gets ONE retry with the next-in-chain model substituted into `cfg.model` BEFORE the result lands in quorum. On success the peer recovers (`recovered_after_quota=True`, `model_fallback_used=<id>`, appears in `quota_recoveries` not `quota_throttled_peers`). On failure the peer drops with this error_kind. Skipped for the Claude family because Claude's own `--fallback-model` CLI flag handles overload natively (auto-injected by `_build_cli_command` when chain non-empty). |
-| `model_substituted`  | A CLI peer with `require_pinned_model: true` was served by a model other than its pinned `model` — e.g. Claude Fable 5 refused and the Claude Code surface silently fell back to Opus 4.8. Prefix: `ModelSubstituted:`. Only observable when `usage_from_json: true` surfaces the served model id (the `modelUsage` key with the most `outputTokens` — the answer's author); the served model must fail the lenient variant-tolerant `adapters._model_pin_satisfied` check. Terminal for the peer (ok=False, drops quorum) so a substituted model's answer is never recorded as the requested model's vote; `result.model` still reports the REAL served model, and substituted outputs are excluded from the finding matrix. Detected across every round including the --cross-rank ranking pass, and preserved through repair-retry merges. Surfaced as `metadata['model_substituted_peers']: [{peer, requested, served_by, ranking_round?}]` (omitted when empty), lifted top-level in the MCP `council_run` payload + schema, with a `peer_model_substituted` progress event. Opt-in — a peer without `require_pinned_model` or without JSON usage never trips it. |
+| `model_substituted`  | A CLI peer with `require_pinned_model: true` was served by a model other than its pinned `model` — e.g. Claude Fable 5 refused and the Claude Code surface silently fell back to Opus 4.8. Prefix: `ModelSubstituted:`. Only observable when `usage_from_json: true` surfaces the served model id (the `modelUsage` key with the most `outputTokens` — the answer's author); the served model must fail the lenient variant-tolerant `adapters._model_pin_satisfied` check. Terminal for the peer (ok=False, drops quorum) so a substituted model's answer is never recorded as the requested model's vote; `result.model` still reports the REAL served model, and substituted outputs are excluded from the finding matrix. Detected live per round (round 1, the --cross-rank ranking pass, round-2 deliberation) plus the synthesis-chair turn, and preserved through repair-retry merges (with combined original+retry output). Surfaced as `metadata['model_substituted_peers']: [{peer, requested, served_by, ranking_round?, synthesis?}]` (omitted when empty), lifted top-level in the MCP `council_run` payload + schema (v7), with a per-round `peer_model_substituted` progress event. Opt-in — a peer without `require_pinned_model` or without JSON usage never trips it. Known limit: attribution is by max cumulative `outputTokens`, so a mid-turn refusal fallback inside a long agentic turn can evade it. |
 | `unknown`            | Non-empty error that did not match any known prefix — file a dogfood note            |
 
 ## Custom CLI participant: minimal template

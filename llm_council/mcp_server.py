@@ -284,7 +284,7 @@ def council_run_schema() -> dict[str, Any]:
     }
 
 
-COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 6  # v6 = per-result terse_retry_attempted, section_repair_attempted, is_ranking_round, continue_debate, evidence_verification_failures now surfaced
+COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 7  # v7 = model_substituted_peers (top-level); v6 = per-result terse_retry_attempted, section_repair_attempted, is_ranking_round, continue_debate, evidence_verification_failures
 COUNCIL_RUN_VALID_STANCES = ("for", "against", "neutral")
 COUNCIL_RUN_VALID_ERROR_KINDS = (
     "timeout",
@@ -1435,7 +1435,6 @@ async def run_council(
         question=question,
         cross_rank=bool(arguments.get("cross_rank")),
         focus=resolved_focus,
-        safe_context=safe_context,
     )
     if image_manifest:
         metadata["images"] = [

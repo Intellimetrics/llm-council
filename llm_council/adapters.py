@@ -698,7 +698,14 @@ def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -
     # signal — but the council run survives an overload that would
     # otherwise drop the peer. Only the first chain entry is honored
     # because the flag itself accepts a single model.
-    if family == "claude":
+    #
+    # `require_pinned_model` suppresses the injection entirely: the flag's
+    # whole purpose is serving the answer from a different model, which is
+    # exactly the swap the pin guard drops as `model_substituted`. Injecting
+    # it would pay for an answer the guard then discards (and mislabel a
+    # designed overload recovery as a safety-refusal fallback). The pin
+    # wins; `config.config_warnings` flags the contradictory combination.
+    if family == "claude" and not cfg.get("require_pinned_model"):
         fallback_chain = cfg.get("fallback_chain") or []
         if fallback_chain:
             primary = str(model) if model else None
@@ -1444,11 +1451,21 @@ def _merge_cli_retry(
     # peer's refusal fallback and a different model served it. Falling
     # through to `return original` here would reclassify the run as
     # invalid_response and silently lose the swap signal the
-    # `require_pinned_model` guard exists to surface.
+    # `require_pinned_model` guard exists to surface. Combine both outputs
+    # (same as `_merge_section_retry`'s substituted branch) so the original
+    # pinned-model response stays auditable next to the substituted retry.
     if retry.error.startswith(MODEL_SUBSTITUTED_PREFIX):
         from dataclasses import replace as _replace
 
-        return _replace(retry, prompt_chars=merged_prompt_chars)
+        return _replace(
+            retry,
+            output=_format_retry_transcript(
+                original_output=original.output,
+                retry_output=retry.output,
+                recovered=False,
+            ),
+            prompt_chars=merged_prompt_chars,
+        )
     return original
 
 

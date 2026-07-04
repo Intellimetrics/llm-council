@@ -21,6 +21,7 @@ from llm_council.adapters import (
     _parse_cli_usage_json,
     run_cli_participant,
 )
+from proc_stubs import fake_proc_returning as _fake_proc_returning
 
 
 # --- fixtures ---------------------------------------------------------------
@@ -255,24 +256,6 @@ def _stub_cfg(family: str) -> dict:
         # Bare label output below is a valid success; skip the section gate.
         "require_sections": False,
     }
-
-
-def _fake_proc_returning(stdout: str):
-    from unittest.mock import AsyncMock, patch
-
-    class _FakeProc:
-        returncode = 0
-
-        async def communicate(self, _data=None):
-            return (stdout.encode(), b"")
-
-        async def wait(self):
-            return 0
-
-    return patch(
-        "llm_council.adapters.asyncio.create_subprocess_exec",
-        new=AsyncMock(return_value=_FakeProc()),
-    )
 
 
 def test_run_cli_participant_claude_json_populates_usage(tmp_path: Path):

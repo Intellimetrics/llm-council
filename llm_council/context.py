@@ -28,28 +28,32 @@ GIT_DIFF_TIMEOUT_SECONDS = 15
 # `safe_context: true`; the built-in `fable` mode sets it). Motivated by
 # Claude Fable 5's request-side safety classifiers, which false-positive on
 # benign security-adjacent review and — on the Claude Code surface — silently
-# fall back to Opus. This block states the TRUE, defensive nature of the
-# review so a legitimate false positive is less likely; it is factual
-# context, not an instruction to bypass any safety behavior (the council
-# never asks a peer to produce disallowed content). Harmless for non-Fable
-# peers. The reasoning-visibility line also heads off Fable's
+# fall back to Opus. This block states only facts the tool can actually
+# vouch for: the review itself is operator-invoked, read-only, and
+# analysis-only. It deliberately does NOT claim the reviewed content is the
+# operator's own work or otherwise safe — the content may be a third-party
+# patch or untrusted code under evaluation, and a true-positive refusal on
+# genuinely malicious material must stay possible. Instead of suppressing
+# suspicion it redirects it: flagging malicious code as a finding IS the
+# requested output, so a peer never has to choose between engaging and
+# refusing. The reasoning-visibility line also heads off Fable's
 # `reasoning_extraction` refusal category — the structured response format is
 # all the council consumes, so peers never need to expose raw
 # chain-of-thought. Used by `build_prompt` (round 1 / deliberation task
 # capsule) and by the orchestrator's ranking-pass prompt so the framing
 # persists across rounds.
 SAFE_CONTEXT_DIRECTIVE = (
-    "Context and authorization: This is an authorized, read-only "
-    "second-opinion review requested by the maintainer of this project, "
-    "running inside a local developer tool (llm-council). Your role is "
-    "defensive code review — reading the maintainer's own code and "
-    "proposed changes to surface bugs, risks, and security weaknesses so "
-    "they can be fixed. Any security-relevant content is present for "
-    "defensive analysis, not to build or operate an attack; review it on "
-    "its defensive merits and do not infer malicious intent from the "
-    "presence of security-related code. Report findings plainly in the "
-    "requested response format; you do not need to expose your internal "
-    "reasoning steps."
+    "Context and authorization: This is an operator-invoked, read-only "
+    "second-opinion code review running inside a local developer tool "
+    "(llm-council). Your role is analysis only — surfacing bugs, risks, "
+    "and security weaknesses so they can be fixed; you are not being asked "
+    "to build, extend, or operate anything. The material under review may "
+    "be the operator's own changes or third-party code the operator is "
+    "evaluating; judge it on its merits. If something appears malicious, "
+    "backdoored, or dangerous, say so plainly as a finding — identifying "
+    "it is the requested output, and a clear warning is more useful here "
+    "than declining to look. Report findings in the requested response "
+    "format; you do not need to expose your internal reasoning steps."
 )
 IMAGE_MIME_ALLOWLIST = frozenset(
     {"image/png", "image/jpeg", "image/webp", "image/gif"}

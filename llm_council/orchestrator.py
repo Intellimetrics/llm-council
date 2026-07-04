@@ -455,7 +455,6 @@ async def execute_council(
     question: str | None = None,
     cross_rank: bool = False,
     focus: list[Any] | None = None,
-    safe_context: bool = False,
 ) -> tuple[list[ParticipantResult], dict[str, Any]]:
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
 
@@ -657,6 +656,16 @@ async def execute_council(
         isinstance(mode_cfg_for_timeout, dict)
         and mode_cfg_for_timeout.get("tool_call_voting")
     )
+    # M-fable safe-context framing: resolved from the mode config here (like
+    # `timeout_multiplier` / `tool_call_voting` above) rather than threaded in
+    # by each caller — deriving it internally makes a caller-side desync
+    # (round-1 prompt framed, ranking prompt bare) impossible. Callers still
+    # resolve the same key themselves for `build_prompt`, which runs before
+    # this function.
+    safe_context = bool(
+        isinstance(mode_cfg_for_timeout, dict)
+        and mode_cfg_for_timeout.get("safe_context")
+    )
 
     if run_targets:
         run_results = await run_participants(
@@ -730,7 +739,48 @@ async def execute_council(
             quota_recoveries_seen.add(entry["peer"])
             emit({"event": "peer_quota_recovered", "round": round_number, **entry})
 
+    # Pinned-model substitutions (M-fable), mirrored on the quota pattern.
+    # A `require_pinned_model` peer served by a different model (e.g. Claude
+    # Fable 5 refused -> Claude Code silently fell back to Opus) drops with
+    # `error_kind=model_substituted`; accumulate those across rounds + the
+    # --cross-rank ranking pass with (peer, served_by) dedup. `served_by` is
+    # the REAL model the CLI reported.
+    model_substituted_peers: list[dict[str, Any]] = []
+    substitution_seen: set[tuple[str, str | None]] = set()
+
+    def _detect_and_emit_substitutions(
+        round_outputs: list[ParticipantResult],
+    ) -> None:
+        """Detect pinned-model substitutions in ``round_outputs``, append them
+        to the run-level accumulator (deduped on (peer, served_by)), and emit
+        one progress event per new entry.
+
+        Reads ``round_number`` at call time like ``_detect_and_emit_quota``,
+        so each event carries the round the swap actually happened in and
+        fires live rather than in an end-of-run scan.
+        """
+        for r in round_outputs:
+            if classify_error(r.error) != ERROR_KIND_MODEL_SUBSTITUTED:
+                continue
+            # Strip both the ":roundN" deliberation suffix and the ":rank"
+            # ranking-pass suffix back to the configured peer name.
+            base = _base_name(r.name).split(":")[0]
+            key = (base, r.model)
+            if key in substitution_seen:
+                continue
+            substitution_seen.add(key)
+            entry = {
+                "peer": base,
+                "requested": (participant_cfg.get(base, {}) or {}).get("model"),
+                "served_by": r.model,
+            }
+            if getattr(r, "is_ranking_round", False):
+                entry["ranking_round"] = True
+            model_substituted_peers.append(entry)
+            emit({"event": "peer_model_substituted", "round": round_number, **entry})
+
     _detect_and_emit_quota(results)
+    _detect_and_emit_substitutions(results)
     initial_disagreement = has_disagreement(round_results)
     metadata = {
         "rounds": round_number,
@@ -928,6 +978,7 @@ async def execute_council(
                         }
                     )
             results.extend(ranking_results)
+            _detect_and_emit_substitutions(ranking_results)
 
             rankings_by_peer: dict[str, list[str]] = {}
             for r in ranking_results:
@@ -1079,6 +1130,7 @@ async def execute_council(
         # `quota_throttled_seen` from round 1, so a peer throttled once
         # doesn't emit a second event when round 2 hits the same wall.
         _detect_and_emit_quota(round_results)
+        _detect_and_emit_substitutions(round_results)
 
         round_convergence = _compute_round_convergence(
             prior_round_results, round_results, convergence_thresholds
@@ -1299,42 +1351,6 @@ async def execute_council(
     if missing_key_records:
         metadata["missing_key_peers"] = list(missing_key_records)
 
-    # Surface pinned-model substitutions (M-fable) top-level, mirroring
-    # `quota_throttled_peers`. A `require_pinned_model` peer that was served by
-    # a different model (e.g. Claude Fable 5 refused -> Claude Code silently
-    # fell back to Opus) drops with `error_kind=model_substituted`; lift those
-    # out of the per-result error strings so the transcript JSON / MCP
-    # `structured_results` show the swap plainly. Scan ALL results — not just
-    # the final round — so a round-1 substitution in a deliberating run and a
-    # swap during the --cross-rank ranking pass (is_ranking_round results are
-    # filtered out of `final_round_results`) are surfaced too; dedup on
-    # (peer, served_by) like the per-round quota dedup. `served_by` is the
-    # REAL model the CLI reported. Omit the key entirely when empty so the
-    # common case leaves the schema unchanged.
-    model_substituted_peers: list[dict[str, Any]] = []
-    _substitution_seen: set[tuple[str, str | None]] = set()
-    for r in results:
-        if classify_error(r.error) != ERROR_KIND_MODEL_SUBSTITUTED:
-            continue
-        # Strip both the ":roundN" deliberation suffix and the ":rank"
-        # ranking-pass suffix back to the configured peer name.
-        base = _base_name(r.name).split(":")[0]
-        key = (base, r.model)
-        if key in _substitution_seen:
-            continue
-        _substitution_seen.add(key)
-        entry = {
-            "peer": base,
-            "requested": (participant_cfg.get(base, {}) or {}).get("model"),
-            "served_by": r.model,
-        }
-        if getattr(r, "is_ranking_round", False):
-            entry["ranking_round"] = True
-        model_substituted_peers.append(entry)
-        emit({"event": "peer_model_substituted", "round": metadata["rounds"], **entry})
-    if model_substituted_peers:
-        metadata["model_substituted_peers"] = model_substituted_peers
-
     if synthesize_flag and should_synthesize(synthesize_flag, metadata):
         try:
             chair_name = select_synthesizer(
@@ -1355,6 +1371,33 @@ async def execute_council(
                 finding_matrix=finding_matrix,
             )
             metadata["synthesis"] = synthesis_payload
+            # The chair turn never enters `results`, so the per-round
+            # substitution detector cannot see it — scan its payload here.
+            # A substituted chair memo (e.g. Fable refused the synthesis
+            # prompt and Opus served it) is flagged on the payload and
+            # surfaced through the same channel as in-round substitutions
+            # so it is never consumed as the pinned chair's memo.
+            if (
+                classify_error(str(synthesis_payload.get("error") or ""))
+                == ERROR_KIND_MODEL_SUBSTITUTED
+            ):
+                synthesis_payload["model_substituted"] = True
+                chair_entry = {
+                    "peer": chair_name,
+                    "requested": (
+                        participant_cfg.get(chair_name, {}) or {}
+                    ).get("model"),
+                    "served_by": synthesis_payload.get("model"),
+                    "synthesis": True,
+                }
+                model_substituted_peers.append(chair_entry)
+                emit(
+                    {
+                        "event": "peer_model_substituted",
+                        "round": metadata["rounds"],
+                        **chair_entry,
+                    }
+                )
             emit(
                 {
                     "event": "synthesis_finish",
@@ -1371,6 +1414,16 @@ async def execute_council(
             # a missing chair configuration.
             metadata["synthesis_error"] = str(exc)
             emit({"event": "synthesis_error", "error": str(exc)})
+
+    # Surface pinned-model substitutions (M-fable) top-level, mirroring
+    # `quota_throttled_peers`. Entries were accumulated live per round
+    # (round 1, the --cross-rank ranking pass, round-2 deliberation) plus
+    # the synthesis-chair scan above; lift them out of the per-result error
+    # strings so the transcript JSON / MCP `structured_results` show the
+    # swap plainly. Omit the key entirely when empty so the common case
+    # leaves the schema unchanged.
+    if model_substituted_peers:
+        metadata["model_substituted_peers"] = model_substituted_peers
 
     emit(
         {
