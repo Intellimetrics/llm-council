@@ -2775,6 +2775,9 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             and participant_cfg.get(name, {}).get("max_prompt_chars")
         ]
         effective_max = min([int(default_max), *peer_caps]) if peer_caps else int(default_max)
+        safe_context = bool(
+            (config.get("modes", {}) or {}).get(mode, {}).get("safe_context")
+        )
         prompt = build_prompt(
             question,
             mode=mode,
@@ -2789,6 +2792,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             participants=participant_cfg or None,
             prior_context=prior_context,
             acceptance_contract=acceptance_contract,
+            safe_context=safe_context,
             chunk_strategy=getattr(args, "chunk_strategy", "fail"),
             chunk_progress=_record_chunk_event,
         )

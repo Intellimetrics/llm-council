@@ -121,6 +121,7 @@ def estimate_council(
                     for v in violations
                 )
             )
+    mode_cfg = config.get("modes", {}).get(mode, {})
     prompt = build_prompt(
         question,
         mode=mode,
@@ -132,8 +133,12 @@ def estimate_council(
         max_prompt_chars=config.get("defaults", {}).get("max_prompt_chars")
         or MAX_PROMPT_CHARS,
         image_manifest=image_manifest or None,
+        # Match the runtime prompt so an estimate that passes can't be
+        # rejected by the actual run's per-participant prompt-size guard
+        # (same parity rule as the image budget above) — the framing adds
+        # ~850 chars.
+        safe_context=bool(mode_cfg.get("safe_context")),
     )
-    mode_cfg = config.get("modes", {}).get(mode, {})
     deliberate = bool(deliberate or mode_cfg.get("deliberate"))
     rounds = int(
         max_rounds

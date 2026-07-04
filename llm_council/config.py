@@ -183,6 +183,21 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(
                 f"Participant '{name}' retry_on_missing_label must be a boolean"
             )
+        # Both flags feed the pinned-model substitution guard; a quoted
+        # "false" would silently ENABLE them via truthiness, so fail loud
+        # like the sibling boolean keys above.
+        if "usage_from_json" in participant and not isinstance(
+            participant["usage_from_json"], bool
+        ):
+            raise ValueError(
+                f"Participant '{name}' usage_from_json must be a boolean"
+            )
+        if "require_pinned_model" in participant and not isinstance(
+            participant["require_pinned_model"], bool
+        ):
+            raise ValueError(
+                f"Participant '{name}' require_pinned_model must be a boolean"
+            )
         if "stance" in participant and participant["stance"] is not None:
             stance_value = participant["stance"]
             if not isinstance(stance_value, str) or stance_value not in VALID_STANCES:
@@ -259,6 +274,11 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(
                 f"Mode '{name}' deliberation_early_stop must be a boolean"
             )
+        # Defensive-review framing opt-in (v0.16.0). Boolean when present —
+        # the call sites use bool() truthiness, so a quoted "false" would
+        # silently ENABLE the framing without this check.
+        if "safe_context" in mode and not isinstance(mode["safe_context"], bool):
+            raise ValueError(f"Mode '{name}' safe_context must be a boolean")
         if mode.get("origin_policy") not in (None, "any", "us"):
             raise ValueError(f"Mode '{name}' origin_policy must be 'any' or 'us'")
         _validate_positive_int(mode, "max_rounds", f"mode '{name}'")
@@ -857,12 +877,15 @@ def _normalize_origin(value: str) -> str:
 def config_warnings(config: dict[str, Any]) -> list[str]:
     """Return non-fatal advisories for a loaded config.
 
-    Today this surfaces near-miss typos in participant `origin` strings —
+    Surfaces near-miss typos in participant `origin` strings —
     a participant whose origin normalizes to a canonical value in
     :data:`KNOWN_ORIGIN_STRINGS` but doesn't match it literally is almost
     certainly a typo (e.g., ``us/anthropic`` for ``US / Anthropic``).
     `origin_policy: us` does literal-prefix matching, so such participants
-    silently fail to filter as the user intended.
+    silently fail to filter as the user intended. Also flags the
+    contradictory `require_pinned_model` + `fallback_chain` combination on
+    Claude-family peers (the pin suppresses `--fallback-model` injection,
+    leaving the chain inert).
 
     The returned strings are informational. Callers (CLI command handlers,
     MCP server) print them to stderr or include them in metadata; nothing
@@ -897,6 +920,31 @@ def config_warnings(config: dict[str, Any]) -> list[str]:
             f"so this typo silently breaks US-only filtering. "
             f"Did you mean {suggestion!r}?"
         )
+    for name, cfg in participants.items():
+        if not isinstance(cfg, dict):
+            continue
+        # `require_pinned_model` + non-empty `fallback_chain` conflict on
+        # Claude-family peers: the chain would inject `--fallback-model`,
+        # whose whole purpose is letting the CLI serve the answer from a
+        # different model — exactly the swap the pin guard drops as
+        # `model_substituted`. `_build_cli_command` resolves the conflict by
+        # NOT injecting the flag when the pin is required; surface that the
+        # chain is inert so the operator doesn't rely on dead overload
+        # recovery.
+        if (
+            str(cfg.get("family") or "") == "claude"
+            and cfg.get("require_pinned_model")
+            and (cfg.get("fallback_chain") or [])
+        ):
+            warnings.append(
+                f"Participant {name!r} sets both require_pinned_model and a "
+                "non-empty fallback_chain. These conflict on Claude-family "
+                "CLIs (`--fallback-model` exists to serve the answer from a "
+                "different model — the swap the pin guard rejects), so the "
+                "pin wins and `--fallback-model` is NOT injected: the "
+                "fallback_chain is inert for this peer. Remove one of the "
+                "two keys to silence this warning."
+            )
     import shutil
     if shutil.which("gemini") and not shutil.which("agy"):
         warnings.append(

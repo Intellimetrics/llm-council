@@ -284,7 +284,7 @@ def council_run_schema() -> dict[str, Any]:
     }
 
 
-COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 6  # v6 = per-result terse_retry_attempted, section_repair_attempted, is_ranking_round, continue_debate, evidence_verification_failures now surfaced
+COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 7  # v7 = model_substituted_peers (top-level); v6 = per-result terse_retry_attempted, section_repair_attempted, is_ranking_round, continue_debate, evidence_verification_failures
 COUNCIL_RUN_VALID_STANCES = ("for", "against", "neutral")
 COUNCIL_RUN_VALID_ERROR_KINDS = (
     "timeout",
@@ -298,6 +298,7 @@ COUNCIL_RUN_VALID_ERROR_KINDS = (
     "incomplete_response",
     "untagged_evidence",
     "quota_exhausted",
+    "model_substituted",
     "unknown",
 )
 
@@ -738,6 +739,31 @@ def council_run_output_schema() -> dict[str, Any]:
                     "required": ["peer", "family", "api_key_env"],
                 },
             },
+            "model_substituted_peers": {
+                "type": "array",
+                "description": (
+                    "v0.16.0: peers with `require_pinned_model: true` whose "
+                    "turn was served by a model other than the pinned one "
+                    "(`error_kind=model_substituted`) — e.g. Claude Fable 5 "
+                    "refused and the Claude Code surface silently fell back "
+                    "to Opus. The peer's answer was dropped so the "
+                    "substituted model is never counted as the pinned "
+                    "model's vote. `served_by` is the model the CLI "
+                    "actually reported; `ranking_round: true` marks a swap "
+                    "during the --cross-rank ranking pass. Omitted entirely "
+                    "when no substitution was detected (the common case)."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "peer": {"type": "string"},
+                        "requested": {"type": ["string", "null"]},
+                        "served_by": {"type": ["string", "null"]},
+                        "ranking_round": {"type": "boolean"},
+                    },
+                    "required": ["peer", "served_by"],
+                },
+            },
             "applied_focus": {
                 "type": "array",
                 "description": (
@@ -1154,6 +1180,9 @@ async def run_council(
         and participant_cfg_for_prompt.get(name, {}).get("max_prompt_chars")
     ]
     effective_max = min([int(default_max), *peer_caps]) if peer_caps else int(default_max)
+    safe_context = bool(
+        (config.get("modes", {}) or {}).get(mode, {}).get("safe_context")
+    )
     prompt = build_prompt(
         question,
         mode=mode,
@@ -1168,6 +1197,7 @@ async def run_council(
         participants=participant_cfg_for_prompt or None,
         prior_context=prior_context,
         acceptance_contract=acceptance_contract,
+        safe_context=safe_context,
     )
     from llm_council.safety import apply_secret_scan_policy
 
@@ -1570,6 +1600,13 @@ async def run_council(
     # X env var" signal without parsing per-result errors (the peer
     # never produced a result — it was excluded pre-run).
     metadata, missing_key_peers = _lift(metadata, "missing_key_peers", [])
+    # v0.16.0: pinned-model substitutions (e.g. Claude Fable 5 refused and the
+    # Claude Code surface silently served Opus). Lifted with the same pattern
+    # as quota_throttled_peers so the calling agent sees the swap at the
+    # advertised top-level location instead of parsing metadata.
+    metadata, model_substituted_peers = _lift(
+        metadata, "model_substituted_peers", []
+    )
     # M11 provenance: lift applied review-focus bundles top-level (name +
     # short content hash) so a calling agent sees which inert focus
     # directives shaped the run without parsing metadata. Absent entirely
@@ -1609,6 +1646,8 @@ async def run_council(
         payload["quota_recoveries"] = quota_recoveries
     if missing_key_peers:
         payload["missing_key_peers"] = missing_key_peers
+    if model_substituted_peers:
+        payload["model_substituted_peers"] = model_substituted_peers
     if applied_focus:
         payload["applied_focus"] = applied_focus
     # v0.9.0 Feature 2: lift cross-rank fields to the top-level payload
