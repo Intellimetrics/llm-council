@@ -20,7 +20,6 @@ fails the test rather than hanging the suite.
 from __future__ import annotations
 
 import asyncio
-import codecs
 import json
 import os
 import sys
@@ -70,67 +69,11 @@ async def _call_council_run_over_stdio(root: Path) -> tuple[set[str], dict]:
         limit=1024 * 1024,
     )
 
-    # MCP stdio is specified as newline-delimited JSON, but mcp-python 1.28.1
-    # on Windows can expose a complete tools/call response to the Proactor
-    # StreamReader before exposing its trailing newline. ``readline()`` then
-    # waits forever with the full JSON object already buffered. Decode complete
-    # JSON values incrementally so framing remains correct both with and
-    # without a promptly delivered delimiter. Keep leftovers for a following
-    # notification/response if a single pipe read contains multiple values.
-    wire_text = ""
     unexpected_messages: list[dict] = []
-    utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    json_decoder = json.JSONDecoder()
-
-    async def _read_json_message() -> dict:
-        nonlocal wire_text
-        assert proc.stdout is not None
-        while True:
-            candidate = wire_text.lstrip()
-            if candidate:
-                try:
-                    decoded, end = json_decoder.raw_decode(candidate)
-                except json.JSONDecodeError:
-                    pass
-                else:
-                    wire_text = candidate[end:]
-                    if not isinstance(decoded, dict):
-                        raise AssertionError(
-                            f"MCP server emitted non-object JSON: {decoded!r}"
-                        )
-                    return decoded
-
-            chunk = await proc.stdout.read(4096)
-            if chunk:
-                wire_text += utf8_decoder.decode(chunk)
-                continue
-
-            # EOF may complete a final UTF-8 code point, but it cannot complete
-            # a structurally incomplete JSON value.
-            wire_text += utf8_decoder.decode(b"", final=True)
-            candidate = wire_text.strip()
-            if candidate:
-                try:
-                    decoded, end = json_decoder.raw_decode(candidate)
-                except json.JSONDecodeError as exc:
-                    raise AssertionError(
-                        f"MCP server emitted truncated JSON at EOF: {candidate!r}"
-                    ) from exc
-                if candidate[end:].strip():
-                    raise AssertionError(
-                        "MCP server emitted trailing non-JSON data at EOF: "
-                        f"{candidate[end:]!r}"
-                    )
-                wire_text = ""
-                if not isinstance(decoded, dict):
-                    raise AssertionError(
-                        f"MCP server emitted non-object JSON: {decoded!r}"
-                    )
-                return decoded
-            return {}
 
     async def _request(request_id: int, method: str, params: dict) -> dict:
         assert proc.stdin is not None
+        assert proc.stdout is not None
         message = {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -140,8 +83,8 @@ async def _call_council_run_over_stdio(root: Path) -> tuple[set[str], dict]:
         proc.stdin.write((json.dumps(message) + "\n").encode())
         await proc.stdin.drain()
         while True:
-            response = await _read_json_message()
-            if not response:
+            raw = await proc.stdout.readline()
+            if not raw:
                 stderr = (
                     (await proc.stderr.read()).decode(errors="replace")
                     if proc.stderr is not None
@@ -150,6 +93,7 @@ async def _call_council_run_over_stdio(root: Path) -> tuple[set[str], dict]:
                 raise AssertionError(
                     f"MCP server exited before response {request_id}: {stderr}"
                 )
+            response = json.loads(raw)
             # Ignore server notifications; return the matching response.
             if response.get("id") != request_id:
                 unexpected_messages.append(response)
@@ -199,6 +143,7 @@ async def _call_council_run_over_stdio(root: Path) -> tuple[set[str], dict]:
             )
             payload = _extract_payload(called)
     except TimeoutError as exc:
+        buffered = len(getattr(proc.stdout, "_buffer", b""))
         unexpected_summary = json.dumps(
             unexpected_messages[-3:],
             ensure_ascii=True,
@@ -206,7 +151,7 @@ async def _call_council_run_over_stdio(root: Path) -> tuple[set[str], dict]:
         )
         raise AssertionError(
             "MCP stdio exchange timed out with "
-            f"{len(wire_text)} buffered character(s): {wire_text[-500:]!r}; "
+            f"{buffered} buffered byte(s); "
             f"last unexpected message(s): {unexpected_summary[-4000:]}"
         ) from exc
     finally:
