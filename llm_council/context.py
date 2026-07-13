@@ -6,6 +6,7 @@ import errno
 import hashlib
 import locale
 import mimetypes
+import os
 import re as _re_cross_rank
 import subprocess
 import tempfile
@@ -375,12 +376,39 @@ def _wrap_chunked_diff(chunked_text: str) -> str:
 
 
 def _git_ok(cwd: Path, args: list[str]) -> bool:
+    if not _has_git_metadata(cwd):
+        return False
     return _run_git(cwd, args).returncode == 0
 
 
 def _git_output(cwd: Path, args: list[str]) -> str | None:
+    if not _has_git_metadata(cwd):
+        return None
     result = _run_git(cwd, args)
     return result.stdout if result.returncode == 0 else None
+
+
+def _has_git_metadata(cwd: Path) -> bool:
+    """Cheaply reject non-repositories before launching Git.
+
+    Several run-planning features inspect the same diff. On Windows, spawning
+    Git from a non-repository directory with inherited MCP stdio can consume
+    the full subprocess timeout for every probe. A worktree always has a
+    ``.git`` file or directory at its root; explicit Git environment overrides
+    remain eligible and are left for Git itself to validate.
+    """
+
+    if os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE"):
+        return True
+    try:
+        resolved = cwd.resolve()
+        for directory in (resolved, *resolved.parents):
+            if (directory / ".git").exists():
+                return True
+    except OSError:
+        # Fail open on an unusual filesystem and preserve Git's own diagnostics.
+        return True
+    return False
 
 
 def _read_git_capture(
@@ -407,6 +435,10 @@ def _read_git_capture(
 
 def _run_git(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
     command = ["git", *args]
+    git_env = os.environ.copy()
+    git_env["GIT_TERMINAL_PROMPT"] = "0"
+    git_env["GIT_PAGER"] = "cat"
+    git_env["PAGER"] = "cat"
     try:
         # Direct child output to disk-backed temporary files. `capture_output`
         # buffers the entire diff in memory before this module gets a chance to
@@ -420,6 +452,8 @@ def _run_git(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
             completed = subprocess.run(
                 command,
                 cwd=str(cwd),
+                env=git_env,
+                stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=stderr_file,
                 check=False,

@@ -236,6 +236,9 @@ def test_git_capture_uses_bounded_temporary_streams(
     result = context_module._run_git(tmp_path, ["diff", "--"])
 
     assert "capture_output" not in observed
+    assert observed["stdin"] is subprocess.DEVNULL
+    assert observed["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert observed["env"]["GIT_PAGER"] == "cat"
     assert result.stdout.split("\n[git ", 1)[0] == "x" * 64
     assert "truncated after 64 bytes" in result.stdout
     assert result.stderr.split("\n[git ", 1)[0] == "e" * 32
@@ -253,6 +256,18 @@ def test_git_capture_preserves_timeout_failure_semantics(
     assert result.returncode == 1
     assert result.stdout == ""
     assert "timed out after 15 seconds" in result.stderr
+
+
+def test_git_output_skips_process_for_non_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("Git must not launch outside a repository")
+
+    monkeypatch.setattr(context_module.subprocess, "run", fail_run)
+
+    assert context_module._git_output(tmp_path, ["diff", "--name-only"]) is None
+    assert context_module._git_ok(tmp_path, ["rev-parse", "--is-inside-work-tree"]) is False
 
 
 def test_semantic_filter_preserves_truncation_notice_from_ignored_block() -> None:
