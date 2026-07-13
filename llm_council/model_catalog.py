@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from llm_council.env import env_get
 
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
@@ -58,7 +59,7 @@ def normalize_openrouter_model(model: dict[str, Any]) -> dict[str, Any]:
 
 
 def openrouter_cache_path() -> Path:
-    cache_root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    cache_root = Path(env_get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
     return cache_root / "llm-council" / "openrouter-models.json"
 
 

@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
+import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +26,7 @@ from llm_council.deliberation import (
     recommendation_counts,
     recommendation_label,
     recommendation_line,
+    summarize_recommendations,
 )
 
 ROUND_SUFFIX_RE = re.compile(r":round(\d+)$")
@@ -34,9 +39,539 @@ def safe_slug(text: str, max_len: int = 60) -> str:
 
 
 def transcript_paths(base_dir: Path, question: str) -> tuple[Path, Path]:
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem = f"{stamp}_{safe_slug(question)}"
+    # Keep the timestamp prefix for sorting and continuation-prefix lookup, but
+    # never place question text in a filename. Questions can contain source,
+    # incident details, or credentials; directory listings must not disclose
+    # them even when the transcript files themselves are private.
+    _ = question  # retained for API compatibility; intentionally not used in paths
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    stem = f"{stamp}_{uuid.uuid4().hex}"
     return base_dir / f"{stem}.md", base_dir / f"{stem}.json"
+
+
+def _current_euid() -> int | None:
+    get_euid = getattr(os, "geteuid", None)
+    return int(get_euid()) if get_euid is not None else None
+
+
+def _uses_windows_path_fallback() -> bool:
+    """Return whether directory descriptors are unavailable on this platform."""
+
+    return os.name == "nt"
+
+
+def _is_link_or_reparse_point(path: Path, info: os.stat_result | None = None) -> bool:
+    """Recognize symlinks and Windows junction/reparse-point entries."""
+
+    try:
+        observed = info if info is not None else os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(observed.st_mode):
+        return True
+    attributes = getattr(observed, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse_flag and attributes & reparse_flag)
+
+
+def _prepare_transcript_directory_path(
+    path: Path,
+    *,
+    create: bool,
+    make_private: bool,
+) -> os.stat_result:
+    """Windows-safe path fallback for transcript-directory validation.
+
+    Windows does not support opening a directory with :func:`os.open` or
+    passing that descriptor to :func:`os.scandir`. Reject reparse points,
+    validate the entry before and after chmod, and return the final identity so
+    callers can detect a directory swap before committing an atomic replace.
+    POSIX callers never use this helper and retain descriptor-relative,
+    ``O_NOFOLLOW`` operations.
+    """
+
+    path = Path(path)
+    if _is_link_or_reparse_point(path):
+        raise OSError(f"Refusing symlink or reparse-point transcript directory: {path}")
+    if create:
+        try:
+            path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        except FileExistsError:
+            pass
+
+    listed = os.lstat(path)
+    if _is_link_or_reparse_point(path, listed):
+        raise OSError(f"Refusing symlink or reparse-point transcript directory: {path}")
+    if not stat.S_ISDIR(listed.st_mode):
+        raise NotADirectoryError(f"Transcript path is not a directory: {path}")
+    if make_private:
+        # Windows' chmod surface is narrower than POSIX ACLs, but this keeps the
+        # path compatible with restrictive parent ACLs and is the strongest
+        # stdlib-only permission request available. The no-follow guarantees in
+        # this branch come from repeated lstat/reparse checks and identity
+        # validation; POSIX continues to use fchmod on a pinned descriptor.
+        os.chmod(path, 0o700)
+
+    current = os.lstat(path)
+    if _is_link_or_reparse_point(path, current):
+        raise OSError(f"Refusing symlink or reparse-point transcript directory: {path}")
+    if not stat.S_ISDIR(current.st_mode):
+        raise NotADirectoryError(f"Transcript path is not a directory: {path}")
+    if (listed.st_dev, listed.st_ino) != (current.st_dev, current.st_ino):
+        raise OSError(f"Transcript directory changed while preparing it: {path}")
+    return current
+
+
+def _open_owned_transcript_directory(
+    path: Path,
+    *,
+    create: bool,
+    make_private: bool,
+) -> int:
+    """Open ``path`` as an owned directory without following a leaf symlink.
+
+    The returned descriptor pins subsequent operations to the directory that
+    was inspected, so replacing the pathname after this check cannot redirect a
+    transcript write. On POSIX, ownership is required before permissions are
+    changed; silently chmod'ing a shared or foreign-owned directory would be a
+    dangerous repair policy.
+    """
+
+    path = Path(path)
+    if path.is_symlink():
+        raise OSError(f"Refusing symlink transcript directory: {path}")
+    if create:
+        try:
+            path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        except FileExistsError:
+            # A concurrent creator won the race. The no-follow open and owner
+            # validation below decide whether its directory is safe to use.
+            pass
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_fd = os.open(path, flags)
+    except OSError as exc:
+        if path.is_symlink():
+            raise OSError(f"Refusing symlink transcript directory: {path}") from exc
+        raise
+
+    try:
+        opened = os.fstat(directory_fd)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise NotADirectoryError(f"Transcript path is not a directory: {path}")
+
+        # Defense for platforms without O_NOFOLLOW and a consistency check for
+        # the normal path: lstat must describe the same non-symlink inode that
+        # the descriptor pins.
+        listed = os.lstat(path)
+        if stat.S_ISLNK(listed.st_mode):
+            raise OSError(f"Refusing symlink transcript directory: {path}")
+        if (listed.st_dev, listed.st_ino) != (opened.st_dev, opened.st_ino):
+            raise OSError(f"Transcript directory changed while opening it: {path}")
+
+        euid = _current_euid()
+        if euid is not None and opened.st_uid != euid:
+            raise PermissionError(
+                f"Refusing transcript directory not owned by uid {euid}: {path} "
+                f"(owner uid {opened.st_uid})"
+            )
+        if make_private:
+            if hasattr(os, "fchmod"):
+                os.fchmod(directory_fd, 0o700)
+            else:  # pragma: no cover - Windows fallback
+                os.chmod(path, 0o700, follow_symlinks=False)
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def ensure_private_transcript_dir(path: Path) -> Path:
+    """Create or tighten an owned transcript directory to mode 0700.
+
+    Existing directories are repaired even when they were created under a
+    permissive umask. Leaf symlinks and foreign-owned directories are refused.
+    """
+
+    if _uses_windows_path_fallback():
+        _prepare_transcript_directory_path(
+            Path(path), create=True, make_private=True
+        )
+        return Path(path)
+
+    directory_fd = _open_owned_transcript_directory(
+        Path(path), create=True, make_private=True
+    )
+    os.close(directory_fd)
+    return Path(path)
+
+
+def transcript_dir_within_root(cwd: Path, config: dict, *, root: Path) -> Path:
+    """Resolve ``transcripts_dir`` and require it to remain inside ``root``.
+
+    This is the confinement variant intended for MCP callers. The ordinary
+    :func:`transcript_dir` remains permissive for explicit CLI configurations
+    that intentionally store transcripts elsewhere. Resolving before the
+    containment check also rejects an existing symlink that escapes the root.
+    """
+
+    resolved_root = Path(root).resolve()
+    resolved_cwd = Path(cwd).resolve()
+    try:
+        resolved_cwd.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"working directory must be inside transcript root: {resolved_root}"
+        ) from exc
+    resolved = transcript_dir(resolved_cwd, config).resolve(strict=False)
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"transcripts_dir must be inside MCP project root: {resolved_root}"
+        ) from exc
+    return resolved
+
+
+_TRANSCRIPT_ARTIFACT_SUFFIXES = frozenset({".md", ".json", ".html"})
+
+
+def _is_transcript_artifact_name(name: str) -> bool:
+    candidate = Path(name)
+    return (
+        candidate.suffix.lower() in _TRANSCRIPT_ARTIFACT_SUFFIXES
+        and _RUN_ID_RE.match(candidate.stem) is not None
+    )
+
+
+def _new_permission_report(base_dir: Path) -> dict[str, Any]:
+    return {
+        "directory": str(base_dir),
+        "directory_mode_before": None,
+        "directory_repaired": False,
+        "eligible_files": 0,
+        "already_private_files": [],
+        "repaired_files": [],
+        "would_repair_files": [],
+        "skipped_symlinks": [],
+        "skipped_hardlinks": [],
+        "skipped_unowned": [],
+        "skipped_non_regular": [],
+        "skipped_changed": [],
+    }
+
+
+def _sort_permission_report(report: dict[str, Any]) -> dict[str, Any]:
+    for value in report.values():
+        if isinstance(value, list):
+            value.sort()
+    return report
+
+
+def _inspect_transcript_permissions_path(
+    base_dir: Path,
+    *,
+    repair: bool,
+) -> dict[str, Any]:
+    """Windows path-based counterpart to the POSIX descriptor audit."""
+
+    directory_stat = _prepare_transcript_directory_path(
+        base_dir, create=False, make_private=False
+    )
+    report = _new_permission_report(base_dir)
+    directory_mode = stat.S_IMODE(directory_stat.st_mode)
+    report["directory_mode_before"] = directory_mode
+    if repair and directory_mode != 0o700:
+        _prepare_transcript_directory_path(
+            base_dir, create=False, make_private=True
+        )
+        report["directory_repaired"] = True
+
+    euid = _current_euid()
+    with os.scandir(base_dir) as entries:
+        for entry in entries:
+            name = entry.name
+            if not _is_transcript_artifact_name(name):
+                continue
+            candidate = base_dir / name
+            try:
+                observed = entry.stat(follow_symlinks=False)
+            except OSError:
+                report["skipped_changed"].append(name)
+                continue
+            if _is_link_or_reparse_point(candidate, observed):
+                report["skipped_symlinks"].append(name)
+                continue
+            if not stat.S_ISREG(observed.st_mode):
+                report["skipped_non_regular"].append(name)
+                continue
+            if observed.st_nlink != 1:
+                report["skipped_hardlinks"].append(name)
+                continue
+            if euid is not None and observed.st_uid != euid:
+                report["skipped_unowned"].append(name)
+                continue
+
+            report["eligible_files"] += 1
+            if stat.S_IMODE(observed.st_mode) == 0o600:
+                report["already_private_files"].append(name)
+                continue
+            if not repair:
+                report["would_repair_files"].append(name)
+                continue
+
+            # Open only to compare identity before changing the pathname. On
+            # Windows there is no dir_fd/O_NOFOLLOW equivalent in os.open; a
+            # swapped link is followed read-only, detected by the identity
+            # mismatch, and never chmod'd.
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            try:
+                file_fd = os.open(candidate, flags)
+            except OSError:
+                report["skipped_changed"].append(name)
+                continue
+            try:
+                current = os.fstat(file_fd)
+            finally:
+                os.close(file_fd)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino)
+                != (observed.st_dev, observed.st_ino)
+                or (euid is not None and current.st_uid != euid)
+            ):
+                report["skipped_changed"].append(name)
+                continue
+            try:
+                os.chmod(candidate, 0o600)
+                after = os.lstat(candidate)
+            except OSError:
+                report["skipped_changed"].append(name)
+                continue
+            if (
+                _is_link_or_reparse_point(candidate, after)
+                or (after.st_dev, after.st_ino)
+                != (observed.st_dev, observed.st_ino)
+            ):
+                report["skipped_changed"].append(name)
+                continue
+            report["repaired_files"].append(name)
+
+    return _sort_permission_report(report)
+
+
+def inspect_transcript_permissions(
+    base_dir: Path,
+    *,
+    repair: bool = False,
+) -> dict[str, Any]:
+    """Inspect, and optionally repair, council-owned transcript permissions.
+
+    Only timestamp-prefixed ``.md``, ``.json``, and ``.html`` regular files
+    owned by the current effective user are eligible. Symlinks, multiply-linked
+    files, foreign-owned files, non-regular entries, and entries replaced during
+    inspection are reported and never followed. With ``repair=True`` the
+    directory becomes 0700 and eligible files become 0600.
+    """
+
+    base_dir = Path(base_dir)
+    if _uses_windows_path_fallback():
+        return _inspect_transcript_permissions_path(base_dir, repair=repair)
+
+    directory_fd = _open_owned_transcript_directory(
+        base_dir, create=False, make_private=False
+    )
+    report = _new_permission_report(base_dir)
+    try:
+        directory_stat = os.fstat(directory_fd)
+        directory_mode = stat.S_IMODE(directory_stat.st_mode)
+        report["directory_mode_before"] = directory_mode
+        if repair and directory_mode != 0o700:
+            if hasattr(os, "fchmod"):
+                os.fchmod(directory_fd, 0o700)
+            else:  # pragma: no cover - Windows fallback
+                os.chmod(base_dir, 0o700, follow_symlinks=False)
+            report["directory_repaired"] = True
+
+        euid = _current_euid()
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                name = entry.name
+                if not _is_transcript_artifact_name(name):
+                    continue
+                try:
+                    observed = entry.stat(follow_symlinks=False)
+                except OSError:
+                    report["skipped_changed"].append(name)
+                    continue
+                if stat.S_ISLNK(observed.st_mode):
+                    report["skipped_symlinks"].append(name)
+                    continue
+                if not stat.S_ISREG(observed.st_mode):
+                    report["skipped_non_regular"].append(name)
+                    continue
+                if observed.st_nlink != 1:
+                    report["skipped_hardlinks"].append(name)
+                    continue
+                if euid is not None and observed.st_uid != euid:
+                    report["skipped_unowned"].append(name)
+                    continue
+
+                report["eligible_files"] += 1
+                if stat.S_IMODE(observed.st_mode) == 0o600:
+                    report["already_private_files"].append(name)
+                    continue
+                if not repair:
+                    report["would_repair_files"].append(name)
+                    continue
+
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    file_fd = os.open(name, flags, dir_fd=directory_fd)
+                except OSError:
+                    report["skipped_changed"].append(name)
+                    continue
+                try:
+                    current = os.fstat(file_fd)
+                    if (
+                        not stat.S_ISREG(current.st_mode)
+                        or (current.st_dev, current.st_ino)
+                        != (observed.st_dev, observed.st_ino)
+                        or (euid is not None and current.st_uid != euid)
+                    ):
+                        report["skipped_changed"].append(name)
+                        continue
+                    if hasattr(os, "fchmod"):
+                        os.fchmod(file_fd, 0o600)
+                    else:  # pragma: no cover - Windows fallback
+                        os.chmod(base_dir / name, 0o600, follow_symlinks=False)
+                    report["repaired_files"].append(name)
+                finally:
+                    os.close(file_fd)
+    finally:
+        os.close(directory_fd)
+
+    return _sort_permission_report(report)
+
+
+def _atomic_write_private_path(path: Path, content: str) -> None:
+    """Windows path-based atomic writer with reparse and identity checks."""
+
+    directory_stat = _prepare_transcript_directory_path(
+        path.parent, create=True, make_private=True
+    )
+    file_fd, raw_temporary = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(raw_temporary)
+    try:
+        os.chmod(temporary_path, 0o600)
+        with os.fdopen(file_fd, "w", encoding="utf-8", newline="") as handle:
+            file_fd = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        current_directory = os.lstat(path.parent)
+        if (
+            _is_link_or_reparse_point(path.parent, current_directory)
+            or not stat.S_ISDIR(current_directory.st_mode)
+            or (current_directory.st_dev, current_directory.st_ino)
+            != (directory_stat.st_dev, directory_stat.st_ino)
+        ):
+            raise OSError(
+                f"Transcript directory changed before atomic replace: {path.parent}"
+            )
+        # os.replace replaces the directory entry itself rather than opening
+        # the destination, so an existing file symlink/reparse point is not
+        # followed. The random same-directory temporary name prevents partial
+        # readers and keeps the rename on one filesystem.
+        os.replace(temporary_path, path)
+    except BaseException:
+        if file_fd >= 0:
+            os.close(file_fd)
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _atomic_write_private(path: Path, content: str) -> None:
+    """Atomically replace ``path`` with a private UTF-8 text file.
+
+    Transcripts can contain source, prompts, and model output. Create the
+    temporary file in the destination directory with mode 0600, flush it, and
+    then replace the destination atomically so readers never observe a partial
+    document. The descriptor-relative rename replaces a destination symlink
+    itself rather than following it, avoiding writes through a pre-planted link.
+    """
+
+    if _uses_windows_path_fallback():
+        _atomic_write_private_path(path, content)
+        return
+
+    directory_fd = _open_owned_transcript_directory(
+        path.parent, create=True, make_private=True
+    )
+    temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    file_fd = -1
+    temporary_path: Path | None = None
+    supports_dir_fd = (
+        os.open in os.supports_dir_fd
+        and os.rename in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+    )
+    try:
+        if supports_dir_fd:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            file_fd = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+        else:  # pragma: no cover - Windows fallback
+            file_fd, raw_temporary = tempfile.mkstemp(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
+            temporary_path = Path(raw_temporary)
+        if hasattr(os, "fchmod"):
+            os.fchmod(file_fd, 0o600)
+        with os.fdopen(file_fd, "w", encoding="utf-8", newline="") as handle:
+            file_fd = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if supports_dir_fd:
+            os.rename(
+                temporary_name,
+                path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        else:  # pragma: no cover - Windows fallback
+            assert temporary_path is not None
+            os.replace(temporary_path, path)
+    except BaseException:
+        if file_fd >= 0:
+            os.close(file_fd)
+        try:
+            if supports_dir_fd:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            elif temporary_path is not None:  # pragma: no cover - Windows fallback
+                temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(directory_fd)
 
 
 def transcript_dir(cwd: Path, config: dict) -> Path:
@@ -404,6 +939,11 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
         "ok": result.ok,
         "model": result.model,
         "elapsed_seconds": round(result.elapsed_seconds, 3),
+        "wall_elapsed_seconds": (
+            round(result.wall_elapsed_seconds, 3)
+            if result.wall_elapsed_seconds is not None
+            else None
+        ),
         "command": result.command,
         "output": result.output,
         "error": result.error,
@@ -568,6 +1108,17 @@ def final_round_results(results: list[ParticipantResult]) -> list[ParticipantRes
         return []
     final_round = max(result_round(result.name) for result in primary)
     return [result for result in primary if result_round(result.name) == final_round]
+
+
+def final_decision_label(results: list[ParticipantResult]) -> str:
+    """Return the unique leading final-round peer label, or ``unknown``.
+
+    The dashboard headline is peer-vote telemetry, not mutable caller metadata
+    or the optional synthesis chair's memo. A tie has no council decision and
+    therefore must not be resolved by label ordering.
+    """
+
+    return summarize_recommendations(final_round_results(results)).recommendation
 
 
 _RECOMMENDATION_PREFIX_RE = re.compile(
@@ -778,7 +1329,7 @@ def write_transcript(
     metadata: dict[str, Any] | None = None,
     parent_run_id: str | None = None,
 ) -> None:
-    markdown_path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_transcript_dir(markdown_path.parent)
 
     metadata = metadata or {}
     ok_count = sum(1 for result in results if result.ok)
@@ -867,9 +1418,11 @@ def write_transcript(
                 f"### {result.name} ({status}){cache_tag}",
                 "",
                 f"- Model: `{result.model or 'cli default (unreported)'}`",
-                f"- Elapsed: `{result.elapsed_seconds:.1f}s`",
+                f"- Attempt elapsed: `{result.elapsed_seconds:.1f}s`",
             ]
         )
+        if result.wall_elapsed_seconds is not None:
+            lines.append(f"- Wall elapsed: `{result.wall_elapsed_seconds:.1f}s`")
         if result.total_tokens is not None:
             lines.append(f"- Tokens: `{result.total_tokens}`")
         if result.cost_usd is not None:
@@ -1076,7 +1629,7 @@ def write_transcript(
                     "",
                 ]
             )
-    markdown_path.write_text("\n".join(lines), encoding="utf-8")
+    _atomic_write_private(markdown_path, "\n".join(lines))
 
     # These keys live at the TOP level of the JSON payload for downstream
     # consumers (eval harness, dashboards). We extract them from `metadata`
@@ -1146,10 +1699,7 @@ def write_transcript(
         and cross_rank_rankings_payload
     ):
         json_payload["cross_rank_rankings"] = cross_rank_rankings_payload
-    json_path.write_text(
-        json.dumps(json_payload, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    _atomic_write_private(json_path, json.dumps(json_payload, indent=2) + "\n")
 
     # Generate and write HTML transcript
     html_path = markdown_path.with_suffix(".html")
@@ -1168,7 +1718,7 @@ def write_transcript(
         quorum=quorum,
     )
     try:
-        html_path.write_text(html_content, encoding="utf-8")
+        _atomic_write_private(html_path, html_content)
     except OSError:
         pass
 
@@ -1192,7 +1742,7 @@ def _generate_html_dashboard(
         return html.escape(text)
 
     synthesis = metadata.get("synthesis") or {}
-    decision = synthesis.get("decision_label") or metadata.get("recommendation") or "unknown"
+    decision = final_decision_label(results)
     decision_badge_class = f"badge-{decision.lower()}" if decision.lower() in ("yes", "no", "tradeoff") else "badge-unknown"
 
     peers_html = []

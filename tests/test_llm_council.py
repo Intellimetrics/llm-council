@@ -101,32 +101,44 @@ from llm_council.convergence import (
 
 
 def test_builtin_quick_selects_full_native_triad(monkeypatch):
-    config = load_config(None)
-    # Case A: both or agy only installed -> resolves to antigravity
-    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "agy" else None)
+    config = load_config(None, search=False)
+    # Case A: Antigravity is the available Gemini-family seat.
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/bin/{name}" if name in {"claude", "codex", "agy"} else None,
+    )
     assert select_participants(config, "quick", "codex") == ["claude", "codex", "antigravity"]
 
-    # Case B: gemini only installed -> resolves to gemini
-    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "gemini" else None)
+    # Case B: Gemini is the available (and hard-read-only) neutral seat.
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/bin/{name}" if name in {"claude", "codex", "gemini"} else None,
+    )
     assert select_participants(config, "quick", "codex") == ["claude", "codex", "gemini"]
 
     # Case C: neither installed -> raises ValueError
     monkeypatch.setattr("shutil.which", lambda name: None)
     import pytest
-    with pytest.raises(ValueError, match="Neither Antigravity CLI.*nor Gemini CLI"):
+    with pytest.raises(ValueError, match="No configured Gemini-family CLI"):
         select_participants(config, "quick", "codex")
 
 
 def test_peer_only_excludes_current(monkeypatch):
-    config = load_config(None)
+    config = load_config(None, search=False)
     # Case A: agy only
-    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "agy" else None)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/bin/{name}" if name in {"claude", "codex", "agy"} else None,
+    )
     assert select_participants(config, "peer-only", "codex") == ["claude", "antigravity"]
     assert select_participants(config, "peer-only", "antigravity") == ["claude", "codex"]
     assert select_participants(config, "peer-only", "gemini") == ["claude", "codex"]
 
     # Case B: gemini only
-    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "gemini" else None)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/bin/{name}" if name in {"claude", "codex", "gemini"} else None,
+    )
     assert select_participants(config, "peer-only", "codex") == ["claude", "gemini"]
     assert select_participants(config, "peer-only", "antigravity") == ["claude", "codex"]
     assert select_participants(config, "peer-only", "gemini") == ["claude", "codex"]
@@ -136,11 +148,17 @@ def test_custom_other_cli_peers_stays_peer_only_by_default(monkeypatch):
     config = load_config(None)
     config["modes"]["custom-peer"] = {"strategy": "other_cli_peers"}
     # Case A: agy only
-    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "agy" else None)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/bin/{name}" if name in {"claude", "codex", "agy"} else None,
+    )
     assert select_participants(config, "custom-peer", "codex") == ["claude", "antigravity"]
 
     # Case B: gemini only
-    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "gemini" else None)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/bin/{name}" if name in {"claude", "codex", "gemini"} else None,
+    )
     assert select_participants(config, "custom-peer", "codex") == ["claude", "gemini"]
 
 
@@ -361,12 +379,13 @@ def test_project_config_includes_extra_local_participants():
     )
     assert "local_vllm_qwen" in config["participants"]
     assert config["participants"]["local_vllm_qwen"]["base_url"] == "http://127.0.0.1:8000/v1"
-    # `local-only` mode must surface even without `local_qwen_coder`,
-    # because the wizard-probed participant satisfies has_local.
-    assert "local-only" in config["modes"]
+    # A loopback OpenAI-compatible gateway can still relay upstream, so it
+    # does not make the offline/Ollama-only route available.
+    assert "private-local" not in config["modes"]
+    assert "local-only" not in config["modes"]
 
 
-def test_project_config_omits_local_only_mode_without_any_local_participants():
+def test_project_config_omits_private_local_mode_without_any_local_participants():
     from llm_council.setup_wizard import project_config
 
     config = project_config(
@@ -375,7 +394,7 @@ def test_project_config_omits_local_only_mode_without_any_local_participants():
         include_local=False,
         extra_local_participants=None,
     )
-    assert "local-only" not in config["modes"]
+    assert "private-local" not in config["modes"]
 
 
 def test_write_setup_files_passes_extras_through(tmp_path: Path):
@@ -411,10 +430,8 @@ def test_write_setup_files_passes_extras_through(tmp_path: Path):
     assert "local_lmstudio_llama" in written_config["participants"]
     # The freshly-written config must validate cleanly.
     config = load_config(tmp_path / ".llm-council.yaml")
-    assert "local-only" in config["modes"]
-    assert select_participants(config, "local-only", current=None) == [
-        "local_lmstudio_llama"
-    ]
+    assert "private-local" not in config["modes"]
+    assert "local-only" not in config["modes"]
 
 
 def test_estimate_local_openai_compatible_counts_as_zero(tmp_path: Path):
@@ -441,7 +458,7 @@ participants:
     timeout: 360
 modes:
   test-local:
-    strategy: local_only_peers
+    participants: [local_vllm, local_qwen_coder]
     description: test
 """,
         encoding="utf-8",
@@ -477,24 +494,25 @@ modes:
     assert by_name["local_qwen_coder"]["pricing_source"] == "local"
 
 
-def test_local_only_mode_rejects_runtime_include_of_hosted_peer(tmp_path: Path):
-    """Regression for the v0.4.9 fix: --mode local-only --include claude
-    used to silently smuggle a hosted CLI into a "local-only" run because
+def test_private_local_mode_rejects_runtime_include_of_hosted_peer(tmp_path: Path):
+    """Regression for the v0.4.9 fix: --mode private-local --include claude
+    used to silently smuggle a hosted CLI into a private run because
     runtime include was appended after strategy selection. Now the
     selector hard-fails with a clear error."""
-    config = load_config(None)
+    config = load_config(None, search=False)
     with pytest.raises(ValueError, match="local_only_peers"):
         select_participants(
             config,
-            "local-only",
+            "private-local",
             current="claude",
             include=["claude"],
         )
 
 
-def test_local_only_mode_allows_runtime_include_of_local_peer(tmp_path: Path):
-    """Counterpart to the rejection test: --include of an additional
-    local participant is fine."""
+def test_private_local_mode_rejects_runtime_include_of_openai_gateway(
+    tmp_path: Path,
+):
+    """Loopback alone cannot prove an OpenAI-compatible gateway is offline."""
     config_path = tmp_path / ".llm-council.yaml"
     config_path.write_text(
         """
@@ -511,13 +529,13 @@ participants:
         encoding="utf-8",
     )
     config = load_config(config_path)
-    selected = select_participants(
-        config,
-        "local-only",
-        current=None,
-        include=["local_vllm"],
-    )
-    assert "local_vllm" in selected
+    with pytest.raises(ValueError, match="refuses.*local_vllm"):
+        select_participants(
+            config,
+            "private-local",
+            current=None,
+            include=["local_vllm"],
+        )
 
 
 def test_is_loopback_base_url_excludes_rfc1918():
@@ -527,7 +545,8 @@ def test_is_loopback_base_url_excludes_rfc1918():
     assert is_loopback_base_url("http://localhost:8000/v1") is True
     assert is_loopback_base_url("http://127.0.0.1:8000/v1") is True
     assert is_loopback_base_url("http://[::1]:8000/v1") is True
-    assert is_loopback_base_url("http://0.0.0.0:8000/v1") is True
+    assert is_loopback_base_url("http://0.0.0.0:8000/v1") is False
+    assert is_loopback_base_url("http://[::]:8000/v1") is False
 
     # RFC1918 — emphatically not loopback.
     assert is_loopback_base_url("http://10.0.0.5:8000/v1") is False
@@ -719,26 +738,32 @@ def test_prompt_arg_is_redacted_and_literal_braces_are_safe(tmp_path: Path):
 
 def test_plan_mode_adds_deepseek(monkeypatch):
     config = load_config(None)
-    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "agy" else None)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/bin/{name}" if name in {"claude", "codex", "agy"} else None,
+    )
     selected = select_participants(config, "plan", "claude")
     assert selected == ["claude", "codex", "antigravity", "deepseek_v4_pro"]
 
 
 def test_deliberate_mode_adds_deepseek_and_marks_expensive(monkeypatch):
     config = load_config(None)
-    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "agy" else None)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/bin/{name}" if name in {"claude", "codex", "agy"} else None,
+    )
     selected = select_participants(config, "deliberate", "claude")
     assert selected == ["claude", "codex", "antigravity", "deepseek_v4_pro"]
     assert config["modes"]["deliberate"]["deliberate"] is True
 
 
 # ---------------------------------------------------------------------------
-# local-only mode (strategy: local_only_peers)
+# private-local mode (strategy: local_only_peers)
 # ---------------------------------------------------------------------------
 
 
-def test_local_only_mode_picks_up_default_ollama_participant():
-    """The shipped `local-only` mode should resolve to the built-in
+def test_private_local_mode_picks_up_default_ollama_participant():
+    """The shipped `private-local` mode should resolve to the built-in
     Ollama-backed participant on a clean default config — no extra wiring
     needed.
 
@@ -750,24 +775,24 @@ def test_local_only_mode_picks_up_default_ollama_participant():
     discovery.
     """
     config = load_config(None, search=False)
-    assert "local-only" in config["modes"]
-    selected = select_participants(config, "local-only", current=None)
+    assert "private-local" in config["modes"]
+    assert "local-only" not in config["modes"]
+    selected = select_participants(config, "private-local", current=None)
     assert selected == ["local_qwen_coder"]
 
 
-def test_local_only_mode_excludes_native_clis_even_when_current(tmp_path: Path):
+def test_private_local_mode_excludes_native_clis_even_when_current(tmp_path: Path):
     """The host CLI (claude/codex/gemini) is never local in this sense — its
-    inference is hosted. `local-only` must not reach for the current agent."""
-    config = load_config(None)
-    selected = select_participants(config, "local-only", current="claude")
+    inference is hosted. `private-local` must not reach for the current agent."""
+    config = load_config(None, search=False)
+    selected = select_participants(config, "private-local", current="claude")
     assert "claude" not in selected
     assert "codex" not in selected
     assert "gemini" not in selected
 
 
-def test_local_only_mode_includes_local_openai_compatible(tmp_path: Path):
-    """A user-defined `type: openai_compatible` participant on loopback should
-    be selected. A hosted one (api.together.xyz) must be filtered out."""
+def test_private_local_mode_excludes_local_openai_compatible(tmp_path: Path):
+    """Loopback OpenAI-compatible gateways require an explicit custom mode."""
     config_path = tmp_path / ".llm-council.yaml"
     config_path.write_text(
         """
@@ -788,18 +813,24 @@ participants:
     family: qwen
     origin: "China / Alibaba Qwen"
     api_key_env: TOGETHER_API_KEY
+modes:
+  explicit-local:
+    participants: [local_vllm]
 """,
         encoding="utf-8",
     )
     config = load_config(config_path)
-    selected = select_participants(config, "local-only", current=None)
-    assert "local_vllm" in selected
+    selected = select_participants(config, "private-local", current=None)
+    assert "local_vllm" not in selected
     assert "local_qwen_coder" in selected  # default Ollama entry
     assert "hosted_together" not in selected
+    assert select_participants(config, "explicit-local", current=None) == [
+        "local_vllm"
+    ]
 
 
-def test_local_only_mode_includes_localhost_hostname(tmp_path: Path):
-    """Hostname `localhost` must qualify just like the literal `127.0.0.1`."""
+def test_private_local_mode_excludes_localhost_openai_gateway(tmp_path: Path):
+    """Even a localhost OpenAI-compatible endpoint may relay upstream."""
     config_path = tmp_path / ".llm-council.yaml"
     config_path.write_text(
         """
@@ -816,14 +847,14 @@ participants:
         encoding="utf-8",
     )
     config = load_config(config_path)
-    selected = select_participants(config, "local-only", current=None)
-    assert "local_lmstudio" in selected
+    selected = select_participants(config, "private-local", current=None)
+    assert "local_lmstudio" not in selected
+    assert "local_qwen_coder" in selected
 
 
-def test_local_only_mode_includes_rfc1918_ip(tmp_path: Path):
-    """A private-network IP (e.g., `10.0.0.5`) should qualify — covers the
-    homelab/on-prem case where the inference server is on the LAN, not the
-    same machine."""
+def test_private_local_mode_excludes_rfc1918_ip(tmp_path: Path):
+    """A LAN endpoint still leaves this machine and cannot satisfy the
+    `private-local` boundary, even when it is private/on-prem."""
     config_path = tmp_path / ".llm-council.yaml"
     config_path.write_text(
         """
@@ -840,12 +871,13 @@ participants:
         encoding="utf-8",
     )
     config = load_config(config_path)
-    selected = select_participants(config, "local-only", current=None)
-    assert "homelab_vllm" in selected
+    selected = select_participants(config, "private-local", current=None)
+    assert "homelab_vllm" not in selected
+    assert "local_qwen_coder" in selected
 
 
-def test_local_only_mode_errors_when_no_local_participants():
-    """If a config has no local participants at all, `local-only` must
+def test_private_local_mode_errors_when_no_local_participants():
+    """If a config has no local participants at all, `private-local` must
     produce a clear error naming the strategy — not silently degrade to
     empty."""
     # Construct a minimal hosted-only config directly. `load_config` would
@@ -863,14 +895,14 @@ def test_local_only_mode_errors_when_no_local_participants():
             },
         },
         "modes": {
-            "local-only": {
+            "private-local": {
                 "strategy": "local_only_peers",
                 "description": "test",
             },
         },
     }
     with pytest.raises(ValueError, match="local_only_peers"):
-        select_participants(config, "local-only", current=None)
+        select_participants(config, "private-local", current=None)
 
 
 def test_local_only_strategy_rejects_include_current(tmp_path: Path):
@@ -1228,7 +1260,10 @@ def test_explicit_participants_respect_origin_policy_with_clear_error():
 
 def test_us_origin_policy_filters_non_us_additions(monkeypatch):
     config = load_config(None)
-    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "agy" else None)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/bin/{name}" if name in {"claude", "codex", "agy"} else None,
+    )
     selected = select_participants(config, "diverse", "codex", origin_policy="us")
     assert selected == ["claude", "codex", "antigravity"]
 
@@ -1356,7 +1391,10 @@ def test_consensus_mode_default_assigns_for_against_neutral():
 
 def test_consensus_mode_select_participants_returns_full_triad(monkeypatch):
     config = load_config(None)
-    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "agy" else None)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/bin/{name}" if name in {"claude", "codex", "agy"} else None,
+    )
     selected = select_participants(config, "consensus", "claude")
     assert selected == ["claude", "codex", "antigravity"]
 
@@ -3536,7 +3574,10 @@ def test_claude_4_6_cli_command_pins_model_via_flag():
 
 def test_quick_mode_can_include_pinned_opus_variant_via_include(monkeypatch):
     config = load_config(None)
-    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "agy" else None)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/bin/{name}" if name in {"claude", "codex", "agy"} else None,
+    )
     selected = select_participants(
         config, "quick", current="claude", include=["claude_4_6"]
     )
@@ -5059,6 +5100,8 @@ participants:
     type: openrouter
     model: openai/gpt-4o-mini
     api_key_env: X
+    input_per_million: 0.15
+    output_per_million: 0.60
 modes:
   review-cheap:
     participants: [cheap]
@@ -5276,6 +5319,7 @@ def test_example_config_loads_exact_modes():
         "claude",
         "codex",
         "gemini",
+        "antigravity",
         "deepseek_v4_pro",
         "qwen_coder_plus",
     }
@@ -5400,7 +5444,7 @@ def test_setup_yes_auto_selects_tri_cli_when_native_clis_exist(
     tmp_path: Path, monkeypatch, capsys
 ):
     def fake_which(name: str):
-        return f"/usr/bin/{name}" if name in {"claude", "codex"} else None
+        return f"/usr/bin/{name}" if name in {"claude", "gemini"} else None
 
     monkeypatch.setattr(cli_module.shutil, "which", fake_which)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -5525,7 +5569,9 @@ def test_setup_yes_allow_incomplete_writes_blocked_preset(
     assert "deepseek_v4_flash" in config["participants"]
 
 
-def test_setup_prints_next_steps_and_cli_warnings(tmp_path: Path, monkeypatch, capsys):
+def test_setup_prints_next_steps_without_warning_for_optional_primary(
+    tmp_path: Path, monkeypatch, capsys
+):
     def fake_which(name: str):
         return None if name == "claude" else f"/usr/bin/{name}"
 
@@ -5549,8 +5595,8 @@ def test_setup_prints_next_steps_and_cli_warnings(tmp_path: Path, monkeypatch, c
     assert "AGENTS.md" in output
     assert "GEMINI.md" in output
     assert "Run `llm-council doctor`" in output
-    assert "Warnings:" in output
-    assert "claude was not found on PATH" in output
+    assert "Warnings:" not in output
+    assert "claude was not found on PATH" not in output
 
 
 def test_setup_writes_config_mcp_and_instructions(tmp_path: Path):
@@ -5573,7 +5619,7 @@ def test_setup_writes_config_mcp_and_instructions(tmp_path: Path):
 def test_mcp_config_does_not_embed_openrouter_env_reference(tmp_path: Path):
     config = mcp_config(tmp_path)
     env = config["mcpServers"]["llm-council"]["env"]
-    assert env["PYTHONPATH"] == str(tmp_path.resolve())
+    assert "PYTHONPATH" not in env
     assert env["LLM_COUNCIL_MCP_ROOT"] == str(tmp_path.resolve())
     assert "OPENROUTER_API_KEY" not in env
 
@@ -5675,7 +5721,12 @@ def test_doctor_does_not_require_optional_ollama(monkeypatch):
     ]
     monkeypatch.setattr(cli_module, "check_environment", lambda *args, **kwargs: checks)
     monkeypatch.setattr(cli_module, "load_project_env", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(cli_module, "load_config", lambda *_args, **_kwargs: {})
+    config = {
+        "defaults": {"mode": "quick"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {"quick": {"participants": ["claude"]}},
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_args, **_kwargs: config)
     args = argparse.Namespace(
         config=None,
         json=False,
@@ -5694,7 +5745,12 @@ def test_doctor_requires_python_mcp(monkeypatch):
     ]
     monkeypatch.setattr(cli_module, "check_environment", lambda *args, **kwargs: checks)
     monkeypatch.setattr(cli_module, "load_project_env", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(cli_module, "load_config", lambda *_args, **_kwargs: {})
+    config = {
+        "defaults": {"mode": "quick"},
+        "participants": {"claude": {"type": "cli", "command": "claude"}},
+        "modes": {"quick": {"participants": ["claude"]}},
+    }
+    monkeypatch.setattr(cli_module, "load_config", lambda *_args, **_kwargs: config)
     args = argparse.Namespace(
         config=None,
         json=False,
@@ -11428,6 +11484,8 @@ def test_transcripts_prune_dry_run(tmp_path: Path, capsys):
     captured = capsys.readouterr().out
     assert rc == 0
     assert "would remove" in captured
+    assert "re-run with --delete" in captured
+    assert "--apply" not in captured
     # Nothing actually deleted in dry-run.
     assert sorted(p.name for p in out_dir.glob("*.json")) == ["a.json", "b.json", "c.json"]
 
@@ -11497,6 +11555,8 @@ participants:
     type: openrouter
     model: openai/gpt-4o-mini
     api_key_env: X
+    input_per_million: 0.15
+    output_per_million: 0.60
 modes:
   review-cheap:
     participants: [cheap]

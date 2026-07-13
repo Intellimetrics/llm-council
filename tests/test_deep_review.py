@@ -556,15 +556,18 @@ def test_deep_review_html_transcript_generation(tmp_path):
 def test_deep_review_git_hook_installer(tmp_path):
     from llm_council.cli import cmd_install_hook
     import argparse
-    
-    # Set up mock git dir
+    import subprocess
+
+    # Use a real repository so the installer exercises git's hook-path
+    # resolution (the same path also works for linked worktrees).
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     git_dir = tmp_path / ".git"
-    git_dir.mkdir()
-    
+
     args = argparse.Namespace(
         root=str(tmp_path),
         hook_type="pre-commit",
-        mode="consensus"
+        mode="consensus",
+        force=False,
     )
     
     exit_code = cmd_install_hook(args)
@@ -886,7 +889,6 @@ modes:
         
         # Verify webbrowser.open was called
         assert mock_open.call_count == 1
-
 
 
 

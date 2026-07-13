@@ -204,30 +204,32 @@ def test_drop_missing_key_participants_drops_openai_compatible_with_explicit_env
     assert dropped[0]["api_key_env"] == "EXPLICIT_OPENAI_COMPAT_KEY"
 
 
-def test_drop_missing_key_participants_skips_openai_compatible_without_explicit_env(
+def test_drop_missing_key_participants_uses_default_for_openai_compatible_without_explicit_env(
     monkeypatch,
 ):
-    """v0.12.2 fix: openai_compatible peers WITHOUT api_key_env must NOT be
-    pre-dropped — the OPENROUTER_API_KEY default would falsely-drop a
-    local server (e.g. vLLM on loopback) that legitimately doesn't need
-    auth. Defer to the adapter, which surfaces its own `Missing X` error
-    if a key was actually required."""
+    """The OpenAI-compatible adapter requires a key even for loopback and
+    defaults an omitted api_key_env to OPENROUTER_API_KEY. Pre-drop must use
+    that same contract instead of letting an unrunnable peer reach quorum."""
     import os as _os
     from llm_council.orchestrator import _drop_missing_key_participants
 
-    # Ensure even the legacy OPENROUTER_API_KEY default is unset — the
-    # peer must stay active regardless.
     _os.environ.pop("OPENROUTER_API_KEY", None)
     cfg = {
         "local_vllm": {
             "type": "openai_compatible",
             "base_url": "http://127.0.0.1:8000/v1",
-            # No api_key_env: this is a local server, no auth expected.
+            # No api_key_env: adapter uses OPENROUTER_API_KEY.
         },
     }
     active, dropped = _drop_missing_key_participants(["local_vllm"], cfg)
-    assert active == ["local_vllm"]
-    assert dropped == []
+    assert active == []
+    assert dropped == [
+        {
+            "peer": "local_vllm",
+            "family": "local_vllm",
+            "api_key_env": "OPENROUTER_API_KEY",
+        }
+    ]
 
 
 def test_drop_missing_key_participants_keeps_openai_compatible_with_env_set(

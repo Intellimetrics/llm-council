@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
-import os
 import shutil
+import subprocess
+from collections.abc import Collection
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
+from llm_council.adapters import (
+    ERROR_KIND_CLIENT_INELIGIBLE,
+    _build_cli_command,
+    classify_error,
+    clean_subprocess_env,
+)
+from llm_council.config import participant_api_key_env
+from llm_council.env import env_get
 from llm_council.model_catalog import (
     openrouter_cache_age_seconds,
     openrouter_cache_path,
@@ -22,6 +32,8 @@ CATALOG_STALE_SECONDS_DEFAULT = 14 * 24 * 60 * 60
 # can't stall the doctor for half a minute. On failure we fall through to a
 # stale-warning Check, so the user still gets a usable report.
 CATALOG_AUTO_REFRESH_TIMEOUT_SECONDS = 10.0
+NATIVE_CLI_PROBE_TIMEOUT_SECONDS = 15.0
+NATIVE_CLI_PROBE_MAX_TIMEOUT_SECONDS = 30.0
 
 # Well-known local OpenAI-compatible inference servers. Listed in order of
 # rough popularity; the doctor port-scan iterates this list.
@@ -45,6 +57,123 @@ class Check:
     name: str
     ok: bool
     detail: str
+    error_kind: str | None = None
+    suggested_fallback: str | None = None
+
+
+def _native_probe_requested(
+    probe_native: bool | Collection[str], name: str
+) -> bool:
+    if probe_native is True:
+        return True
+    if not probe_native:
+        return False
+    if isinstance(probe_native, str):
+        return probe_native == name
+    return name in probe_native
+
+
+def _probe_error_excerpt(text: str, *, limit: int = 240) -> str:
+    collapsed = " ".join((text or "").split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 1] + "…"
+
+
+def probe_native_cli(
+    name: str,
+    cfg: dict[str, Any],
+    *,
+    cwd: Path | None = None,
+    suggested_fallback: str | None = None,
+) -> Check:
+    """Run a tiny, explicitly requested native-CLI auth/readiness probe.
+
+    The normal doctor remains PATH-only and makes no model calls. This probe
+    intentionally invokes the configured command because Gemini's known
+    ``UNSUPPORTED_CLIENT`` state is account-dependent and is not exposed by
+    ``--version``. Runtime is hard-capped even when config requests more.
+    """
+
+    command_name = str(cfg.get("command") or name)
+    if not shutil.which(command_name):
+        return Check(
+            name=f"probe:cli:{name}",
+            ok=False,
+            detail=f"skipped because {command_name} is not on PATH",
+            error_kind="cli_not_found",
+        )
+    prompt = "Readiness probe. Reply with only: OK"
+    probe_cwd = (cwd or Path.cwd()).resolve()
+    command = _build_cli_command(name, cfg, prompt, probe_cwd)
+    timeout = min(
+        max(
+            float(
+                cfg.get("doctor_probe_timeout")
+                or NATIVE_CLI_PROBE_TIMEOUT_SECONDS
+            ),
+            1.0,
+        ),
+        NATIVE_CLI_PROBE_MAX_TIMEOUT_SECONDS,
+    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(probe_cwd),
+            env=clean_subprocess_env(
+                cfg.get("env_passthrough"),
+                strict=bool(cfg.get("env_strict", False)),
+            ),
+            input=prompt if cfg.get("stdin_prompt") else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return Check(
+            name=f"probe:cli:{name}",
+            ok=False,
+            detail=f"readiness probe timed out after {timeout:g}s",
+            error_kind="timeout",
+        )
+    except Exception as exc:  # noqa: BLE001 - doctor must report, not abort
+        return Check(
+            name=f"probe:cli:{name}",
+            ok=False,
+            detail=f"{type(exc).__name__}: {exc}",
+            error_kind="probe_failed",
+        )
+
+    if completed.returncode == 0:
+        return Check(
+            name=f"probe:cli:{name}",
+            ok=True,
+            detail="authenticated invocation succeeded",
+        )
+
+    error_text = (completed.stderr or completed.stdout or "").strip()
+    error_kind = classify_error(error_text) or "unknown"
+    if error_kind == ERROR_KIND_CLIENT_INELIGIBLE:
+        fallback_note = (
+            f"; configured fallback {suggested_fallback!r} is available"
+            if suggested_fallback
+            else ""
+        )
+        detail = (
+            "Gemini authentication rejected this CLI client "
+            f"(UNSUPPORTED_CLIENT){fallback_note}"
+        )
+    else:
+        excerpt = _probe_error_excerpt(error_text) or "no stderr output"
+        detail = f"exit {completed.returncode}: {excerpt}"
+    return Check(
+        name=f"probe:cli:{name}",
+        ok=False,
+        detail=detail,
+        error_kind=error_kind,
+        suggested_fallback=suggested_fallback,
+    )
 
 
 def _is_openrouter_participant(cfg: dict[str, Any]) -> bool:
@@ -67,6 +196,8 @@ def check_environment(
     *,
     probe_openrouter: bool = False,
     probe_ollama: bool = False,
+    probe_native: bool | Collection[str] = False,
+    probe_cwd: Path | None = None,
 ) -> list[Check]:
     checks: list[Check] = []
     participants = config.get("participants", {})
@@ -80,19 +211,43 @@ def check_environment(
             Check(
                 name=f"cli:{name}",
                 ok=bool(resolved),
-                detail=resolved or f"{command} not found on PATH",
+                detail=(
+                    f"{resolved} (executable found; authentication not probed)"
+                    if resolved
+                    else f"{command} not found on PATH"
+                ),
             )
         )
+        if resolved and _native_probe_requested(probe_native, name):
+            suggested_fallback = None
+            if cfg.get("family") == "gemini":
+                fallback_cfg = participants.get("antigravity") or {}
+                fallback_command = str(
+                    fallback_cfg.get("command") or "antigravity"
+                )
+                if (
+                    fallback_cfg.get("type") == "cli"
+                    and shutil.which(fallback_command)
+                ):
+                    suggested_fallback = "antigravity"
+            checks.append(
+                probe_native_cli(
+                    name,
+                    cfg,
+                    cwd=probe_cwd,
+                    suggested_fallback=suggested_fallback,
+                )
+            )
 
-    openrouter_envs = sorted(
+    api_key_envs = sorted(
         {
-            str(cfg.get("api_key_env") or "OPENROUTER_API_KEY")
+            key_env
             for cfg in participants.values()
-            if _is_openrouter_participant(cfg)
+            if (key_env := participant_api_key_env(cfg)) is not None
         }
     )
-    for key_env in openrouter_envs:
-        api_key = os.environ.get(key_env)
+    for key_env in api_key_envs:
+        api_key = env_get(key_env)
         checks.append(
             Check(
                 name=f"env:{key_env}",
@@ -100,11 +255,19 @@ def check_environment(
                 detail="set" if api_key else "not set",
             )
         )
+    openrouter_envs = sorted(
+        {
+            key_env
+            for cfg in participants.values()
+            if _is_openrouter_participant(cfg)
+            and (key_env := participant_api_key_env(cfg)) is not None
+        }
+    )
     if openrouter_envs:
         checks.append(_check_openrouter_catalog_age(config))
         if probe_openrouter:
             key_env = openrouter_envs[0]
-            checks.append(_probe_openrouter(os.environ.get(key_env), key_env=key_env))
+            checks.append(_probe_openrouter(env_get(key_env), key_env=key_env))
 
     if any(cfg.get("type") == "ollama" for cfg in participants.values()):
         resolved = shutil.which("ollama")
@@ -123,7 +286,14 @@ def check_environment(
                 (ollama_cfgs[0] if ollama_cfgs else {}).get("base_url")
                 or "http://localhost:11434"
             )
-            checks.append(_probe_ollama(base_url))
+            expected_models = [
+                str(cfg.get("model"))
+                for cfg in ollama_cfgs
+                if cfg.get("model")
+                and str(cfg.get("base_url") or "http://localhost:11434").rstrip("/")
+                == base_url.rstrip("/")
+            ]
+            checks.append(_probe_ollama(base_url, expected_models=expected_models))
 
     try:
         import mcp  # noqa: F401
@@ -251,13 +421,42 @@ def _probe_openrouter(
         )
 
 
-def _probe_ollama(base_url: str) -> Check:
+def _probe_ollama(
+    base_url: str, *, expected_models: list[str] | None = None
+) -> Check:
     root = base_url.rstrip("/")
     try:
         response = httpx.get(f"{root}/api/tags", timeout=5)
         if response.status_code == 200:
-            count = len((response.json() or {}).get("models", []))
-            return Check(name="probe:ollama", ok=True, detail=f"{count} models")
+            records = (response.json() or {}).get("models", [])
+            installed = {
+                str(record.get("name") or record.get("model"))
+                for record in records
+                if isinstance(record, dict)
+                and (record.get("name") or record.get("model"))
+            }
+            missing = [
+                model
+                for model in expected_models or []
+                if model not in installed
+                and not (
+                    ":" not in model
+                    and any(name.startswith(f"{model}:") for name in installed)
+                )
+            ]
+            if missing:
+                return Check(
+                    name="probe:ollama",
+                    ok=False,
+                    detail=(
+                        "configured model(s) not installed: "
+                        + ", ".join(sorted(set(missing)))
+                        + f"; server reports {len(installed)} model(s)"
+                    ),
+                )
+            return Check(
+                name="probe:ollama", ok=True, detail=f"{len(installed)} models"
+            )
         return Check(
             name="probe:ollama", ok=False, detail=f"HTTP {response.status_code}"
         )
@@ -452,7 +651,16 @@ def probe_local_openai(base_url: str | None) -> list[Check]:
 
 
 def checks_to_dict(checks: list[Check]) -> list[dict[str, object]]:
-    return [
-        {"name": check.name, "ok": check.ok, "detail": check.detail}
-        for check in checks
-    ]
+    rendered: list[dict[str, object]] = []
+    for check in checks:
+        item: dict[str, object] = {
+            "name": check.name,
+            "ok": check.ok,
+            "detail": check.detail,
+        }
+        if check.error_kind is not None:
+            item["error_kind"] = check.error_kind
+        if check.suggested_fallback is not None:
+            item["suggested_fallback"] = check.suggested_fallback
+        rendered.append(item)
+    return rendered

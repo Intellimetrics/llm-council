@@ -3,15 +3,15 @@
 [![Tests](https://github.com/Intellimetrics/llm-council/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/Intellimetrics/llm-council/actions/workflows/test.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776ab?logo=python&logoColor=white)](pyproject.toml)
 [![MCP](https://img.shields.io/badge/MCP-ready-2f855a)](docs/llm-council.md)
-[![Read-only](https://img.shields.io/badge/default-read--only-6b7280)](#read-only-safety)
+[![Source read-only peers](https://img.shields.io/badge/peers-source--read--only-6b7280)](#read-only-safety)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.16.0-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.17.0-111827)](CHANGELOG.md)
 
 Your coding agent is incredibly fast, capable, and confident. 
 
 That is highly valuable—until it confidently overwrites a critical database migration, introduces a subtle security vulnerability, or refactors a complex module it wasn't supposed to touch.
 
-**LLM Council** is a lightweight, read-only multi-agent orchestration harness designed to give your primary coding agent a fast, independent second opinion before committing to risky changes or expensive edits. It runs as a Python 3.11+ MCP server and command-line tool.
+**LLM Council** is a lightweight, source-read-only multi-agent orchestration harness designed to give your primary coding agent a fast, independent second opinion before committing to risky changes or expensive edits. Peers cannot edit project source; the host still writes council-owned transcripts, caches, and explicitly requested configuration. It runs as a Python 3.11+ MCP server and command-line tool.
 
 ---
 
@@ -26,14 +26,15 @@ graph TD
     Server -- "2. Parse prompt / git diff" --> Orchestrator[Orchestrator]
     Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerA[Peer A: Claude]
     Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerB[Peer B: Codex]
-    Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerC[Peer C: Gemini]
+    Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerC[Peer C: Gemini-family CLI]
     PeerA -- "4. YES/NO/TRADEOFF" --> Consensus[Consensus Evaluator]
     PeerB -- "4. YES/NO/TRADEOFF" --> Consensus
     PeerC -- "4. YES/NO/TRADEOFF" --> Consensus
-    Consensus -- "5. Compile stances" --> Synth[Synthesis Chair]
-    Synth -- "6. Generate Memo & Markdown/HTML dashboard" --> Out[Output Handler]
-    Out -- "7. Auto-open HTML Dashboard (webbrowser)" --> Browser([Default Browser])
-    Out -- "8. Structured JSON & Summary" --> Agent
+    Consensus -- "5. Write Markdown/HTML transcript" --> Out[Output Handler]
+    Consensus -. "Optional: --synthesize" .-> Synth[Synthesis Chair]
+    Synth -. "Decision memo" .-> Out
+    Out -. "Optional: --open or config" .-> Browser([Default Browser])
+    Out -- "6. Structured JSON & Summary" --> Agent
 ```
 
 ---
@@ -44,14 +45,14 @@ graph TD
     *   `RECOMMENDATION: yes` — Safe to proceed.
     *   `RECOMMENDATION: no` — Stop; major issues detected.
     *   `RECOMMENDATION: tradeoff` — Plausible, but note critical trade-offs.
-*   **Assigned-Stance Debates**: Support for multi-round refutation and debates (`consensus` mode) where one peer defends, one opposes, and one remains neutral, followed by a compilation from the **Synthesis Chair**.
-*   **Family Exclusion Routing**: Automatically detects the active agent running the session and excludes models from the same family (e.g., Gemini-family) from the peer pool to maximize reviewer diversity.
+*   **Assigned-Stance Review**: `consensus` assigns for/against/neutral stances in the first round. Add `--deliberate` for multi-round critique and `--synthesize` for an optional **Synthesis Chair** decision memo.
+*   **Host-Aware Routing**: Detects the active developer agent. `quick` includes that host for an explicit council pass; `peer-only` excludes the host's family when the user wants only outside perspectives.
 *   **Rigorous Sandboxing & Read-Only Safety**: Native CLI peers are invoked with binary-level flags disabling file writes (`--permission-mode default` for Claude, `--sandbox read-only` for Codex).
 *   **Cost Controls & Caching**: Pre-flight token and USD cost estimation (`llm-council estimate`) plus response caching prevents unexpected hosted API charges. A hard `--max-cost-usd` / `--max-tokens` gate refuses a run before launch; an optional soft `cost_warn_usd` tier warns (but never blocks) when an estimate gets pricey, and an optional `litellm` fallback prices hosted models missing from the OpenRouter catalog.
 *   **Credential Secret Scanning**: Scans all prompt content for API keys, tokens, or private keys, with configurable responses (`warn`, `block`, `redact`, or `off`).
-*   **Auto-Opening HTML Dashboard**: Automatically generates a beautifully formatted HTML dashboard of the run and opens it in your default web browser upon completion.
+*   **HTML Transcript**: Every run generates a formatted HTML transcript. Opening it in the default browser is opt-in through `--open` or `defaults.auto_open_browser: true`.
 *   **Anti-Herding Deliberation**: Round-2 deliberation asks peers to converge toward what is *correct* rather than toward agreement — no capitulating to the group, no digging in out of consistency bias — and to critique each other rather than re-defend their own prior answer (mitigating the multi-agent-debate herding failure mode).
-*   **Dissent-Preserving Synthesis**: The Synthesis Chair attributes consensus blockers to the peers who raised them, narrates how positions moved across rounds, and names genuine remaining disagreement instead of papering over it — minority signal is never silently merged away.
+*   **Dissent-Preserving Synthesis** *(opt-in)*: With `--synthesize`, the Synthesis Chair attributes blockers to the peers who raised them, narrates position changes, and names genuine remaining disagreement instead of papering it over.
 *   **Cross-Vendor Independence Warning** *(opt-in)*: When every labeled vote comes from a single vendor family, the council flags it (`min_distinct_vendors`) so correlated same-vendor agreement isn't mistaken for independent corroboration.
 *   **Contract-Scoped & Independent Review** *(opt-in)*: Anchor a review on numbered acceptance criteria (`--acceptance-contract`) so only real violations block, and suppress prior-round verdicts on a continuation (`--independent-review`) so re-reviews aren't anchored to past opinions.
 *   **Observable Per-CLI Usage** *(opt-in)*: `usage_from_json` reads real token counts and cost from the Claude/Codex JSON output modes — recovering usage telemetry that is otherwise invisible for native CLI peers — while preserving the read-only invocation.
@@ -63,7 +64,7 @@ graph TD
 Even if you only have access to a single LLM (due to offline constraints, local setup, or API key limits), running a council session provides substantial value:
 
 1.  **Fresh Eyes / Context Separation**: In a typical developer agent session, the context window accumulates tools, history, and reasoning, leading to confirmation bias. The council calls a fresh, isolated API process containing *only* the diff and prompt, forcing a clean evaluation.
-2.  **Persona & State Splitting**: By invoking multiple calls to the same model concurrently with different persona prompts (e.g., Peer A as the *Attacker*, Peer B as the *Defender*, Peer C as the *Judge*), you isolate their states. The model cannot see its own arguments from the other perspective until the synthesis phase.
+2.  **Persona & State Splitting**: By invoking multiple calls to the same model concurrently with different persona prompts (e.g., Peer A as the *Attacker*, Peer B as the *Defender*, Peer C as the *Judge*), you isolate their states. Peers see one another's arguments only if deliberation or synthesis is enabled.
 3.  **Adversarial Extraction**: Forcing the model to adopt contrarian stances (e.g. "Find 3 security flaws in this diff") bypasses its default cooperative/agreeable bias, extracting a deeper critique than a standard prompt.
 
 ---
@@ -95,18 +96,18 @@ Navigate to your active project repository and initialize the council:
 cd /path/to/your/project
 llm-council setup --plan
 llm-council setup --yes --preset auto
-llm-council doctor
+llm-council doctor --probe-native --probe-ollama
 ```
 
 > [!IMPORTANT]
-> After running setup, restart your active terminal session or reload your developer agent so it detects the newly configured MCP server and project-specific instructions.
+> Setup writes host-specific snippets under `.llm-council/instructions/`; it does not edit your existing instruction files. Append the active host's full snippet to `CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`, then restart that developer-agent session so MCP and the routing rules reload. `setup` prints the exact paths.
 
 ### The 30-Second Example
 Once configured, you can talk to your primary developer agent (e.g., Claude Code, Codex, Antigravity CLI) directly in natural language:
 
 *   *"Ask the council to review my current changes before we commit."*
 *   *"Take this failing test to council. I need theory and review, not another patch."*
-*   *"Run a local-only council on this code. It cannot leave this machine."*
+*   *"Run a private-local council on this code. Route it only to my same-machine Ollama daemon."*
 
 ---
 
@@ -121,11 +122,14 @@ While most interaction happens transparently via the MCP server inside your agen
 | **`llm-council run --focus`** | Compose operator-authored review-focus bundles onto any mode (comma-separated). <br>`llm-council run --mode review --focus security-review,test-gaps --diff "Safe to merge?"` |
 | **`llm-council run --acceptance-contract`** | Anchor review on stated acceptance criteria (advisory). Pass literal text or a file path inside cwd; a finding blocks only when it violates a numbered criterion. <br>`llm-council run --mode review --acceptance-contract ./CRITERIA.md --diff "Does this meet the contract?"` |
 | **`llm-council run --independent-review`** | On a `--continue` run, suppress the prior council's verdicts/rationales so the round forms its opinion independently. <br>`llm-council run --mode review --continue 20260101_120000 --independent-review --diff "Re-review"` |
+| **`llm-council run --continue`** | Continue a prior run. A private-local parent stays private-local when mode is omitted; moving its context to hosted/native peers is refused unless `--allow-privacy-downgrade` is explicit. |
 | **`llm-council run --cost-warn-usd`** | Attach a non-fatal warning when the pre-flight estimate exceeds a threshold (complements, never replaces, the hard `--max-cost-usd` gate). <br>`llm-council run --mode consensus --cost-warn-usd 0.50 --diff "Worth a full debate?"` |
 | **`llm-council estimate`** | Calculate prompt size and costs before running; reports a `cost_class` (low/moderate/high) plus paid/free peer counts. <br>`llm-council estimate --mode consensus --diff "Should we merge this?"` |
 | **`llm-council last`** | Inspect the last run's raw transcripts. <br>`llm-council last` |
 | **`llm-council config get`** | Retrieve a configuration value. <br>`llm-council config get defaults.auto_open_browser` |
 | **`llm-council config set`** | Set a configuration value. <br>`llm-council config set defaults.auto_open_browser true` |
+| **`llm-council install-hook`** | Install a `pre-commit` or `pre-push` council gate. It validates the mode and refuses to replace an existing hook unless `--force` is explicit. <br>`llm-council install-hook --hook-type pre-push --mode consensus` |
+| **`llm-council transcripts prune`** | Preview transcript deletion under a retention policy; add `--delete` to remove the listed files. <br>`llm-council transcripts prune --keep-last 20 --delete` |
 
 ---
 
@@ -135,11 +139,12 @@ The `llm-council` server exposes the following tools to your developer agents:
 
 | MCP Tool Name | Description / Inputs |
 | :--- | :--- |
-| **`council_run`** | Run a council query with custom modes, context files, and optional diffs. Supports `open: true` to auto-launch the HTML dashboard, `focus: ["security-review", ...]` to compose review-focus bundles, `acceptance_contract: "<text or path>"` to gate blockers on numbered criteria, `independent_review: true` to suppress prior-council context on a continuation run, and `cost_warn_usd` for a non-fatal cost heads-up. Surfaces advisory signals in the result when present (`independence_warning`, `cost_warning`, `cost_estimate`, `applied_focus`). |
+| **`council_run`** | Run a council query with custom modes, context files, and optional diffs. Supports `open: true` to open the HTML transcript, `focus: ["security-review", ...]` to compose review-focus bundles, `acceptance_contract: "<text or path>"` to gate blockers on numbered criteria, `independent_review: true` to suppress prior-council context on a continuation run, and `cost_warn_usd` for a non-fatal cost heads-up. Surfaces advisory signals in the result when present (`independence_warning`, `cost_warning`, `cost_estimate`, `applied_focus`). |
 | **`council_estimate`** | Check token sizes and estimated OpenRouter cost before launching. |
 | **`council_recommend`** | Evaluates a task, risk level, and files touched to recommend whether to consult the council. Also returns a mechanical `difficulty_class` and the matched trigger keywords (`suggested_mode_reason_codes`), an optional LLM-graded `judge` verdict when `recommend_judge` is configured, and a reliability-based `peers_to_consider_dropping` advisory drawn from your recorded outcomes. |
 | **`council_doctor`** | Diagnoses connection issues, API key status, and CLI path resolution. |
-| **`council_list_modes`** | Lists configured modes, presets, and active peers. |
+| **`council_models`** | Lists the cached OpenRouter model catalog. |
+| **`council_list_modes`** | Lists configured runtime modes and participants. |
 | **`council_last_transcript`** | Returns the path and content of the last recorded run. |
 | **`council_stats`** | Aggregates participant metrics (run count, success, tokens, cost) across recorded transcripts. |
 | **`council_query_transcripts`** | Searches past transcript history for similar reviews. |
@@ -153,14 +158,23 @@ The setup wizard (`llm-council setup --plan`) automatically probes your environm
 
 | Preset | Description / Use Case |
 | :--- | :--- |
-| `auto` | Automatically selects the best mix of local CLIs, hosted keys, and local models. |
-| `tri-cli` | Resolves a local 3-member triad (Claude Code, Codex CLI, and Antigravity CLI or Gemini CLI). |
+| `auto` | Selects `tri-cli` when a Gemini-family CLI and at least one Claude/Codex CLI are available; otherwise selects `openrouter` when its key is set. |
+| `tri-cli` | Configures native CLI participants from the Claude/Codex and Gemini families. Runtime routing prefers Antigravity for current-client compatibility; its read-only posture is prompt-enforced, so select Gemini explicitly when its harder plan-mode boundary is available. |
 | `openrouter` | Uses hosted API models through a single OpenRouter key. |
-| `tri-cli-openrouter` | Runs local CLIs with hosted fallback or additional variety. |
-| `local-private` | Strict offline-only review using local Ollama instances. |
-| `all` | Configures every discovered route on the host machine. |
+| `tri-cli-openrouter` | Configures native CLI and hosted OpenRouter participants. |
+| `private-local` | Configures Ollama-only participants, excludes hosted and native CLI participants, and makes `private-local` the generated default mode. |
+| `all` | Configures every discovered participant route on the host machine. |
 
-Custom presets, modes, and default options can be configured directly in `.llm-council.yaml`.
+Custom participants, runtime modes, and default options can be configured directly in `.llm-council.yaml`.
+Older `local-private` setup commands and `local-only` runtime commands remain
+accepted as deprecated aliases; new output and generated config use
+`private-local`.
+
+`private-local` connects only to an HTTP(S) loopback Ollama endpoint and
+ignores proxy environment variables for that connection. It does not sandbox
+or firewall the Ollama daemon itself; for a hard offline guarantee, run Ollama
+with OS/network egress disabled and configure it to use only local model
+artifacts.
 
 ### Advisory configuration knobs
 

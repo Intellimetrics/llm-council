@@ -6,6 +6,7 @@ import asyncio
 import re
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -27,7 +28,11 @@ from llm_council.cache import (
     resolve_ttl_seconds,
 )
 from llm_council.citations import verify_evidence_citations
-from llm_council.config import is_local_participant, is_loopback_base_url
+from llm_council.config import (
+    is_local_base_url,
+    is_loopback_base_url,
+    participant_api_key_env,
+)
 from llm_council.convergence import (
     MIN_TOKENS_FOR_CLASSIFICATION,
     classify,
@@ -43,9 +48,18 @@ from llm_council.deliberation import (
     recommendation_counts,
     recommendation_label,
 )
+from llm_council.env import env_get
 
 
 PREFLIGHT_TIMEOUT_SECONDS = 1.0
+
+
+def _utc_progress_timestamp() -> str:
+    """Return a compact, timezone-explicit timestamp for progress telemetry."""
+
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
 
 
 # Embedded-credential regex shared by `_redact_base_url` (for the rendered
@@ -114,7 +128,13 @@ async def _preflight_one(name: str, cfg: dict[str, Any]) -> str | None:
         return None
     redacted = _redact_base_url(base_url)
     try:
-        async with httpx.AsyncClient(timeout=PREFLIGHT_TIMEOUT_SECONDS) as client:
+        # Local/on-prem probes must never inherit HTTP(S)_PROXY: doing so could
+        # disclose the endpoint path (and, on some proxies, the request) beyond
+        # the machine/private network before the real run even starts.
+        async with httpx.AsyncClient(
+            timeout=PREFLIGHT_TIMEOUT_SECONDS,
+            trust_env=False,
+        ) as client:
             response = await client.get(url)
     except Exception as exc:  # noqa: BLE001 — surface every failure mode legibly
         # Defense-in-depth: httpx errors sometimes quote the URL they tried
@@ -156,7 +176,7 @@ async def preflight_local_participants(
         (name, participant_cfg.get(name) or {})
         for name in participants
     ]
-    # Default-on for loopback (`127.0.0.1`, `localhost`, `[::1]`, `0.0.0.0`)
+    # Default-on for loopback (`127.0.0.1`, `localhost`, `[::1]`)
     # where a 1s timeout is reasonable. Default-off for RFC1918 (`10.x`,
     # `192.168.x`, `172.16-31.x`) where a homelab/VPN endpoint might
     # legitimately take longer to respond. Users wanting to ping their LAN
@@ -165,14 +185,21 @@ async def preflight_local_participants(
     # false`.
     todo = []
     for name, cfg in candidates:
-        if not is_local_participant(cfg):
+        participant_type = cfg.get("type")
+        if participant_type not in {"ollama", "openai_compatible"}:
+            continue
+        base_url = str(
+            cfg.get("base_url")
+            or ("http://localhost:11434" if participant_type == "ollama" else "")
+        )
+        # This operational probe may also be explicitly enabled for a LAN
+        # inference server, so it intentionally uses the broader on-prem
+        # classifier. `private-local` selection uses is_local_participant's
+        # stricter loopback-only boundary instead.
+        if not is_local_base_url(base_url):
             continue
         opted_in = cfg.get("pre_flight_check")  # tri-state: True / False / None
-        is_loopback = is_loopback_base_url(str(cfg.get("base_url") or ""))
-        # Ollama's default base_url is loopback; treat type:ollama as loopback
-        # for preflight purposes when its base_url is omitted/local.
-        if cfg.get("type") == "ollama" and not cfg.get("base_url"):
-            is_loopback = True
+        is_loopback = is_loopback_base_url(base_url)
         if opted_in is False:
             continue  # explicit opt-out always wins
         if opted_in is True:
@@ -355,13 +382,11 @@ def _drop_missing_key_participants(
     so the situation isn't invisible.
 
     Only `type: openrouter` and `type: openai_compatible` participants
-    are checked here. CLI peers authenticate via the host CLI's own
-    session and don't have an `api_key_env` we can preflight; ollama
-    is local. Unknown types are left alone (the run-time adapter will
-    surface its own error).
+    are checked here. Both adapters default an omitted ``api_key_env`` to
+    ``OPENROUTER_API_KEY``. CLI peers authenticate via the host CLI's own
+    session; Ollama has no adapter-level key contract. Unknown types are left
+    alone (the run-time adapter will surface its own error).
     """
-    import os as _os
-
     active: list[str] = []
     dropped: list[dict[str, Any]] = []
     for name in participants:
@@ -370,28 +395,9 @@ def _drop_missing_key_participants(
         if ptype not in {"openrouter", "openai_compatible"}:
             active.append(name)
             continue
-        key_env_raw = cfg.get("api_key_env")
-        if ptype == "openrouter":
-            # OpenRouter peers always need a key, and the well-known env
-            # name is OPENROUTER_API_KEY — safe to assume that default
-            # when api_key_env is omitted.
-            key_env = key_env_raw or "OPENROUTER_API_KEY"
-        else:
-            # `openai_compatible` covers a wide spectrum: hosted OpenAI,
-            # OpenRouter via openai_compatible shim, vLLM / llama.cpp /
-            # LM Studio with no auth, local TGI behind tailnet… A peer
-            # WITHOUT an explicit `api_key_env` declaration leaves us
-            # unable to reliably predict whether it needs auth at all,
-            # so we DEFER to the adapter and skip pre-drop. The adapter
-            # path surfaces its own `Missing X` error if a key really
-            # was required. With an explicit `api_key_env`, the user
-            # has told us the env var to check; treat its absence as a
-            # configuration gap and pre-drop normally.
-            if not key_env_raw:
-                active.append(name)
-                continue
-            key_env = key_env_raw
-        if _os.environ.get(key_env):
+        key_env = participant_api_key_env(cfg)
+        assert key_env is not None  # guarded by ptype above
+        if env_get(key_env):
             active.append(name)
             continue
         dropped.append(
@@ -435,6 +441,135 @@ def _detect_quota_recoveries(
     return new_entries
 
 
+def apply_contextual_persona_recruitment(
+    participants: list[str],
+    participant_cfg: dict[str, Any],
+    cwd: Path,
+    *,
+    stances: dict[str, str] | None = None,
+) -> str | None:
+    """Apply the changed-file persona assignment used by runtime prompts.
+
+    The function deliberately mutates ``participant_cfg`` just as the
+    historical inline implementation did. Preflight callers can invoke it
+    before constructing per-peer prompts, and :func:`execute_council` invokes
+    it again harmlessly so every entry point shares the same recruitment and
+    target-selection rules.
+
+    Returns the participant receiving the persona, or ``None`` when the diff
+    does not match a contextual specialty (or no selected config is usable).
+    """
+
+    changed_files: list[str] = []
+    from llm_council.context import _git_output
+
+    try:
+        git_staged = _git_output(cwd, ["diff", "--cached", "--name-only"])
+        if git_staged:
+            changed_files.extend(git_staged.splitlines())
+        git_unstaged = _git_output(cwd, ["diff", "--name-only"])
+        if git_unstaged:
+            changed_files.extend(git_unstaged.splitlines())
+    except Exception:
+        return None
+
+    persona: str | None = None
+    persona_prompt: str | None = None
+    for filename in changed_files:
+        lowered = filename.lower()
+        if any(
+            marker in lowered
+            for marker in (".sql", "db/", "migrations/", "models.py")
+        ):
+            persona = "database_architect"
+            persona_prompt = (
+                "Role: DATABASE ARCHITECT. Focus on schema design, query "
+                "efficiency, indexes, migration safety, race conditions, and "
+                "transaction safety."
+            )
+            break
+        if any(
+            marker in lowered
+            for marker in (
+                "auth",
+                "login",
+                "security",
+                "perm",
+                "crypt",
+                ".env",
+                "key",
+            )
+        ):
+            persona = "security_auditor"
+            persona_prompt = (
+                "Role: SECURITY AUDITOR. Focus on vulnerability detection, "
+                "authentication, input validation, encryption, secrets "
+                "leakage, and authorization bypasses."
+            )
+            break
+        if any(
+            marker in lowered
+            for marker in (".css", ".html", ".scss", "styles/", "components/")
+        ):
+            persona = "frontend_specialist"
+            persona_prompt = (
+                "Role: FRONTEND & UX SPECIALIST. Focus on semantic HTML, "
+                "accessibility (a11y), responsive styling, layout shifts, "
+                "bundle size, and browser compatibility."
+            )
+            break
+        if any(
+            marker in lowered
+            for marker in (
+                "dockerfile",
+                "workflow",
+                ".github",
+                "yaml",
+                "yml",
+                "toml",
+            )
+        ):
+            persona = "devops_engineer"
+            persona_prompt = (
+                "Role: DEVOPS & CI/CD ENGINEER. Focus on build pipelines, "
+                "container safety, environment variable management, "
+                "dependencies, resource limits, and deployment sanity."
+            )
+            break
+
+    if not persona or not persona_prompt:
+        return None
+
+    target: str | None = None
+    for name in participants:
+        cfg = participant_cfg.get(name)
+        if not isinstance(cfg, dict):
+            continue
+        assigned_stance = (
+            stances.get(name)
+            if isinstance(stances, dict) and name in stances
+            else cfg.get("stance")
+        )
+        if assigned_stance in ("for", "against"):
+            target = name
+            break
+    if target is None:
+        target = next(
+            (
+                name
+                for name in participants
+                if isinstance(participant_cfg.get(name), dict)
+            ),
+            None,
+        )
+    if target is None:
+        return None
+
+    participant_cfg[target]["persona"] = persona
+    participant_cfg[target]["persona_prompt"] = persona_prompt
+    return target
+
+
 async def execute_council(
     participants: list[str],
     participant_cfg: dict[str, Any],
@@ -451,11 +586,14 @@ async def execute_council(
     cache_mode: str = "on",
     stances: dict[str, str] | None = None,
     synthesize: bool | None = None,
+    synthesizer_name: str | None = None,
     current: str | None = None,
     question: str | None = None,
     cross_rank: bool = False,
     focus: list[Any] | None = None,
 ) -> tuple[list[ParticipantResult], dict[str, Any]]:
+    run_started_monotonic = time.monotonic()
+    run_started_at = _utc_progress_timestamp()
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
 
     # Operator-authored review-focus bundles (review_skills.ReviewSkill).
@@ -492,69 +630,12 @@ async def execute_council(
             if isinstance(_peer_cfg, dict) and _peer_name in stances:
                 _peer_cfg["stance"] = stances[_peer_name]
 
-    # Contextual Persona Recruitment
-    changed_files = []
-    from llm_council.context import _git_output
-    try:
-        git_staged = _git_output(cwd, ["diff", "--cached", "--name-only"])
-        if git_staged:
-            changed_files.extend(git_staged.splitlines())
-        git_unstaged = _git_output(cwd, ["diff", "--name-only"])
-        if git_unstaged:
-            changed_files.extend(git_unstaged.splitlines())
-    except Exception:
-        pass
-
-    persona = None
-    persona_prompt = None
-    for f in changed_files:
-        f_lower = f.lower()
-        if any(ext in f_lower for ext in (".sql", "db/", "migrations/", "models.py")):
-            persona = "database_architect"
-            persona_prompt = (
-                "Role: DATABASE ARCHITECT. Focus on schema design, query efficiency, indexes, migration safety, "
-                "race conditions, and transaction safety."
-            )
-            break
-        elif any(kwd in f_lower for kwd in ("auth", "login", "security", "perm", "crypt", ".env", "key")):
-            persona = "security_auditor"
-            persona_prompt = (
-                "Role: SECURITY AUDITOR. Focus on vulnerability detection, authentication, input validation, encryption, "
-                "secrets leakage, and authorization bypasses."
-            )
-            break
-        elif any(ext in f_lower for ext in (".css", ".html", ".scss", "styles/", "components/")):
-            persona = "frontend_specialist"
-            persona_prompt = (
-                "Role: FRONTEND & UX SPECIALIST. Focus on semantic HTML, accessibility (a11y), responsive styling, "
-                "layout shifts, bundle size, and browser compatibility."
-            )
-            break
-        elif any(kwd in f_lower for kwd in ("dockerfile", "workflow", ".github", "yaml", "yml", "toml")):
-            persona = "devops_engineer"
-            persona_prompt = (
-                "Role: DEVOPS & CI/CD ENGINEER. Focus on build pipelines, container safety, environment variable management, "
-                "dependencies, resource limits, and deployment sanity."
-            )
-            break
-
-    if persona and persona_prompt:
-        assigned = False
-        for _peer_name in participants:
-            _peer_cfg = participant_cfg.get(_peer_name)
-            if isinstance(_peer_cfg, dict):
-                stance = _peer_cfg.get("stance") or (stances.get(_peer_name) if stances else None)
-                if stance in ("for", "against"):
-                    _peer_cfg["persona"] = persona
-                    _peer_cfg["persona_prompt"] = persona_prompt
-                    assigned = True
-                    break
-        if not assigned and participants:
-            _peer_name = participants[0]
-            _peer_cfg = participant_cfg.get(_peer_name)
-            if isinstance(_peer_cfg, dict):
-                _peer_cfg["persona"] = persona
-                _peer_cfg["persona_prompt"] = persona_prompt
+    apply_contextual_persona_recruitment(
+        participants,
+        participant_cfg,
+        cwd,
+        stances=stances,
+    )
 
     cache_disabled_for_mode = is_caching_disabled_for_mode(mode)
     cache_ctx_round1 = CacheContext(
@@ -571,11 +652,62 @@ async def execute_council(
     )
 
     progress_events: list[dict[str, Any]] = []
+    phase_starts: dict[tuple[Any, ...], float] = {
+        ("council",): run_started_monotonic
+    }
+
+    def _phase_key(event: dict[str, Any], *, finish: bool) -> tuple[Any, ...] | None:
+        kind = str(event.get("event") or "")
+        if kind in {"participant_start", "participant_finish"}:
+            return (
+                "participant",
+                event.get("participant"),
+                event.get("round"),
+            )
+        if kind in {"council_start", "council_finish"}:
+            return ("council",)
+        if kind in {"cross_rank_start", "cross_rank_complete"}:
+            return ("cross_rank",)
+        if kind in {"synthesis_start", "synthesis_finish", "synthesis_error"}:
+            return ("synthesis", event.get("chair"))
+        if kind in {
+            "deliberation_pending",
+            "deliberation_round_start",
+            "deliberation_finish",
+        }:
+            return ("deliberation",)
+        return None
 
     def emit(event: dict[str, Any]) -> None:
-        progress_events.append(event)
+        # Every event receives an absolute UTC timestamp plus elapsed time from
+        # execute_council entry. Start/finish pairs additionally get a bounded
+        # phase duration. Existing event-specific `elapsed_seconds` retains its
+        # historical meaning (for example, participant attempt time).
+        stamped = dict(event)
+        now = time.monotonic()
+        stamped.setdefault("timestamp", _utc_progress_timestamp())
+        stamped.setdefault(
+            "run_elapsed_seconds", round(now - run_started_monotonic, 3)
+        )
+        kind = str(stamped.get("event") or "")
+        is_finish = kind.endswith("_finish") or kind in {
+            "participant_finish",
+            "cross_rank_complete",
+            "synthesis_error",
+        }
+        phase_key = _phase_key(stamped, finish=is_finish)
+        if phase_key is not None:
+            if is_finish:
+                phase_start = phase_starts.get(phase_key)
+                if phase_start is not None:
+                    stamped.setdefault(
+                        "duration_seconds", round(now - phase_start, 3)
+                    )
+            else:
+                phase_starts.setdefault(phase_key, now)
+        progress_events.append(stamped)
         if progress:
-            progress(event)
+            progress(stamped)
 
     # v0.12.0: drop hosted peers with missing api_key_env BEFORE preflight
     # / council_start, so the missing key never inflates the quorum
@@ -585,6 +717,41 @@ async def execute_council(
     participants, missing_key_records = _drop_missing_key_participants(
         participants, participant_cfg
     )
+
+    # Resolve an opt-in synthesis chair before any peer is invoked. Restrict
+    # resolution to the actual active roster (after missing-key drops) so a
+    # configured-but-unselected peer cannot appear late as an unbudgeted call.
+    # MCP may pass the already-preflighted concrete name; re-resolving here
+    # verifies it still matches after runtime availability filtering.
+    synthesize_flag = bool(
+        config.get("defaults", {}).get("synthesize")
+        if synthesize is None
+        else synthesize
+    )
+    resolved_synthesizer: str | None = None
+    if synthesize_flag:
+        from llm_council.synthesis import select_synthesizer
+
+        active_participant_cfg = {
+            name: participant_cfg[name]
+            for name in participants
+            if name in participant_cfg
+        }
+        resolved_synthesizer = select_synthesizer(
+            config,
+            active_participant_cfg,
+            stances=stances,
+            current=current,
+        )
+        if (
+            synthesizer_name is not None
+            and synthesizer_name != resolved_synthesizer
+        ):
+            raise ValueError(
+                "Preflight synthesizer no longer matches the active roster: "
+                f"expected '{synthesizer_name}', resolved "
+                f"'{resolved_synthesizer}'."
+            )
     for record in missing_key_records:
         emit({"event": "peer_missing_api_key", **record})
 
@@ -1044,7 +1211,12 @@ async def execute_council(
                 }
             )
 
-    cumulative_excluded: set[str] = set()
+    # A peer that failed the local-server preflight was never launched in
+    # round 1. Keep it out of every later round as well: rebuilding the roster
+    # from the original participant list would otherwise silently reintroduce
+    # it during deliberation and pay the full participant timeout for the same
+    # endpoint that already failed fast.
+    cumulative_excluded: set[str] = set(preflight_failures)
     aborted_all_excluded = False
     early_stopped = False
     convergence_by_round: dict[int, list[dict[str, Any]]] = {}
@@ -1076,7 +1248,11 @@ async def execute_council(
                     "event": "deliberation_skip_participants",
                     "round": round_number + 1,
                     "skipped": sorted(cumulative_excluded),
-                    "reason": "timed_out_or_prompt_too_large",
+                    "reason": (
+                        "preflight_failed_or_timed_out_or_prompt_too_large"
+                        if preflight_failures
+                        else "timed_out_or_prompt_too_large"
+                    ),
                 }
             )
         if not deliberation_participants:
@@ -1296,14 +1472,8 @@ async def execute_council(
     # Runs at most once per council run. Chair output is metadata; the
     # headline `recommendation` (computed in mcp_server.run_council / cli)
     # stays derived from peer votes only — see synthesis.run_synthesis_chair.
-    synthesize_flag = bool(
-        config.get("defaults", {}).get("synthesize")
-        if synthesize is None
-        else synthesize
-    )
     from llm_council.synthesis import (
         run_synthesis_chair,
-        select_synthesizer,
         should_synthesize,
     )
     from llm_council.transcript import final_round_results
@@ -1323,20 +1493,12 @@ async def execute_council(
     # finding-matrix pass and the synthesis chair below. Both consumers
     # want the same view: only the latest-round entries per peer.
     final_results = final_round_results(results)
-    # Exclude model-substituted results from the matrix input: their `output`
-    # is the SUBSTITUTED model's full response (only ok/error were flipped by
-    # the guard), so a FINDINGS block in it would be attributed to the pinned
-    # peer — exactly the "substituted answer counted as the requested model's
-    # opinion" failure `require_pinned_model` exists to prevent. Deliberation
-    # and synthesis already skip not-ok results; the matrix builder does not,
-    # hence the explicit filter here.
-    finding_matrix = build_matrix_from_results(
-        [
-            r
-            for r in final_results
-            if classify_error(r.error) != ERROR_KIND_MODEL_SUBSTITUTED
-        ]
-    )
+    # Exclude every failed result from the matrix input. In particular, a
+    # pinned-model integrity failure retains captured output for audit, but
+    # that text must never be attributed to the configured peer as a finding.
+    # Deliberation and synthesis already skip not-ok results; the matrix
+    # builder does not, hence the explicit filter here.
+    finding_matrix = build_matrix_from_results([r for r in final_results if r.ok])
     if not finding_matrix.is_empty():
         metadata["finding_matrix"] = matrix_to_dict(finding_matrix)
 
@@ -1352,68 +1514,84 @@ async def execute_council(
         metadata["missing_key_peers"] = list(missing_key_records)
 
     if synthesize_flag and should_synthesize(synthesize_flag, metadata):
-        try:
-            chair_name = select_synthesizer(
-                config,
-                participant_cfg,
-                stances=stances,
-                current=current,
+        assert resolved_synthesizer is not None
+        chair_name = resolved_synthesizer
+        chair_preflight_error = preflight_failures.get(chair_name)
+        if chair_preflight_error is not None:
+            # A local chair that failed the same endpoint preflight as its
+            # round-1 vote must never be silently reintroduced as a second,
+            # full-timeout synthesis invocation. Keep the preselected chair
+            # (and therefore the preflight budget) stable; do not pick a
+            # replacement after peer calls have started.
+            synthesis_error = (
+                f"Synthesis chair '{chair_name}' failed participant preflight "
+                f"and was not invoked: {chair_preflight_error}"
             )
-            emit({"event": "synthesis_start", "chair": chair_name})
-            convergence_for_chair = metadata.get("convergence")
-            synthesis_payload = await run_synthesis_chair(
-                question=(question or prompt),
-                results=final_results,
-                convergence=convergence_for_chair,
-                participant_cfg=participant_cfg,
-                cwd=cwd,
-                chair_name=chair_name,
-                finding_matrix=finding_matrix,
-            )
-            metadata["synthesis"] = synthesis_payload
-            # The chair turn never enters `results`, so the per-round
-            # substitution detector cannot see it — scan its payload here.
-            # A substituted chair memo (e.g. Fable refused the synthesis
-            # prompt and Opus served it) is flagged on the payload and
-            # surfaced through the same channel as in-round substitutions
-            # so it is never consumed as the pinned chair's memo.
-            if (
-                classify_error(str(synthesis_payload.get("error") or ""))
-                == ERROR_KIND_MODEL_SUBSTITUTED
-            ):
-                synthesis_payload["model_substituted"] = True
-                chair_entry = {
-                    "peer": chair_name,
-                    "requested": (
-                        participant_cfg.get(chair_name, {}) or {}
-                    ).get("model"),
-                    "served_by": synthesis_payload.get("model"),
-                    "synthesis": True,
-                }
-                model_substituted_peers.append(chair_entry)
-                emit(
-                    {
-                        "event": "peer_model_substituted",
-                        "round": metadata["rounds"],
-                        **chair_entry,
-                    }
-                )
+            metadata["synthesis_error"] = synthesis_error
             emit(
                 {
-                    "event": "synthesis_finish",
+                    "event": "synthesis_error",
                     "chair": chair_name,
-                    "ok": synthesis_payload.get("ok"),
-                    "decision_label": synthesis_payload.get("decision_label"),
+                    "reason": "preflight_failed",
+                    "error": synthesis_error,
                 }
             )
-        except ValueError as exc:
-            # Chair config errors (missing synthesizer, host CLI excluded
-            # from participants, etc.) surface as metadata + an emitted
-            # event for the CLI/MCP layer to render. Peer votes are
-            # already valid — we don't fail the whole council run over
-            # a missing chair configuration.
-            metadata["synthesis_error"] = str(exc)
-            emit({"event": "synthesis_error", "error": str(exc)})
+        else:
+            try:
+                emit({"event": "synthesis_start", "chair": chair_name})
+                convergence_for_chair = metadata.get("convergence")
+                synthesis_payload = await run_synthesis_chair(
+                    question=(question or prompt),
+                    results=final_results,
+                    convergence=convergence_for_chair,
+                    participant_cfg=participant_cfg,
+                    cwd=cwd,
+                    chair_name=chair_name,
+                    finding_matrix=finding_matrix,
+                )
+                metadata["synthesis"] = synthesis_payload
+                # The chair turn never enters `results`, so the per-round
+                # substitution detector cannot see it — scan its payload here.
+                # A substituted chair memo (e.g. Fable refused the synthesis
+                # prompt and Opus served it) is flagged on the payload and
+                # surfaced through the same channel as in-round substitutions
+                # so it is never consumed as the pinned chair's memo.
+                if (
+                    classify_error(str(synthesis_payload.get("error") or ""))
+                    == ERROR_KIND_MODEL_SUBSTITUTED
+                ):
+                    synthesis_payload["model_substituted"] = True
+                    chair_entry = {
+                        "peer": chair_name,
+                        "requested": (
+                            participant_cfg.get(chair_name, {}) or {}
+                        ).get("model"),
+                        "served_by": synthesis_payload.get("model"),
+                        "synthesis": True,
+                    }
+                    model_substituted_peers.append(chair_entry)
+                    emit(
+                        {
+                            "event": "peer_model_substituted",
+                            "round": metadata["rounds"],
+                            **chair_entry,
+                        }
+                    )
+                emit(
+                    {
+                        "event": "synthesis_finish",
+                        "chair": chair_name,
+                        "ok": synthesis_payload.get("ok"),
+                        "decision_label": synthesis_payload.get("decision_label"),
+                    }
+                )
+            except ValueError as exc:
+                # Configuration/roster errors were already rejected before peer
+                # launch. A ValueError raised while constructing or invoking the
+                # chair happens after valid peer votes, so preserve those votes
+                # and surface only the synthesis failure as metadata.
+                metadata["synthesis_error"] = str(exc)
+                emit({"event": "synthesis_error", "error": str(exc)})
 
     # Surface pinned-model substitutions (M-fable) top-level, mirroring
     # `quota_throttled_peers`. Entries were accumulated live per round
@@ -1425,12 +1603,47 @@ async def execute_council(
     if model_substituted_peers:
         metadata["model_substituted_peers"] = model_substituted_peers
 
+    run_wall_elapsed = time.monotonic() - run_started_monotonic
+    run_finished_at = _utc_progress_timestamp()
+    participant_elapsed_aggregate = sum(
+        float(result.elapsed_seconds) for result in results
+    )
+    participant_wall_elapsed_aggregate = sum(
+        float(
+            result.wall_elapsed_seconds
+            if result.wall_elapsed_seconds is not None
+            else result.elapsed_seconds
+        )
+        for result in results
+    )
+    metadata.update(
+        {
+            "run_started_at": run_started_at,
+            "run_finished_at": run_finished_at,
+            "run_wall_elapsed_seconds": round(run_wall_elapsed, 6),
+            "participant_elapsed_seconds_aggregate": round(
+                participant_elapsed_aggregate, 6
+            ),
+            "participant_wall_elapsed_seconds_aggregate": round(
+                participant_wall_elapsed_aggregate, 6
+            ),
+        }
+    )
     emit(
         {
             "event": "council_finish",
             "rounds": metadata["rounds"],
             "ok": sum(1 for result in results if result.ok),
             "total": len(results),
+            "timestamp": run_finished_at,
+            "run_elapsed_seconds": round(run_wall_elapsed, 3),
+            "duration_seconds": round(run_wall_elapsed, 3),
+            "participant_elapsed_seconds_aggregate": round(
+                participant_elapsed_aggregate, 3
+            ),
+            "participant_wall_elapsed_seconds_aggregate": round(
+                participant_wall_elapsed_aggregate, 3
+            ),
         }
     )
 

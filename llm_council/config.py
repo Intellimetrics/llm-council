@@ -15,13 +15,18 @@ from urllib.parse import urlparse
 import yaml
 
 from llm_council.defaults import DEFAULT_CONFIG, KNOWN_ORIGIN_STRINGS, VALID_STANCES
+from llm_council.env import env_get, project_directories
 
 
 BASELINE_CLIS = ("claude", "codex", "gemini", "antigravity")
+MODE_ALIASES = {
+    "local-only": "private-local",
+    "local-private": "private-local",
+}
 OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 PARTICIPANT_TYPES = frozenset({"cli", "openrouter", "openai_compatible", "ollama"})
 OPENAI_COMPATIBLE_TYPES = frozenset({"openrouter", "openai_compatible"})
-_LOOPBACK_HOSTNAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
+_LOOPBACK_HOSTNAMES = frozenset({"localhost"})
 _TRUSTED_PUBLIC_HOSTS = frozenset({"openrouter.ai"})
 BUILTIN_FULL_TRIAD_MODES = frozenset(
     {"quick", "plan", "review", "diverse", "us-only", "deliberate"}
@@ -69,27 +74,51 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
     return result
 
 
-def find_config(start: Path | None = None) -> Path | None:
-    """Find a project config by walking upward from start."""
+def find_config(
+    start: Path | str | None = None,
+    *,
+    stop_at: Path | str | None = None,
+) -> Path | None:
+    """Find the nearest project config within an optional trust boundary.
 
-    current = (start or Path.cwd()).resolve()
-    for directory in (current, *current.parents):
+    ``stop_at`` is inclusive. When supplied, neither ancestor traversal nor a
+    symlinked config target may escape it. Omitting it preserves the CLI's
+    historical search from ``start`` through the filesystem root.
+    """
+
+    directories = project_directories(start or Path.cwd(), stop_at=stop_at)
+    boundary = Path(stop_at).expanduser().resolve() if stop_at is not None else None
+    if boundary is not None and boundary.is_file():
+        boundary = boundary.parent
+    for directory in directories:
         for name in CONFIG_NAMES:
             candidate = directory / name
-            if candidate.exists():
-                return candidate
+            if not candidate.exists():
+                continue
+            if boundary is not None:
+                try:
+                    candidate.resolve().relative_to(boundary)
+                except (OSError, ValueError):
+                    continue
+            return candidate
     return None
 
 
-def load_config(path: str | Path | None = None, *, search: bool = True) -> dict[str, Any]:
+def load_config(
+    path: str | Path | None = None,
+    *,
+    search: bool = True,
+    stop_at: Path | str | None = None,
+) -> dict[str, Any]:
     """Load config, merging project values over built-in defaults."""
 
-    config = copy.deepcopy(DEFAULT_CONFIG)
     if path:
         config_path = Path(path).expanduser()
     else:
-        config_path = find_config() if search else None
+        config_path = find_config(stop_at=stop_at) if search else None
     if not config_path:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        _canonicalize_private_local_mode(config, explicit_private_local=False)
         validate_config(config)
         return config
     if not config_path.exists():
@@ -98,14 +127,80 @@ def load_config(path: str | Path | None = None, *, search: bool = True) -> dict[
     data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         raise ValueError(f"Config must be a YAML mapping: {config_path}")
+    return resolve_config_data(data)
+
+
+def resolve_config_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Merge and validate an in-memory project config mapping.
+
+    Configuration writers use this before replacing the on-disk YAML so an
+    invalid `config set` request cannot corrupt the project and strand every
+    subsequent command.  The merge semantics intentionally match
+    :func:`load_config`, including ``replace_defaults`` and CLI migrations.
+    """
+
+    if not isinstance(data, dict):
+        raise ValueError("Config must be a YAML mapping")
+    raw_modes = data.get("modes")
+    explicit_private_local = isinstance(raw_modes, dict) and "private-local" in raw_modes
+    config = copy.deepcopy(DEFAULT_CONFIG)
     if data.get("replace_defaults"):
         config["participants"] = {}
         config["modes"] = {}
         data = {key: value for key, value in data.items() if key != "replace_defaults"}
+    elif explicit_private_local and isinstance(raw_modes, dict):
+        # A legacy project may explicitly pin private-local participants over
+        # the now-dynamic built-in strategy. Deep merge must not retain the
+        # opposing selector key or validation sees both shapes at once.
+        raw_private = raw_modes.get("private-local")
+        base_private = config.get("modes", {}).get("private-local")
+        if isinstance(raw_private, dict) and isinstance(base_private, dict):
+            if "participants" in raw_private:
+                base_private.pop("strategy", None)
+            elif "strategy" in raw_private:
+                base_private.pop("participants", None)
     merged = deep_merge(config, data)
     migrate_known_cli_defaults(merged)
+    _canonicalize_private_local_mode(
+        merged, explicit_private_local=explicit_private_local
+    )
     validate_config(merged)
     return merged
+
+
+def _canonicalize_private_local_mode(
+    config: dict[str, Any], *, explicit_private_local: bool
+) -> None:
+    """Make ``private-local`` the canonical dynamic local-inference mode.
+
+    ``local-only`` remains accepted as an input compatibility alias but is
+    removed from the resolved mode registry. An operator who explicitly
+    defines ``private-local`` keeps that exact custom roster; otherwise the
+    canonical name adopts the alias's local-only strategy so it discovers
+    every configured loopback Ollama endpoint.
+    """
+
+    modes = config.get("modes")
+    if not isinstance(modes, dict):
+        return
+    local_alias = modes.get("local-only")
+    if isinstance(local_alias, dict) and not explicit_private_local:
+        canonical = copy.deepcopy(local_alias)
+        canonical["description"] = (
+            "All configured same-machine loopback Ollama participants. "
+            "Excludes OpenAI-compatible gateways, LAN endpoints, and hosted "
+            "CLI/API participants."
+        )
+        modes["private-local"] = canonical
+    # Do not expose two labels for the same destination. Callers may still
+    # pass `local-only`; select_participants translates that legacy input.
+    modes.pop("local-only", None)
+    defaults = config.get("defaults")
+    if isinstance(defaults, dict) and defaults.get("mode") in {
+        "local-only",
+        "local-private",
+    }:
+        defaults["mode"] = "private-local"
 
 
 def validate_config(config: dict[str, Any]) -> None:
@@ -375,6 +470,7 @@ def validate_config(config: dict[str, Any]) -> None:
     # Advisory-only; positive integer when present (absent = feature off).
     _validate_positive_int(defaults, "min_distinct_vendors", "defaults")
     _validate_positive_number(defaults, "mcp_max_estimated_cost_usd", "defaults")
+    _validate_positive_number(defaults, "mcp_request_timeout_seconds", "defaults")
     # M6 soft cost-warning threshold (advisory only — never gates a run).
     # Non-negative number when present (an explicit 0 means "warn on any
     # estimated spend"); absent = feature off.
@@ -492,8 +588,8 @@ def _enforce_public_https_endpoint(name: str, parsed: Any) -> None:
 def _resolve_host_addresses_cached(host: str) -> tuple[tuple[str, ...], str | None]:
     """Cached form of `getaddrinfo` for use in hot paths.
 
-    `is_local_base_url` is called from `select_participants` (every run)
-    and from preflight (every run); resolving the same hostname N times
+    `is_local_base_url` is called from on-prem endpoint validation and
+    preflight; resolving the same hostname N times
     in close succession is wasteful. The OS resolver caches under the
     hood, but a small in-process cache eliminates the syscall + GIL
     round-trip too. The cache is intentionally small (64 entries) and
@@ -558,6 +654,8 @@ def _parse_base_url_host(
         parsed = urlparse(base_url.strip())
     except ValueError:
         return None
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return None
     host = parsed.hostname
     if not host:
         return None
@@ -569,10 +667,11 @@ def is_loopback_base_url(base_url: str) -> bool:
     """True iff `base_url` points at the loopback interface.
 
     Stricter than :func:`is_local_base_url` — only matches `localhost`,
-    `127.0.0.1`, `[::1]`, `0.0.0.0`, etc. RFC1918 addresses (`10.x`,
-    `172.16-31.x`, `192.168.x`) return False. Used by the orchestrator
-    pre-flight ping where a 1s timeout is reasonable for loopback but
-    can false-fail homelab/VPN servers on a slower LAN link.
+    `127.0.0.0/8`, and `[::1]`. Unspecified bind addresses (`0.0.0.0`,
+    `[::]`) and RFC1918 addresses (`10.x`, `172.16-31.x`, `192.168.x`)
+    return False. Used by privacy-sensitive participant selection and by the
+    orchestrator pre-flight ping where a 1s timeout is reasonable for
+    same-machine endpoints but can false-fail LAN/VPN servers.
     """
     parsed = _parse_base_url_host(base_url)
     if parsed is None:
@@ -582,22 +681,23 @@ def is_loopback_base_url(base_url: str) -> bool:
         return True
     if literal is None:
         return False
-    # is_loopback covers 127.0.0.0/8 and ::1; is_unspecified covers 0.0.0.0
-    # which servers commonly bind to. Exclude is_private (RFC1918) — that's
-    # what is_local_base_url handles.
-    return literal.is_loopback or literal.is_unspecified
+    # A server may bind to an unspecified address, but an unspecified address
+    # is not itself a loopback endpoint. Keep this classifier literal and
+    # fail-closed because `private-local` promises same-machine routing.
+    return literal.is_loopback
 
 
 def is_local_base_url(base_url: str) -> bool:
     """True iff `base_url` points at a loopback or RFC1918-style address.
 
-    Used by the `local_only_peers` mode strategy. Mirrors the host classification
-    in :func:`_enforce_public_https_endpoint` but inverted — instead of erroring
-    on private hosts, it identifies them so the local-only mode can select them.
+    This broader helper is useful for on-prem/private-network validation. It is
+    intentionally *not* the `private-local` trust boundary: an RFC1918 endpoint
+    still leaves the user's machine. Privacy-sensitive selection uses
+    :func:`is_loopback_base_url` instead.
 
     Hostnames that fail to resolve are treated as **not** local — better to
-    omit a participant from a local-only run than to silently include a peer
-    we cannot prove is on-prem.
+    skip an on-prem-only operation than to act on an endpoint we cannot prove
+    is inside the private network.
     """
     parsed = _parse_base_url_host(base_url)
     if parsed is None:
@@ -620,21 +720,53 @@ def is_local_base_url(base_url: str) -> bool:
 
 
 def is_local_participant(cfg: dict[str, Any]) -> bool:
-    """True iff a participant runs on the user's machine / private network.
+    """True iff a participant's inference endpoint stays on this machine.
 
-    - `type: ollama` is always local (the adapter only talks to localhost-ish
-      servers and the type itself implies on-prem).
-    - `type: openai_compatible` is local when its `base_url` resolves loopback
-      or RFC1918.
+    - `type: ollama` is local only when its configured endpoint is loopback
+      (the omitted base_url default is ``http://localhost:11434``).
+    - `type: openai_compatible` is local only when its `base_url` is loopback.
     - `type: cli` and `type: openrouter` are never local for this purpose:
       the binary may run locally but the inference is hosted.
+
+    LAN/RFC1918 endpoints are deliberately excluded. This broader local-runtime
+    classification is used for proxy suppression and cost estimates; canonical
+    `private-local` admission is narrower still and uses
+    :func:`is_private_local_participant`.
     """
     ptype = cfg.get("type")
     if ptype == "ollama":
-        return True
+        return is_loopback_base_url(
+            str(cfg.get("base_url") or "http://localhost:11434")
+        )
     if ptype == "openai_compatible":
-        return is_local_base_url(str(cfg.get("base_url") or ""))
+        return is_loopback_base_url(str(cfg.get("base_url") or ""))
     return False
+
+
+def is_private_local_participant(cfg: dict[str, Any]) -> bool:
+    """True iff cfg is a loopback Ollama peer admitted by `private-local`.
+
+    A loopback OpenAI-compatible URL can be a gateway that forwards upstream,
+    so endpoint locality alone cannot support an offline promise for that
+    protocol. Ollama is the only protocol admitted by the canonical private
+    route. This controls llm-council's connection; operators needing a hard
+    offline guarantee must also prevent the Ollama daemon itself from egressing.
+    """
+
+    return cfg.get("type") == "ollama" and is_local_participant(cfg)
+
+
+def participant_api_key_env(cfg: dict[str, Any]) -> str | None:
+    """Return the API-key env var required by an HTTP API participant.
+
+    Both OpenRouter and the generic OpenAI-compatible adapter default to
+    ``OPENROUTER_API_KEY`` when ``api_key_env`` is omitted. Ollama and native
+    CLI participants do not use this adapter-level key contract.
+    """
+
+    if cfg.get("type") not in {"openrouter", "openai_compatible"}:
+        return None
+    return str(cfg.get("api_key_env") or "OPENROUTER_API_KEY")
 
 
 def migrate_known_cli_defaults(config: dict[str, Any]) -> None:
@@ -748,7 +880,13 @@ def _validate_positive_number(mapping: dict[str, Any], key: str, label: str) -> 
     if key not in mapping or mapping[key] is None:
         return
     value = mapping[key]
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    # Spell this as ``not value > 0`` so NaN is rejected too: comparisons
+    # against NaN make ``value <= 0`` false even though NaN is not positive.
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not value > 0
+    ):
         raise ValueError(f"{label}.{key} must be a positive number")
 
 
@@ -763,9 +901,7 @@ def _validate_nonnegative_number(mapping: dict[str, Any], key: str, label: str) 
 def detect_current_agent() -> str | None:
     """Best-effort detection of the CLI we are currently running under."""
 
-    explicit = os.environ.get("LLM_COUNCIL_CURRENT") or os.environ.get(
-        "LLM_COUNCIL_AGENT"
-    )
+    explicit = env_get("LLM_COUNCIL_CURRENT") or env_get("LLM_COUNCIL_AGENT")
     if explicit:
         normalized = explicit.strip().lower()
         if normalized == "agy":
@@ -945,12 +1081,6 @@ def config_warnings(config: dict[str, Any]) -> list[str]:
                 "fallback_chain is inert for this peer. Remove one of the "
                 "two keys to silence this warning."
             )
-    import shutil
-    if shutil.which("gemini") and not shutil.which("agy"):
-        warnings.append(
-            "Gemini CLI is installed but Antigravity CLI is replacing it. "
-            "Please install/upgrade to Antigravity CLI (agy) for the best experience."
-        )
     return warnings
 
 
@@ -966,6 +1096,7 @@ def select_participants(
 
     participants = config.get("participants", {})
     modes = config.get("modes", {})
+    mode = canonical_mode_name(config, mode)
 
     mode_cfg = modes.get(mode, {})
     effective_origin_policy = (
@@ -985,40 +1116,122 @@ def select_participants(
             selected = list(mode_cfg["participants"])
         elif mode_cfg.get("strategy") == "other_cli_peers":
             import shutil
-            has_agy = bool(shutil.which("agy"))
-            has_gemini = bool(shutil.which("gemini"))
-            if not has_agy and not has_gemini:
-                raise ValueError(
-                    "Neither Antigravity CLI (agy) nor Gemini CLI (gemini) "
-                    "was found on your PATH. The quick triad mode requires "
-                    "at least one Gemini-family CLI. Please install Antigravity CLI."
+
+            # Resolve the Gemini-family seat from the configured participant
+            # map, not from unrelated binaries that merely happen to be on
+            # PATH.  A project that configures `gemini` but not `antigravity`
+            # must remain usable after `agy` is installed globally.  Prefer
+            # Gemini's flag-enforced plan mode over Antigravity's softer,
+            # prompt-enforced read-only posture when both are available.
+            current_exclusion_families = {
+                "claude": {"claude"},
+                "codex": {"codex"},
+                "gemini": {"gemini", "antigravity"},
+                "antigravity": {"gemini", "antigravity"},
+            }.get(current or "", set())
+
+            def _available_cli_names(family: str) -> list[str]:
+                available: list[str] = []
+                for participant_name, participant_cfg in participants.items():
+                    if not isinstance(participant_cfg, dict):
+                        continue
+                    if participant_cfg.get("type") != "cli":
+                        continue
+                    if participant_cfg.get("family") != family:
+                        continue
+                    command = str(
+                        participant_cfg.get("command") or participant_name
+                    )
+                    # Every native participant is launched as a subprocess,
+                    # including the active host when include_current is set.
+                    # Do not infer subprocess availability from host identity:
+                    # an embedded Claude/Codex session does not itself provide
+                    # a callable transport for the corresponding CLI.
+                    if shutil.which(command):
+                        available.append(participant_name)
+                return available
+
+            def _preferred_seat(family: str, canonical: str) -> str | None:
+                available = _available_cli_names(family)
+                if canonical in available:
+                    return canonical
+                return available[0] if available else None
+
+            gemini_seat = _preferred_seat("gemini", "gemini")
+            antigravity_seat = _preferred_seat("antigravity", "antigravity")
+            gemini_peers = [gemini_seat] if gemini_seat else []
+            antigravity_peers = [antigravity_seat] if antigravity_seat else []
+            # Prefer Antigravity when both Gemini-family CLIs are installed.
+            # Some Gemini CLI distributions are present on PATH but reject
+            # this client at invocation time (UNSUPPORTED_CLIENT); Antigravity
+            # is the dependable compatibility route and doctor can opt-in to a
+            # native readiness probe for either command.
+            neutral_candidates = antigravity_peers or gemini_peers
+            if not neutral_candidates:
+                configured = [
+                    name
+                    for name, cfg in participants.items()
+                    if isinstance(cfg, dict)
+                    and cfg.get("type") == "cli"
+                    and cfg.get("family") in {"gemini", "antigravity"}
+                ]
+                detail = (
+                    f" Configured Gemini-family participants: {', '.join(configured)}."
+                    if configured
+                    else " No Gemini-family participant is configured."
                 )
-            neutral_peer = "antigravity" if (has_agy or not has_gemini) else "gemini"
-            triad = ["claude", "codex", neutral_peer]
+                raise ValueError(
+                    "No configured Gemini-family CLI is available on PATH. "
+                    "Native council modes require Gemini CLI or Antigravity "
+                    "CLI. Antigravity is the compatibility default; select "
+                    "Gemini explicitly when its hard plan-mode boundary is "
+                    "available."
+                    + detail
+                )
+            neutral_peer = neutral_candidates[0]
+            primary_peers = [
+                seat
+                for seat in (
+                    _preferred_seat("claude", "claude"),
+                    _preferred_seat("codex", "codex"),
+                )
+                if seat
+            ]
+            if not primary_peers:
+                raise ValueError(
+                    "No configured Claude- or Codex-family CLI is available "
+                    "on PATH. Native council modes require at least one "
+                    "primary CLI plus a Gemini-family CLI."
+                )
+            native_seats = [*primary_peers, neutral_peer]
 
             if mode_cfg.get("include_current", False):
-                selected = list(triad)
+                selected = list(native_seats)
             else:
-                exclusions = {current} if current else set()
-                if "gemini" in exclusions or "antigravity" in exclusions:
-                    exclusions.add("gemini")
-                    exclusions.add("antigravity")
-                selected = [name for name in triad if name not in exclusions]
+                selected = [
+                    name
+                    for name in native_seats
+                    if name != current
+                    and (
+                        not current_exclusion_families
+                        or participants[name].get("family")
+                        not in current_exclusion_families
+                    )
+                ]
                 if not current:
-                    selected = list(triad)
+                    selected = list(native_seats)
             selected.extend(mode_cfg.get("add", []))
         elif mode_cfg.get("strategy") == "local_only_peers":
             selected = [
                 name
                 for name, cfg in participants.items()
-                if is_local_participant(cfg)
+                if is_private_local_participant(cfg)
             ]
             if not selected:
                 raise ValueError(
                     f"Mode '{mode}' (strategy local_only_peers) has no "
-                    "matching participants. Add at least one `type: ollama` "
-                    "or `type: openai_compatible` participant whose "
-                    "base_url is loopback or private (see "
+                    "matching participants. Add at least one loopback "
+                    "`type: ollama` participant (see "
                     "docs/local-models.md)."
                 )
         else:
@@ -1035,17 +1248,32 @@ def select_participants(
                 name
                 for name in include
                 if name in participants
-                and not is_local_participant(participants[name])
+                and not is_private_local_participant(participants[name])
             ]
             if offenders:
                 raise ValueError(
                     f"Mode '{mode}' (strategy local_only_peers) refuses "
                     f"--include of non-local participants: "
                     f"{', '.join(offenders)}. The mode's purpose is to "
-                    "consult only on-prem inference. For a hybrid run, "
+                    "consult only same-machine Ollama inference. For a hybrid run, "
                     "use a different mode or pass --participants explicitly."
                 )
         selected.extend(include)
+
+    if mode_cfg.get("strategy") == "local_only_peers" or mode == "private-local":
+        offenders = [
+            name
+            for name in selected
+            if name in participants
+            and not is_private_local_participant(participants[name])
+        ]
+        if offenders:
+            raise ValueError(
+                f"Mode '{mode}' permits only loopback `type: ollama` "
+                f"participants; refused: {', '.join(offenders)}. Use an "
+                "explicit custom mode for local OpenAI-compatible gateways "
+                "or hybrid routing."
+            )
 
     deduped: list[str] = []
     for name in selected:
@@ -1123,6 +1351,16 @@ def select_participants(
                 participant_entry["model"] = model_id
 
     return deduped
+
+
+def canonical_mode_name(config: dict[str, Any], mode: str) -> str:
+    """Resolve a deprecated mode alias without breaking raw legacy configs."""
+
+    modes = config.get("modes", {})
+    canonical = MODE_ALIASES.get(mode, mode)
+    if canonical in modes or mode not in modes:
+        return canonical
+    return mode
 
 
 def balance_stances(active_participants: list[str], mode_stances: dict[str, str] | None) -> dict[str, str] | None:
@@ -1244,5 +1482,3 @@ def apply_smart_routing(config: dict[str, Any], mode: str, cwd: Path) -> None:
                     file=sys.stderr,
                     flush=True
                 )
-
-

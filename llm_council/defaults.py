@@ -100,6 +100,10 @@ DEFAULT_CONFIG: dict = {
         # a participant name | "neutral_peer" | "current".
         "synthesizer": None,
         "synthesizer_max_prompt_chars": 60_000,
+        # Entire MCP request wall-clock contract. Individual peer timeouts
+        # remain independently configurable, but a stuck multi-round request
+        # cannot outlive this top-level deadline unless the caller overrides it.
+        "mcp_request_timeout_seconds": 1200,
         # Tier-2 secret scanner. "warn" (default) counts likely credentials
         # in the prompt body and emits a progress event but ships the prompt
         # UNCHANGED (no mitigation); "block" raises before any participant
@@ -472,10 +476,10 @@ DEFAULT_CONFIG: dict = {
             "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTIGRAVITY_API_KEY"],
-            # `agy` has no --model flag — model is session-state only.
-            # Fallback is impossible from outside the CLI, so the chain
-            # stays empty and quota-throttled antigravity drops with the
-            # `quota_throttled_peers` signal alone (Phase 1).
+            # agy 1.0.x accepts --model, but its display-name ids are not
+            # portable and an unknown id silently falls back to session
+            # state. Keep the built-in chain empty rather than pretend a
+            # cross-install fallback is reliable.
             "fallback_chain": [],
         },
     },
@@ -507,24 +511,24 @@ DEFAULT_CONFIG: dict = {
         "quick": {
             "strategy": "other_cli_peers",
             "include_current": True,
-            "description": "Ask Claude, Codex, and Gemini as explicit council participants.",
+            "description": "Ask available native CLI participants from the Claude/Codex and Gemini families.",
         },
         "peer-only": {
             "strategy": "other_cli_peers",
             "include_current": False,
-            "description": "Ask only the other native CLIs, excluding the current host.",
+            "description": "Ask only other available native CLI participants, excluding the current host.",
         },
         "plan": {
             "strategy": "other_cli_peers",
             "include_current": True,
             "add": ["deepseek_v4_pro"],
-            "description": "Claude/Codex/Gemini plus DeepSeek for independent planning.",
+            "description": "Native CLI participants plus DeepSeek for independent planning.",
         },
         "review": {
             "strategy": "other_cli_peers",
             "include_current": True,
             "add": ["qwen_coder_plus"],
-            "description": "Claude/Codex/Gemini plus Qwen coding model.",
+            "description": "Native CLI participants plus the Qwen coding participant.",
         },
         # Consult Claude Fable 5 as a single read-only reviewer. `safe_context:
         # true` injects the defensive-review framing (context.build_prompt) that
@@ -579,7 +583,7 @@ DEFAULT_CONFIG: dict = {
             "description": (
                 "EXPERIMENTAL — Claude/Codex/Gemini directed to use their "
                 "file-read / grep / glob tools to verify diff claims before "
-                "voting. CLI peers only; hosted peers do not participate."
+                "voting. CLI participants only; hosted participants do not participate."
             ),
         },
         "review-cheap": {
@@ -588,26 +592,22 @@ DEFAULT_CONFIG: dict = {
                 "qwen_coder_flash",
                 "glm_4_7_flash",
             ],
-            "description": "Cheap hosted breadth reviewers.",
+            "description": "Cheap hosted breadth participants.",
         },
         "diverse": {
             "strategy": "other_cli_peers",
             "include_current": True,
             "add": ["deepseek_v4_pro", "glm_5_1", "kimi_k2_6"],
             "timeout_multiplier": 1.5,
-            "description": "Native triad plus cross-lab planning diversity.",
+            "description": "Native CLI participants plus cross-lab planning participants.",
         },
         "private-local": {
-            "participants": ["local_qwen_coder"],
-            "description": "Local-only private pass. Requires the model/runtime to exist.",
-        },
-        "local-only": {
             "strategy": "local_only_peers",
             "description": (
-                "All configured local participants — `type: ollama` and any "
-                "`type: openai_compatible` whose base_url is loopback or "
-                "RFC1918. Excludes hosted-inference CLIs (claude/codex/"
-                "gemini) and hosted API peers (openrouter). See "
+                "All configured same-machine loopback `type: ollama` "
+                "participants. Excludes OpenAI-compatible gateways, LAN "
+                "endpoints, hosted-inference CLIs (claude/codex/gemini), and "
+                "hosted API participants (openrouter). See "
                 "docs/local-models.md for adding local-server participants."
             ),
         },

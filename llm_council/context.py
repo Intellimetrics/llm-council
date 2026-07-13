@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import locale
 import mimetypes
+import re as _re_cross_rank
 import subprocess
+import tempfile
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable
 
 from llm_council.defaults import (
     DEFAULT_STANCE_PROMPTS,
@@ -20,9 +24,18 @@ from llm_council.diff_chunking import (
 )
 
 
-MAX_CONTEXT_FILE_CHARS = 120_000
 MAX_PROMPT_CHARS = 200_000
+MAX_CONTEXT_FILES = 32
+MAX_CONTEXT_PATH_CHARS = 4_096
+MAX_CONTEXT_FILE_CHARS = 120_000
+MAX_CONTEXT_TOTAL_CHARS = 480_000
+MAX_ACCEPTANCE_CONTRACT_CHARS = 120_000
+MAX_GIT_DIFF_CAPTURE_BYTES = 2_000_000
+MAX_GIT_DIFF_TOTAL_CAPTURE_BYTES = MAX_GIT_DIFF_CAPTURE_BYTES * 2
+MAX_GIT_STDERR_CAPTURE_BYTES = 64_000
 GIT_DIFF_TIMEOUT_SECONDS = 15
+TEXT_TRUNCATION_SUFFIX = "\n\n[truncated]\n"
+GIT_DIFF_TRUNCATION_PREFIX = "[git diff output truncated after "
 
 # Defensive-review "safe context" framing (opt-in via a mode's
 # `safe_context: true`; the built-in `fable` mode sets it). Motivated by
@@ -84,9 +97,42 @@ def ensure_inside_cwd(path: Path, cwd: Path) -> None:
         ) from exc
 
 
-def read_context_file(
-    path: str | Path, *, cwd: Path, allow_outside_cwd: bool = False
-) -> str:
+def _truncate_text(text: str, max_chars: int) -> tuple[str, bool]:
+    """Return a character-bounded prefix using the historical marker."""
+
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars] + TEXT_TRUNCATION_SUFFIX, True
+
+
+def _read_text_bounded(path: Path, max_chars: int) -> tuple[str, int, bool]:
+    """Read at most ``max_chars + 1`` decoded characters from ``path``.
+
+    The extra character is only a truncation sentinel. Text-mode reading keeps
+    the limit character-based (matching the old post-read behavior) while
+    avoiding an unbounded ``Path.read_text`` allocation.
+    """
+
+    if max_chars < 0:
+        raise ValueError("max_chars must be non-negative")
+    with path.open("r", errors="replace") as handle:
+        sample = handle.read(max_chars + 1)
+    text, truncated = _truncate_text(sample, max_chars)
+    return text, min(len(sample), max_chars), truncated
+
+
+def _render_context_file(
+    path: str | Path,
+    *,
+    cwd: Path,
+    allow_outside_cwd: bool,
+    max_chars: int,
+) -> tuple[str, int, bool]:
+    raw_path = str(path)
+    if len(raw_path) > MAX_CONTEXT_PATH_CHARS:
+        raise ValueError(
+            f"Context file path exceeds {MAX_CONTEXT_PATH_CHARS} characters"
+        )
     source = Path(path)
     if not source.is_absolute():
         source = cwd / source
@@ -96,11 +142,21 @@ def read_context_file(
         raise ValueError(f"Context file does not exist: {source}")
     if not source.is_file():
         raise ValueError(f"Context path is not a file: {source}")
-    text = source.read_text(errors="replace")
-    if len(text) > MAX_CONTEXT_FILE_CHARS:
-        text = text[:MAX_CONTEXT_FILE_CHARS] + "\n\n[truncated]\n"
+    text, chars_read, truncated = _read_text_bounded(source, max_chars)
     label = _relative_label(source, cwd)
-    return f"## File: {label}\n\n```\n{text}\n```"
+    return f"## File: {label}\n\n```\n{text}\n```", chars_read, truncated
+
+
+def read_context_file(
+    path: str | Path, *, cwd: Path, allow_outside_cwd: bool = False
+) -> str:
+    rendered, _chars_read, _truncated = _render_context_file(
+        path,
+        cwd=cwd,
+        allow_outside_cwd=allow_outside_cwd,
+        max_chars=MAX_CONTEXT_FILE_CHARS,
+    )
+    return rendered
 
 
 def resolve_acceptance_contract(
@@ -126,14 +182,25 @@ def resolve_acceptance_contract(
     # Only attempt a file-read when the value resolves to an existing regular
     # file. A multi-line contract or an arbitrary sentence won't, so it falls
     # through to literal text below.
-    if source.is_file():
+    try:
+        source_is_file = source.is_file()
+    except OSError as exc:
+        # A long inline contract is text, not a path. POSIX stat(2) raises
+        # ENAMETOOLONG before ``is_file`` can return False; treating that one
+        # path-shape error as literal preserves the advertised <text|path>
+        # contract without masking permission or I/O failures for real paths.
+        if exc.errno != errno.ENAMETOOLONG:
+            raise
+        source_is_file = False
+    if source_is_file:
         if not allow_outside_cwd:
             ensure_inside_cwd(source, cwd)
-        text = source.read_text(errors="replace")
-        if len(text) > MAX_CONTEXT_FILE_CHARS:
-            text = text[:MAX_CONTEXT_FILE_CHARS] + "\n\n[truncated]\n"
+        text, _chars_read, _truncated = _read_text_bounded(
+            source, MAX_ACCEPTANCE_CONTRACT_CHARS
+        )
         return text.strip() or None
-    return stripped
+    bounded, _truncated = _truncate_text(stripped, MAX_ACCEPTANCE_CONTRACT_CHARS)
+    return bounded.strip()
 
 
 def resolve_image_path(
@@ -236,6 +303,11 @@ def _filter_semantic_diff(diff_text: str | None) -> str:
         ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
         ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3"
     )
+    truncation_notices = [
+        line
+        for line in diff_text.splitlines()
+        if line.startswith(GIT_DIFF_TRUNCATION_PREFIX)
+    ]
     blocks = diff_text.split("diff --git ")
     filtered_blocks = []
     # The first block might be empty or preamble
@@ -254,7 +326,11 @@ def _filter_semantic_diff(diff_text: str | None) -> str:
         if not should_ignore:
             filtered_blocks.append("diff --git " + block)
             
-    return "".join(filtered_blocks)
+    filtered = "".join(filtered_blocks)
+    for notice in truncation_notices:
+        if notice not in filtered:
+            filtered = filtered.rstrip() + "\n" + notice + "\n"
+    return filtered
 
 
 def _read_git_diff_sections(cwd: Path) -> tuple[list[str], str]:
@@ -303,18 +379,63 @@ def _git_output(cwd: Path, args: list[str]) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def _run_git(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=str(cwd),
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=GIT_DIFF_TIMEOUT_SECONDS,
+def _read_git_capture(
+    handle: BinaryIO,
+    *,
+    max_bytes: int,
+    stream_name: str,
+) -> str:
+    """Decode a bounded prefix from a temporary git output stream."""
+
+    handle.seek(0)
+    sample = handle.read(max_bytes + 1)
+    truncated = len(sample) > max_bytes
+    text = sample[:max_bytes].decode(
+        locale.getpreferredencoding(False), errors="replace"
+    )
+    if truncated:
+        text += (
+            f"\n[git {stream_name} truncated after {max_bytes} bytes; "
+            "narrow the diff before review]\n"
         )
+    return text
+
+
+def _run_git(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    command = ["git", *args]
+    try:
+        # Direct child output to disk-backed temporary files. `capture_output`
+        # buffers the entire diff in memory before this module gets a chance to
+        # truncate it; temporary streams keep peak memory bounded even when a
+        # repository has a multi-gigabyte generated diff. We then decode only a
+        # fixed prefix for prompt construction.
+        with (
+            tempfile.TemporaryFile(mode="w+b") as stdout_file,
+            tempfile.TemporaryFile(mode="w+b") as stderr_file,
+        ):
+            completed = subprocess.run(
+                command,
+                cwd=str(cwd),
+                stdout=stdout_file,
+                stderr=stderr_file,
+                check=False,
+                timeout=GIT_DIFF_TIMEOUT_SECONDS,
+            )
+            stdout = _read_git_capture(
+                stdout_file,
+                max_bytes=MAX_GIT_DIFF_CAPTURE_BYTES,
+                stream_name="diff output",
+            )
+            stderr = _read_git_capture(
+                stderr_file,
+                max_bytes=MAX_GIT_STDERR_CAPTURE_BYTES,
+                stream_name="stderr",
+            )
+            return subprocess.CompletedProcess(
+                command, completed.returncode, stdout, stderr
+            )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return subprocess.CompletedProcess(["git", *args], 1, "", str(exc))
+        return subprocess.CompletedProcess(command, 1, "", str(exc))
 
 
 def _git_diff_unavailable(reason: str) -> str:
@@ -470,6 +591,10 @@ def build_prompt(
 ) -> str:
     """Build the read-only prompt sent to each participant."""
 
+    if len(context_paths) > MAX_CONTEXT_FILES:
+        raise ValueError(
+            f"Too many context files: {len(context_paths)} > {MAX_CONTEXT_FILES}"
+        )
     if chunk_strategy not in VALID_STRATEGIES:
         raise ValueError(
             f"Unknown chunk_strategy '{chunk_strategy}'. "
@@ -513,6 +638,9 @@ def build_prompt(
     # design, so no separate chunking path. Placed after the user question
     # and before the response-format block.
     if acceptance_contract and acceptance_contract.strip():
+        contract_text, _contract_truncated = _truncate_text(
+            acceptance_contract.strip(), MAX_ACCEPTANCE_CONTRACT_CHARS
+        )
         head_sections.extend(
             [
                 "",
@@ -522,7 +650,7 @@ def build_prompt(
                 "criteria; surface anything else as a non-blocking concern or "
                 "suggestion, not a blocker.",
                 "Criteria:",
-                acceptance_contract.strip(),
+                contract_text,
             ]
         )
     head_sections.extend(
@@ -605,10 +733,27 @@ def build_prompt(
         diff_default_section = "\n".join(diff_lines)
         diff_section_index = len(context_sections)
         context_sections.append(diff_default_section)
+    context_chars_read = 0
     for item in context_paths:
-        rendered = read_context_file(
-            item, cwd=cwd, allow_outside_cwd=allow_outside_cwd
+        remaining = MAX_CONTEXT_TOTAL_CHARS - context_chars_read
+        if remaining <= 0:
+            raise ValueError(
+                "Context files exceed aggregate character limit: "
+                f"maximum is {MAX_CONTEXT_TOTAL_CHARS}"
+            )
+        read_limit = min(MAX_CONTEXT_FILE_CHARS, remaining)
+        rendered, chars_read, truncated = _render_context_file(
+            item,
+            cwd=cwd,
+            allow_outside_cwd=allow_outside_cwd,
+            max_chars=read_limit,
         )
+        if truncated and read_limit < MAX_CONTEXT_FILE_CHARS:
+            raise ValueError(
+                "Context files exceed aggregate character limit: "
+                f"maximum is {MAX_CONTEXT_TOTAL_CHARS}"
+            )
+        context_chars_read += chars_read
         # Derive the label the same way read_context_file did so the chunker
         # can match path-mentions in the question.
         source = Path(item)
@@ -897,9 +1042,6 @@ def apply_per_peer_directives(
 # deliberation builder filters those out. We DO NOT feed ranking
 # results back to peers in-round — they are post-deliberation telemetry
 # only, mirroring how the v0.8 finding-matrix is handled.
-
-import re as _re_cross_rank
-
 
 CROSS_RANK_MIN_PEERS = 2
 

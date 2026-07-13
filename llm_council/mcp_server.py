@@ -14,37 +14,51 @@ from typing import Any
 
 from llm_council import __version__
 from llm_council.budget import (
+    DEFAULT_MCP_MAX_PROMPT_CHARS,
     DEFAULT_IMAGE_MAX_BYTES,
     DEFAULT_IMAGE_TOTAL_MAX_BYTES,
+    apply_preflight_cost_to_mcp_budget,
     enforce_mcp_budget,
     image_attachment_violations,
     mcp_budget_report,
     summarize_preflight_caps,
 )
-from llm_council.context import IMAGE_MIME_ALLOWLIST
+from llm_council.context import IMAGE_MIME_ALLOWLIST, MAX_CONTEXT_FILES
 from llm_council.defaults import DEFAULT_CONFIG
 from llm_council.config import (
     apply_tier_override,
+    canonical_mode_name,
     config_warnings,
     detect_current_agent,
     find_config,
     load_config,
+    resolve_config_data,
     select_participants,
 )
 from llm_council.context import (
     MAX_PROMPT_CHARS,
+    apply_per_peer_directives,
     build_image_manifest,
     build_prompt,
     resolve_acceptance_contract,
 )
 from llm_council import display
 from llm_council.doctor import check_environment, checks_to_dict
-from llm_council.env import load_project_env
-from llm_council.estimate import estimate_council
+from llm_council.env import load_project_env, project_env_context
+from llm_council.estimate import (
+    DEFAULT_COMPLETION_TOKENS,
+    IMAGE_TOKEN_HEURISTIC,
+    cross_rank_prompt_char_bounds,
+    deliberation_prompt_char_bounds,
+    estimate_council,
+    synthesis_prompt_char_bound,
+)
 from llm_council.model_catalog import fetch_openrouter_models
-from llm_council.orchestrator import execute_council
+from llm_council.orchestrator import (
+    apply_contextual_persona_recruitment,
+    execute_council,
+)
 from llm_council import policy
-from llm_council.policy import should_use_council
 from llm_council.recommend_judge import grade_difficulty
 from llm_council.stats import aggregate_reliability, compute_stats
 from llm_council.transcript import (
@@ -52,8 +66,9 @@ from llm_council.transcript import (
     find_transcript_by_id,
     format_prior_council_context,
     latest_transcript,
+    inspect_transcript_permissions,
     normalize_run_id,
-    transcript_dir,
+    transcript_dir_within_root,
     transcript_paths,
     write_transcript,
 )
@@ -63,6 +78,17 @@ from llm_council.update_check import check_for_update
 def _mode_description() -> str:
     names = ", ".join(sorted(DEFAULT_CONFIG["modes"]))
     return f"Council mode. Built-in choices: {names}."
+
+
+def _working_directory_schema() -> dict[str, Any]:
+    return {
+        "type": "string",
+        "description": (
+            "Absolute project directory for this call. It must exist inside "
+            "this server's configured LLM_COUNCIL_MCP_ROOT; omit it to use "
+            "that root. Relative paths are refused."
+        ),
+    }
 
 
 def council_run_schema() -> dict[str, Any]:
@@ -90,6 +116,7 @@ def council_run_schema() -> dict[str, Any]:
             },
             "context_files": {
                 "type": "array",
+                "maxItems": MAX_CONTEXT_FILES,
                 "items": {"type": "string"},
                 "description": "Files to include as read-only context.",
             },
@@ -121,7 +148,33 @@ def council_run_schema() -> dict[str, Any]:
                 "default": False,
                 "description": "Automatically open the HTML transcript in the browser.",
             },
-            "working_directory": {"type": "string"},
+            "working_directory": _working_directory_schema(),
+            "chunk_strategy": {
+                "type": "string",
+                "enum": ["fail", "head", "tail", "hash-aware"],
+                "default": "fail",
+                "description": (
+                    "How to fit an oversized git diff into the MCP prompt "
+                    "budget. Any dropped content is returned in chunk metadata."
+                ),
+            },
+            "allow_privacy_downgrade": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Explicitly allow a private-local continuation to send "
+                    "prior context to non-local participants."
+                ),
+            },
+            "request_timeout_seconds": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 7200,
+                "description": (
+                    "Wall-clock deadline for the complete MCP council request. "
+                    "Defaults to defaults.mcp_request_timeout_seconds."
+                ),
+            },
             "dry_run": {"type": "boolean", "default": False},
             "transparent": {"type": "boolean", "default": False},
             "deliberate": {
@@ -284,7 +337,7 @@ def council_run_schema() -> dict[str, Any]:
     }
 
 
-COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 7  # v7 = model_substituted_peers (top-level); v6 = per-result terse_retry_attempted, section_repair_attempted, is_ranking_round, continue_debate, evidence_verification_failures
+COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 8  # v8 = wall time + client/pin eligibility; v7 = model substitutions
 COUNCIL_RUN_VALID_STANCES = ("for", "against", "neutral")
 COUNCIL_RUN_VALID_ERROR_KINDS = (
     "timeout",
@@ -299,6 +352,8 @@ COUNCIL_RUN_VALID_ERROR_KINDS = (
     "untagged_evidence",
     "quota_exhausted",
     "model_substituted",
+    "pinned_model_unverified",
+    "client_ineligible",
     "unknown",
 )
 
@@ -327,8 +382,9 @@ def council_run_output_schema() -> dict[str, Any]:
                 "type": "string",
                 "enum": ["yes", "no", "tradeoff", "unknown"],
                 "description": (
-                    "Majority label across the final round. `unknown` when "
-                    "no peer produced a usable label."
+                    "Unique leading label across the final round. `unknown` "
+                    "when no peer produced a usable label or the top labels "
+                    "are tied."
                 ),
             },
             "agreement_count": {
@@ -361,7 +417,7 @@ def council_run_output_schema() -> dict[str, Any]:
             },
             "html": {
                 "type": "string",
-                "description": "Filesystem path to the HTML transcript dashboard.",
+                "description": "Filesystem path to the HTML transcript.",
             },
             "results": {
                 "type": "array",
@@ -379,6 +435,7 @@ def council_run_output_schema() -> dict[str, Any]:
                             "enum": [*COUNCIL_RUN_VALID_STANCES, None],
                         },
                         "elapsed_seconds": {"type": "number"},
+                        "wall_elapsed_seconds": {"type": ["number", "null"]},
                         "error": {"type": "string"},
                         "error_kind": {
                             "type": ["string", "null"],
@@ -812,7 +869,7 @@ def last_transcript_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "working_directory": {"type": "string"},
+            "working_directory": _working_directory_schema(),
             "format": {
                 "type": "string",
                 "enum": ["markdown", "json"],
@@ -835,7 +892,7 @@ def recommend_schema() -> dict[str, Any]:
                 "enum": ["low", "medium", "high"],
                 "default": "medium",
             },
-            "working_directory": {"type": "string"},
+            "working_directory": _working_directory_schema(),
         },
         "required": ["task"],
         "additionalProperties": False,
@@ -867,6 +924,7 @@ def estimate_schema() -> dict[str, Any]:
             },
             "context_files": {
                 "type": "array",
+                "maxItems": MAX_CONTEXT_FILES,
                 "items": {"type": "string"},
                 "description": "Files to include as read-only context.",
             },
@@ -890,7 +948,12 @@ def estimate_schema() -> dict[str, Any]:
                 "description": "Inline base64 images. Estimate stages them to .llm-council/inputs/<run-id>/ before computing prompt size.",
             },
             "include_diff": {"type": "boolean", "default": False},
-            "working_directory": {"type": "string"},
+            "working_directory": _working_directory_schema(),
+            "chunk_strategy": {
+                "type": "string",
+                "enum": ["fail", "head", "tail", "hash-aware"],
+                "default": "fail",
+            },
             "deliberate": {"type": "boolean", "default": False},
             "max_rounds": {"type": "integer", "minimum": 1, "maximum": 3},
             "completion_tokens": {
@@ -928,9 +991,11 @@ def doctor_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "working_directory": {"type": "string"},
+            "working_directory": _working_directory_schema(),
             "probe_openrouter": {"type": "boolean", "default": False},
             "probe_ollama": {"type": "boolean", "default": False},
+            "probe_native": {"type": "boolean", "default": False},
+            "repair_transcript_permissions": {"type": "boolean", "default": False},
             "check_update": {"type": "boolean", "default": False},
         },
         "additionalProperties": False,
@@ -941,7 +1006,7 @@ def stats_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "working_directory": {"type": "string"},
+            "working_directory": _working_directory_schema(),
             "since_days": {
                 "type": "integer",
                 "minimum": 1,
@@ -949,7 +1014,7 @@ def stats_schema() -> dict[str, Any]:
             },
             "participant": {
                 "type": "string",
-                "description": "Filter the per-participant view to one peer.",
+                "description": "Filter participant metrics to one participant.",
             },
         },
         "additionalProperties": False,
@@ -980,7 +1045,7 @@ def query_transcripts_schema() -> dict[str, Any]:
                 "maximum": 50,
                 "default": 5,
             },
-            "working_directory": {"type": "string"},
+            "working_directory": _working_directory_schema(),
         },
         "required": ["query"],
         "additionalProperties": False,
@@ -1069,29 +1134,59 @@ async def run_council(
     progress_token: Any | None = None,
 ) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
-    load_project_env(cwd)
-    config = load_config(find_config(cwd), search=False)
+    # MCP servers are long-lived and may serve sibling projects concurrently.
+    # Keep dotenv values in a ContextVar overlay for the entire async request;
+    # adapters/tasks inherit it without mutating or racing over os.environ.
+    with project_env_context(cwd, stop_at=_mcp_root()):
+        config = load_config(find_config(cwd, stop_at=_mcp_root()), search=False)
+        configured_timeout = (
+            config.get("defaults", {}).get("mcp_request_timeout_seconds")
+            or 1200
+        )
+        request_timeout = float(
+            arguments.get("request_timeout_seconds") or configured_timeout
+        )
+        if request_timeout <= 0 or request_timeout > 7200:
+            raise ValueError(
+                "request_timeout_seconds must be greater than 0 and no more "
+                "than 7200"
+            )
+        try:
+            async with asyncio.timeout(request_timeout):
+                return await _run_council_scoped(
+                    arguments,
+                    cwd=cwd,
+                    config=config,
+                    mcp_session=mcp_session,
+                    progress_token=progress_token,
+                )
+        except TimeoutError as exc:
+            raise ValueError(
+                "CouncilRequestTimeout: the complete MCP council request "
+                f"exceeded {request_timeout:g}s. Raise "
+                "request_timeout_seconds/defaults.mcp_request_timeout_seconds, "
+                "choose fewer participants, or reduce rounds/context."
+            ) from exc
+
+
+async def _run_council_scoped(
+    arguments: dict[str, Any],
+    *,
+    cwd: Path,
+    config: dict[str, Any],
+    mcp_session: Any | None = None,
+    progress_token: Any | None = None,
+) -> dict[str, Any]:
+    # Retain the call for compatibility with existing instrumentation. Inside
+    # project_env_context it is intentionally a no-op (see env.py).
+    load_project_env(cwd, stop_at=_mcp_root())
     warnings = config_warnings(config)
-    tier = arguments.get("tier")
-    if tier:
-        apply_tier_override(config, str(tier))
-    mode = arguments.get("mode") or config.get("defaults", {}).get("mode", "quick")
-    from llm_council.config import apply_smart_routing
-    apply_smart_routing(config, mode, cwd)
-    current = arguments.get("current") or detect_current_agent()
-    participants = select_participants(
-        config,
-        mode,
-        current,
-        explicit=arguments.get("participants"),
-        include=arguments.get("include"),
-        origin_policy=arguments.get("origin_policy"),
-    )
+
     question = arguments["question"]
-    transcripts_root = transcript_dir(cwd, config)
-    md_path, json_path = transcript_paths(transcripts_root, question)
+    transcripts_root = transcript_dir_within_root(cwd, config, root=_mcp_root())
     parent_run_id: str | None = None
     prior_context: str | None = None
+    prior_transcript: dict[str, Any] | None = None
     continuation_id = arguments.get("continuation_id")
     if continuation_id:
         normalize_run_id(continuation_id)
@@ -1107,9 +1202,58 @@ async def run_council(
             if prior_path
             else normalize_run_id(continuation_id)
         )
+
+    inherited_mode: str | None = None
+    if arguments.get("mode") is None and prior_transcript is not None:
+        from llm_council.privacy import transcript_was_private_local
+
+        if transcript_was_private_local(prior_transcript):
+            inherited_mode = str(prior_transcript.get("mode") or "private-local")
+    mode = canonical_mode_name(
+        config,
+        arguments.get("mode")
+        or inherited_mode
+        or config.get("defaults", {}).get("mode", "quick"),
+    )
+    from llm_council.config import apply_smart_routing
+
+    apply_smart_routing(config, mode, cwd)
+    # An explicit tier is an operator pin and therefore has higher precedence
+    # than automatic low-risk routing. Applying it last prevents `tier: deep`
+    # from being silently stepped down to a cheaper model.
+    tier = arguments.get("tier")
+    if tier:
+        apply_tier_override(config, str(tier))
+    current = arguments.get("current") or detect_current_agent()
+    participants = select_participants(
+        config,
+        mode,
+        current,
+        explicit=arguments.get("participants"),
+        include=arguments.get("include"),
+        origin_policy=arguments.get("origin_policy"),
+    )
+
+    if prior_transcript is not None:
+        from llm_council.privacy import privacy_downgrade_error
+
+        downgrade_error = privacy_downgrade_error(
+            prior_transcript,
+            participants=participants,
+            participant_cfg=config.get("participants", {}) or {},
+            allow_privacy_downgrade=bool(
+                arguments.get("allow_privacy_downgrade")
+            ),
+        )
+        if downgrade_error:
+            raise ValueError(downgrade_error)
         prior_context = format_prior_council_context(
             prior_transcript, run_id=parent_run_id
         )
+
+    # Transcript identifiers are opaque; never place user question text in a
+    # filesystem path, even before secret scanning runs.
+    md_path, json_path = transcript_paths(transcripts_root, "")
     sweep_old_inline_inputs(cwd)
     inline_staged = _stage_inline_images(arguments.get("images"), cwd, md_path.stem)
     image_path_inputs = list(arguments.get("image_paths") or []) + inline_staged
@@ -1173,16 +1317,21 @@ async def run_council(
     default_max = (
         config.get("defaults", {}).get("max_prompt_chars") or MAX_PROMPT_CHARS
     )
+    mcp_max = (
+        config.get("defaults", {}).get("mcp_max_prompt_chars")
+        or DEFAULT_MCP_MAX_PROMPT_CHARS
+    )
     peer_caps = [
         int(participant_cfg_for_prompt.get(name, {}).get("max_prompt_chars"))
         for name in participants
         if isinstance(participant_cfg_for_prompt.get(name), dict)
         and participant_cfg_for_prompt.get(name, {}).get("max_prompt_chars")
     ]
-    effective_max = min([int(default_max), *peer_caps]) if peer_caps else int(default_max)
+    effective_max = min([int(default_max), int(mcp_max), *peer_caps])
     safe_context = bool(
         (config.get("modes", {}) or {}).get(mode, {}).get("safe_context")
     )
+    chunk_events: list[dict[str, Any]] = []
     prompt = build_prompt(
         question,
         mode=mode,
@@ -1198,8 +1347,10 @@ async def run_council(
         prior_context=prior_context,
         acceptance_contract=acceptance_contract,
         safe_context=safe_context,
+        chunk_strategy=str(arguments.get("chunk_strategy") or "fail"),
+        chunk_progress=chunk_events.append,
     )
-    from llm_council.safety import apply_secret_scan_policy
+    from llm_council.safety import apply_secret_scan_policy, redact_secrets
 
     _defaults_cfg = config.get("defaults", {}) or {}
     _scan_policy = str(_defaults_cfg.get("secret_scan") or "warn").lower()
@@ -1217,8 +1368,14 @@ async def run_council(
     # transcript. Pop it so the redacted prompt isn't duplicated into the
     # metadata.secret_scan payload below.
     _redacted_prompt = secret_scan_payload.pop("redacted_prompt", None)
+    persisted_question = question
     if _redacted_prompt is not None:
         prompt = _redacted_prompt
+        persisted_question, _question_findings = redact_secrets(
+            question,
+            cwd=cwd,
+            allowlist_filename=_scan_allowlist,
+        )
     transparent = bool(
         arguments.get("transparent") or config.get("defaults", {}).get("transparent")
     )
@@ -1246,23 +1403,224 @@ async def run_council(
     if min_quorum_arg is None:
         min_quorum_arg = mode_cfg.get("min_quorum")
     min_quorum_value = int(min_quorum_arg) if min_quorum_arg is not None else None
+
+    # Resolve review-focus bundles before estimating so their per-peer framing
+    # is included in hard token/cost caps as well as the actual calls.
+    resolved_focus = None
+    focus_directive = ""
+    _focus_arg = arguments.get("focus")
+    if _focus_arg:
+        from llm_council import review_skills as _review_skills
+
+        _focus_names = [str(name) for name in _focus_arg]
+        try:
+            resolved_focus, _ = _review_skills.resolve_focus(_focus_names, cwd)
+        except _review_skills.FocusNotFound as exc:
+            raise ValueError(str(exc)) from exc
+        focus_directive = _review_skills.render_focus_directive(resolved_focus)
+
+    tool_call_voting = bool(mode_cfg.get("tool_call_voting"))
+    apply_contextual_persona_recruitment(
+        participants,
+        participant_cfg_for_prompt,
+        cwd,
+        stances=mode_stances if isinstance(mode_stances, dict) else None,
+    )
+
+    resolved_synthesizer: str | None = None
+    if synthesize:
+        from llm_council.synthesis import select_synthesizer
+
+        selected_participant_cfg = {
+            name: participant_cfg_for_prompt[name]
+            for name in participants
+            if name in participant_cfg_for_prompt
+        }
+        resolved_synthesizer = select_synthesizer(
+            config,
+            selected_participant_cfg,
+            stances=mode_stances if isinstance(mode_stances, dict) else None,
+            current=current,
+        )
+
+    participant_prompts: dict[str, str] = {}
+    for name in participants:
+        peer_cfg = participant_cfg_for_prompt.get(name) or {}
+        assigned_stance = (
+            mode_stances.get(name)
+            if isinstance(mode_stances, dict)
+            else peer_cfg.get("stance")
+        )
+        participant_prompts[name] = apply_per_peer_directives(
+            prompt,
+            mode=mode,
+            family=peer_cfg.get("family"),
+            tool_call_voting=tool_call_voting,
+            stance=assigned_stance,
+            persona=peer_cfg.get("persona"),
+            persona_prompt=peer_cfg.get("persona_prompt"),
+            focus_directive=focus_directive,
+        )
+    budget_prompt_chars = max(
+        [len(prompt), *(len(text) for text in participant_prompts.values())]
+    )
+    participant_prompt_char_counts = {
+        name: len(text) for name, text in participant_prompts.items()
+    }
+    deliberation_prompt_bounds = (
+        deliberation_prompt_char_bounds(
+            participants=participants,
+            participant_cfg=participant_cfg_for_prompt,
+            mode=mode,
+            tool_call_voting=tool_call_voting,
+            stances=mode_stances if isinstance(mode_stances, dict) else None,
+            focus_directive=focus_directive,
+        )
+        if deliberate and max_rounds > 1
+        else {}
+    )
+    image_prompt_tokens = {
+        name: len(image_manifest) * IMAGE_TOKEN_HEURISTIC
+        if (participant_cfg_for_prompt.get(name) or {}).get("vision")
+        else 0
+        for name in participants
+    }
+    cross_rank_enabled = bool(arguments.get("cross_rank"))
+    ranking_prompt_bounds = (
+        cross_rank_prompt_char_bounds(
+            participants=participants,
+            participant_cfg=participant_cfg_for_prompt,
+            question=persisted_question or prompt,
+            completion_tokens=DEFAULT_COMPLETION_TOKENS,
+            focus_directive=focus_directive,
+            safe_context=safe_context,
+        )
+        if cross_rank_enabled and len(participants) >= 2
+        else {}
+    )
+    synthesis_prompt_bound = (
+        synthesis_prompt_char_bound(
+            participant_cfg_for_prompt.get(resolved_synthesizer, {})
+        )
+        if resolved_synthesizer is not None
+        else None
+    )
     budget = mcp_budget_report(
         config=config,
         participants=participants,
-        prompt_chars=len(prompt),
+        prompt_chars=budget_prompt_chars,
         deliberate=deliberate,
         max_rounds=max_rounds,
-        cross_rank=bool(arguments.get("cross_rank")),
+        cross_rank=cross_rank_enabled,
         synthesize=synthesize,
+        synthesizer_name=resolved_synthesizer,
+        participant_prompt_chars=participant_prompt_char_counts,
+        deliberation_prompt_chars=deliberation_prompt_bounds,
+        cross_rank_prompt_chars=ranking_prompt_bounds,
+        synthesis_prompt_chars=synthesis_prompt_bound,
+        image_prompt_tokens=image_prompt_tokens,
     )
+
+    max_cost_usd = arguments.get("max_cost_usd")
+    max_tokens = arguments.get("max_tokens")
+    # M6 soft cost-warning threshold. None-aware precedence (NOT an `or`
+    # chain, so an explicit 0 at either layer is respected): MCP arg >
+    # defaults.cost_warn_usd.
+    cost_warn_usd = arguments.get("cost_warn_usd")
+    if cost_warn_usd is None:
+        cost_warn_usd = config.get("defaults", {}).get("cost_warn_usd")
+    # Compute the pre-flight estimate once and reuse it for the hard budget
+    # gate (when a cap is set), the M6 soft warning, and the L7 compact echo.
+    # allow_network=False keeps it cheap (cached catalog only) so the
+    # always-on L7 echo adds no meaningful latency.
+    preflight: dict[str, Any] | None = None
+    cost_warning_payload: dict[str, Any] | None = None
+    cost_estimate_block: dict[str, Any] | None = None
+    try:
+        preflight = estimate_council(
+            config=config,
+            cwd=cwd,
+            question=persisted_question,
+            mode=mode,
+            current=current,
+            explicit=arguments.get("participants"),
+            include=arguments.get("include"),
+            origin_policy=arguments.get("origin_policy"),
+            context_paths=arguments.get("context_files") or [],
+            include_diff=bool(arguments.get("include_diff")),
+            allow_outside_cwd=False,
+            deliberate=deliberate,
+            max_rounds=max_rounds,
+            use_cache=True,
+            allow_network=False,
+            image_paths=image_path_inputs or None,
+            prepared_prompt=prompt,
+            prepared_participants=participants,
+            participant_prompts=participant_prompts,
+            cross_rank=cross_rank_enabled,
+            synthesize=synthesize,
+            synthesizer_name=resolved_synthesizer,
+            focus_directive=focus_directive,
+            cross_rank_prompt_chars=ranking_prompt_bounds,
+            synthesis_prompt_chars=synthesis_prompt_bound,
+            deliberation_prompt_chars=deliberation_prompt_bounds,
+        )
+    except (OSError, ValueError) as exc:
+        # Preserve any cheap prompt/input violation first. Otherwise explicit
+        # caps and the default hosted-run ceiling fail closed when the richer
+        # whole-run estimate (including outputs) cannot be computed.
+        enforce_mcp_budget(budget)
+        if (
+            max_cost_usd is not None
+            or max_tokens is not None
+            or budget.get("paid_hosted_participants")
+        ):
+            raise ValueError(
+                f"failed to compute pre-flight estimate: {exc}"
+            ) from exc
+    if preflight is not None:
+        from llm_council.estimate import compact_cost_estimate
+
+        apply_preflight_cost_to_mcp_budget(budget, preflight)
+        cost_estimate_block = compact_cost_estimate(preflight)
+        cost_total, token_total, unpriced_paid = summarize_preflight_caps(preflight)
+        if max_cost_usd is not None and unpriced_paid:
+            raise ValueError(
+                "Pre-flight estimate cannot enforce max_cost_usd: non-local "
+                f"peer(s) without complete pricing: {', '.join(unpriced_paid)}. "
+                "Configure input_per_million and output_per_million (or, for "
+                "OpenRouter, confirm the model id against `council_models`), "
+                "or drop these peers before relying on the cost cap."
+            )
+        if max_cost_usd is not None and cost_total > float(max_cost_usd):
+            raise ValueError(
+                f"Pre-flight estimate ${cost_total:.6f} (with worst-case "
+                f"outer-retry headroom) exceeds max_cost_usd "
+                f"${float(max_cost_usd):.6f}; refused before any participant "
+                "was invoked."
+            )
+        if max_tokens is not None and token_total > int(max_tokens):
+            raise ValueError(
+                f"Pre-flight estimate {token_total} tokens exceeds max_tokens "
+                f"{int(max_tokens)}; refused before any participant was invoked."
+            )
+        # M6: soft warning off the SAME reduction the hard gate uses, so soft
+        # and hard numbers can never drift. Only reached when the run proceeds
+        # (a tripped hard gate above raises before this point).
+        if cost_warn_usd is not None and cost_total >= float(cost_warn_usd):
+            cost_warning_payload = {
+                "estimated_usd": cost_total,
+                "threshold_usd": float(cost_warn_usd),
+            }
+    # Both real and dry runs honor the default MCP ceiling. Dry-run means
+    # "invoke no peers", not "preview a run the server would refuse".
+    enforce_mcp_budget(budget)
 
     if arguments.get("dry_run"):
         # Strict MCP clients reject any council_run response that doesn't
         # satisfy the advertised outputSchema. Build a schema-valid envelope
-        # with sentinel values for the fields a real run would populate, and
-        # park the dry-run preview details in `metadata`. `recommendation:
-        # "unknown"` is a legal enum value precisely for "no peer labeled" —
-        # which is exactly what dry-run is.
+        # with sentinel values for fields a real run would populate, and keep
+        # the fully enforced preview details in metadata.
         participant_models = {
             name: (config.get("participants", {}).get(name, {}) or {}).get("model")
             for name in participants
@@ -1288,6 +1646,24 @@ async def run_council(
             deliberated=False,
             rounds=0,
         )
+        dry_metadata: dict[str, Any] = {
+            "dry_run": True,
+            "prompt_chars": len(prompt),
+            "deliberate": deliberate,
+            "max_rounds": max_rounds,
+            "budget": budget,
+            "participant_models": participant_models,
+            "images": [
+                _public_image_entry(entry, cwd) for entry in image_manifest
+            ],
+            "config_warnings": warnings,
+        }
+        if cost_estimate_block is not None:
+            dry_metadata["cost_estimate"] = cost_estimate_block
+        if cost_warning_payload is not None:
+            dry_metadata["cost_warning"] = cost_warning_payload
+        if chunk_events:
+            dry_metadata["chunk_events"] = list(chunk_events)
         return {
             "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
             "recommendation": "unknown",
@@ -1300,96 +1676,10 @@ async def run_council(
             "current": current,
             "participants": participants,
             "results": [],
-            "metadata": {
-                "dry_run": True,
-                "prompt_chars": len(prompt),
-                "deliberate": deliberate,
-                "max_rounds": max_rounds,
-                "budget": budget,
-                "participant_models": participant_models,
-                "images": [
-                    _public_image_entry(entry, cwd) for entry in image_manifest
-                ],
-                "config_warnings": warnings,
-            },
+            "metadata": dry_metadata,
             "summary_markdown": dry_summary,
         }
 
-    enforce_mcp_budget(budget)
-
-    max_cost_usd = arguments.get("max_cost_usd")
-    max_tokens = arguments.get("max_tokens")
-    # M6 soft cost-warning threshold. None-aware precedence (NOT an `or`
-    # chain, so an explicit 0 at either layer is respected): MCP arg >
-    # defaults.cost_warn_usd.
-    cost_warn_usd = arguments.get("cost_warn_usd")
-    if cost_warn_usd is None:
-        cost_warn_usd = config.get("defaults", {}).get("cost_warn_usd")
-    # Compute the pre-flight estimate once and reuse it for the hard budget
-    # gate (when a cap is set), the M6 soft warning, and the L7 compact echo.
-    # allow_network=False keeps it cheap (cached catalog only) so the
-    # always-on L7 echo adds no meaningful latency.
-    preflight: dict[str, Any] | None = None
-    cost_warning_payload: dict[str, Any] | None = None
-    cost_estimate_block: dict[str, Any] | None = None
-    try:
-        preflight = estimate_council(
-            config=config,
-            cwd=cwd,
-            question=question,
-            mode=mode,
-            current=current,
-            explicit=arguments.get("participants"),
-            include=arguments.get("include"),
-            origin_policy=arguments.get("origin_policy"),
-            context_paths=arguments.get("context_files") or [],
-            include_diff=bool(arguments.get("include_diff")),
-            allow_outside_cwd=False,
-            deliberate=deliberate,
-            max_rounds=max_rounds,
-            use_cache=True,
-            allow_network=False,
-            image_paths=image_path_inputs or None,
-        )
-    except (OSError, ValueError) as exc:
-        # Hard caps fail closed if the estimate can't be computed; the soft
-        # warning / echo are best-effort and degrade silently.
-        if max_cost_usd is not None or max_tokens is not None:
-            raise ValueError(
-                f"failed to compute pre-flight estimate: {exc}"
-            ) from exc
-    if preflight is not None:
-        from llm_council.estimate import compact_cost_estimate
-
-        cost_estimate_block = compact_cost_estimate(preflight)
-        cost_total, token_total, unpriced_paid = summarize_preflight_caps(preflight)
-        if max_cost_usd is not None and unpriced_paid:
-            raise ValueError(
-                "Pre-flight estimate cannot enforce max_cost_usd: hosted "
-                f"peer(s) without a catalog price: {', '.join(unpriced_paid)}. "
-                "Confirm the model id against `council_models` or drop these "
-                "peers before relying on the cost cap."
-            )
-        if max_cost_usd is not None and cost_total > float(max_cost_usd):
-            raise ValueError(
-                f"Pre-flight estimate ${cost_total:.6f} (with worst-case "
-                f"repair-retry headroom) exceeds max_cost_usd "
-                f"${float(max_cost_usd):.6f}; refused before any participant "
-                "was invoked."
-            )
-        if max_tokens is not None and token_total > int(max_tokens):
-            raise ValueError(
-                f"Pre-flight estimate {token_total} tokens exceeds max_tokens "
-                f"{int(max_tokens)}; refused before any participant was invoked."
-            )
-        # M6: soft warning off the SAME reduction the hard gate uses, so soft
-        # and hard numbers can never drift. Only reached when the run proceeds
-        # (a tripped hard gate above raises before this point).
-        if cost_warn_usd is not None and cost_total >= float(cost_warn_usd):
-            cost_warning_payload = {
-                "estimated_usd": cost_total,
-                "threshold_usd": float(cost_warn_usd),
-            }
     cfg = config.get("participants", {})
     # Stash warnings now so they survive into the post-run response. We
     # populate the metadata field once execute_council has returned its
@@ -1404,19 +1694,6 @@ async def run_council(
     _progress_cb = _build_mcp_progress_callback(
         mcp_session, progress_token, planned_total=_planned_total
     )
-    # Resolve operator-authored review-focus bundles. Fail fast (raise
-    # ValueError, mirroring this handler's other input-validation errors)
-    # on an unknown bundle name BEFORE execute_council launches any peer.
-    resolved_focus = None
-    _focus_arg = arguments.get("focus")
-    if _focus_arg:
-        from llm_council import review_skills as _review_skills
-
-        _focus_names = [str(name) for name in _focus_arg]
-        try:
-            resolved_focus, _ = _review_skills.resolve_focus(_focus_names, cwd)
-        except _review_skills.FocusNotFound as exc:
-            raise ValueError(str(exc)) from exc
     results, metadata = await execute_council(
         participants,
         cfg,
@@ -1431,8 +1708,9 @@ async def run_council(
         mode=mode,
         stances=mode_stances if isinstance(mode_stances, dict) else None,
         synthesize=synthesize,
+        synthesizer_name=resolved_synthesizer,
         current=current,
-        question=question,
+        question=persisted_question,
         cross_rank=bool(arguments.get("cross_rank")),
         focus=resolved_focus,
     )
@@ -1442,6 +1720,12 @@ async def run_council(
         ]
     if secret_scan_payload.get("detected_count") or _scan_policy != "off":
         metadata["secret_scan"] = secret_scan_payload
+    if chunk_events:
+        metadata["chunk_events"] = list(chunk_events)
+        metadata["diff_chunking"] = dict(chunk_events[-1])
+        progress_events = metadata.setdefault("progress_events", [])
+        if isinstance(progress_events, list):
+            progress_events.extend(chunk_events)
     # Record the pre-run independent-review suppression (only when it actually
     # occurred). Surfaced as a metadata flag rather than a mid-run progress
     # event because the decision precedes execute_council.
@@ -1455,10 +1739,30 @@ async def run_council(
         metadata["cost_estimate"] = cost_estimate_block
     if cost_warning_payload is not None:
         metadata["cost_warning"] = cost_warning_payload
+    from llm_council.adapters import classify_error
+    from llm_council.deliberation import (
+        recommendation_label,
+        summarize_recommendations,
+    )
+    from llm_council.transcript import final_round_results
+
+    final = final_round_results(results)
+    vote_summary = summarize_recommendations(final)
+    recommendation = vote_summary.recommendation
+    agreement = vote_summary.agreement_count
+    labeled_total = vote_summary.total_labeled
+    # Persist the exact same final-round vote reduction returned to the MCP
+    # caller. Transcript consumers must not have to recompute it (and risk
+    # drifting on tie semantics) from cumulative multi-round results.
+    metadata["recommendation"] = recommendation
+    metadata["agreement_count"] = agreement
+    metadata["total_labeled"] = labeled_total
+    metadata["recommendation_counts"] = dict(vote_summary.counts)
+    metadata["recommendation_tied"] = vote_summary.tied
     write_transcript(
         md_path,
         json_path,
-        question=question,
+        question=persisted_question,
         mode=mode,
         current=current,
         participants=participants,
@@ -1468,25 +1772,6 @@ async def run_council(
         metadata=metadata,
         parent_run_id=parent_run_id,
     )
-    from llm_council.adapters import classify_error
-    from llm_council.deliberation import (
-        labeled_quorum_count,
-        recommendation_counts,
-        recommendation_label,
-    )
-    from llm_council.transcript import final_round_results
-
-    final = final_round_results(results)
-    counts = recommendation_counts(final)
-    labeled_total = labeled_quorum_count(final)
-    if labeled_total == 0:
-        recommendation = "unknown"
-        agreement = 0
-    else:
-        recommendation = max(
-            ("yes", "no", "tradeoff"), key=lambda label: counts[label]
-        )
-        agreement = counts[recommendation]
     structured_results = []
     for result in results:
         label = (
@@ -1501,6 +1786,11 @@ async def run_council(
                 "label": label,
                 "stance": result.stance,
                 "elapsed_seconds": round(result.elapsed_seconds, 3),
+                "wall_elapsed_seconds": (
+                    round(result.wall_elapsed_seconds, 3)
+                    if result.wall_elapsed_seconds is not None
+                    else None
+                ),
                 "error": result.error,
                 "error_kind": classify_error(result.error),
                 "model": result.model,
@@ -1553,15 +1843,17 @@ async def run_council(
             "label": row.get("label"),
             "stance": row.get("stance"),
             "elapsed_seconds": row.get("elapsed_seconds") or 0,
+            "wall_elapsed_seconds": row.get("wall_elapsed_seconds"),
         }
         for row in structured_results
         if row["name"] in final_names
     ]
     summary_markdown = render_summary_markdown(
         mode=mode,
-        ok_count=sum(1 for r in results if r.ok),
-        total=len(results),
+        ok_count=sum(1 for r in final if r.ok),
+        total=len(final),
         elapsed_seconds=sum(r.elapsed_seconds for r in results),
+        wall_elapsed_seconds=metadata.get("run_wall_elapsed_seconds"),
         recommendation=recommendation,
         per_peer_rows=final_peer_rows,
         transcript_path=str(md_path),
@@ -1712,9 +2004,9 @@ async def run_council(
 
 def last_transcript(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
-    load_project_env(cwd)
-    config = load_config(find_config(cwd), search=False)
-    out_dir = transcript_dir(cwd, config)
+    load_project_env(cwd, stop_at=_mcp_root())
+    config = load_config(find_config(cwd, stop_at=_mcp_root()), search=False)
+    out_dir = transcript_dir_within_root(cwd, config, root=_mcp_root())
     path = latest_transcript(out_dir, suffix=".json" if arguments.get("format") == "json" else ".md")
     if path is None:
         return {"found": False, "path": None, "content": ""}
@@ -1723,8 +2015,8 @@ def last_transcript(arguments: dict[str, Any]) -> dict[str, Any]:
 
 def run_doctor(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
-    load_project_env(cwd)
-    config = load_config(find_config(cwd), search=False)
+    load_project_env(cwd, stop_at=_mcp_root())
+    config = load_config(find_config(cwd, stop_at=_mcp_root()), search=False)
     result: dict[str, Any] = {
         "config_warnings": config_warnings(config),
         "checks": checks_to_dict(
@@ -1732,8 +2024,24 @@ def run_doctor(arguments: dict[str, Any]) -> dict[str, Any]:
                 config,
                 probe_openrouter=bool(arguments.get("probe_openrouter")),
                 probe_ollama=bool(arguments.get("probe_ollama")),
+                probe_native=bool(arguments.get("probe_native")),
+                probe_cwd=cwd,
             )
         )
+    }
+    out_dir = transcript_dir_within_root(cwd, config, root=_mcp_root())
+    if arguments.get("repair_transcript_permissions"):
+        result["transcript_permissions"] = (
+            inspect_transcript_permissions(out_dir, repair=True)
+            if out_dir.is_dir()
+            else {"directory": str(out_dir), "status": "not_created"}
+        )
+    result["server"] = {
+        "version": __version__,
+        "project_root": str(_mcp_root()),
+        "working_directory": str(cwd),
+        "config_path": str(find_config(cwd, stop_at=_mcp_root()) or ""),
+        "project_scoped": True,
     }
     result["version"] = __version__
     if arguments.get("check_update"):
@@ -1749,7 +2057,10 @@ def _peers_to_consider_dropping(cwd: Path, config: dict[str, Any]) -> list[str]:
     """
     try:
         reliability = aggregate_reliability(
-            cwd, transcripts_dir=transcript_dir(cwd, config)
+            cwd,
+            transcripts_dir=transcript_dir_within_root(
+                cwd, config, root=_mcp_root()
+            ),
         )
         return policy.peers_to_consider_dropping(reliability)
     except Exception:
@@ -1781,8 +2092,8 @@ async def _run_recommend(arguments: dict[str, Any]) -> dict[str, Any]:
     config: dict[str, Any] | None = None
     try:
         cwd = _resolve_working_directory(arguments)
-        load_project_env(cwd)
-        config = load_config(find_config(cwd), search=False)
+        load_project_env(cwd, stop_at=_mcp_root())
+        config = load_config(find_config(cwd, stop_at=_mcp_root()), search=False)
     except Exception:
         config = None
 
@@ -1806,13 +2117,30 @@ async def _run_recommend(arguments: dict[str, Any]) -> dict[str, Any]:
 def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         cwd = _resolve_working_directory(arguments)
-        load_project_env(cwd)
-        config = load_config(find_config(cwd), search=False)
+        load_project_env(cwd, stop_at=_mcp_root())
+        config = load_config(find_config(cwd, stop_at=_mcp_root()), search=False)
         warnings = config_warnings(config)
+        mode = canonical_mode_name(
+            config,
+            arguments.get("mode")
+            or config.get("defaults", {}).get("mode", "quick"),
+        )
+        from llm_council.config import apply_smart_routing
+
+        # Match `council_run`: automatic low-risk routing first, explicit tier
+        # last so an operator pin cannot be silently downgraded.
+        apply_smart_routing(config, mode, cwd)
         tier = arguments.get("tier")
         if tier:
             apply_tier_override(config, str(tier))
-        mode = arguments.get("mode") or config.get("defaults", {}).get("mode", "quick")
+        defaults_cfg = config.setdefault("defaults", {})
+        defaults_cfg["max_prompt_chars"] = min(
+            int(defaults_cfg.get("max_prompt_chars") or MAX_PROMPT_CHARS),
+            int(
+                defaults_cfg.get("mcp_max_prompt_chars")
+                or DEFAULT_MCP_MAX_PROMPT_CHARS
+            ),
+        )
         current = arguments.get("current") or detect_current_agent()
         completion_tokens = (
             1500
@@ -1829,6 +2157,7 @@ def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
             arguments.get("images"), cwd, estimate_slug
         )
         image_path_inputs = list(arguments.get("image_paths") or []) + inline_staged
+        chunk_events: list[dict[str, Any]] = []
         estimate = estimate_council(
             config=config,
             cwd=cwd,
@@ -1848,7 +2177,11 @@ def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
             openrouter_models=arguments.get("openrouter_models") or [],
             use_cache=not bool(arguments.get("no_cache")),
             image_paths=image_path_inputs or None,
+            chunk_strategy=str(arguments.get("chunk_strategy") or "fail"),
+            chunk_progress=chunk_events.append,
         )
+        if chunk_events:
+            estimate["chunk_events"] = chunk_events
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     return {
@@ -1879,9 +2212,9 @@ def list_models(arguments: dict[str, Any]) -> dict[str, Any]:
 
 def run_stats(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
-    load_project_env(cwd)
-    config = load_config(find_config(cwd), search=False)
-    out_dir = transcript_dir(cwd, config)
+    load_project_env(cwd, stop_at=_mcp_root())
+    config = load_config(find_config(cwd, stop_at=_mcp_root()), search=False)
+    out_dir = transcript_dir_within_root(cwd, config, root=_mcp_root())
     since_days = arguments.get("since_days")
     if since_days is not None:
         since_days = int(since_days)
@@ -1899,8 +2232,8 @@ def run_stats(arguments: dict[str, Any]) -> dict[str, Any]:
 
 def list_modes(arguments: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_working_directory(arguments)
-    load_project_env(cwd)
-    config = load_config(find_config(cwd), search=False)
+    load_project_env(cwd, stop_at=_mcp_root())
+    config = load_config(find_config(cwd, stop_at=_mcp_root()), search=False)
     return {
         "modes": config.get("modes", {}),
         "participants": list(config.get("participants", {}).keys()),
@@ -1917,9 +2250,9 @@ def query_transcripts(arguments: dict[str, Any]) -> dict[str, Any]:
     from llm_council.query import search_similar
 
     cwd = _resolve_working_directory(arguments)
-    load_project_env(cwd)
-    config = load_config(find_config(cwd), search=False)
-    out_dir = transcript_dir(cwd, config)
+    load_project_env(cwd, stop_at=_mcp_root())
+    config = load_config(find_config(cwd, stop_at=_mcp_root()), search=False)
+    out_dir = transcript_dir_within_root(cwd, config, root=_mcp_root())
     query_text = arguments.get("query")
     if not isinstance(query_text, str) or not query_text.strip():
         raise ValueError("query must be a non-empty string")
@@ -1959,10 +2292,7 @@ def config_schema() -> dict[str, Any]:
                 "type": "string",
                 "description": "The value to set (used only for action='set'). Strings like 'true'/'false' will be parsed appropriately.",
             },
-            "working_directory": {
-                "type": "string",
-                "description": "Project root directory to look for the configuration file.",
-            },
+            "working_directory": _working_directory_schema(),
         },
         "required": ["action", "key"],
         "additionalProperties": False,
@@ -1975,8 +2305,8 @@ def run_config(arguments: dict[str, Any]) -> dict[str, Any]:
     import yaml
 
     cwd = _resolve_working_directory(arguments)
-    load_project_env(cwd)
-    cfg_file = find_config(cwd)
+    load_project_env(cwd, stop_at=_mcp_root())
+    cfg_file = find_config(cwd, stop_at=_mcp_root())
     if not cfg_file:
         raise ValueError("Configuration file not found. Run setup first.")
     cfg_path = Path(cfg_file)
@@ -2004,10 +2334,36 @@ def run_config(arguments: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("Value is required for set action")
         parsed_val = _parse_config_value(value_str)
         _set_nested_val(config, key, parsed_val)
+
         try:
-            cfg_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
-        except Exception as e:
-            raise ValueError(f"Failed to write configuration: {e}")
+            resolve_config_data(config)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Refusing to write invalid configuration: {exc}"
+            ) from exc
+
+        import tempfile
+
+        temp_path: Path | None = None
+        try:
+            payload = yaml.safe_dump(config, sort_keys=False)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=cfg_path.parent,
+                prefix=f".{cfg_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                handle.write(payload)
+                temp_path = Path(handle.name)
+            temp_path.chmod(cfg_path.stat().st_mode)
+            os.replace(temp_path, cfg_path)
+        except Exception as exc:
+            raise ValueError(f"Failed to write configuration: {exc}") from exc
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
         return {
             "key": key,
             "value": parsed_val,
@@ -2067,7 +2423,7 @@ async def _serve() -> None:
                 description="List configured council modes and participants.",
                 inputSchema={
                     "type": "object",
-                    "properties": {"working_directory": {"type": "string"}},
+                    "properties": {"working_directory": _working_directory_schema()},
                     "additionalProperties": False,
                 },
             ),
@@ -2138,23 +2494,39 @@ async def _serve() -> None:
                 progress_token=progress_token,
             )
         elif name == "council_recommend":
-            result = await _run_recommend(arguments)
+            cwd = _resolve_working_directory(arguments)
+            with project_env_context(cwd, stop_at=_mcp_root()):
+                result = await _run_recommend(arguments)
         elif name == "council_estimate":
-            result = estimate_run(arguments)
+            cwd = _resolve_working_directory(arguments)
+            with project_env_context(cwd, stop_at=_mcp_root()):
+                result = estimate_run(arguments)
         elif name == "council_list_modes":
-            result = list_modes(arguments)
+            cwd = _resolve_working_directory(arguments)
+            with project_env_context(cwd, stop_at=_mcp_root()):
+                result = list_modes(arguments)
         elif name == "council_last_transcript":
-            result = last_transcript(arguments)
+            cwd = _resolve_working_directory(arguments)
+            with project_env_context(cwd, stop_at=_mcp_root()):
+                result = last_transcript(arguments)
         elif name == "council_doctor":
-            result = run_doctor(arguments)
+            cwd = _resolve_working_directory(arguments)
+            with project_env_context(cwd, stop_at=_mcp_root()):
+                result = run_doctor(arguments)
         elif name == "council_models":
             result = list_models(arguments)
         elif name == "council_stats":
-            result = run_stats(arguments)
+            cwd = _resolve_working_directory(arguments)
+            with project_env_context(cwd, stop_at=_mcp_root()):
+                result = run_stats(arguments)
         elif name == "council_query_transcripts":
-            result = query_transcripts(arguments)
+            cwd = _resolve_working_directory(arguments)
+            with project_env_context(cwd, stop_at=_mcp_root()):
+                result = query_transcripts(arguments)
         elif name == "council_config":
-            result = run_config(arguments)
+            cwd = _resolve_working_directory(arguments)
+            with project_env_context(cwd, stop_at=_mcp_root()):
+                result = run_config(arguments)
         else:
             raise ValueError(f"Unknown tool: {name}")
         text_blocks = [TextContent(type="text", text=json.dumps(result, indent=2))]
@@ -2310,9 +2682,19 @@ def _public_image_entry(entry: dict[str, Any], cwd: Path) -> dict[str, Any]:
     }
 
 
+def _mcp_root() -> Path:
+    return Path(os.environ.get("LLM_COUNCIL_MCP_ROOT") or ".").resolve()
+
+
 def _resolve_working_directory(arguments: dict[str, Any]) -> Path:
-    root = Path(os.environ.get("LLM_COUNCIL_MCP_ROOT") or ".").resolve()
-    cwd = Path(arguments.get("working_directory") or root).resolve()
+    root = _mcp_root()
+    requested = arguments.get("working_directory")
+    if requested and not Path(str(requested)).is_absolute():
+        raise ValueError(
+            "WorkingDirectoryMustBeAbsolute: requested="
+            f"{requested!r}; configured_root={root}. Pass an absolute path."
+        )
+    cwd = Path(requested or root).resolve()
     if not cwd.exists():
         raise ValueError(f"working_directory does not exist: {cwd}")
     if not cwd.is_dir():
@@ -2321,7 +2703,11 @@ def _resolve_working_directory(arguments: dict[str, Any]) -> Path:
         cwd.relative_to(root)
     except ValueError as exc:
         raise ValueError(
-            f"working_directory must be inside MCP project root: {root}"
+            "ProjectRootMismatch: requested="
+            f"{cwd}; configured_root={root}. This MCP server is project-scoped; "
+            "working_directory must be inside MCP project root. "
+            "restart/reconnect it from the target checkout or use that "
+            "checkout's .mcp.json."
         ) from exc
     return cwd
 

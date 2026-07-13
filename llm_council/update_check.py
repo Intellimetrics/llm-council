@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
 import time
@@ -12,6 +11,8 @@ from pathlib import Path
 from typing import Any, Callable, IO
 
 import httpx
+
+from llm_council.env import env_get
 
 
 TAGS_URL = "https://api.github.com/repos/Intellimetrics/llm-council/tags?per_page=50"
@@ -139,7 +140,7 @@ def _version_parts(version: str) -> list[int]:
 
 
 def _default_nag_cache_path() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    base = env_get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
     return Path(base) / "llm-council" / "update-check.json"
 
 
@@ -160,7 +161,7 @@ def maybe_print_update_nag(
     which speaks structured stdio that a stray stderr nag would not break
     but is still etiquette to leave clean.
     """
-    if os.environ.get(NAG_OPT_OUT_ENV, "").strip():
+    if (env_get(NAG_OPT_OUT_ENV, "") or "").strip():
         return False
     out = stream if stream is not None else sys.stderr
     cache_file = cache_path if cache_path is not None else _default_nag_cache_path()

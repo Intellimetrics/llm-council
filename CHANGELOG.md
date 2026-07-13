@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.17.0 - 2026-07-13
+
+v0.17.0 is a release-hardening pass driven by a full repository review and
+multiple dogfood council runs. It closes privacy and project-boundary gaps,
+makes MCP resource limits enforceable, improves runtime honesty, and adds the
+regression coverage needed to keep those guarantees from drifting.
+
+**Privacy and transcript integrity**
+* Secret-scan `redact` now protects the separately persisted question as well
+  as the assembled peer prompt, so raw credentials cannot reappear in
+  ranking/synthesis prompts or Markdown, JSON, and HTML artifacts.
+* Transcript filenames are opaque sortable identifiers and no longer contain
+  question text. On POSIX, new transcript directories/files are owner-only
+  (`0700` / `0600`) and written through descriptor-anchored atomic replacement;
+  Windows uses reparse-safe path checks, inherited ACLs, and atomic replace.
+* `doctor --repair-transcript-permissions` safely audits and repairs eligible
+  historical artifacts without following symlinks or touching foreign-owned or
+  multiply-linked files.
+* A continuation from `private-local` inherits that mode when no replacement
+  is supplied and refuses hosted/native participants unless the operator
+  explicitly passes `--allow-privacy-downgrade`.
+
+**MCP and input boundaries**
+* MCP config and dotenv discovery stop at `LLM_COUNCIL_MCP_ROOT`; context,
+  acceptance-contract, diff, and transcript paths cannot escape that root.
+  Relative working directories are rejected with project-root diagnostics.
+* Context files, contracts, and Git output are read with per-item and aggregate
+  bounds. Diff capture is disk-backed and visibly truncated instead of being
+  accumulated without limit.
+* MCP now exposes the same diff chunk strategies as the CLI, applies the MCP
+  prompt ceiling to every participant type, and enforces a whole-request
+  deadline through `defaults.mcp_request_timeout_seconds` or the per-call
+  `request_timeout_seconds` override.
+* `council_run` output schema v8 adds participant wall time and the stable
+  `client_ineligible` and `pinned_model_unverified` error kinds.
+
+**Runtime honesty and resilience**
+* Progress events carry UTC timestamps and run-relative durations. Results now
+  separate legacy attempt time from true wall time (including retries), and
+  summaries expose run wall time versus participant aggregates.
+* Doctor's default native-CLI checks now say explicitly that authentication was
+  not probed. `--probe-native` performs a bounded readiness invocation and
+  recognizes Gemini `UNSUPPORTED_CLIENT`; Ollama probing verifies that every
+  configured model actually exists, not merely that `/api/tags` responds.
+* A peer that requires pinned-model verification now fails closed with
+  `pinned_model_unverified` when the CLI omits served-model identity, rather
+  than accepting an answer whose authorship cannot be verified.
+* Antigravity's exact `Individual quota reached` response now classifies as
+  `quota_exhausted`. Native routing prefers the compatible Antigravity seat
+  when both Gemini-family CLIs are installed; Gemini remains available for
+  explicit hard-plan-mode selection.
+* Standalone estimates include contextual personas, per-peer directives,
+  stances, safe-context framing, and chunking, matching the prompts a real run
+  will construct.
+
+**Product and distribution**
+* Setup-generated host instructions include the absolute project directory,
+  and the documentation now distinguishes destinations from actions through a
+  central product vocabulary.
+* Package data includes the evaluation fixtures required by installed wheels.
+  Source and wheel builds are covered by packaging regressions.
+
+**Validation and dogfood**
+* Full suite: **1,444 passed, 2 skipped** on the release checkout, plus focused
+  Ruff, packaging, permission, and diff-integrity checks.
+* The final private-local dogfood completed non-degraded with a `yes`
+  recommendation after the health probe identified and corrected a stale local
+  Ollama model selection. A hosted recheck degraded honestly when two native
+  CLIs timed out and Antigravity reached its external quota; its telemetry
+  exposed the final quota-classification and wall-time serialization fixes.
+
 ## 0.16.0 - 2026-07-04
 
 v0.16.0 wires **Claude Fable 5** in as a read-only council peer, with a "reduce + detect" design for the one hazard Fable adds: its request-side safety classifiers false-positive on benign security-adjacent review, and on the Claude Code surface a refused request is **silently re-served by Opus 4.8** — a model swap the default text-mode CLI invocation can't see. Left unaddressed, an Opus answer would be recorded as a "Fable" opinion. Everything here is **opt-in and default-OFF**; no existing mode's behavior changes.
