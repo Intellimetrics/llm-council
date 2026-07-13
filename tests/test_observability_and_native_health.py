@@ -194,7 +194,10 @@ def test_execute_council_records_run_wall_and_timestamped_progress(
     monkeypatch, tmp_path: Path
 ) -> None:
     async def fake_run_participants(*_args, **_kwargs):
-        await asyncio.sleep(0.01)
+        # Stay above Windows' coarser scheduler/clock tick. A 10 ms sleep can
+        # legitimately quantize to a zero-length monotonic interval in CI even
+        # though the production timer is working.
+        await asyncio.sleep(0.05)
         return [
             ParticipantResult(
                 "peer",
@@ -218,7 +221,7 @@ def test_execute_council_records_run_wall_and_timestamped_progress(
         )
     )
 
-    assert metadata["run_wall_elapsed_seconds"] >= 0.009
+    assert metadata["run_wall_elapsed_seconds"] > 0.0
     assert metadata["participant_elapsed_seconds_aggregate"] == 1.25
     assert metadata["participant_wall_elapsed_seconds_aggregate"] == 1.75
     assert metadata["run_started_at"].endswith("Z")
