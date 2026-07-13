@@ -78,6 +78,7 @@ async def _call_council_run_over_stdio(root: Path) -> tuple[set[str], dict]:
     # without a promptly delivered delimiter. Keep leftovers for a following
     # notification/response if a single pipe read contains multiple values.
     wire_text = ""
+    unexpected_messages: list[dict] = []
     utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     json_decoder = json.JSONDecoder()
 
@@ -151,6 +152,7 @@ async def _call_council_run_over_stdio(root: Path) -> tuple[set[str], dict]:
                 )
             # Ignore server notifications; return the matching response.
             if response.get("id") != request_id:
+                unexpected_messages.append(response)
                 continue
             if "error" in response:
                 raise AssertionError(
@@ -197,9 +199,15 @@ async def _call_council_run_over_stdio(root: Path) -> tuple[set[str], dict]:
             )
             payload = _extract_payload(called)
     except TimeoutError as exc:
+        unexpected_summary = json.dumps(
+            unexpected_messages[-3:],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
         raise AssertionError(
             "MCP stdio exchange timed out with "
-            f"{len(wire_text)} buffered character(s): {wire_text[-500:]!r}"
+            f"{len(wire_text)} buffered character(s): {wire_text[-500:]!r}; "
+            f"last unexpected message(s): {unexpected_summary[-4000:]}"
         ) from exc
     finally:
         # Closing the OS pipe is the MCP stdio shutdown signal. Do this
