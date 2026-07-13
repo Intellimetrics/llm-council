@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
 import re
 import shlex
 import time
@@ -20,12 +19,13 @@ from llm_council.cache import (
     build_payload as cache_build_payload,
     cache_path as cache_path_for,
     compute_key as cache_compute_key,
-    is_caching_disabled_for_mode,
     read_cache as cache_read,
     write_cache as cache_write,
 )
 from llm_council.citations import parse_verified_tag, strip_verified_tag
+from llm_council.config import is_local_participant, participant_api_key_env
 from llm_council.context import IMAGE_MIME_ALLOWLIST, apply_per_peer_directives
+from llm_council.env import env_get, env_items
 
 
 # Families whose JSON output shape `_parse_cli_usage_json` actually parses.
@@ -34,6 +34,12 @@ from llm_council.context import IMAGE_MIME_ALLOWLIST, apply_per_peer_directives
 # a matching parser (it would break the RECOMMENDATION: label check on raw
 # JSON stdout). See `_build_cli_command` and `_parse_cli_usage_json`.
 _USAGE_JSON_FAMILIES = frozenset({"claude", "codex"})
+
+# Salt cache keys for pinned-model peers after changing the integrity contract
+# from "flag only observed substitutions" to "require observed telemetry".
+# Otherwise a pre-change cache entry whose fallback ``model`` merely repeated
+# cfg.model could bypass the new fail-closed check.
+_MODEL_PIN_CACHE_CONTRACT_VERSION = 1
 
 OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_HEADERS = {
@@ -266,6 +272,12 @@ class ParticipantResult:
     # attribute recoveries to the right mechanism.
     model_fallback_used: str | None = None
     recovered_after_quota: bool = False
+    # End-to-end wall time for this participant pipeline in the current run.
+    # Unlike legacy `elapsed_seconds`, this includes cache lookup, retry
+    # backoff, terse/repair/quota retries, and response-envelope validation.
+    # Keep the fields separate: existing stats and cache payloads intentionally
+    # treat `elapsed_seconds` as the original/adapter-attempt timing.
+    wall_elapsed_seconds: float | None = None
 
 
 @dataclass
@@ -516,7 +528,18 @@ def _cache_lookup(
     if cache_ctx is None or cache_ctx.cache_disabled:
         return None, None
     lookup_start = time.monotonic()
-    key = cache_compute_key(name, cfg, prompt, image_manifest=image_manifest)
+    cache_cfg = cfg
+    if cfg.get("require_pinned_model"):
+        cache_cfg = dict(cfg)
+        cache_cfg["_model_pin_cache_contract_version"] = (
+            _MODEL_PIN_CACHE_CONTRACT_VERSION
+        )
+    key = cache_compute_key(
+        name,
+        cache_cfg,
+        prompt,
+        image_manifest=image_manifest,
+    )
     if not cache_ctx.can_read():
         return key, None
     path = cache_path_for(cache_ctx.cwd, name, key)
@@ -736,7 +759,7 @@ def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -
     return command + args
 
 
-async def run_cli_participant(
+async def _run_cli_participant_pipeline(
     name: str,
     cfg: dict[str, Any],
     prompt: str,
@@ -804,7 +827,7 @@ async def run_cli_participant(
             # timeout annotation — the swap is terminal either way, and
             # keeping the original timeout kind would hide the substitution
             # from `classify_error` and the orchestrator's surfacing.
-            if terse_result.error.startswith(MODEL_SUBSTITUTED_PREFIX):
+            if terse_result.error.startswith(MODEL_PIN_INTEGRITY_PREFIXES):
                 from dataclasses import replace as _replace
                 merged = _replace(
                     terse_result,
@@ -962,6 +985,38 @@ async def run_cli_participant(
             _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
             return merged
     _maybe_persist_cache(name, prompt, cache_key, result, cache_ctx)
+    return result
+
+
+async def run_cli_participant(
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    cwd: Path,
+    *,
+    cache_ctx: CacheContext | None = None,
+    mode_multiplier: float | None = None,
+    mode: str | None = None,
+) -> ParticipantResult:
+    """Run the complete CLI pipeline and record its true wall time.
+
+    The implementation deliberately wraps (rather than repurposes) the
+    pipeline's existing ``elapsed_seconds`` values. Several retry paths retain
+    the first attempt's elapsed time for historical telemetry; callers that
+    need operator-visible latency should use ``wall_elapsed_seconds``.
+    """
+
+    wall_start = time.monotonic()
+    result = await _run_cli_participant_pipeline(
+        name,
+        cfg,
+        prompt,
+        cwd,
+        cache_ctx=cache_ctx,
+        mode_multiplier=mode_multiplier,
+        mode=mode,
+    )
+    result.wall_elapsed_seconds = time.monotonic() - wall_start
     return result
 
 
@@ -1137,9 +1192,8 @@ async def _run_cli_once(
         # Prefer the model id the CLI actually reported (usage_fields["model"])
         # over the requested cfg model — this is the REAL executed model. Falls
         # back to cfg.get("model") when JSON parsing was off or absent.
-        resolved_model = cfg.get("model")
-        if usage_fields is not None and usage_fields.get("model"):
-            resolved_model = usage_fields["model"]
+        observed_model = usage_fields.get("model") if usage_fields else None
+        resolved_model = observed_model or cfg.get("model")
         # Pinned-model guard (M-fable). When a peer sets `require_pinned_model`
         # and JSON usage surfaced the model that ACTUALLY served the turn, drop
         # the peer if that served model doesn't match the pinned request — e.g.
@@ -1147,29 +1201,34 @@ async def _run_cli_once(
         # to Opus 4.8. This keeps a substituted model's answer from being
         # recorded as the requested model's opinion. `resolved_model` still
         # reports the REAL served model so the transcript shows what happened.
-        # Only fires on a positive, observed mismatch (needs usage_from_json);
-        # a peer with no JSON usage never trips this.
-        substitution_error = ""
-        if (
-            ok
-            and cfg.get("require_pinned_model")
-            and cfg.get("model")
-            and not _model_pin_satisfied(cfg.get("model"), resolved_model)
-        ):
-            substitution_error = (
-                f"{MODEL_SUBSTITUTED_PREFIX} `{name}` requested "
-                f"{cfg.get('model')} but the CLI served {resolved_model} "
-                f"(likely a safety-refusal fallback); dropping so the "
-                f"substituted model is not recorded as a "
-                f"{cfg.get('model')} vote"
-            )
+        # A required pin is an integrity assertion, so it fails closed when
+        # the successful CLI response does not contain served-model telemetry.
+        # This is distinct from a positive substitution observation: callers
+        # can tell "we could not verify the pin" from "we verified a swap".
+        model_pin_error = ""
+        if ok and cfg.get("require_pinned_model") and cfg.get("model"):
+            if not observed_model:
+                model_pin_error = (
+                    f"{PINNED_MODEL_UNVERIFIED_PREFIX} `{name}` requested "
+                    f"{cfg.get('model')} but the CLI response did not report "
+                    "the served model; dropping because the required pin "
+                    "could not be verified"
+                )
+            elif not _model_pin_satisfied(cfg.get("model"), observed_model):
+                model_pin_error = (
+                    f"{MODEL_SUBSTITUTED_PREFIX} `{name}` requested "
+                    f"{cfg.get('model')} but the CLI served {observed_model} "
+                    f"(likely a safety-refusal fallback); dropping so the "
+                    f"substituted model is not recorded as a "
+                    f"{cfg.get('model')} vote"
+                )
         return (
             ParticipantResult(
                 name=name,
-                ok=ok and not validation_error and not substitution_error,
+                ok=ok and not validation_error and not model_pin_error,
                 output=out,
                 error=(
-                    substitution_error
+                    model_pin_error
                     or validation_error
                     or (err if not ok else "")
                 ),
@@ -1454,7 +1513,7 @@ def _merge_cli_retry(
     # `require_pinned_model` guard exists to surface. Combine both outputs
     # (same as `_merge_section_retry`'s substituted branch) so the original
     # pinned-model response stays auditable next to the substituted retry.
-    if retry.error.startswith(MODEL_SUBSTITUTED_PREFIX):
+    if retry.error.startswith(MODEL_PIN_INTEGRITY_PREFIXES):
         from dataclasses import replace as _replace
 
         return _replace(
@@ -1560,7 +1619,7 @@ def _merge_section_retry(
     # `_merge_cli_retry`) rather than reporting the original section failure.
     # `_merged` stamps `section_repair_attempted=True`, holding the
     # one-extra-call ceiling.
-    if retry.error.startswith(MODEL_SUBSTITUTED_PREFIX):
+    if retry.error.startswith(MODEL_PIN_INTEGRITY_PREFIXES):
         return _merged(
             ok=False,
             output=_format_retry_transcript(
@@ -1776,7 +1835,8 @@ async def run_openai_compatible_participant(
     mode_multiplier: float | None = None,
     mode: str | None = None,
 ) -> ParticipantResult:
-    return await _run_hosted_participant(
+    wall_start = time.monotonic()
+    result = await _run_hosted_participant(
         _run_openai_compatible_inner,
         _maybe_section_repair_openai_compatible,
         name,
@@ -1787,6 +1847,8 @@ async def run_openai_compatible_participant(
         mode_multiplier=mode_multiplier,
         mode=mode,
     )
+    result.wall_elapsed_seconds = time.monotonic() - wall_start
+    return result
 
 
 async def _maybe_section_repair_hosted(
@@ -1867,8 +1929,8 @@ async def _run_openai_compatible_inner(
     mode: str | None = None,
 ) -> ParticipantResult:
     start = time.monotonic()
-    key_env = cfg.get("api_key_env", "OPENROUTER_API_KEY")
-    api_key = os.environ.get(key_env)
+    key_env = participant_api_key_env(cfg) or "OPENROUTER_API_KEY"
+    api_key = env_get(key_env)
     model = cfg.get("model")
     if not api_key:
         return ParticipantResult(
@@ -1898,11 +1960,16 @@ async def _run_openai_compatible_inner(
         "usage": {"include": True},
     }
     headers = _build_openai_compatible_headers(api_key, cfg, is_openrouter=is_openrouter)
+    trust_env = not is_local_participant(cfg)
     timeout = float(_resolve_effective_timeout(
         cfg, mode_multiplier, base_default=180, prompt_chars=len(prompt)
     ))
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=trust_env,
+        ) as client:
             response = await _request_with_retries(
                 client,
                 "POST",
@@ -1971,7 +2038,9 @@ async def _run_openai_compatible_inner(
                     retry_payload["messages"] = retry_messages
                     try:
                         async with httpx.AsyncClient(
-                            timeout=timeout, follow_redirects=False
+                            timeout=timeout,
+                            follow_redirects=False,
+                            trust_env=trust_env,
                         ) as retry_client:
                             retry_response = await _request_with_retries(
                                 retry_client,
@@ -2229,7 +2298,8 @@ async def run_ollama_participant(
     mode_multiplier: float | None = None,
     mode: str | None = None,
 ) -> ParticipantResult:
-    return await _run_hosted_participant(
+    wall_start = time.monotonic()
+    result = await _run_hosted_participant(
         _run_ollama_inner,
         _maybe_section_repair_ollama,
         name,
@@ -2240,6 +2310,8 @@ async def run_ollama_participant(
         mode_multiplier=mode_multiplier,
         mode=mode,
     )
+    result.wall_elapsed_seconds = time.monotonic() - wall_start
+    return result
 
 
 async def _maybe_section_repair_ollama(
@@ -2287,11 +2359,15 @@ async def _run_ollama_inner(
         "messages": [user_message],
         "stream": False,
     }
+    trust_env = not is_local_participant(cfg)
     try:
         ollama_timeout = float(_resolve_effective_timeout(
             cfg, mode_multiplier, base_default=180, prompt_chars=len(prompt)
         ))
-        async with httpx.AsyncClient(timeout=ollama_timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=ollama_timeout,
+            trust_env=trust_env,
+        ) as client:
             response = await _request_with_retries(
                 client,
                 "POST",
@@ -2325,7 +2401,10 @@ async def _run_ollama_inner(
                     retry_payload = dict(payload)
                     retry_payload["messages"] = retry_messages
                     try:
-                        async with httpx.AsyncClient(timeout=ollama_timeout) as retry_client:
+                        async with httpx.AsyncClient(
+                            timeout=ollama_timeout,
+                            trust_env=trust_env,
+                        ) as retry_client:
                             retry_response = await _request_with_retries(
                                 retry_client,
                                 "POST",
@@ -2439,6 +2518,7 @@ async def run_participant(
     mode: str | None = None,
     tool_call_voting: bool = False,
 ) -> ParticipantResult:
+    wall_start = time.monotonic()
     ptype = cfg.get("type")
     if ptype == "cli":
         # CLI participants intentionally don't receive image_manifest at the
@@ -2470,11 +2550,16 @@ async def run_participant(
             elapsed_seconds=0,
             model=cfg.get("model"),
         )
-    return _with_envelope(
+    result = _with_envelope(
         result,
         tool_call_voting=tool_call_voting,
         family=cfg.get("family"),
     )
+    # Re-stamp at the dispatcher boundary so the value includes response
+    # envelope parsing as well as the transport wrapper. This also covers the
+    # unsupported-type path, which has no dedicated adapter wrapper.
+    result.wall_elapsed_seconds = time.monotonic() - wall_start
+    return result
 
 
 async def _request_with_retries(
@@ -2624,6 +2709,18 @@ async def run_participants(
                         "status": status,
                         "ok": result.ok,
                         "elapsed_seconds": round(result.elapsed_seconds, 3),
+                        "wall_elapsed_seconds": round(
+                            result.wall_elapsed_seconds
+                            if result.wall_elapsed_seconds is not None
+                            else result.elapsed_seconds,
+                            3,
+                        ),
+                        "duration_seconds": round(
+                            result.wall_elapsed_seconds
+                            if result.wall_elapsed_seconds is not None
+                            else result.elapsed_seconds,
+                            3,
+                        ),
                         "error": result.error,
                         "model": result.model,
                         "total_tokens": result.total_tokens,
@@ -3641,12 +3738,22 @@ ERROR_KIND_ABDICATED = "abdicated"
 ERROR_KIND_INCOMPLETE_RESPONSE = "incomplete_response"
 ERROR_KIND_UNTAGGED_EVIDENCE = "untagged_evidence"
 ERROR_KIND_QUOTA_EXHAUSTED = "quota_exhausted"
+# The installed native CLI is present but the authenticated account/client is
+# permanently ineligible to use it. This is deliberately distinct from quota
+# and transient launch errors so routing code can offer a different configured
+# participant instead of retrying the same unusable executable.
+ERROR_KIND_CLIENT_INELIGIBLE = "client_ineligible"
 # A CLI peer with `require_pinned_model: true` was served by a model other than
 # the one it pinned via `model` — e.g. Claude Fable 5 refused and the Claude
 # Code surface silently fell back to Opus 4.8. The peer drops (ok=False) so the
 # substituted model's answer is never recorded as the requested model's opinion.
 # Only observable when `usage_from_json: true` surfaces the served model id.
 ERROR_KIND_MODEL_SUBSTITUTED = "model_substituted"
+# A CLI peer required a pinned model, but its successful response did not
+# expose the served model. Absence of telemetry cannot prove the requested
+# model authored the response, so the peer is dropped rather than silently
+# treating the requested configuration value as observed execution data.
+ERROR_KIND_PINNED_MODEL_UNVERIFIED = "pinned_model_unverified"
 ERROR_KIND_UNKNOWN = "unknown"
 
 KNOWN_ERROR_KINDS = frozenset(
@@ -3662,7 +3769,9 @@ KNOWN_ERROR_KINDS = frozenset(
         ERROR_KIND_INCOMPLETE_RESPONSE,
         ERROR_KIND_UNTAGGED_EVIDENCE,
         ERROR_KIND_QUOTA_EXHAUSTED,
+        ERROR_KIND_CLIENT_INELIGIBLE,
         ERROR_KIND_MODEL_SUBSTITUTED,
+        ERROR_KIND_PINNED_MODEL_UNVERIFIED,
         ERROR_KIND_UNKNOWN,
     }
 )
@@ -3672,6 +3781,11 @@ ABDICATED_ERROR_PREFIX = "AbdicatedResponse:"
 INCOMPLETE_RESPONSE_PREFIX = "IncompleteResponse:"
 UNTAGGED_EVIDENCE_PREFIX = "UntaggedEvidence:"
 MODEL_SUBSTITUTED_PREFIX = "ModelSubstituted:"
+PINNED_MODEL_UNVERIFIED_PREFIX = "PinnedModelUnverified:"
+MODEL_PIN_INTEGRITY_PREFIXES = (
+    MODEL_SUBSTITUTED_PREFIX,
+    PINNED_MODEL_UNVERIFIED_PREFIX,
+)
 
 # Quota-exhaustion / rate-limit detection. CLI peers expose this through
 # stderr; hosted APIs through httpx exception messages. The signal is
@@ -3691,6 +3805,10 @@ QUOTA_EXHAUSTED_PATTERNS = (
     re.compile(r"resource\s+has\s+been\s+exhausted", re.IGNORECASE),
     # Anthropic / Claude
     re.compile(r"quota[_\s]+exceeded", re.IGNORECASE),
+    re.compile(
+        r"\b(?:individual\s+)?quota\s+(?:has\s+been\s+)?reached\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"exceeded\s+your\s+(?:current\s+)?quota", re.IGNORECASE),
     re.compile(r"usage\s+limit", re.IGNORECASE),
     re.compile(r"\d+-hour\s+limit", re.IGNORECASE),
@@ -3716,6 +3834,21 @@ QUOTA_EXHAUSTED_PATTERNS = (
         re.IGNORECASE | re.DOTALL,
     ),
 )
+
+
+def is_client_ineligible_error(error: str) -> bool:
+    """Recognize a durable native-client eligibility rejection.
+
+    Gemini CLI 0.42+ reports the individual-tier migration failure with both
+    ``IneligibleTierError`` and ``UNSUPPORTED_CLIENT``. Requiring both markers
+    avoids treating arbitrary model prose or a generic authentication problem
+    as a permanent route failure.
+    """
+
+    if not error:
+        return False
+    lowered = error.lower()
+    return "ineligibletiererror" in lowered and "unsupported_client" in lowered
 
 
 def is_quota_exhausted_error(error: str) -> bool:
@@ -3766,6 +3899,10 @@ def classify_error(error: str) -> str | None:
         return ERROR_KIND_UNTAGGED_EVIDENCE
     if error.startswith(MODEL_SUBSTITUTED_PREFIX):
         return ERROR_KIND_MODEL_SUBSTITUTED
+    if error.startswith(PINNED_MODEL_UNVERIFIED_PREFIX):
+        return ERROR_KIND_PINNED_MODEL_UNVERIFIED
+    if is_client_ineligible_error(error):
+        return ERROR_KIND_CLIENT_INELIGIBLE
     # Quota check runs BEFORE the downstream_markers fallthrough so an
     # httpx 429 (which would otherwise match "HTTPStatusError") gets the
     # more specific `quota_exhausted` classification. Also runs after the
@@ -3918,7 +4055,7 @@ def clean_subprocess_env(
     """
     allowed = {key.upper() for key in (env_passthrough or [])}
     env: dict[str, str] = {}
-    for key, value in os.environ.items():
+    for key, value in env_items():
         if key == "CLAUDECODE":
             continue
         upper = key.upper()

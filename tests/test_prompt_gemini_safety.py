@@ -2,7 +2,6 @@ import asyncio
 from copy import deepcopy
 from pathlib import Path
 
-import pytest
 
 from llm_council.adapters import run_cli_participant
 from llm_council.context import build_prompt

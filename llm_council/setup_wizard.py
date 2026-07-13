@@ -10,7 +10,11 @@ from typing import Any
 
 import yaml
 
-from llm_council.config import deep_merge
+from llm_council.config import (
+    deep_merge,
+    is_private_local_participant,
+    resolve_config_data,
+)
 from llm_council.defaults import DEFAULT_CONFIG
 
 
@@ -47,13 +51,19 @@ If the user wants to view or change configuration options (e.g. "open html autom
 Routing rules:
 - Always pass `current` as `{current}` so transcripts show which host will
   synthesize and act on the council output.
-- Use `quick` mode unless the user names a mode. `quick` asks Claude, Codex,
-  and Gemini as explicit read-only participants. Use `peer-only` only when the
-  user specifically wants to exclude this host CLI from subprocess review.
+- Always pass `working_directory` as the absolute project path
+  `{project_root}`. MCP servers are project-scoped and reject relative paths
+  or paths outside their configured root.
+- Omit `mode` to use this project's configured default (`{default_mode}`).
+  Use another mode only when the user names one that is configured here. Use
+  `peer-only` only when configured and the user wants to exclude this host.
 - Treat "on the diff", "current diff", or "review my changes" as
   `include_diff: true`.
 - Treat "cheap" or "budget" as `review-cheap`.
 - Treat "private", "local", or "offline" as `private-local`.
+- `private-local` routes only to loopback Ollama participants. It does not
+  firewall the Ollama daemon itself; hard offline use also requires OS/network
+  egress controls around that daemon.
 - Treat "with deepseek" as including `deepseek_v4_pro`.
 - Treat "with qwen" as including `qwen_coder_plus`.
 - Treat "with glm" as including `glm_5_1`.
@@ -138,7 +148,10 @@ def project_config(
         participant_names.add("local_qwen_coder")
     participant_names.update(extra_local_participants.keys())
 
-    has_local = include_local or bool(extra_local_participants)
+    has_local = include_local or any(
+        is_private_local_participant(cfg)
+        for cfg in extra_local_participants.values()
+    )
     modes = {
         name: mode
         for name, mode in DEFAULT_CONFIG["modes"].items()
@@ -159,6 +172,11 @@ def project_config(
         "participants": {},
         "modes": modes,
     }
+    if include_local and not include_native and not include_openrouter:
+        # `private-local` is a setup-time data-boundary promise. Keep the
+        # generated default on the strategy that admits loopback Ollama only,
+        # even when the operator omits --mode on subsequent runs.
+        config["defaults"]["mode"] = "private-local"
     if not include_native and include_openrouter:
         config["defaults"]["mode"] = "quick"
     if us_only_default:
@@ -195,10 +213,9 @@ def _mode_available(
     if mode.get("strategy") == "other_cli_peers" and not include_native:
         return False
     if mode.get("strategy") == "local_only_peers":
-        # `local-only` is only useful when at least one local participant
-        # is configured — either the built-in `local_qwen_coder` (gated by
-        # `include_local`) or any wizard-probed local openai_compatible
-        # peer (signalled via `has_local`).
+        # `private-local` is only useful when a loopback Ollama participant is
+        # configured. Wizard-probed OpenAI-compatible servers remain available
+        # to explicit custom modes but cannot substantiate an offline promise.
         return has_local
     return _mode_participants(mode).issubset(participant_names)
 
@@ -211,7 +228,7 @@ def _openrouter_only_modes() -> dict[str, dict[str, Any]]:
                 "qwen_coder_flash",
                 "glm_4_7_flash",
             ],
-            "description": "Hosted OpenRouter breadth reviewers.",
+            "description": "Hosted OpenRouter breadth participants.",
         },
         "plan": {
             "participants": [
@@ -219,7 +236,7 @@ def _openrouter_only_modes() -> dict[str, dict[str, Any]]:
                 "qwen_coder_plus",
                 "glm_5_1",
             ],
-            "description": "Hosted OpenRouter planning reviewers.",
+            "description": "Hosted OpenRouter planning participants.",
         },
         "review": {
             "participants": [
@@ -251,7 +268,6 @@ def mcp_config(project_root: Path) -> dict[str, Any]:
                 "command": command,
                 "args": args,
                 "env": {
-                    "PYTHONPATH": str(project_root.resolve()),
                     "LLM_COUNCIL_MCP_ROOT": str(project_root.resolve()),
                 },
             }
@@ -284,10 +300,14 @@ def write_setup_files(
     )
     if config_path.exists() and not force:
         existing_config = _read_yaml_mapping(config_path)
-        merged_config = deep_merge(desired_config, existing_config)
+        merged_config = _merge_setup_config(desired_config, existing_config)
     else:
         existing_config = None
         merged_config = desired_config
+        # Keep setup writers on the same migration and validation path as
+        # normal config loading. Invalid generated/probed participant data
+        # must fail before any project file is replaced.
+        resolve_config_data(merged_config)
     if force or not config_path.exists() or merged_config != existing_config:
         config_path.write_text(
             yaml.safe_dump(merged_config, sort_keys=False),
@@ -315,7 +335,13 @@ def write_setup_files(
             path = instructions_dir / f"{name}.md"
             if force or not path.exists():
                 path.write_text(
-                    INSTRUCTION_TEXT.format(current=name),
+                    INSTRUCTION_TEXT.format(
+                        current=name,
+                        project_root=str(root.resolve()),
+                        default_mode=merged_config.get("defaults", {}).get(
+                            "mode", "quick"
+                        ),
+                    ),
                     encoding="utf-8",
                 )
                 written.append(path)
@@ -347,6 +373,40 @@ def write_setup_files(
             written.append(project_gitignore)
 
     return written
+
+
+def _merge_setup_config(
+    desired_config: dict[str, Any], existing_config: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge generated setup data while preserving explicit mode selectors.
+
+    Existing project config has precedence during a non-force setup run. A
+    recursive merge alone cannot express that a fixed ``participants`` roster
+    replaces a generated ``strategy`` (or vice versa), so it can accidentally
+    leave both selector keys on one mode. Preserve the selector shape chosen by
+    the existing config, then resolve and validate the complete mapping before
+    it reaches disk.
+    """
+
+    merged = deep_merge(desired_config, existing_config)
+    existing_modes = existing_config.get("modes")
+    merged_modes = merged.get("modes")
+    if isinstance(existing_modes, dict) and isinstance(merged_modes, dict):
+        for name, existing_mode in existing_modes.items():
+            merged_mode = merged_modes.get(name)
+            if not isinstance(existing_mode, dict) or not isinstance(
+                merged_mode, dict
+            ):
+                continue
+            has_participants = "participants" in existing_mode
+            has_strategy = existing_mode.get("strategy") is not None
+            if has_participants and not has_strategy:
+                merged_mode.pop("strategy", None)
+            elif has_strategy and not has_participants:
+                merged_mode.pop("participants", None)
+
+    resolve_config_data(merged)
+    return merged
 
 
 def _ensure_project_gitignore(path: Path) -> bool:
@@ -483,10 +543,12 @@ If the user wants to view or change configuration options (e.g. "open html autom
 Routing rules:
 - Pass `current` as `{current}` so transcripts record which host will
   synthesize and act on the council output.
-- Default `mode` is `quick`. Use `consensus` when the user explicitly
-  wants assigned-stance debate (for/against/neutral). Use `peer-only`
-  when the user wants to exclude this host from the council. Use
-  `private-local` for offline/Ollama-only review.
+- Omit `mode` to use the configured project default. Use `consensus` when the
+  user explicitly wants assigned-stance debate (for/against/neutral). Use
+  `peer-only` when the user wants to exclude this host from the council. Use
+  `private-local` for loopback Ollama-only review. This prevents council
+  routing to hosted/native peers but does not firewall the Ollama daemon;
+  hard offline use also requires OS/network egress controls around it.
 - Treat "on the diff" / "current diff" / "review my changes" as
   `include_diff: true`.
 - Treat "with budget" or "max $X" as setting `max_cost_usd` to that
@@ -496,8 +558,9 @@ Routing rules:
   prior run; the new transcript will record `parent_run_id`.
 
 Council output shape (when the host supports MCP outputSchema):
-- `recommendation`: yes / no / tradeoff / unknown — the majority label
-- `agreement_count`: peers matching the majority
+- `recommendation`: yes / no / tradeoff / unknown — the unique leading
+  final-round label, or unknown when leaders tie
+- `agreement_count`: peers matching that unique leading label
 - `degraded`: true when fewer than `min_quorum` peers labeled
 - `transcript`: filesystem path to the markdown transcript
 
@@ -519,7 +582,7 @@ _CLAUDE_CODE_SKILL_MD = (
     "description: >-\n"
     "  Read-only multi-agent council for second opinions before risky\n"
     "  edits. Routes to the local CLI triad (Claude / Codex / Gemini) plus\n"
-    "  optional OpenRouter / Ollama peers via the llm-council MCP server.\n"
+    "  optional OpenRouter / Ollama participants via the llm-council MCP server.\n"
     "---\n"
     "\n"
     "# LLM Council\n"

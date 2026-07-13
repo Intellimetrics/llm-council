@@ -17,11 +17,14 @@ from typing import Any
 from llm_council import __version__
 from llm_council.config import (
     apply_tier_override,
+    canonical_mode_name,
     config_warnings,
     detect_current_agent,
     find_config,
     load_config,
     parse_csv,
+    participant_api_key_env,
+    resolve_config_data,
     select_participants,
 )
 from llm_council.adapters import classify_error
@@ -30,17 +33,25 @@ from llm_council.budget import image_attachment_violations
 from llm_council import display
 from llm_council.context import (
     MAX_PROMPT_CHARS,
+    apply_per_peer_directives,
     build_image_manifest,
     build_prompt,
     resolve_acceptance_contract,
 )
-from llm_council.doctor import check_environment, checks_to_dict, probe_local_openai
+from llm_council.doctor import (
+    Check,
+    check_environment,
+    checks_to_dict,
+    probe_local_openai,
+)
 from llm_council.env import load_project_env
-from llm_council.estimate import CLI_DEFAULT_MODEL_LABEL, estimate_council
+from llm_council.estimate import (
+    CLI_DEFAULT_MODEL_LABEL,
+    deliberation_prompt_char_bounds,
+    estimate_council,
+)
 from llm_council.model_catalog import (
     fetch_openrouter_models,
-    openrouter_cache_age_seconds,
-    openrouter_cache_path,
     refresh_openrouter_cache,
 )
 from llm_council.orchestrator import execute_council
@@ -50,8 +61,10 @@ from llm_council.stats import compute_stats, format_stats_text
 from llm_council.transcript import (
     continuation_depth_limit_error,
     find_transcript_by_id,
+    final_round_results,
     format_prior_council_context,
     latest_transcript,
+    inspect_transcript_permissions,
     normalize_run_id,
     transcript_dir,
     transcript_paths,
@@ -63,6 +76,27 @@ from llm_council.update_check import (
     hydrate_nag_cache_from_status,
     maybe_print_update_nag,
 )
+
+
+_SETUP_PRESETS = (
+    "auto",
+    "tri-cli",
+    "openrouter",
+    "tri-cli-openrouter",
+    "private-local",
+    "all",
+)
+_SETUP_PRESET_ALIASES = {"local-private": "private-local"}
+
+
+def _setup_preset_arg(value: str) -> str:
+    canonical = _SETUP_PRESET_ALIASES.get(value, value)
+    if canonical not in _SETUP_PRESETS:
+        raise argparse.ArgumentTypeError(
+            f"unknown preset {value!r}; choose one of: "
+            + ", ".join(_SETUP_PRESETS)
+        )
+    return canonical
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -179,6 +213,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--allow-privacy-downgrade",
+        action="store_true",
+        help=(
+            "Explicitly allow a private-local continuation to send prior "
+            "question/summary context to non-local participants. Refused by "
+            "default."
+        ),
+    )
+    run.add_argument(
         "--cache",
         dest="cache_mode",
         choices=["on", "off", "refresh"],
@@ -210,8 +253,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Hard ceiling on the council's pre-flight estimated cost in USD. "
             "If the estimate exceeds this, the run is refused before any "
             "subprocess or HTTP call. Free/local participants count as $0; "
-            "if the catalog is unavailable, the cap is informational only "
-            "(unknown costs cannot be enforced)."
+            "hosted or non-local participants with unknown pricing are refused "
+            "when this cap is set."
         ),
     )
     run.add_argument(
@@ -314,7 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--open",
         action="store_true",
         default=False,
-        help="Automatically open the HTML transcript dashboard in the default browser at the end of the run.",
+        help="Automatically open the HTML transcript in the default browser at the end of the run.",
     )
 
     sub.add_parser("list", help="List participants and modes")
@@ -325,20 +368,14 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--root", default=".", help="Project root")
     setup.add_argument(
         "--preset",
-        choices=[
-            "auto",
-            "tri-cli",
-            "openrouter",
-            "tri-cli-openrouter",
-            "local-private",
-            "all",
-        ],
+        type=_setup_preset_arg,
+        metavar="{" + ",".join(_SETUP_PRESETS) + "}",
         default="auto",
         help=(
             "Setup scope: auto detects local CLIs/OpenRouter, "
-            "tri-cli for Claude/Codex/Gemini only, openrouter for hosted-only, "
+            "tri-cli for Claude/Codex plus a Gemini-family CLI, openrouter for hosted-only, "
             "tri-cli-openrouter for native CLIs plus hosted models, "
-            "local-private for native CLIs plus Ollama, all for every preset"
+            "private-local for offline Ollama-only review, all for every participant route"
         ),
     )
     setup.add_argument("--yes", action="store_true", help="Non-interactive defaults")
@@ -387,6 +424,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="consensus",
         help="The mode to run the hook in (default: consensus)",
     )
+    hook.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing hook instead of refusing to overwrite it",
+    )
 
     cfg_parser = sub.add_parser("config", help="Get or set configuration values in .llm-council.yaml")
     cfg_sub = cfg_parser.add_subparsers(dest="config_command")
@@ -412,6 +454,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe-ollama",
         action="store_true",
         help="Validate Ollama is serving its tags endpoint",
+    )
+    doctor.add_argument(
+        "--probe-native",
+        action="store_true",
+        help="Invoke configured native CLIs with a bounded readiness probe",
+    )
+    doctor.add_argument(
+        "--repair-transcript-permissions",
+        action="store_true",
+        help="Tighten owned transcript directories/files to 0700/0600",
     )
     doctor.add_argument(
         "--probe-local-openai",
@@ -471,6 +523,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow --context and --image files outside the working directory",
     )
     estimate.add_argument("--diff", action="store_true", help="Include git diff")
+    estimate.add_argument(
+        "--chunk-strategy",
+        choices=["fail", "head", "tail", "hash-aware"],
+        default="fail",
+        help=(
+            "How to fit an oversized git diff into the prompt budget; matches "
+            "the run command."
+        ),
+    )
     estimate.add_argument("--stdin", action="store_true", help="Append stdin as context")
     estimate.add_argument("--cwd", default=".", help="Working directory")
     estimate.add_argument(
@@ -509,9 +570,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Hard ceiling on the council's pre-flight estimated cost in USD. "
             "The breakdown is still printed, but the command exits non-zero "
             "if the estimate exceeds this. Free/local participants count as "
-            "$0; if the catalog is unavailable for a hosted peer, the cap is "
-            "informational only (unknown costs cannot be enforced and the "
-            "command refuses rather than waving them through)."
+            "$0; hosted or non-local participants with unknown pricing are "
+            "refused when this cap is set."
         ),
     )
     estimate.add_argument(
@@ -584,9 +644,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     transcripts_prune.add_argument(
-        "--apply",
+        "--delete",
+        dest="apply",
         action="store_true",
-        help="Actually delete; default is dry-run reporting what would go",
+        help="Delete transcripts matching the retention policy; default is a dry run",
+    )
+    transcripts_prune.add_argument(
+        "--apply",
+        dest="apply",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     transcripts_prune.add_argument("--json", action="store_true", help="Print JSON")
 
@@ -606,14 +673,14 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument(
         "--participant",
         default=None,
-        help="Filter the per-participant table to one peer",
+        help="Filter participant metrics to one participant",
     )
     stats.add_argument("--json", action="store_true", help="Print JSON")
     stats.add_argument(
         "--eval",
         action="store_true",
         help=(
-            "Aggregate the per-mode and per-peer trend across the most recent "
+            "Aggregate the per-mode and per-participant trend across the most recent "
             "eval scorecards under `.llm-council/eval-runs/` instead of the "
             "transcript-derived stats. Use with --last to widen the window."
         ),
@@ -628,7 +695,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--reliability",
         action="store_true",
         help=(
-            "Print per-peer reliability counters derived from "
+            "Print per-participant reliability counters derived from "
             "`.llm-council/outcomes/`: useful_count, false_blocker_count, "
             "unique_blocker_catch_count, and the mechanical "
             "verified_citation_rate. Combine with --participant to filter."
@@ -636,9 +703,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stats.add_argument(
         "--peer",
-        dest="reliability_peer",
-        default=None,
-        help="Alias of --participant for --reliability; filters to one peer.",
+        dest="participant",
+        help=argparse.SUPPRESS,
     )
 
     outcome = sub.add_parser(
@@ -952,9 +1018,15 @@ def cmd_list(args: argparse.Namespace) -> int:
         model = cfg.get("model") or "cli default (unreported)"
         print(f"  {name:20} {cfg.get('type'):10} {model}")
     print("\nModes:")
-    for name, cfg in config.get("modes", {}).items():
+    modes = config.get("modes", {})
+    for name, cfg in modes.items():
+        if name in {"local-only", "local-private"} and "private-local" in modes:
+            continue
         flag = " [EXPERIMENTAL]" if cfg.get("experimental") else ""
-        print(f"  {name:20}{flag} {cfg.get('description', '')}")
+        description = str(cfg.get("description", ""))
+        if flag and description.upper().startswith("EXPERIMENTAL"):
+            description = description.partition("—")[2].strip() or description
+        print(f"  {name:20}{flag} {description}")
     return 0
 
 
@@ -972,34 +1044,128 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_install_hook(args: argparse.Namespace) -> int:
+    import shlex
+    import stat
+    import subprocess
+    import tempfile
+
     root = Path(args.root).resolve()
-    git_dir = root / ".git"
-    if not git_dir.is_dir():
-        print(f"Error: {root} is not a git repository (missing .git directory).", file=sys.stderr)
+    try:
+        resolved = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "rev-parse",
+                "--git-path",
+                f"hooks/{args.hook_type}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        detail = getattr(exc, "stderr", "") or str(exc)
+        print(
+            f"Error: {root} is not a usable git worktree: {detail.strip()}",
+            file=sys.stderr,
+        )
         return 1
-    
-    hooks_dir = git_dir / "hooks"
-    hooks_dir.mkdir(parents=True, exist_ok=True)
-    
-    hook_file = hooks_dir / args.hook_type
-    
+
+    hook_path = Path(resolved.stdout.strip())
+    hook_file = hook_path if hook_path.is_absolute() else root / hook_path
+
+    load_project_env(root)
+    try:
+        config = load_config(find_config(root), search=False)
+    except (OSError, ValueError) as exc:
+        print(f"Error: Could not load council config: {exc}", file=sys.stderr)
+        return 1
+    known_modes = config.get("modes", {})
+    hook_mode = canonical_mode_name(config, args.mode)
+    if hook_mode not in known_modes:
+        choices = ", ".join(sorted(known_modes))
+        print(
+            f"Error: Unknown council mode '{args.mode}'. Known modes: {choices}",
+            file=sys.stderr,
+        )
+        return 1
+    if (hook_file.exists() or hook_file.is_symlink()) and not getattr(
+        args, "force", False
+    ):
+        print(
+            f"Error: Refusing to overwrite existing hook: {hook_file}. "
+            "Rerun with --force to replace it.",
+            file=sys.stderr,
+        )
+        return 1
+
+    quoted_mode = shlex.quote(hook_mode)
+    quoted_question = shlex.quote(f"{args.hook_type} validation.")
     script_content = f"""#!/bin/sh
 # Git hook installed by llm-council
 echo "Running LLM Council {args.hook_type} audit..."
-exec llm-council run --diff "Pre-commit validation." --mode {args.mode}
+exec llm-council run --diff --mode {quoted_mode} {quoted_question}
 """
-    
+
+    temp_path: Path | None = None
     try:
-        hook_file.write_text(script_content, encoding="utf-8")
-        import os
-        import stat
-        st = os.stat(hook_file)
-        os.chmod(hook_file, st.st_mode | stat.S_IEXEC)
+        hook_file.parent.mkdir(parents=True, exist_ok=True)
+        if getattr(args, "force", False):
+            # Populate a sibling file and atomically replace the hook path so
+            # --force never follows an attacker-controlled symlink target.
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=hook_file.parent,
+                prefix=f".{hook_file.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                handle.write(script_content)
+                temp_path = Path(handle.name)
+            os.chmod(temp_path, 0o755)
+            os.replace(temp_path, hook_file)
+            temp_path = None
+        else:
+            try:
+                fd = os.open(
+                    hook_file,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o755,
+                )
+            except FileExistsError:
+                print(
+                    f"Error: Refusing to overwrite existing hook: {hook_file}. "
+                    "Rerun with --force to replace it.",
+                    file=sys.stderr,
+                )
+                return 1
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(script_content)
+            st = os.stat(hook_file, follow_symlinks=False)
+            try:
+                os.chmod(
+                    hook_file,
+                    st.st_mode | stat.S_IEXEC,
+                    follow_symlinks=False,
+                )
+            except NotImplementedError:
+                # Windows exposes the keyword but cannot honor no-follow
+                # chmod.  Its chmod implementation does not manage executable
+                # bits anyway, so keep the safely-created hook rather than
+                # retrying with a symlink-following call.  POSIX failures stay
+                # fatal because the executable bit is meaningful there.
+                if os.name != "nt":
+                    raise
         print(f"Successfully installed LLM Council {args.hook_type} hook to {hook_file}")
         return 0
     except Exception as e:
         print(f"Error: Failed to write git hook: {e}", file=sys.stderr)
         return 1
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _parse_config_value(value_str: str) -> Any:
@@ -1077,12 +1243,37 @@ def cmd_config(args: argparse.Namespace) -> int:
     elif args.config_command == "set":
         parsed_val = _parse_config_value(args.value)
         _set_nested_val(config, args.key, parsed_val)
-        
+
         try:
-            cfg_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+            resolve_config_data(config)
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(
+                f"Refusing to write invalid configuration: {exc}"
+            ) from exc
+
+        import tempfile
+
+        temp_path: Path | None = None
+        try:
+            payload = yaml.safe_dump(config, sort_keys=False)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=cfg_path.parent,
+                prefix=f".{cfg_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                handle.write(payload)
+                temp_path = Path(handle.name)
+            temp_path.chmod(cfg_path.stat().st_mode)
+            os.replace(temp_path, cfg_path)
             print(f"Successfully set {args.key} to {parsed_val}")
         except Exception as e:
             raise SystemExit(f"Failed to write configuration: {e}")
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
         return 0
         
     else:
@@ -1205,7 +1396,7 @@ def _probe_and_collect_local_participants(
                     if raw.isdigit() and 1 <= int(raw) <= len(served_models):
                         model_id = served_models[int(raw) - 1]
                         break
-                    print(f"  Invalid choice.")
+                    print("  Invalid choice.")
         else:
             model_id = input(
                 "  Endpoint did not list models — enter the model id manually: "
@@ -1258,9 +1449,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     _guard_setup_preset(preset, args)
 
-    include_native = preset != "openrouter"
+    include_native = preset not in {"openrouter", "private-local"}
     include_openrouter = preset in {"openrouter", "tri-cli-openrouter", "all"}
-    include_local = preset in {"local-private", "all"}
+    include_local = preset in {"private-local", "all"}
 
     if not args.yes:
         print("LLM Council setup")
@@ -1270,9 +1461,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
             cmd = "agy" if name == "antigravity" else name
             print(f"  {name:12} {shutil.which(cmd) or 'not found'}")
         include_openrouter = _confirm(
-            "Include OpenRouter participant presets?", include_openrouter
+            "Include hosted OpenRouter participants?", include_openrouter
         )
-        include_local = _confirm("Include local/Ollama participant preset?", include_local)
+        include_local = _confirm("Include local Ollama participants?", include_local)
         us_only_default = _confirm(
             "Default to US-origin participants only?", args.us_only_default
         )
@@ -1353,23 +1544,26 @@ def _auto_setup_preset(which=None) -> str:
     has_claude = bool(which("claude"))
     has_codex = bool(which("codex"))
     has_neutral = bool(which("agy") or which("gemini"))
-    native_role_count = sum([has_claude, has_codex, has_neutral])
-    if native_role_count >= 2:
+    if has_neutral and (has_claude or has_codex):
         return "tri-cli"
     if os.environ.get("OPENROUTER_API_KEY"):
         return "openrouter"
 
     found_list = []
-    if has_claude: found_list.append("claude")
-    if has_codex: found_list.append("codex")
-    if which("agy"): found_list.append("antigravity")
-    elif which("gemini"): found_list.append("gemini")
+    if has_claude:
+        found_list.append("claude")
+    if has_codex:
+        found_list.append("codex")
+    if which("agy"):
+        found_list.append("antigravity")
+    elif which("gemini"):
+        found_list.append("gemini")
     found = ", ".join(found_list) or "none"
 
     raise SystemExit(
         "Auto setup could not find a usable default council route. "
         f"Found native CLIs: {found}. "
-        "Install at least two of claude, codex, and antigravity (or gemini), or set "
+        "Install Gemini or Antigravity plus at least one of Claude or Codex, or set "
         "OPENROUTER_API_KEY in your shell, .env, .env.local, or .llm-council.env "
         "and rerun setup. Advanced users who intentionally want to stage an "
         "incomplete config can choose an explicit preset with --allow-incomplete."
@@ -1384,11 +1578,13 @@ def _detect_setup_routes() -> dict[str, object]:
     has_codex = bool(native_paths.get("codex"))
     has_neutral = bool(native_paths.get("antigravity") or native_paths.get("gemini"))
     native_count = sum([has_claude, has_codex, has_neutral])
+    native_usable = has_neutral and (has_claude or has_codex)
     has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
     ollama_path = which("ollama")
     return {
         "native_paths": native_paths,
         "native_count": native_count,
+        "native_usable": native_usable,
         "has_openrouter": has_openrouter,
         "ollama_path": ollama_path,
         "auto": _auto_setup_preset_or_none(which),
@@ -1403,46 +1599,45 @@ def _auto_setup_preset_or_none(which=None) -> str | None:
 
 
 def _preset_status(preset: str, routes: dict[str, object]) -> tuple[str, str]:
-    native_count = int(routes["native_count"])
+    preset = _SETUP_PRESET_ALIASES.get(preset, preset)
+    native_usable = bool(routes["native_usable"])
     has_openrouter = bool(routes["has_openrouter"])
     has_ollama = bool(routes["ollama_path"])
     if preset == "auto":
         selected = routes["auto"]
         if selected:
             return "recommended", f"would select `{selected}`"
-        return "blocked", "needs at least two native CLIs or OPENROUTER_API_KEY"
+        return (
+            "blocked",
+            "needs Gemini/Antigravity plus Claude/Codex, or OPENROUTER_API_KEY",
+        )
     if preset == "tri-cli":
-        if native_count >= 2:
-            return "available", "uses installed Claude/Codex/Gemini/Antigravity CLI accounts"
-        return "blocked", "needs at least two of claude, codex, and antigravity (or gemini)"
+        if native_usable:
+            return "available", "uses installed native CLI participants"
+        return "blocked", "needs Gemini or Antigravity plus at least one of Claude or Codex"
     if preset == "openrouter":
         if has_openrouter:
-            return "available", "uses hosted OpenRouter reviewers"
+            return "available", "uses hosted OpenRouter participants"
         return "blocked", "needs OPENROUTER_API_KEY"
     if preset == "tri-cli-openrouter":
-        if native_count >= 2 and has_openrouter:
-            return "available", "uses native CLI peers plus hosted reviewers"
+        if native_usable and has_openrouter:
+            return "available", "uses native CLI and hosted OpenRouter participants"
         missing = []
-        if native_count < 2:
-            missing.append("two native CLIs")
+        if not native_usable:
+            missing.append("a usable native route")
         if not has_openrouter:
             missing.append("OPENROUTER_API_KEY")
         return "blocked", "needs " + " and ".join(missing)
-    if preset == "local-private":
-        if native_count >= 2 and has_ollama:
-            return "available", "uses native CLI peers plus local Ollama"
-        missing = []
-        if native_count < 2:
-            missing.append("two native CLIs")
-        if not has_ollama:
-            missing.append("ollama")
-        return "blocked", "needs " + " and ".join(missing)
+    if preset == "private-local":
+        if has_ollama:
+            return "available", "uses local Ollama only (default mode: private-local)"
+        return "blocked", "needs ollama"
     if preset == "all":
-        if native_count >= 2 and has_openrouter and has_ollama:
-            return "available", "writes native, hosted, and local presets"
+        if native_usable and has_openrouter and has_ollama:
+            return "available", "writes native, hosted, and local participant routes"
         missing = []
-        if native_count < 2:
-            missing.append("two native CLIs")
+        if not native_usable:
+            missing.append("a usable native route")
         if not has_openrouter:
             missing.append("OPENROUTER_API_KEY")
         if not has_ollama:
@@ -1484,14 +1679,7 @@ def _print_setup_plan(root: Path) -> None:
     print(f"  ollama   {routes['ollama_path'] or 'not found'}")
     print()
     print("Preset choices:")
-    for preset in (
-        "auto",
-        "tri-cli",
-        "openrouter",
-        "tri-cli-openrouter",
-        "local-private",
-        "all",
-    ):
+    for preset in _SETUP_PRESETS:
         status, detail = _preset_status(preset, routes)
         print(f"  {preset:19} {status:11} {detail}")
     print()
@@ -1503,17 +1691,11 @@ def _print_setup_plan(root: Path) -> None:
 def _prompt_setup_preset(root: Path) -> str:
     _print_setup_plan(root)
     default = _auto_setup_preset_or_none() or "openrouter"
-    valid = {
-        "auto",
-        "tri-cli",
-        "openrouter",
-        "tri-cli-openrouter",
-        "local-private",
-        "all",
-    }
+    valid = set(_SETUP_PRESETS)
     answer = input(f"Choose setup preset [{default}]: ").strip()
     if not answer:
         answer = default
+    answer = _SETUP_PRESET_ALIASES.get(answer, answer)
     if answer not in valid:
         raise SystemExit(
             f"Unknown preset '{answer}'. Choose one of: {', '.join(sorted(valid))}."
@@ -1576,15 +1758,24 @@ def _print_setup_next_steps(
 
     warnings: list[str] = []
     if include_native:
-        for name in ("claude", "codex"):
-            if shutil.which(name) is None:
-                warnings.append(f"{name} was not found on PATH; native CLI modes need it.")
+        has_primary = bool(shutil.which("claude") or shutil.which("codex"))
+        if not has_primary:
+            warnings.append(
+                "neither claude nor codex was found on PATH; native CLI "
+                "modes need at least one."
+            )
         has_agy = bool(shutil.which("agy"))
         has_gemini = bool(shutil.which("gemini"))
         if not has_agy and not has_gemini:
-            warnings.append("antigravity was not found on PATH; native CLI modes need it.")
-        elif has_gemini and not has_agy:
-            warnings.append("antigravity was not found on PATH (found gemini). We recommend installing/upgrading to antigravity.")
+            warnings.append(
+                "neither gemini nor antigravity was found on PATH; native "
+                "CLI modes need one Gemini-family participant."
+            )
+        elif has_agy and not has_gemini:
+            warnings.append(
+                "using Antigravity's prompt-enforced compatibility route; "
+                "install Gemini CLI for flag-enforced plan mode."
+            )
     if include_openrouter and not os.environ.get("OPENROUTER_API_KEY"):
         warnings.append(
             "OPENROUTER_API_KEY is not exported; hosted OpenRouter modes need it."
@@ -1607,7 +1798,37 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         config,
         probe_openrouter=args.probe_openrouter,
         probe_ollama=args.probe_ollama,
+        probe_native=bool(getattr(args, "probe_native", False)),
+        probe_cwd=env_start.resolve() if env_start.is_dir() else env_start.parent.resolve(),
     )
+    if getattr(args, "repair_transcript_permissions", False):
+        repair_root = transcript_dir(
+            env_start.resolve() if env_start.is_dir() else env_start.parent.resolve(),
+            config,
+        )
+        if repair_root.is_dir():
+            report = inspect_transcript_permissions(repair_root, repair=True)
+            repaired = len(report["repaired_files"])
+            skipped = sum(
+                len(value)
+                for key, value in report.items()
+                if key.startswith("skipped_") and isinstance(value, list)
+            )
+            checks.append(Check(
+                name="transcripts:permissions",
+                ok=skipped == 0,
+                detail=(
+                    f"repaired {repaired} file(s); directory_repaired="
+                    f"{report['directory_repaired']}; skipped={skipped}; "
+                    f"directory={repair_root}"
+                ),
+            ))
+        else:
+            checks.append(Check(
+                name="transcripts:permissions",
+                ok=True,
+                detail=f"no transcript directory yet: {repair_root}",
+            ))
     probe_local = getattr(args, "probe_local_openai", None)
     if probe_local is not None:
         # `--probe-local-openai` (no arg) → scan defaults; with a URL → probe
@@ -1615,6 +1836,29 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         # argparse's `const=""` for the bare flag.
         explicit_url = probe_local or None
         checks.extend(probe_local_openai(explicit_url))
+    default_mode = config.get("defaults", {}).get("mode", "quick")
+    try:
+        default_participants = select_participants(config, default_mode, current=None)
+    except ValueError as exc:
+        default_participants = []
+        checks.append(
+            Check(
+                name="route:default-mode",
+                ok=False,
+                detail=f"mode '{default_mode}' is not runnable: {exc}",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                name="route:default-mode",
+                ok=True,
+                detail=(
+                    f"mode '{default_mode}' selects "
+                    + ", ".join(default_participants)
+                ),
+            )
+        )
     check_update = bool(getattr(args, "check_update", False))
     if args.json:
         if check_update:
@@ -1629,18 +1873,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"{status:8} {check.name:24} {check.detail}")
         if check_update:
             _print_update_status(check_for_update(__version__))
-    required_names = {"python:mcp"}
-    default_mode = config.get("defaults", {}).get("mode", "quick")
-    try:
-        default_participants = select_participants(config, default_mode, current=None)
-    except ValueError:
-        default_participants = []
+    required_names = {"python:mcp", "route:default-mode"}
     for name in default_participants:
         participant = config.get("participants", {}).get(name, {})
         if participant.get("type") == "cli":
             required_names.add(f"cli:{name}")
-        elif participant.get("type") == "openrouter":
-            api_key_env = participant.get("api_key_env") or "OPENROUTER_API_KEY"
+        elif api_key_env := participant_api_key_env(participant):
             required_names.add(f"env:{api_key_env}")
         elif participant.get("type") == "ollama":
             required_names.add("cli:ollama")
@@ -1717,15 +1955,24 @@ def cmd_estimate(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
     _emit_config_warnings(config)
+
+    mode = canonical_mode_name(
+        config, args.mode or config.get("defaults", {}).get("mode", "quick")
+    )
+    from llm_council.config import apply_smart_routing
+
+    # Match `run`: automatic low-risk routing establishes the baseline, then
+    # an explicit tier remains the operator's final model pin.
+    apply_smart_routing(config, mode, cwd)
     tier = getattr(args, "tier", None)
     if tier:
         try:
             apply_tier_override(config, tier)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
-    mode = args.mode or config.get("defaults", {}).get("mode", "quick")
     current = args.current or detect_current_agent()
     stdin_text = sys.stdin.read() if args.stdin else None
+    chunk_events: list[dict[str, Any]] = []
     try:
         estimate = estimate_council(
             config=config,
@@ -1746,9 +1993,13 @@ def cmd_estimate(args: argparse.Namespace) -> int:
             openrouter_models=args.openrouter_model,
             use_cache=not args.no_cache,
             image_paths=args.image or None,
+            chunk_strategy=getattr(args, "chunk_strategy", "fail"),
+            chunk_progress=chunk_events.append,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
+    if chunk_events:
+        estimate["chunk_events"] = chunk_events
 
     if args.json:
         print(json.dumps(estimate, indent=2))
@@ -1897,7 +2148,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
             format_reliability_text,
         )
 
-        peer_filter = args.reliability_peer or args.participant
+        peer_filter = args.participant
         reliability = aggregate_reliability(
             cwd,
             transcripts_dir=out_dir,
@@ -1938,9 +2189,9 @@ def _eval_council_caller(
     from one Suite run.
     """
     from llm_council.orchestrator import execute_council
-    from llm_council.context import build_prompt
 
     def _call(prompt_text: str, mode: str) -> list[Any]:
+        mode = canonical_mode_name(config, mode)
         # Resolve participants for THIS mode.
         try:
             participants = select_participants(
@@ -2007,7 +2258,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
 
     try:
         config = load_config(args.config if hasattr(args, "config") else None, search=False)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError):
         # When no explicit config is supplied, fall back to find_config(cwd).
         try:
             config = load_config(find_config(cwd), search=False)
@@ -2364,7 +2615,7 @@ def _cmd_transcripts_prune(args: argparse.Namespace, out_dir: Path) -> int:
         for record in pruned:
             print(f"  - {record['json']}")
         if not args.apply and pruned:
-            print("re-run with --apply to actually delete")
+            print("re-run with --delete to delete these transcripts")
     return 0
 
 
@@ -2619,6 +2870,49 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
     _emit_config_warnings(config)
+
+    # Resolve continuation metadata before routing. A private-local parent
+    # keeps its privacy boundary when --mode is omitted; an explicit move to
+    # hosted peers is refused after participant selection unless the caller
+    # acknowledges it with --allow-privacy-downgrade.
+    out_dir = transcript_dir(cwd, config)
+    parent_run_id: str | None = None
+    prior_context: str | None = None
+    prior_transcript: dict[str, Any] | None = None
+    continue_id = getattr(args, "continue_id", None)
+    if continue_id:
+        try:
+            normalize_run_id(continue_id)
+            depth_error = continuation_depth_limit_error(config, out_dir, continue_id)
+            if depth_error:
+                raise SystemExit(depth_error)
+            prior_transcript = find_transcript_by_id(out_dir, continue_id)
+            prior_path = prior_transcript.get("_path")
+            parent_run_id = (
+                Path(str(prior_path)).stem
+                if prior_path
+                else normalize_run_id(continue_id)
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+
+    inherited_mode: str | None = None
+    if args.mode is None and prior_transcript is not None:
+        from llm_council.privacy import transcript_was_private_local
+
+        if transcript_was_private_local(prior_transcript):
+            inherited_mode = str(prior_transcript.get("mode") or "private-local")
+    mode = canonical_mode_name(
+        config,
+        args.mode
+        or inherited_mode
+        or config.get("defaults", {}).get("mode", "quick"),
+    )
+    from llm_council.config import apply_smart_routing
+
+    # Automatic cost routing is a baseline convenience.  An explicit --tier
+    # is an operator decision and therefore applies last.
+    apply_smart_routing(config, mode, cwd)
     tier = getattr(args, "tier", None)
     if tier:
         try:
@@ -2630,9 +2924,6 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                 f"Tier '{tier}' applied: swapped models for {', '.join(swapped)}",
                 flush=True,
             )
-    mode = args.mode or config.get("defaults", {}).get("mode", "quick")
-    from llm_council.config import apply_smart_routing
-    apply_smart_routing(config, mode, cwd)
     current = args.current or detect_current_agent()
     explicit = parse_csv(args.participants)
     include = parse_csv(args.include)
@@ -2647,29 +2938,24 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+
+    if prior_transcript is not None:
+        from llm_council.privacy import privacy_downgrade_error
+
+        downgrade_error = privacy_downgrade_error(
+            prior_transcript,
+            participants=participants,
+            participant_cfg=config.get("participants", {}) or {},
+            allow_privacy_downgrade=bool(
+                getattr(args, "allow_privacy_downgrade", False)
+            ),
+        )
+        if downgrade_error:
+            raise SystemExit(downgrade_error)
+        prior_context = format_prior_council_context(
+            prior_transcript, run_id=parent_run_id
+        )
     stdin_text = sys.stdin.read() if args.stdin else None
-    out_dir = transcript_dir(cwd, config)
-    parent_run_id: str | None = None
-    prior_context: str | None = None
-    continue_id = getattr(args, "continue_id", None)
-    if continue_id:
-        try:
-            normalize_run_id(continue_id)
-            _depth_err = continuation_depth_limit_error(config, out_dir, continue_id)
-            if _depth_err:
-                raise SystemExit(_depth_err)
-            prior_transcript = find_transcript_by_id(out_dir, continue_id)
-            prior_path = prior_transcript.get("_path")
-            parent_run_id = (
-                Path(str(prior_path)).stem
-                if prior_path
-                else normalize_run_id(continue_id)
-            )
-            prior_context = format_prior_council_context(
-                prior_transcript, run_id=parent_run_id
-            )
-        except (FileNotFoundError, ValueError) as exc:
-            raise SystemExit(str(exc)) from exc
     # Independent-review isolation (advisory). Resolution order:
     # CLI flag > per-mode independent_review > defaults.independent_review.
     # Default OFF. When ON and a prior_context WOULD have been injected from a
@@ -2799,7 +3085,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 
-    from llm_council.safety import apply_secret_scan_policy
+    from llm_council.safety import apply_secret_scan_policy, redact_secrets
 
     defaults_cfg = config.get("defaults", {}) or {}
     scan_policy = str(defaults_cfg.get("secret_scan") or "warn").lower()
@@ -2821,8 +3107,17 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     # transcript. Pop it so the (large) redacted prompt isn't duplicated into
     # metadata.secret_scan below.
     _redacted = scan_result.pop("redacted_prompt", None)
+    persisted_question = question
     if _redacted is not None:
         prompt = _redacted
+        # `question` is persisted separately and is also reused by ranking /
+        # synthesis prompts. Redact that copy too so the policy protects every
+        # artifact and every later participant call, not only round one.
+        persisted_question, _question_findings = redact_secrets(
+            question,
+            cwd=cwd,
+            allowlist_filename=scan_allowlist,
+        )
     if scan_result.get("detected_count"):
         kinds_summary = ", ".join(
             f"{k}={v}" for k, v in sorted(scan_result["kinds"].items())
@@ -2841,6 +3136,11 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     mode_cfg = config.get("modes", {}).get(mode, {})
     transparent = bool(args.transparent or config.get("defaults", {}).get("transparent"))
     deliberate = bool(args.deliberate or mode_cfg.get("deliberate"))
+    synthesize = bool(
+        getattr(args, "synthesize", False)
+        or mode_cfg.get("synthesize")
+        or config.get("defaults", {}).get("synthesize")
+    )
     max_rounds = int(
         args.max_rounds
         or mode_cfg.get("max_rounds")
@@ -2855,6 +3155,91 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     else:
         min_quorum_value = None
     participant_cfg = config.get("participants", {})
+
+    # Resolve focus and the concrete synthesis chair before estimating or
+    # launching any peer. Their auxiliary calls are part of the hard budget,
+    # and a bad focus/chair configuration must fail closed before spend.
+    resolved_focus: list[Any] | None = None
+    focus_directive = ""
+    _focus_arg = getattr(args, "focus", None)
+    if _focus_arg:
+        from llm_council import review_skills as _review_skills
+
+        _focus_names = parse_csv(_focus_arg)
+        try:
+            resolved_focus, _focus_skipped = _review_skills.resolve_focus(
+                _focus_names, cwd
+            )
+        except _review_skills.FocusNotFound as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if _focus_skipped:
+            _skipped_names = ", ".join(s["name"] for s in _focus_skipped)
+            print(
+                f"warning: skipped malformed review-focus bundle(s): {_skipped_names}",
+                file=sys.stderr,
+            )
+        focus_directive = _review_skills.render_focus_directive(resolved_focus)
+
+    from llm_council.orchestrator import apply_contextual_persona_recruitment
+
+    apply_contextual_persona_recruitment(
+        participants,
+        participant_cfg,
+        cwd,
+        stances=mode_stances if isinstance(mode_stances, dict) else None,
+    )
+    tool_call_voting = bool(mode_cfg.get("tool_call_voting"))
+    participant_prompts: dict[str, str] = {}
+    for name in participants:
+        peer_cfg = participant_cfg.get(name) or {}
+        assigned_stance = (
+            mode_stances.get(name)
+            if isinstance(mode_stances, dict)
+            else peer_cfg.get("stance")
+        )
+        participant_prompts[name] = apply_per_peer_directives(
+            prompt,
+            mode=mode,
+            family=peer_cfg.get("family"),
+            tool_call_voting=tool_call_voting,
+            stance=assigned_stance,
+            persona=peer_cfg.get("persona"),
+            persona_prompt=peer_cfg.get("persona_prompt"),
+            focus_directive=focus_directive,
+        )
+
+    deliberation_prompt_bounds = (
+        deliberation_prompt_char_bounds(
+            participants=participants,
+            participant_cfg=participant_cfg,
+            mode=mode,
+            tool_call_voting=tool_call_voting,
+            stances=mode_stances if isinstance(mode_stances, dict) else None,
+            focus_directive=focus_directive,
+        )
+        if deliberate and max_rounds > 1
+        else {}
+    )
+
+    synthesizer_name: str | None = None
+    if synthesize:
+        from llm_council.synthesis import select_synthesizer
+
+        active_participant_cfg = {
+            name: participant_cfg[name]
+            for name in participants
+            if name in participant_cfg
+        }
+        try:
+            synthesizer_name = select_synthesizer(
+                config,
+                active_participant_cfg,
+                stances=mode_stances if isinstance(mode_stances, dict) else None,
+                current=current,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
 
     # Budget gates run BEFORE the dry-run early-return so users can validate
     # their cap is configured correctly without spending real-call dollars.
@@ -2877,7 +3262,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         preflight = estimate_council(
             config=config,
             cwd=cwd,
-            question=question,
+            question=persisted_question,
             mode=mode,
             current=current,
             explicit=parse_csv(args.participants),
@@ -2892,6 +3277,14 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             use_cache=True,
             allow_network=False,
             image_paths=args.image,
+            prepared_prompt=prompt,
+            prepared_participants=participants,
+            participant_prompts=participant_prompts,
+            cross_rank=bool(getattr(args, "cross_rank", False)),
+            synthesize=synthesize,
+            synthesizer_name=synthesizer_name,
+            focus_directive=focus_directive or None,
+            deliberation_prompt_chars=deliberation_prompt_bounds,
         )
     except (OSError, ValueError) as exc:
         # The hard caps MUST fail closed if the estimate can't be computed;
@@ -2906,7 +3299,8 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         cost_estimate_block = compact_cost_estimate(preflight)
         if max_cost_usd is not None or max_tokens is not None:
             # enforce_preflight_caps uses the retry-safety total so a worst-case
-            # repair retry can't silently push spend past the cap, and flags
+            # repair/timeout recovery can't silently push spend past the cap,
+            # and flags
             # hosted peers with unknown catalog price (which would otherwise slip
             # past a $-cap). Shared with cmd_estimate + the MCP run pipeline.
             try:
@@ -2917,8 +3311,8 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                     breakdown_hint=(
                         "drop expensive peers, raise the cap, or run `llm-council "
                         "estimate ...` for a per-peer breakdown. To exclude the "
-                        "repair-retry margin, set retry_on_missing_label: false on "
-                        "individual participants."
+                        "outer-retry margin, set retries: 0 on individual "
+                        "participants."
                     ),
                 )
             except ValueError as exc:
@@ -3006,27 +3400,6 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         config.setdefault("defaults", {})["require_sections"] = bool(_cli_require_sections)
     if _cli_strict_evidence is not None:
         config.setdefault("defaults", {})["strict_evidence"] = bool(_cli_strict_evidence)
-    # Resolve operator-authored review-focus bundles. Fail fast on an
-    # unknown bundle name BEFORE execute_council launches any peer.
-    resolved_focus: list[Any] | None = None
-    _focus_arg = getattr(args, "focus", None)
-    if _focus_arg:
-        from llm_council import review_skills as _review_skills
-
-        _focus_names = parse_csv(_focus_arg)
-        try:
-            resolved_focus, _focus_skipped = _review_skills.resolve_focus(
-                _focus_names, cwd
-            )
-        except _review_skills.FocusNotFound as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-        if _focus_skipped:
-            _skipped_names = ", ".join(s["name"] for s in _focus_skipped)
-            print(
-                f"warning: skipped malformed review-focus bundle(s): {_skipped_names}",
-                file=sys.stderr,
-            )
     results, metadata = await execute_council(
         participants,
         participant_cfg,
@@ -3041,12 +3414,22 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         mode=mode,
         cache_mode=getattr(args, "cache_mode", "on"),
         stances=mode_stances if isinstance(mode_stances, dict) else None,
-        synthesize=bool(getattr(args, "synthesize", False)),
+        synthesize=synthesize,
+        synthesizer_name=synthesizer_name,
         current=current,
-        question=question,
+        question=persisted_question,
         cross_rank=bool(getattr(args, "cross_rank", False)),
         focus=resolved_focus,
     )
+    from llm_council.deliberation import summarize_recommendations
+
+    final_results = final_round_results(results)
+    recommendation_summary = summarize_recommendations(final_results)
+    metadata["recommendation"] = recommendation_summary.recommendation
+    metadata["agreement_count"] = recommendation_summary.agreement_count
+    metadata["total_labeled"] = recommendation_summary.total_labeled
+    metadata["recommendation_counts"] = dict(recommendation_summary.counts)
+    metadata["recommendation_tied"] = recommendation_summary.tied
     # Record the secret-scan result in metadata for transcript-based
     # audit tooling. The stderr warning above is for the live terminal;
     # transcripts need their own copy because audit pipelines don't read
@@ -3059,11 +3442,8 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     # a mid-run progress event because the decision precedes execute_council.
     if prior_context_suppressed:
         metadata["prior_context_suppressed_for_independence"] = True
-    # Surface a synthesis configuration error inline. The orchestrator
-    # catches ValueError from the chair-resolution path and stamps it as
-    # metadata so peer votes still flow through; rendering it here gives
-    # the user a reason for the missing synthesis section instead of
-    # silent absence.
+    # Surface any non-configuration synthesis failure reported after the
+    # early chair validation (for example, a chair call that fails at runtime).
     if metadata.get("synthesis_error"):
         print(
             display.format_gutter(
@@ -3103,11 +3483,11 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     if cost_warning_payload is not None:
         metadata["cost_warning"] = cost_warning_payload
 
-    md_path, json_path = transcript_paths(out_dir, question)
+    md_path, json_path = transcript_paths(out_dir, persisted_question)
     write_transcript(
         md_path,
         json_path,
-        question=question,
+        question=persisted_question,
         mode=mode,
         current=current,
         participants=participants,
@@ -3130,6 +3510,11 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                             "name": result.name,
                             "ok": result.ok,
                             "elapsed_seconds": round(result.elapsed_seconds, 3),
+                            "wall_elapsed_seconds": (
+                                round(result.wall_elapsed_seconds, 3)
+                                if result.wall_elapsed_seconds is not None
+                                else None
+                            ),
                             "error": result.error,
                             "error_kind": classify_error(result.error),
                             "model": result.model,
@@ -3159,7 +3544,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     else:
         from llm_council.adapters import is_timeout_error
 
-        ok = sum(1 for result in results if result.ok)
+        ok = sum(1 for result in final_results if result.ok)
         timed_out = [result for result in results if is_timeout_error(result.error)]
         color = display.wants_color(sys.stdout)
         unicode_safe = display.wants_unicode_rule(sys.stdout)
@@ -3167,7 +3552,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         print(
             display.format_gutter(
                 display.VERB_CONCLUDED,
-                f"llm-council {complete_word}: {ok}/{len(results)} participants succeeded",
+                f"llm-council {complete_word}: {ok}/{len(final_results)} participants succeeded",
                 color=color,
             )
         )
@@ -3239,8 +3624,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     notify_cfg = config.get("notifications")
     if isinstance(notify_cfg, dict) and notify_cfg.get("webhook_url"):
         webhook_url = notify_cfg.get("webhook_url")
-        from llm_council.deliberation import recommendation_counts
-        counts = recommendation_counts(results)
+        counts = recommendation_summary.counts
         summary_text = (
             f"LLM Council Run Finished!\n"
             f"Question: {question[:150] if question else 'None'}...\n"
@@ -3257,8 +3641,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     # Quorum policy enforcement
     policies = config.get("quorum_policies")
     if isinstance(policies, dict):
-        from llm_council.deliberation import recommendation_counts
-        counts = recommendation_counts(results)
+        counts = recommendation_summary.counts
         total_votes = counts["yes"] + counts["no"] + counts["tradeoff"]
         
         active_policy = policies.get("standard")
@@ -3286,6 +3669,13 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                     
         if isinstance(active_policy, dict):
             threshold = active_policy.get("threshold", "majority")
+            if total_votes == 0:
+                print(
+                    "\nQUORUM ERROR: Policy failed closed because the final "
+                    "round produced no usable yes/no/tradeoff votes.",
+                    file=sys.stderr,
+                )
+                return 1
             if threshold == "unanimous":
                 if counts["no"] > 0 or counts["tradeoff"] > 0:
                     print(

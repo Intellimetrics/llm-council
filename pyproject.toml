@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-council"
-version = "0.16.0"
-description = "Lightweight read-only multi-agent council for coding projects."
+version = "0.17.0"
+description = "Lightweight source-read-only multi-agent council for coding projects."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -43,6 +43,12 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["llm_council*"]
+
+[tool.setuptools.package-data]
+"llm_council.eval" = [
+  "fixtures/*/*.json",
+  "fixtures/*/*.md",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

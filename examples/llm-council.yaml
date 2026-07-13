@@ -71,6 +71,30 @@ participants:
     - GEMINI_API_KEY
     - GOOGLE_API_KEY
 
+  # Antigravity is the default Gemini-family compatibility route. Select the
+  # Gemini participant explicitly when its hard plan-mode boundary is usable.
+  # Its read-only posture is prompt-enforced, not flag-enforced: --sandbox
+  # restricts shell commands but does not disable Antigravity's file-write
+  # tool. Keep --dangerously-skip-permissions out of this participant.
+  antigravity:
+    type: cli
+    family: antigravity
+    origin: US / Google
+    command: agy
+    args:
+    - --print
+    - --sandbox
+    - "-"
+    model:
+    timeout: 240
+    max_prompt_chars: 120000
+    read_only: true
+    stdin_prompt: true
+    env_passthrough:
+    - GEMINI_API_KEY
+    - GOOGLE_API_KEY
+    - ANTIGRAVITY_API_KEY
+
   deepseek_v4_pro:
     type: openrouter
     family: deepseek
@@ -97,7 +121,7 @@ modes:
   quick:
     strategy: other_cli_peers
     include_current: true
-    description: Ask Claude, Codex, and Gemini as explicit council participants.
+    description: Ask available Claude/Codex and Gemini-family participants.
 
   peer-only:
     strategy: other_cli_peers
@@ -109,11 +133,11 @@ modes:
     include_current: true
     add:
     - deepseek_v4_pro
-    description: Claude/Codex/Gemini plus DeepSeek V4 Pro for independent planning.
+    description: Native CLI participants plus DeepSeek V4 Pro for independent planning.
 
   review:
     strategy: other_cli_peers
     include_current: true
     add:
     - qwen_coder_plus
-    description: Claude/Codex/Gemini plus Qwen Coder Plus for coding review.
+    description: Native CLI participants plus Qwen Coder Plus for code review.

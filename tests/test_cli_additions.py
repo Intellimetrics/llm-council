@@ -1,5 +1,4 @@
-import sys
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 import pytest
 from llm_council.cli import cmd_run_async, build_parser
 from llm_council.adapters import ParticipantResult

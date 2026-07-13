@@ -19,9 +19,10 @@ line, which is why it doesn't need to announce itself.
 
 from __future__ import annotations
 
-import os
 import sys
 from typing import IO
+
+from llm_council.env import env_get
 
 
 GUTTER_WIDTH = 12
@@ -97,7 +98,7 @@ def wants_color(stream: IO | None = None) -> bool:
     disables color. We also disable color when the target stream is not
     a TTY so piped/CI output stays clean.
     """
-    if os.environ.get("NO_COLOR"):
+    if env_get("NO_COLOR"):
         return False
     target = stream if stream is not None else sys.stderr
     isatty = getattr(target, "isatty", None)
@@ -116,7 +117,7 @@ def wants_quiet() -> bool:
     (layout still prints). MCP servers have no per-call CLI flags, so an
     env-only switch is the only shape that works on both surfaces.
     """
-    value = os.environ.get("LLM_COUNCIL_QUIET", "").strip().lower()
+    value = (env_get("LLM_COUNCIL_QUIET", "") or "").strip().lower()
     return value not in ("", "0", "false", "no", "off")
 
 
@@ -201,6 +202,7 @@ def render_summary_markdown(
     recommendation: str,
     per_peer_rows: list[dict],
     transcript_path: str | None,
+    wall_elapsed_seconds: float | None = None,
     deliberated: bool = False,
     rounds: int = 1,
 ) -> str:
@@ -216,29 +218,45 @@ def render_summary_markdown(
     prose. ANSI is irrelevant here — this surface is markdown-only.
     """
     deliberation_note = f" · {rounds} rounds" if deliberated else ""
+    timing = f"participant aggregate={elapsed_seconds:.1f}s"
+    if wall_elapsed_seconds is not None:
+        timing = (
+            f"run wall={wall_elapsed_seconds:.1f}s · "
+            f"participant aggregate={elapsed_seconds:.1f}s"
+        )
     header = (
         f"**LLM Council** · mode={mode} · {ok_count}/{total} succeeded · "
-        f"{elapsed_seconds:.1f}s · recommendation={recommendation}{deliberation_note}"
+        f"{timing} · recommendation={recommendation}{deliberation_note}"
     )
     lines = [header, ""]
     if per_peer_rows:
         has_stance = any(row.get("stance") for row in per_peer_rows)
+        has_wall_time = any(
+            row.get("wall_elapsed_seconds") is not None for row in per_peer_rows
+        )
+        time_heading = "wall time" if has_wall_time else "time"
         if has_stance:
-            lines.append("| peer | label | stance | time |")
+            lines.append(f"| peer | label | stance | {time_heading} |")
             lines.append("|---|---|---|---|")
             for row in per_peer_rows:
+                peer_elapsed = row.get("wall_elapsed_seconds")
+                if peer_elapsed is None:
+                    peer_elapsed = row.get("elapsed_seconds", 0)
                 lines.append(
                     f"| {row['name']} | {row.get('label') or '—'} | "
                     f"{row.get('stance') or '—'} | "
-                    f"{row.get('elapsed_seconds', 0):.1f}s |"
+                    f"{float(peer_elapsed or 0):.1f}s |"
                 )
         else:
-            lines.append("| peer | label | time |")
+            lines.append(f"| peer | label | {time_heading} |")
             lines.append("|---|---|---|")
             for row in per_peer_rows:
+                peer_elapsed = row.get("wall_elapsed_seconds")
+                if peer_elapsed is None:
+                    peer_elapsed = row.get("elapsed_seconds", 0)
                 lines.append(
                     f"| {row['name']} | {row.get('label') or '—'} | "
-                    f"{row.get('elapsed_seconds', 0):.1f}s |"
+                    f"{float(peer_elapsed or 0):.1f}s |"
                 )
     if transcript_path:
         lines.extend(["", f"> Transcript: `{transcript_path}`"])
@@ -298,8 +316,20 @@ def format_progress_message(event: dict) -> str | None:
         body = f"{peer} slow ({elapsed:.0f}s / {timeout:.0f}s timeout)"
     elif kind == "participant_finish":
         status = event.get("status") or ("ok" if event.get("ok") else "error")
-        elapsed = float(event.get("elapsed_seconds") or 0)
-        body = f"{peer} {status} ({elapsed:.1f}s)"
+        attempt_elapsed = float(event.get("elapsed_seconds") or 0)
+        wall_elapsed_raw = event.get("wall_elapsed_seconds")
+        if wall_elapsed_raw is None:
+            wall_elapsed_raw = event.get("duration_seconds")
+        wall_elapsed = float(
+            attempt_elapsed if wall_elapsed_raw is None else wall_elapsed_raw
+        )
+        if abs(wall_elapsed - attempt_elapsed) >= 0.05:
+            body = (
+                f"{peer} {status} (wall {wall_elapsed:.1f}s; "
+                f"attempt {attempt_elapsed:.1f}s)"
+            )
+        else:
+            body = f"{peer} {status} ({wall_elapsed:.1f}s)"
     elif kind == "deliberation_pending":
         body = f"disagreement detected, deliberation round {round_no} starting"
     elif kind in ("deliberation_skip", "deliberation_skipped"):
@@ -337,7 +367,11 @@ def format_progress_message(event: dict) -> str | None:
     elif kind == "council_finish":
         ok = event.get("ok")
         total = event.get("total")
-        body = f"concluded: {ok}/{total} ok"
+        wall_elapsed = event.get("duration_seconds")
+        if wall_elapsed is None:
+            body = f"concluded: {ok}/{total} ok"
+        else:
+            body = f"concluded: {ok}/{total} ok · run wall {float(wall_elapsed):.1f}s"
     # Suppressed by design: participant_start (per-peer noise multiplier
     # when N peers fire concurrently — participant_finish is the visible
     # signal), images_skipped, truncated_for_deliberation,

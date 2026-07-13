@@ -8,6 +8,7 @@ the headline recommendation: chair output is metadata, not a vote.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,27 @@ from llm_council.findings import FindingMatrix
 
 MAX_SYNTHESIS_PROMPT_CHARS_DEFAULT = 60_000
 MAX_RATIONALE_CHARS = 320
+
+_DECISION_SECTION_RE = re.compile(
+    r"^###\s+Decision\s*$\n(?P<body>.*?)(?=^###\s+|\Z)",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
+_DECISION_LABEL_RE = re.compile(r"^(?:[*_`]+)?(yes|no|tradeoff)\b", re.IGNORECASE)
+
+
+def _synthesis_decision_label(output: str) -> str:
+    """Parse the verdict from the chair's required ``### Decision`` section."""
+
+    section = _DECISION_SECTION_RE.search(output or "")
+    if section is None:
+        return "unknown"
+    for raw_line in section.group("body").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = _DECISION_LABEL_RE.match(line)
+        return match.group(1).lower() if match else "unknown"
+    return "unknown"
 
 
 def should_synthesize(
@@ -441,7 +463,9 @@ async def run_synthesis_chair(
         "output": chair_result.output,
         "error": chair_result.error,
         "decision_label": (
-            recommendation_label(chair_result.output) if chair_result.ok else "unknown"
+            _synthesis_decision_label(chair_result.output)
+            if chair_result.ok
+            else "unknown"
         ),
         "blockers": list(chair_result.blockers),
         "evidence": list(chair_result.evidence),

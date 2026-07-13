@@ -30,7 +30,7 @@ llm-council setup --plan                       # detect routes, do not write
 llm-council setup --yes --preset tri-cli       # write without prompting
 
 # Diagnostics
-llm-council doctor [--probe-openrouter] [--probe-ollama] [--check-update]
+llm-council doctor [--probe-openrouter] [--probe-ollama] [--probe-native] [--repair-transcript-permissions] [--check-update]
 
 # Direct council run (skips MCP)
 llm-council run --current codex --mode review --diff "Review this change"
@@ -408,8 +408,9 @@ Key modules:
   `--fallback-model <chain[0]>` so the CLI itself handles overload
   internally; the llm-council-level walker is SKIPPED for Claude to
   avoid double-paying the peer. Antigravity ships with
-  `fallback_chain: []` because `agy` has no `--model` flag (the peer
-  drops with `quota_throttled_peers` signal). Default chains shipped
+  `fallback_chain: []` because portable `agy` model ids do not exist and an
+  unrecognized `--model` value silently falls back to session state (the peer
+  therefore drops with a `quota_throttled_peers` signal). Default chains shipped
   in `DEFAULT_CONFIG` are capability-graceful (same-tier minor version
   back → next-tier-smaller → smallest); wrong model ids just make
   that step fail and the walker proceeds (or the peer drops if chain
@@ -494,13 +495,11 @@ Key modules:
   identical (for `degraded` / `min_quorum` purposes) to a run that
   never listed that peer at all — a missing key is an operator
   configuration gap, not a council failure. Asymmetry between the
-  two hosted types: `openrouter` peers without explicit
-  `api_key_env` default to `OPENROUTER_API_KEY` (well-known
-  convention); `openai_compatible` peers without explicit
-  `api_key_env` are NOT pre-dropped (the type covers everything
-  from hosted OpenAI to no-auth local vLLM — we defer to the
-  adapter rather than guess). With explicit `api_key_env` set, both
-  types pre-drop normally.
+  hosted types: both `openrouter` and `openai_compatible` peers
+  without explicit `api_key_env` default to `OPENROUTER_API_KEY`.
+  Configure an explicit environment variable for a different hosted
+  provider; use the dedicated local participant types for no-auth
+  local inference.
 - **Independence warning is advisory-only (H2).** The optional
   `defaults.min_distinct_vendors` (global) and per-mode
   `modes.<name>.require_distinct_vendors` (override; resolution: mode
@@ -660,8 +659,10 @@ failure path; do not let strings drift.
 | `abdicated`          | Peer emitted `RECOMMENDATION:` and `EFFORT: blocked` with no concrete missing artifact in EITHER `BLOCKERS:` or `ASSUMPTIONS:`. Terminal for the round — no repair retry, drops quorum so consensus doesn't form on a non-vote. The cache DOES persist the raw output; `_with_envelope` re-derives `ok=False` on every read so repeat runs still drop quorum without paying the peer again. Prefix: `AbdicatedResponse:` |
 | `incomplete_response` | Response had the `RECOMMENDATION:` label but missed one or more `(REQUIRED)` sections from the prompt after one repair-retry. Prefix: `IncompleteResponse:` |
 | `untagged_evidence`  | `defaults.strict_evidence: true` AND one or more EVIDENCE bullets lacked a `[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]` tag after one repair-retry. Prefix: `UntaggedEvidence:` |
-| `quota_exhausted`    | Peer hit a known quota / rate-limit signal (`RESOURCE_EXHAUSTED`, `quota_exceeded`, `rate_limit_exceeded`, `insufficient_quota`, `insufficient credits`, `usage limit`, `5-hour limit`, HTTP 429 with quota-adjacent text). Detected by `adapters.is_quota_exhausted_error` over the raw error string — no prefix synthesized. Surfaced top-level in transcripts and MCP `structured_results` as `quota_throttled_peers: [{peer, family, model, message}]`; orchestrator emits a `peer_quota_throttled` progress event per peer (deduped across rounds). Phase 2 (v0.11.6): a peer with non-empty `cfg.fallback_chain` gets ONE retry with the next-in-chain model substituted into `cfg.model` BEFORE the result lands in quorum. On success the peer recovers (`recovered_after_quota=True`, `model_fallback_used=<id>`, appears in `quota_recoveries` not `quota_throttled_peers`). On failure the peer drops with this error_kind. Skipped for the Claude family because Claude's own `--fallback-model` CLI flag handles overload natively (auto-injected by `_build_cli_command` when chain non-empty). |
+| `quota_exhausted`    | Peer hit a known quota / rate-limit signal (`RESOURCE_EXHAUSTED`, `quota_exceeded`, `Individual quota reached`, `rate_limit_exceeded`, `insufficient_quota`, `insufficient credits`, `usage limit`, `5-hour limit`, HTTP 429 with quota-adjacent text). Detected by `adapters.is_quota_exhausted_error` over the raw error string — no prefix synthesized. Surfaced top-level in transcripts and MCP `structured_results` as `quota_throttled_peers: [{peer, family, model, message}]`; orchestrator emits a `peer_quota_throttled` progress event per peer (deduped across rounds). A peer with a non-empty `cfg.fallback_chain` walks up to three next-in-chain models before landing in quorum. On success the peer recovers (`recovered_after_quota=True`, `model_fallback_used=<id>`, appears in `quota_recoveries` not `quota_throttled_peers`). On failure the peer drops with this error kind. Skipped for the Claude family because Claude's own `--fallback-model` CLI flag handles overload natively (auto-injected by `_build_cli_command` when chain non-empty). |
 | `model_substituted`  | A CLI peer with `require_pinned_model: true` was served by a model other than its pinned `model` — e.g. Claude Fable 5 refused and the Claude Code surface silently fell back to Opus 4.8. Prefix: `ModelSubstituted:`. Only observable when `usage_from_json: true` surfaces the served model id (the `modelUsage` key with the most `outputTokens` — the answer's author); the served model must fail the lenient variant-tolerant `adapters._model_pin_satisfied` check. Terminal for the peer (ok=False, drops quorum) so a substituted model's answer is never recorded as the requested model's vote; `result.model` still reports the REAL served model, and substituted outputs are excluded from the finding matrix. Detected live per round (round 1, the --cross-rank ranking pass, round-2 deliberation) plus the synthesis-chair turn, and preserved through repair-retry merges (with combined original+retry output). Surfaced as `metadata['model_substituted_peers']: [{peer, requested, served_by, ranking_round?, synthesis?}]` (omitted when empty), lifted top-level in the MCP `council_run` payload + schema (v7), with a per-round `peer_model_substituted` progress event. Opt-in — a peer without `require_pinned_model` or without JSON usage never trips it. Known limit: attribution is by max cumulative `outputTokens`, so a mid-turn refusal fallback inside a long agentic turn can evade it. |
+| `pinned_model_unverified` | A peer required pinned-model verification but the CLI output did not report a served model. Prefix: `PinnedModelUnverified:`. The answer is excluded from quorum rather than being attributed without evidence. |
+| `client_ineligible` | A native client is installed but durably ineligible for the configured account/tier, currently Gemini's `IneligibleTierError` with `UNSUPPORTED_CLIENT`. Doctor's opt-in native probe surfaces the compatible fallback. |
 | `unknown`            | Non-empty error that did not match any known prefix — file a dogfood note            |
 
 ## Custom CLI participant: minimal template
@@ -762,7 +763,7 @@ REQUESTED id — never a server-side confirmation that the CLI honored it. The
 estimate row substitutes the load-bearing `CLI_DEFAULT_MODEL_LABEL`
 (`"cli default"`) sentinel for `model: None` peers; `cli.py:cmd_estimate`
 compares against that same constant to render the peer NAME in the table.
-**Do NOT pin antigravity's model** — `agy` has no `--model` flag, so
-`_build_cli_command` skips `--model` injection for `family == "antigravity"`
-and any pinned id is silently ignored rather than producing a broken
-invocation.
+Antigravity 1.0.x accepts `--model`, so a configured model is injected like
+other non-Codex CLIs. Use the exact `agy models` display name: an unrecognized
+value silently falls back to Antigravity's session default, so a requested id
+is not proof of the model that served the response.

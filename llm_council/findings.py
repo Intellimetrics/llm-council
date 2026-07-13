@@ -19,7 +19,6 @@ This module is consumed by synthesis only.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 import re
 

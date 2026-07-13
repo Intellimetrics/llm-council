@@ -16,7 +16,6 @@ Anything missing => feature stays off (returns None).
 from __future__ import annotations
 
 import json
-import os
 import re
 from typing import Any
 
@@ -27,6 +26,7 @@ from llm_council.adapters import (
     OPENROUTER_HEADERS,
     _is_openrouter_endpoint,
 )
+from llm_council.env import env_get
 
 # Hosted participant types eligible to act as the judge.
 _HOSTED_TYPES = frozenset({"openrouter", "openai_compatible"})
@@ -70,7 +70,7 @@ def _resolve_judge_peer(config: dict[str, Any]) -> dict[str, Any] | None:
         key_env = peer.get("api_key_env")
     if not key_env or not isinstance(key_env, str):
         return None
-    api_key = os.environ.get(key_env)
+    api_key = env_get(key_env)
     if not api_key:
         return None
     return {"peer": peer, "model": model, "api_key": api_key}

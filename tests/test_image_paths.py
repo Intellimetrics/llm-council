@@ -19,7 +19,6 @@ from llm_council.adapters import (
 )
 from llm_council.budget import (
     DEFAULT_IMAGE_MAX_BYTES,
-    DEFAULT_IMAGE_TOTAL_MAX_BYTES,
     image_attachment_violations,
 )
 from llm_council.cli import main
@@ -371,10 +370,9 @@ async def test_mcp_run_council_full_pipeline_records_images_in_transcript(
     metadata; the live (non-dry-run) path that flows through
     write_transcript wasn't. Mock execute_council to skip subprocess
     spawn but exercise the metadata wiring + transcript markdown."""
-    from dataclasses import replace
 
     monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
-    image = _make_png(tmp_path / "ui.png")
+    _make_png(tmp_path / "ui.png")
 
     async def fake_execute_council(participants, *args, **kwargs):
         from llm_council.adapters import ParticipantResult
@@ -758,7 +756,6 @@ def test_build_image_manifest_does_not_load_full_file_into_memory(tmp_path: Path
     We patch read_bytes to fail loudly; if it's called we know we regressed."""
     image = _make_png(tmp_path / "ui.png")
 
-    real_open = Path.open
     read_bytes_called = []
     real_read_bytes = Path.read_bytes
 

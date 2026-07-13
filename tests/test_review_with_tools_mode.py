@@ -54,17 +54,24 @@ def test_review_with_tools_routes_to_cli_peers_only(monkeypatch):
     """Default participant list (via select_participants) is CLI-only."""
     config = {
         "participants": {
-            "claude": {"type": "cli", "family": "claude"},
-            "codex": {"type": "cli", "family": "codex"},
-            "gemini": {"type": "cli", "family": "gemini"},
-            "antigravity": {"type": "cli", "family": "antigravity"},
+            "claude": {"type": "cli", "family": "claude", "command": "claude"},
+            "codex": {"type": "cli", "family": "codex", "command": "codex"},
+            "gemini": {"type": "cli", "family": "gemini", "command": "gemini"},
+            "antigravity": {
+                "type": "cli",
+                "family": "antigravity",
+                "command": "agy",
+            },
             "qwen_coder_plus": {"type": "openrouter", "family": "qwen"},
         },
         "modes": DEFAULT_CONFIG["modes"],
         "defaults": {},
     }
-    # Case A: agy only
-    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "agy" else None)
+    # Case A: Antigravity fills the neutral seat.
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/bin/{name}" if name in {"claude", "codex", "agy"} else None,
+    )
     selected = select_participants(config, mode="review-with-tools", current="claude")
     assert "claude" in selected
     assert "codex" in selected
@@ -73,8 +80,11 @@ def test_review_with_tools_routes_to_cli_peers_only(monkeypatch):
     assert "qwen_coder_plus" not in selected
     assert set(selected) == {"claude", "codex", "antigravity"}
 
-    # Case B: gemini only
-    monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "gemini" else None)
+    # Case B: Gemini fills the neutral seat.
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/bin/{name}" if name in {"claude", "codex", "gemini"} else None,
+    )
     selected = select_participants(config, mode="review-with-tools", current="claude")
     assert "claude" in selected
     assert "codex" in selected

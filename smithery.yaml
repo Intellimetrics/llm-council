@@ -1,11 +1,13 @@
 # Smithery deployment manifest for the llm-council MCP server.
 # Docs: https://smithery.ai/docs/build/project-config/smithery-yaml
 #
-# llm-council is a stdio MCP server. It exposes nine tools (council_run,
+# llm-council is a stdio MCP server. It exposes ten tools (council_run,
 # council_estimate, council_recommend, council_doctor, council_list_modes,
-# council_last_transcript, council_models, council_stats, council_run with
-# typed outputSchema). The server is read-only by default — configured
-# council participants are explicitly forbidden from editing files.
+# council_last_transcript, council_models, council_stats,
+# council_query_transcripts, and council_config). council_run advertises a
+# typed outputSchema. Council peers are forbidden from editing project source.
+# The host writes council-owned transcripts/cache artifacts, and explicit
+# management tools can update council configuration or artifact permissions.
 
 runtime: python
 
@@ -16,7 +18,7 @@ startCommand:
     - mcp-server
 
 # Optional environment-variable knobs. None are strictly required for the
-# native CLI triad (claude / codex / gemini) — install those separately on
+# native CLI triad (claude / codex / antigravity-or-gemini) — install those separately on
 # the host. OPENROUTER_API_KEY is only needed if the user wires up the
 # `openrouter` / `openai_compatible` participant types.
 configSchema:
@@ -28,7 +30,7 @@ configSchema:
         OpenRouter API key. Only required when the user enables
         OpenRouter-routed peers via `type: openrouter` or
         `type: openai_compatible` with an OpenRouter-hosted base_url.
-        Native CLI peers (Claude Code, Codex CLI, Gemini CLI) and
+        Native CLI peers (Claude Code, Codex CLI, Antigravity/Gemini CLI) and
         local Ollama do not need this. The `api_key_env` field on a
         participant config controls which env var the adapter reads —
         OPENROUTER_API_KEY is the default but can be overridden per
@@ -46,9 +48,9 @@ metadata:
   name: llm-council
   description: >-
     Read-only multi-agent council MCP server. Lets one coding agent ask a
-    council of other LLMs (Claude Code, Codex CLI, Gemini CLI, OpenRouter
+    council of other LLMs (Claude Code, Codex CLI, Antigravity/Gemini CLI, OpenRouter
     hosted models, local Ollama) for second opinions before acting. Ships
-    consensus / deliberate / quick modes, conversation threading,
+    consensus / quick modes, optional deliberation, conversation threading,
     convergence detection, per-peer budgets, and pre-flight cost caps.
   license: MIT
   homepage: https://github.com/Intellimetrics/llm-council

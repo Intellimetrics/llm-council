@@ -3,6 +3,8 @@
 The [README](../README.md) is the agent-first user guide. This file is the
 deeper reference for people and coding agents that need exact setup behavior,
 config fields, MCP tool names, cost controls, and custom participant routing.
+The [product vocabulary](vocabulary.md) is the source of truth for
+operator-facing labels.
 
 > [!NOTE]
 > In normal use, a person does not run council by hand. They ask their coding
@@ -50,7 +52,7 @@ Use the agent-first install path:
    `pipx install --force git+https://github.com/Intellimetrics/llm-council.git`
 3. Do not use `uvx`; this must be a stable project install.
 4. From this project root, run `llm-council setup --plan`.
-5. Show me the detected routes and ask which preset I want: `auto`, `tri-cli`, `openrouter`, `tri-cli-openrouter`, `local-private`, or `all`. Do not choose silently unless I explicitly say to use the recommendation.
+5. Show me the detected routes and ask which preset I want: `auto`, `tri-cli`, `openrouter`, `tri-cli-openrouter`, `private-local`, or `all`. Do not choose silently unless I explicitly say to use the recommendation.
 6. Run `llm-council setup --yes --preset <my-choice>`.
 7. If setup reports no usable council route, stop and ask me whether to set `OPENROUTER_API_KEY` or install another native CLI.
 8. After setup, read the generated snippet for this CLI from `.llm-council/instructions/`, then append that file's full contents to the correct project instruction file without overwriting existing content.
@@ -91,9 +93,10 @@ llm-council doctor
 Agent installs should run `llm-council setup --plan` first and ask the user
 which preset to write. `setup --yes` uses `--preset auto` only when the user has
 explicitly accepted the default. Auto setup writes a default config only when it
-finds a usable route: at least two installed native CLIs, or `OPENROUTER_API_KEY`
-in your shell or project env files. This protects the common one-CLI case from
-getting a native-only council that cannot run.
+finds a route that runtime participant selection can use: Gemini CLI or
+Antigravity plus at least one of Claude Code or Codex CLI, or
+`OPENROUTER_API_KEY` in your shell or project env files. This protects an
+incomplete native installation from getting a council that cannot run.
 
 Explicit presets are validated too. If the chosen preset needs missing CLI tools
 or API keys, non-interactive setup stops before writing files, and interactive
@@ -102,13 +105,23 @@ want to stage config before installing those dependencies.
 
 Preset choices:
 
-- `auto`: choose `tri-cli` when at least two native CLIs exist, otherwise choose
-  `openrouter` when `OPENROUTER_API_KEY` is available.
-- `tri-cli`: Claude Code, Codex CLI, and Gemini CLI.
-- `openrouter`: hosted OpenRouter reviewers only.
-- `tri-cli-openrouter`: native CLIs plus hosted OpenRouter reviewers.
-- `local-private`: native CLIs plus Ollama.
-- `all`: every built-in preset.
+- `auto`: choose `tri-cli` when a Gemini-family CLI and at least one Claude/Codex
+  CLI are available; otherwise choose `openrouter` when `OPENROUTER_API_KEY` is
+  available.
+- `tri-cli`: native CLI participants from the Claude/Codex and Gemini families.
+  Runtime routing prefers Antigravity for current-client compatibility. Its
+  read-only posture is prompt-enforced; select Gemini explicitly when its
+  harder plan-mode boundary is available and `doctor --probe-native` confirms
+  the client is eligible.
+- `openrouter`: hosted OpenRouter participants only.
+- `tri-cli-openrouter`: native CLI and hosted OpenRouter participants.
+- `private-local`: Ollama-only participants, no hosted or native CLI
+  participants, with
+  generated default mode `private-local`.
+- `all`: every available native, hosted, and local participant route.
+
+Older `--preset local-private` commands remain accepted as a deprecated alias
+for `private-local`.
 
 Useful setup variants:
 
@@ -159,6 +172,8 @@ Instruction snippet mapping:
   full contents of `.llm-council/instructions/codex.md` to it.
 - Gemini CLI: create `GEMINI.md` in the project root if needed, then append the
   full contents of `.llm-council/instructions/gemini.md` to it.
+- Antigravity: create `GEMINI.md` in the project root if needed, then append the
+  full contents of `.llm-council/instructions/antigravity.md` to it.
 
 Restart the relevant CLI after changing `.mcp.json` or instruction files.
 
@@ -246,8 +261,8 @@ llm-council estimate --mode review-cheap --completion-tokens 2500 "Review this d
 ## Config model
 
 Project config merges over built-in defaults unless `replace_defaults: true` is
-set. Generated setup configs use `replace_defaults: true` so presets remain
-exact.
+set. Generated setup configs use `replace_defaults: true` so the selected setup
+bundle remains exact.
 
 Core keys:
 
@@ -257,17 +272,21 @@ Core keys:
 - `defaults.max_concurrency`: maximum concurrent participant calls per round
 - `defaults.max_deliberation_rounds`: default cap for opt-in deliberation
 - `defaults.max_prompt_chars`: global prompt construction cap, default 200000
-- `defaults.mcp_max_prompt_chars`: MCP budget guard for hosted paid calls
+- `defaults.mcp_max_prompt_chars`: universal MCP prompt-construction guard, default 80000
+- `defaults.mcp_request_timeout_seconds`: wall-clock deadline for a complete MCP request, default 1200
 - `defaults.mcp_max_estimated_cost_usd`: MCP estimated cost guard
 - `defaults.auto_open_browser`: automatically open HTML transcripts in the default web browser (boolean, default `false`)
 - `participants`: named CLI, OpenRouter, or Ollama participants
-- `modes`: named participant routing presets
+- `modes`: named runtime participant-routing configurations
 - `transcripts_dir`: local run transcript directory
 
-Prompt sizing has two layers. `defaults.max_prompt_chars` limits the built
-prompt before any participant runs. A participant-level `max_prompt_chars`
-skips only that participant when the already-built prompt is too large for that
-model or CLI.
+CLI prompt sizing has two layers: `defaults.max_prompt_chars` limits the built
+prompt before any participant runs, and a participant-level
+`max_prompt_chars` skips only a peer whose cap is tighter. MCP adds the
+universal `defaults.mcp_max_prompt_chars` ceiling and constructs against the
+tightest applicable cap. Use `chunk_strategy` (`fail`, `head`, `tail`, or
+`hash-aware`) when an included diff would otherwise exceed that ceiling; any
+dropped content is reported in chunk metadata.
 
 ## Participants
 
@@ -288,7 +307,7 @@ OpenRouter participants:
 
 ```yaml
 participants:
-  reviewer:
+  hosted_example:
     type: openrouter
     model: provider/model-id
     api_key_env: OPENROUTER_API_KEY
@@ -300,7 +319,7 @@ Ollama participants:
 
 ```yaml
 participants:
-  local_reviewer:
+  local_example:
     type: ollama
     model: qwen3-coder-next:q4_K_M
     base_url: http://localhost:11434
@@ -311,8 +330,8 @@ Hosted paid MCP calls fail closed when pricing is unknown. Add
 
 ## Model and cost selection
 
-Native CLI participants use the user's installed Claude Code, Codex CLI, or
-Gemini CLI account. That cost is external to `llm-council`; it may be a
+Native CLI participants use the user's installed Claude Code, Codex CLI,
+Gemini CLI, or Antigravity account. That cost is external to `llm-council`; it may be a
 subscription, a rate limit, or a CLI-specific API setup. OpenRouter participants
 are hosted API calls billed by token. Ollama participants are local runtime
 calls.
@@ -399,11 +418,15 @@ for current costs.
 ## Modes
 
 A mode either lists exact participants or uses one of two strategies:
-`other_cli_peers` (the native triad — Claude/Codex/Gemini, optionally with
-extras via `add`) or `local_only_peers` (every configured participant whose
-inference runs on-prem). Built-in native modes set `include_current: true`,
-so `quick` asks Claude, Codex, and Gemini as explicit read-only participants
-even when one of them is the active host. Use `peer-only`, or set
+`other_cli_peers` (available Claude/Codex participants plus one Gemini-family
+participant,
+optionally with extras via `add`) or `local_only_peers` (every configured
+loopback Ollama participant). Antigravity is preferred for current-client
+compatibility, while Gemini remains available for explicit selection when its
+hard plan-mode boundary is supported. Built-in native modes set
+`include_current: true`, so `quick` includes
+every available native participant, including the active host when its CLI
+executable is discoverable on `PATH`. Use `peer-only`, or set
 `include_current: false`, when you only want outside perspectives.
 
 ```yaml
@@ -420,16 +443,34 @@ modes:
     add: ["qwen_coder_plus"]
   cheap:
     participants: ["deepseek_v4_flash", "qwen_coder_flash"]
-  local-only:
+  private-local:
     strategy: local_only_peers
 ```
 
-The built-in `local-only` mode auto-discovers every `type: ollama` participant
-plus any `type: openai_compatible` whose `base_url` is loopback or RFC1918.
-Hosted-inference CLIs and hosted API peers are excluded. See
+The built-in `private-local` mode auto-discovers only `type: ollama`
+participants whose `base_url` is loopback (`localhost`, `127.0.0.0/8`, or
+`::1`; an omitted URL defaults to localhost). OpenAI-compatible gateways are
+excluded even on loopback because they can relay prompts to hosted providers;
+LAN/RFC1918 endpoints are excluded because their traffic leaves this machine.
+Hosted-inference CLI and API participants are also excluded. See
 [`docs/local-models.md`](local-models.md) for adding local-server
 participants. `local_only_peers` does not support `include_current` or
 `add` — use an explicit `participants:` list for hybrid modes.
+
+Council disables proxy-environment inheritance for loopback Ollama calls, but
+cannot police the Ollama daemon's own network behavior. Run that daemon with
+OS-level egress blocked when a hard offline guarantee is required.
+
+Older configs and commands that use `local-only` remain accepted as a
+deprecated input alias, but resolved mode listings expose only
+`private-local`.
+
+Continuation preserves this boundary. When a parent transcript was
+`private-local` and the new call omits `mode`, the continuation inherits
+`private-local`. A requested move to hosted or native participants is refused
+unless the operator explicitly supplies `--allow-privacy-downgrade` (CLI) or
+`allow_privacy_downgrade: true` (MCP), acknowledging that prior context will
+leave the local-only route.
 
 `origin_policy: us` filters non-US participants. If the filter removes every
 participant, the run fails clearly.
@@ -492,12 +533,13 @@ successfully without them.
 
 ## MCP
 
-Generated `.mcp.json` sets:
+Generated `.mcp.json` sets only `LLM_COUNCIL_MCP_ROOT` to the project root.
+It deliberately does not add the target project to `PYTHONPATH`; doing so can
+shadow the installed `llm_council` package with an unrelated project module.
 
-- `PYTHONPATH` to the project root
-- `LLM_COUNCIL_MCP_ROOT` to the project root
-
-Every MCP `working_directory` must be inside `LLM_COUNCIL_MCP_ROOT`. If you run
+Every MCP `working_directory` must be an absolute path inside
+`LLM_COUNCIL_MCP_ROOT`. Configuration, dotenv discovery, context reads, and
+transcript output are confined to that root. If you run
 the server manually without that environment variable, the root is the process
 current directory:
 
@@ -539,12 +581,19 @@ cost when available, and a compact final-round model comparison.
 
 ## Transcripts
 
-Each run writes a Markdown transcript and JSON metadata:
+Each run writes Markdown, JSON metadata, and an HTML transcript:
 
 ```text
-.llm-council/runs/<timestamp>_<slug>.md
-.llm-council/runs/<timestamp>_<slug>.json
+.llm-council/runs/<timestamp>_<opaque-id>.md
+.llm-council/runs/<timestamp>_<opaque-id>.json
+.llm-council/runs/<timestamp>_<opaque-id>.html
 ```
+
+New artifacts never place question text in filenames. POSIX writes use private
+permissions (0700 directory, 0600 files); Windows uses the destination's
+inherited ACLs with reparse-point checks and atomic replacement. Repair
+eligible historical artifacts with
+`llm-council doctor --repair-transcript-permissions`.
 
 Use:
 
@@ -553,14 +602,21 @@ llm-council last
 llm-council last --path-only
 llm-council transcripts list
 llm-council transcripts summary
+llm-council transcripts prune --keep-last 20
+llm-council transcripts prune --keep-last 20 --delete
 ```
+
+Transcript pruning is a dry run unless `--delete` is present. The deprecated
+`--apply` spelling remains accepted for compatibility but is hidden from help.
 
 ## Safety notes
 
-The built-in Claude, Codex, and Gemini participants are configured for
-read-only or plan modes, and prompts are sent over stdin where the CLI supports
-it. Subprocess environments are sanitized; only configured `env_passthrough`
-variables are forwarded.
+The built-in Claude, Codex, and Gemini participants use CLI-enforced read-only
+or plan modes, and prompts are sent over stdin where the CLI supports it.
+Antigravity has no equivalent write-disable flag; its `--sandbox` restricts
+shell commands, while the council prompt supplies a softer read-only directive.
+Prefer Gemini for untrusted content. Subprocess environments are sanitized;
+only configured `env_passthrough` variables are forwarded.
 
 > [!WARNING]
 > Do not include secrets in diffs or context files. OpenRouter participants

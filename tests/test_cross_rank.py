@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,7 +29,6 @@ from llm_council.adapters import (
 )
 from llm_council.cache import build_payload as cache_build_payload
 from llm_council.context import (
-    CROSS_RANK_MIN_PEERS,
     build_anonymization_map,
     build_ranking_prompt,
     compute_rank_position_means,
@@ -321,7 +319,6 @@ def _run_orchestrator_with_cross_rank(
         factory = _default_factory
 
     call_count = {"n": 0}
-    second_call_results = {}
 
     async def fake_run_participants(selected, *args, **kwargs):
         call_count["n"] += 1
@@ -707,7 +704,7 @@ def _write_transcript_with_cross_rank(
         "prompt": "p",
         "metadata": {},
         "results": [
-            {"name": name, "ok": True, "output": f"RECOMMENDATION: yes - r"}
+            {"name": name, "ok": True, "output": "RECOMMENDATION: yes - r"}
             for name in cross_rank_scores
         ],
         "cross_rank_scores": cross_rank_scores,

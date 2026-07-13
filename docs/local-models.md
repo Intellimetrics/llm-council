@@ -205,7 +205,7 @@ participants:
 
 If you're already running Ollama, you can use the OpenAI-compatible adapter
 instead of `type: ollama` — useful when you want to pass through the same
-plumbing the hosted reviewers use:
+plumbing as hosted participants:
 
 ```yaml
 participants:
@@ -243,19 +243,24 @@ participants:
 
 ## Wiring local participants into modes
 
-### Built-in `local-only` mode
+### Built-in `private-local` mode
 
-The `local-only` mode auto-discovers every local participant in your config —
-both `type: ollama` entries and any `type: openai_compatible` whose `base_url`
-resolves to loopback (`127.0.0.1`, `localhost`) or RFC1918. No further
-wiring needed:
+The `private-local` mode auto-discovers only `type: ollama` participants whose
+`base_url` is same-machine loopback (`127.0.0.0/8`, `localhost`, or `::1`). An
+omitted Ollama URL defaults to localhost. OpenAI-compatible gateways are
+excluded even on loopback because they can forward to hosted providers.
+LAN/RFC1918 and public endpoints are excluded because their traffic leaves
+this machine. No further wiring is needed:
 
 ```bash
-llm-council run --mode local-only --diff "Review this change"
+llm-council run --mode private-local --diff "Review this change"
 ```
 
-Hosted-inference CLI peers (claude/codex/gemini) and hosted API peers
-(openrouter) are excluded — `local-only` is for offline/private review.
+Hosted-inference CLI participants (claude/codex/gemini/antigravity) and hosted API participants
+(openrouter) are excluded — `private-local` is for offline/private review.
+Proxy environment variables are ignored for loopback calls. The Ollama daemon
+is still a separate process whose own egress council cannot enforce; firewall
+it at the OS/network layer when offline operation is mandatory.
 
 ### Custom modes
 
@@ -263,26 +268,27 @@ To mix local and hosted peers, define your own mode:
 
 ```yaml
 modes:
-  # Native triad plus a local pass
+  # Available native CLI participants plus a local participant
   plan-with-local:
     strategy: other_cli_peers
     include_current: true
     add: ["local_vllm"]
-    description: "Native triad plus local Qwen on vLLM."
+    description: "Native CLI participants plus local Qwen on vLLM."
 
   # Pin a specific local participant
   vllm-only:
     participants: ["local_vllm"]
-    description: "Single-peer local review against vLLM."
+    description: "Single-participant local review against vLLM."
 ```
 
 Or use `--include local_vllm` on a single run without modifying modes.
 
 ## Cost estimation
 
-Local participants count as `$0` in `--max-cost-usd` and `--max-tokens`
-estimates. That's correct for cash cost, but the GPU is real — a council run
-with three local peers can spin your machine for tens of minutes against a
+Local participants count as `$0` in `--max-cost-usd` estimates, while their
+prompt and completion tokens are still included in `--max-tokens`. The zero
+cash estimate is correct for council-managed spend, but the GPU is real — a
+council run with three local peers can spin your machine for tens of minutes against a
 `--max-cost-usd 0.10` cap and still pass. Use `--max-tokens` (which does
 include local participants) when you want to bound effort, not just spend.
 
@@ -301,7 +307,7 @@ Two ways to actually parallelize:
    (vLLM's continuous batching, TGI's `--max-concurrent-requests`).
 
 For most council use, sequential local execution is fine — the bottleneck
-becomes "wait for the slowest peer," same as with hosted reviewers.
+becomes "wait for the slowest peer," same as with hosted peers.
 
 ## Troubleshooting
 
@@ -332,7 +338,7 @@ single completion. If you're running into the default 180s timeout, bump
 ### Pre-flight ping is failing my LAN endpoint (homelab/VPN)
 
 By default the orchestrator pre-flight pings only **loopback** endpoints
-(`127.0.0.1`, `localhost`, `[::1]`, `0.0.0.0`) with a 1-second timeout.
+(`127.0.0.0/8`, `localhost`, `[::1]`) with a 1-second timeout.
 RFC1918 endpoints (`10.x`, `172.16-31.x`, `192.168.x`) are skipped by
 default — homelab and VPN servers can take longer than a second to
 respond, and a false-positive failure is worse than no ping. To opt a

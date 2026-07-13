@@ -6,14 +6,24 @@ For the pass-7 anchor (codex's response with all four tag kinds), see
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+from unittest.mock import patch
+
+import llm_council.adapters as adapters_module
 from llm_council.adapters import (
     EVIDENCE_TAG_RE,
     KNOWN_ERROR_KINDS,
+    STRICT_EVIDENCE_REPAIR_RETRY_INSTRUCTION,
     UNTAGGED_EVIDENCE_PREFIX,
+    ParticipantResult,
     _extract_response_envelope,
     _parse_tagged_entry,
     _response_validation_error,
     classify_error,
+    run_cli_participant,
+    run_ollama_participant,
+    run_openai_compatible_participant,
 )
 
 
@@ -328,20 +338,6 @@ def test_stats_evidence_tag_distribution_counts_each_tag():
 #
 # These tests mock the inner adapter calls directly so the retry-loop
 # logic is exercised without spinning up subprocesses or HTTP clients.
-
-import asyncio
-from pathlib import Path
-from unittest.mock import patch
-
-import llm_council.adapters as adapters_module
-from llm_council.adapters import (
-    ParticipantResult,
-    STRICT_EVIDENCE_REPAIR_RETRY_INSTRUCTION,
-    classify_error,
-    run_cli_participant,
-    run_ollama_participant,
-    run_openai_compatible_participant,
-)
 
 
 _UNTAGGED_OUTPUT = (

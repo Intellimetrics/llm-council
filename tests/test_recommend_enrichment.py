@@ -11,7 +11,6 @@ from pathlib import Path
 
 import pytest
 
-from llm_council import policy
 from llm_council.config import validate_config
 from llm_council.mcp_server import _run_recommend, estimate_run
 from llm_council.policy import (

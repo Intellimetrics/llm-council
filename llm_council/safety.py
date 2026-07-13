@@ -106,7 +106,6 @@ def scan_prompt_for_secrets(
         return []
     allowlist = _load_allowlist(cwd or Path("."), allowlist_filename)
     findings: list[dict[str, Any]] = []
-    lines = prompt.splitlines()
     for kind, match in _iter_secret_matches(prompt, allowlist):
         value = match.group(0)
         line_number = prompt.count("\n", 0, match.start()) + 1

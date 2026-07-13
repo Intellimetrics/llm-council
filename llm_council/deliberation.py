@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from llm_council.adapters import RECOMMENDATION_RE, ParticipantResult
 
 MAX_DELIBERATION_PROMPT_CHARS = 80_000
+DELIBERATION_TRUNCATION_SUFFIX = (
+    "\n\n[deliberation prompt truncated by llm-council]\n"
+)
 # Per-peer excerpt cap for deliberation rounds. Sized so a 3-peer council
 # fits inside MAX_DELIBERATION_PROMPT_CHARS alongside the question text and
 # pointer preamble (the bulky `Context:` payload from round 1 is stripped);
@@ -81,6 +86,64 @@ def recommendation_counts(results: list[ParticipantResult]) -> dict[str, int]:
             continue
         counts[recommendation_label(result.output)] += 1
     return counts
+
+
+@dataclass(frozen=True)
+class RecommendationSummary:
+    """Machine-facing summary of a set of peer votes.
+
+    ``recommendation`` is emitted only for a unique trinary leader. A tied
+    top count is intentionally ``unknown`` rather than relying on iteration
+    order (which previously biased unresolved yes/no ties toward ``yes``).
+    """
+
+    recommendation: str
+    agreement_count: int
+    total_labeled: int
+    counts: dict[str, int]
+    tied: bool
+
+
+def summarize_recommendations(
+    results: list[ParticipantResult],
+) -> RecommendationSummary:
+    """Summarize votes, requiring a unique leader for a recommendation.
+
+    Callers holding cumulative multi-round results should pass only their
+    final-round view (for example ``transcript.final_round_results(results)``).
+    """
+
+    counts = recommendation_counts(results)
+    labels = ("yes", "no", "tradeoff")
+    total_labeled = sum(counts[label] for label in labels)
+    if total_labeled == 0:
+        return RecommendationSummary(
+            recommendation="unknown",
+            agreement_count=0,
+            total_labeled=0,
+            counts=counts,
+            tied=False,
+        )
+
+    top_count = max(counts[label] for label in labels)
+    leaders = [label for label in labels if counts[label] == top_count]
+    if len(leaders) != 1:
+        return RecommendationSummary(
+            recommendation="unknown",
+            agreement_count=0,
+            total_labeled=total_labeled,
+            counts=counts,
+            tied=True,
+        )
+
+    recommendation = leaders[0]
+    return RecommendationSummary(
+        recommendation=recommendation,
+        agreement_count=top_count,
+        total_labeled=total_labeled,
+        counts=counts,
+        tied=False,
+    )
 
 
 def labeled_quorum_count(results: list[ParticipantResult]) -> int:
@@ -218,7 +281,10 @@ def build_deliberation_prompt(
     if len(prompt) <= MAX_DELIBERATION_PROMPT_CHARS:
         return prompt, truncated_peers
     return (
-        prompt[:MAX_DELIBERATION_PROMPT_CHARS]
-        + "\n\n[deliberation prompt truncated by llm-council]\n",
+        prompt[
+            : MAX_DELIBERATION_PROMPT_CHARS
+            - len(DELIBERATION_TRUNCATION_SUFFIX)
+        ].rstrip()
+        + DELIBERATION_TRUNCATION_SUFFIX,
         truncated_peers,
     )

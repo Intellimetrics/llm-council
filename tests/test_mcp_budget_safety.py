@@ -96,10 +96,17 @@ def test_mcp_doctor_returns_serialized_checks(tmp_path: Path, monkeypatch):
     # `config_warnings` was added to the doctor payload so MCP clients can
     # surface the same advisory the CLI prints. An empty list on a clean
     # default config is the expected baseline.
-    assert result == {
-        "checks": [{"name": "cli:codex", "ok": True, "detail": "ok"}],
+    assert result["checks"] == [
+        {"name": "cli:codex", "ok": True, "detail": "ok"}
+    ]
+    assert result["version"] == __version__
+    assert result["config_warnings"] == []
+    assert result["server"] == {
         "version": __version__,
-        "config_warnings": [],
+        "project_root": str(tmp_path),
+        "working_directory": str(tmp_path),
+        "config_path": "",
+        "project_scoped": True,
     }
 
 
@@ -298,7 +305,7 @@ def test_mcp_budget_report_synthesize_noop_when_chair_is_free_local():
 
 
 @pytest.mark.asyncio
-async def test_mcp_dry_run_reports_budget_without_enforcing(
+async def test_mcp_dry_run_enforces_default_budget_without_invoking_peers(
     tmp_path: Path, monkeypatch
 ):
     monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
@@ -313,19 +320,15 @@ participants:
         encoding="utf-8",
     )
 
-    result = await run_council(
-        {
-            "question": "short prompt",
-            "working_directory": str(tmp_path),
-            "participants": ["deepseek_v4_pro"],
-            "dry_run": True,
-        }
-    )
-
-    budget = result["metadata"]["budget"]
-    assert budget["cost_estimate_available"] is True
-    assert budget["within_budget"] is False
-    assert budget["violations"][0]["limit"] == "max_estimated_cost_usd"
+    with pytest.raises(ValueError, match="max_estimated_cost_usd"):
+        await run_council(
+            {
+                "question": "short prompt",
+                "working_directory": str(tmp_path),
+                "participants": ["deepseek_v4_pro"],
+                "dry_run": True,
+            }
+        )
 
 
 @pytest.mark.asyncio
