@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from llm_council.adapters import ABDICATED_ERROR_PREFIX, ParticipantResult
+from llm_council.adapters import ParticipantResult
 from llm_council.stats import _new_peer_bucket, aggregate
 
 

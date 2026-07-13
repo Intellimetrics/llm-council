@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,18 @@ PROMPT_PREVIEW_CHARS = 200
 CACHE_SCHEMA_VERSION = 3  # v3 = structured evidence shape (list[{text, tag}]), prompt_chars, recovered_after_timeout, section_repair_attempted. evidence_verification_failures is optional with a `[]` default on rehydrate, so we deliberately do NOT bump for it — keeps old v3 caches readable.
 
 _MODES_THAT_SKIP_CACHE = frozenset({"consensus"})
+
+# A council run can finish several participants at once.  Their cache keys are
+# normally distinct, but duplicate seats or concurrent callers can target the
+# same entry.  Windows may reject simultaneous MoveFileEx replacements of one
+# destination with ERROR_ACCESS_DENIED/ERROR_SHARING_VIOLATION even though each
+# source file is closed and each individual replacement is valid.  Keep the
+# critical rename boundary tiny and serialized in-process; bounded retries
+# cover a short-lived handle in another process without masking persistent
+# permission failures.
+_CACHE_REPLACE_LOCK = threading.Lock()
+_WINDOWS_TRANSIENT_REPLACE_ERRORS = frozenset({5, 32, 33})
+_WINDOWS_REPLACE_RETRY_DELAYS = (0.005, 0.01, 0.02, 0.04, 0.08)
 
 
 def is_caching_disabled_for_mode(mode: str | None) -> bool:
@@ -127,10 +140,27 @@ def write_cache(path: Path, payload: dict[str, Any], ttl_seconds: int) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fp:
             json.dump(enriched, fp, indent=2, sort_keys=True)
             fp.write("\n")
-        os.replace(tmp_path, path)
+        _replace_cache_file(tmp_path, path)
     except OSError:
         _safe_unlink(tmp_path)
         raise
+
+
+def _replace_cache_file(source: Path, destination: Path) -> None:
+    """Atomically publish one cache file across Windows writer races."""
+
+    with _CACHE_REPLACE_LOCK:
+        for attempt in range(len(_WINDOWS_REPLACE_RETRY_DELAYS) + 1):
+            try:
+                os.replace(source, destination)
+                return
+            except PermissionError as exc:
+                winerror = getattr(exc, "winerror", None)
+                if winerror not in _WINDOWS_TRANSIENT_REPLACE_ERRORS or attempt == len(
+                    _WINDOWS_REPLACE_RETRY_DELAYS
+                ):
+                    raise
+                time.sleep(_WINDOWS_REPLACE_RETRY_DELAYS[attempt])
 
 
 def _safe_unlink(path: Path) -> None:

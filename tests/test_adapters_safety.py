@@ -4,13 +4,64 @@ import sys
 from pathlib import Path
 
 from llm_council.adapters import (
-    ParticipantResult,
     clean_subprocess_env,
     is_timeout_error,
     redact_prompt_args,
     run_cli_participant,
     run_participants,
 )
+
+
+def _process_is_running(pid: int) -> bool:
+    """Cross-platform process liveness probe used by cleanup tests.
+
+    POSIX defines signal 0 as an existence/permission check. Windows does not:
+    ``os.kill(pid, 0)`` is routed through ``TerminateProcess`` and reports
+    ``ERROR_INVALID_PARAMETER`` for an exited PID. Query the process handle on
+    Windows instead so a successful timeout cleanup is not reported as a test
+    failure.
+    """
+
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_process.restype = wintypes.HANDLE
+    get_exit_code = kernel32.GetExitCodeProcess
+    get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    get_exit_code.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = open_process(process_query_limited_information, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        # ERROR_INVALID_PARAMETER is Windows' documented result for a PID
+        # that no longer identifies a process.
+        if error == 87:
+            return False
+        raise ctypes.WinError(error)
+    try:
+        exit_code = wintypes.DWORD()
+        if not get_exit_code(handle, ctypes.byref(exit_code)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return exit_code.value == still_active
+    finally:
+        close_handle(handle)
 
 
 def test_run_cli_participant_cleans_up_timed_out_process(tmp_path: Path):
@@ -24,7 +75,15 @@ def test_run_cli_participant_cleans_up_timed_out_process(tmp_path: Path):
     result = asyncio.run(
         run_cli_participant(
             "python",
-            {"type": "cli", "command": sys.executable, "args": ["-c", code], "timeout": 1},
+            {
+                "type": "cli",
+                "command": sys.executable,
+                "args": ["-c", code],
+                "timeout": 1,
+                # This test covers one timed-out process cleanup, not the
+                # separate terse-retry policy (whose minimum budget is 30s).
+                "terse_retry_on_timeout": False,
+            },
             "prompt",
             tmp_path,
         )
@@ -37,11 +96,7 @@ def test_run_cli_participant_cleans_up_timed_out_process(tmp_path: Path):
     assert "participants.python.timeout" in result.error
 
     pid = int((tmp_path / "child.pid").read_text())
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        pass
-    else:
+    if _process_is_running(pid):
         raise AssertionError(f"timed-out subprocess still exists: {pid}")
 
 

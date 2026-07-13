@@ -299,7 +299,14 @@ def _inspect_transcript_permissions_path(
                 continue
             candidate = base_dir / name
             try:
-                observed = entry.stat(follow_symlinks=False)
+                # On Windows, DirEntry.stat() deliberately reports zero for
+                # st_dev, st_ino, and st_nlink.  Those fields are security
+                # inputs below: a zero link count made every normal file look
+                # multiply linked, while zero identities could not be compared
+                # with the subsequently opened file.  A path stat performs the
+                # real system call and, with lstat, still refuses to follow a
+                # symlink/reparse-point leaf.
+                observed = os.lstat(candidate)
             except OSError:
                 report["skipped_changed"].append(name)
                 continue

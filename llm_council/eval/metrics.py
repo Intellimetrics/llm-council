@@ -44,7 +44,7 @@ list / tokenization regime with the deliberation convergence detector.
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any
 
 from llm_council.convergence import jaccard_similarity, tokenize
 

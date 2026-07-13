@@ -63,8 +63,8 @@ regression coverage needed to keep those guarantees from drifting.
   Source and wheel builds are covered by packaging regressions.
 
 **Validation and dogfood**
-* Full suite: **1,444 passed, 2 skipped** on the release checkout, plus focused
-  Ruff, packaging, permission, and diff-integrity checks.
+* Full suite: **1,445 passed, 2 skipped** on the release checkout, plus full
+  repository Ruff, packaging, permission, and diff-integrity checks.
 * The final private-local dogfood completed non-degraded with a `yes`
   recommendation after the health probe identified and corrected a stale local
   Ollama model selection. A hosted recheck degraded honestly when two native

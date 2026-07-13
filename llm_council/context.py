@@ -115,7 +115,11 @@ def _read_text_bounded(path: Path, max_chars: int) -> tuple[str, int, bool]:
 
     if max_chars < 0:
         raise ValueError("max_chars must be non-negative")
-    with path.open("r", errors="replace") as handle:
+    # Council-authored/project text inputs are UTF-8 everywhere else in the
+    # CLI.  Spell the encoding out here as well: relying on the process locale
+    # makes a character budget become a byte/code-page budget on Windows (for
+    # example, one UTF-8 ``é`` is decoded as two cp1252 characters).
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
         sample = handle.read(max_chars + 1)
     text, truncated = _truncate_text(sample, max_chars)
     return text, min(len(sample), max_chars), truncated

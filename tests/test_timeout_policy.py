@@ -504,7 +504,7 @@ def test_cli_success_populates_prompt_chars():
     timeout-failure branch set this field, which left `timeout_recoveries`
     uncrossable with `timeout_by_prompt_size`."""
     import asyncio
-    from unittest.mock import AsyncMock, patch
+    from unittest.mock import AsyncMock
 
     medium_prompt = "x" * 14_263  # pass-7 anchor; lands in `medium` bucket
 
@@ -552,7 +552,6 @@ def test_recovered_after_timeout_populates_prompt_chars():
     prompt)` — not the terse retry's length — so recoveries land in the
     same size bucket as the timeout that triggered them."""
     import asyncio
-    from unittest.mock import AsyncMock, patch
 
     medium_prompt = "x" * 14_263
 
@@ -684,7 +683,6 @@ def test_pass8_terse_retry_failure_is_visible_in_result():
     modes apart.
     """
     import asyncio
-    from unittest.mock import patch
 
     pass7_anchor_prompt = "x" * 14_394  # exact pass-8 transcript size
 

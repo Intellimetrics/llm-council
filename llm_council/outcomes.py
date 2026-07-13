@@ -14,7 +14,7 @@ scoring waits for >=200 marked outcomes per the plan's out-of-scope list.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Literal

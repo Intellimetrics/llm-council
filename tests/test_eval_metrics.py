@@ -6,7 +6,6 @@ file should complete in well under a second.
 
 from __future__ import annotations
 
-import pytest
 
 from llm_council.eval.metrics import (
     MATCH_JACCARD_THRESHOLD,

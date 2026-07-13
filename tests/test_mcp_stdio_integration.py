@@ -3,14 +3,13 @@
 This is the integration counterpart to the in-process drift-guard
 (``test_mcp_structured_results_keys_match_declared_schema``): it spawns the
 actual ``llm_council.mcp_server`` over stdio, performs the JSON-RPC initialize +
-list_tools + call_tool handshake through the `mcp` client, and asserts the
+list_tools + call_tool handshake on the wire, and asserts the
 ``council_run`` response carries the advertised ``schema_version`` and the
 schema-required fields.
 
-Why it matters: every prior schema bump (v5 -> v6 this release) was validated by
-MANUAL dogfooding after a server restart (see MEMORY: MCP-restart dogfood). This
-test exercises the same transport automatically, so a schema/transport
-regression is caught by CI instead of by hand.
+Why it matters: prior schema bumps relied on manual dogfooding after a server
+restart. This test exercises the same transport automatically, so a
+schema/transport regression is caught by CI instead of by hand.
 
 Uses ``dry_run`` (no peer subprocesses / HTTP) and a local-peer config so it
 does not depend on any CLI being installed in the test environment. The whole
@@ -20,6 +19,7 @@ fails the test rather than hanging the suite.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -48,10 +48,6 @@ async def _call_council_run_over_stdio(root: Path) -> tuple[set[str], dict]:
 
     Returns (tool_names, council_run_payload).
     """
-    import anyio
-    from mcp import ClientSession
-    from mcp.client.stdio import StdioServerParameters, stdio_client
-
     env = os.environ.copy()
     # Make the subprocess import the same tree the test runs against, and pin
     # the MCP root so working_directory passes the containment check.
@@ -59,37 +55,129 @@ async def _call_council_run_over_stdio(root: Path) -> tuple[set[str], dict]:
     env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
     env["LLM_COUNCIL_MCP_ROOT"] = str(root)
 
-    server_params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "llm_council.mcp_server"],
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "llm_council.mcp_server",
+        cwd=str(root),
         env=env,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        # The tools/list response includes the full council_run schema and can
+        # exceed asyncio's conservative 64 KiB default line limit.
+        limit=1024 * 1024,
     )
 
-    async def _exchange() -> tuple[set[str], dict]:
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                listed = await session.list_tools()
-                tool_names = {t.name for t in listed.tools}
-                result = await session.call_tool(
-                    "council_run",
-                    {
+    async def _request(request_id: int, method: str, params: dict) -> dict:
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        message = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }
+        proc.stdin.write((json.dumps(message) + "\n").encode())
+        await proc.stdin.drain()
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                stderr = (
+                    (await proc.stderr.read()).decode(errors="replace")
+                    if proc.stderr is not None
+                    else ""
+                )
+                raise AssertionError(
+                    f"MCP server exited before response {request_id}: {stderr}"
+                )
+            response = json.loads(raw)
+            # Ignore server notifications; return the matching response.
+            if response.get("id") != request_id:
+                continue
+            if "error" in response:
+                raise AssertionError(
+                    f"MCP request {method} failed: {response['error']}"
+                )
+            return response["result"]
+
+    shutdown_timed_out = False
+    try:
+        async with asyncio.timeout(45):
+            initialized = await _request(
+                1,
+                "initialize",
+                {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "llm-council-tests", "version": "1"},
+                },
+            )
+            assert initialized.get("serverInfo", {}).get("name") == "llm-council"
+
+            assert proc.stdin is not None
+            notification = {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            }
+            proc.stdin.write((json.dumps(notification) + "\n").encode())
+            await proc.stdin.drain()
+
+            listed = await _request(2, "tools/list", {})
+            tool_names = {tool["name"] for tool in listed["tools"]}
+            called = await _request(
+                3,
+                "tools/call",
+                {
+                    "name": "council_run",
+                    "arguments": {
                         "question": "stdio integration probe",
                         "working_directory": str(root),
                         "dry_run": True,
                     },
-                )
-                payload = _extract_payload(result)
-                return tool_names, payload
+                },
+            )
+            payload = _extract_payload(called)
+    finally:
+        # Closing the OS pipe is the MCP stdio shutdown signal. Do this
+        # explicitly instead of relying on mcp-python's stdio_client context:
+        # its Windows cleanup can hang in process.wait() after a valid response.
+        if proc.stdin is not None:
+            proc.stdin.close()
+            try:
+                await asyncio.wait_for(proc.stdin.wait_closed(), timeout=3)
+            except (OSError, TimeoutError):
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except TimeoutError:
+            shutdown_timed_out = True
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
 
-    with anyio.fail_after(45):
-        return await _exchange()
+    assert not shutdown_timed_out, "MCP server did not exit after stdio closed"
+    assert proc.returncode == 0
+    return tool_names, payload
 
 
 def _extract_payload(result) -> dict:
-    """Pull the council_run dict from a CallToolResult — prefer the structured
-    content, fall back to parsing the first text block as JSON."""
-    structured = getattr(result, "structuredContent", None)
+    """Pull the council_run dict from a typed or raw MCP call result."""
+    structured = (
+        result.get("structuredContent")
+        if isinstance(result, dict)
+        else getattr(result, "structuredContent", None)
+    )
     if isinstance(structured, dict) and structured:
         # The low-level server may wrap a bare return under a "result" key.
         if "schema_version" in structured:
@@ -97,8 +185,17 @@ def _extract_payload(result) -> dict:
         for value in structured.values():
             if isinstance(value, dict) and "schema_version" in value:
                 return value
-    for block in getattr(result, "content", []) or []:
-        text = getattr(block, "text", None)
+    content = (
+        result.get("content", [])
+        if isinstance(result, dict)
+        else getattr(result, "content", [])
+    )
+    for block in content or []:
+        text = (
+            block.get("text")
+            if isinstance(block, dict)
+            else getattr(block, "text", None)
+        )
         if text:
             try:
                 return json.loads(text)
@@ -189,4 +286,3 @@ async def test_mcp_server_stdio_council_config(tmp_path: Path):
     import yaml
     config = yaml.safe_load((tmp_path / ".llm-council.yaml").read_text(encoding="utf-8"))
     assert config["defaults"]["auto_open_browser"] is True
-

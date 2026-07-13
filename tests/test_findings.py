@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from llm_council.citations import VerifiedRef
 from llm_council.findings import (
     Finding,
-    FindingCluster,
     FindingMatrix,
     cluster_findings,
     extract_findings,

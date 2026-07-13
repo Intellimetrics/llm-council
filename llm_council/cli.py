@@ -1144,7 +1144,20 @@ exec llm-council run --diff --mode {quoted_mode} {quoted_question}
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(script_content)
             st = os.stat(hook_file, follow_symlinks=False)
-            os.chmod(hook_file, st.st_mode | stat.S_IEXEC, follow_symlinks=False)
+            try:
+                os.chmod(
+                    hook_file,
+                    st.st_mode | stat.S_IEXEC,
+                    follow_symlinks=False,
+                )
+            except NotImplementedError:
+                # Windows exposes the keyword but cannot honor no-follow
+                # chmod.  Its chmod implementation does not manage executable
+                # bits anyway, so keep the safely-created hook rather than
+                # retrying with a symlink-following call.  POSIX failures stay
+                # fatal because the executable bit is meaningful there.
+                if os.name != "nt":
+                    raise
         print(f"Successfully installed LLM Council {args.hook_type} hook to {hook_file}")
         return 0
     except Exception as e:

@@ -6,18 +6,20 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 import yaml
 
-from llm_council import __version__
+from llm_council import __version__, cache as cache_module
 import llm_council.adapters as adapters_module
 import llm_council.orchestrator as orchestrator_module
 import llm_council.cli as cli_module
 import llm_council.estimate as estimate_module
 import llm_council.update_check as update_check_module
 from llm_council.adapters import (
+    CacheContext,
     ParticipantResult,
     _format_arg,
     clean_subprocess_env,
@@ -47,6 +49,7 @@ from llm_council.deliberation import (
     recommendation_counts,
     recommendation_label,
 )
+from llm_council.diff_chunking import chunk_diff
 from llm_council import doctor as doctor_module
 from llm_council.doctor import (
     normalize_local_openai_base_url,
@@ -3887,19 +3890,25 @@ def test_detect_current_agent_handles_parent_comm_with_spaces(monkeypatch):
         50: "50 (bash) S 1 1 0 0 -1 0 0",
     }
 
+    def is_fake_proc_path(path: Path) -> bool:
+        # pathlib renders separators according to the runner.  Match semantic
+        # components so this Linux-/proc parser test can use its synthetic
+        # process tree on Windows too.
+        return len(path.parts) >= 3 and path.parts[-3] == "proc"
+
     def pid_of(path: Path) -> int:
-        return int(str(path).split("/")[2])
+        return int(path.parts[-2])
 
     real_read_bytes = Path.read_bytes
     real_read_text = Path.read_text
 
     def fake_read_bytes(self):
-        if str(self).startswith("/proc/"):
+        if is_fake_proc_path(self):
             return fake_cmdline[pid_of(self)]
         return real_read_bytes(self)
 
     def fake_read_text(self, *args, **kwargs):
-        if str(self).startswith("/proc/"):
+        if is_fake_proc_path(self):
             return fake_stat[pid_of(self)]
         return real_read_text(self, *args, **kwargs)
 
@@ -8665,9 +8674,6 @@ def test_validate_config_rejects_out_of_range_convergence_thresholds(tmp_path: P
 # --- diff_chunking ---------------------------------------------------------
 
 
-from llm_council.diff_chunking import chunk_diff
-
-
 def _git_init_with_large_diff(
     tmp_path: Path, *, files: dict[str, tuple[str, str]]
 ) -> None:
@@ -9519,12 +9525,6 @@ def test_write_transcript_overflow_bullet_omitted_when_no_overflow(
 # Per-participant result cache (.llm-council/cache/)
 # ------------------------------------------------------------------
 
-import time as _time
-
-from llm_council import cache as cache_module
-from llm_council.adapters import CacheContext
-
-
 def _make_cli_cfg() -> dict:
     return {
         "type": "cli",
@@ -9621,7 +9621,7 @@ def test_cache_read_treats_expired_entry_as_miss_and_deletes(tmp_path: Path):
     )
     cache_module.write_cache(path, payload, ttl_seconds=1)
     raw = json.loads(path.read_text(encoding="utf-8"))
-    raw["cached_at_unix"] = _time.time() - 10_000
+    raw["cached_at_unix"] = time.time() - 10_000
     path.write_text(json.dumps(raw), encoding="utf-8")
     assert cache_module.read_cache(path) is None
     assert not path.exists()
@@ -9720,7 +9720,7 @@ def test_cli_adapter_cache_refresh_skips_read_but_writes(monkeypatch, tmp_path: 
 def test_cli_adapter_does_not_cache_failed_run(monkeypatch, tmp_path: Path):
     cfg = _make_cli_cfg()
     cfg["retry_on_missing_label"] = False
-    calls = _fake_cli_subprocess(monkeypatch, output=b"no label here", returncode=0)
+    _fake_cli_subprocess(monkeypatch, output=b"no label here", returncode=0)
     ctx = CacheContext(cwd=tmp_path, cache_mode="on", ttl_seconds=3600)
     first = asyncio.run(
         adapters_module.run_cli_participant(
@@ -9943,6 +9943,47 @@ def test_concurrent_writes_do_not_corrupt_cache(tmp_path: Path):
     assert loaded is not None
     assert loaded["recommendation_label"] == "yes"
     assert loaded["output"].startswith("RECOMMENDATION: yes - ")
+
+
+def test_cache_write_retries_transient_windows_replace_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = cache_module.cache_path(tmp_path, "alice", "key1")
+    real_replace = cache_module.os.replace
+    attempts = 0
+
+    def flaky_replace(source: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            error = PermissionError("simulated Windows replacement race")
+            error.winerror = 5
+            raise error
+        real_replace(source, destination)
+
+    monkeypatch.setattr(cache_module.os, "replace", flaky_replace)
+    monkeypatch.setattr(cache_module.time, "sleep", lambda _seconds: None)
+    cache_module.write_cache(
+        path,
+        cache_module.build_payload(
+            participant_name="alice",
+            prompt="prompt",
+            key="key1",
+            output="RECOMMENDATION: yes - retry succeeded",
+            recommendation_label="yes",
+            elapsed_seconds=0.0,
+            prompt_tokens=None,
+            completion_tokens=None,
+            total_tokens=None,
+            cost_usd=None,
+            model=None,
+            command=None,
+        ),
+        3600,
+    )
+
+    assert attempts == 3
+    assert cache_module.read_cache(path) is not None
 
 
 def test_cli_flag_cache_choices_present():
@@ -11964,7 +12005,7 @@ def test_classify_error_recognizes_cli_nonzero_exit():
 def test_parse_keep_since_arg_iso_date_snaps_to_midnight():
     """V3 dogfood fix: prune used to drift by current wall-clock time-of-day
     on ISO dates. Now ISO dates snap to midnight UTC of that date."""
-    from datetime import date, datetime, timezone
+    from datetime import datetime, timezone
 
     from llm_council.cli import _parse_keep_since_arg
 

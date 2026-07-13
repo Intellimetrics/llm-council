@@ -1,6 +1,4 @@
-import asyncio
 import pytest
-from pathlib import Path
 from unittest.mock import patch
 
 from llm_council.orchestrator import execute_council
@@ -352,7 +350,7 @@ quorum_policies:
         
     with patch("llm_council.adapters.run_participant", side_effect=fake_run_participant), \
          patch("llm_council.cli.find_config", return_value=str(config_file)), \
-         patch("llm_council.cli.write_transcript") as mock_write_tr:
+         patch("llm_council.cli.write_transcript"):
         
         exit_code = await cmd_run_async(args)
         
@@ -889,7 +887,6 @@ modes:
         
         # Verify webbrowser.open was called
         assert mock_open.call_count == 1
-
 
 
 

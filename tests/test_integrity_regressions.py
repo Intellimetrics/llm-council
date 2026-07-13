@@ -322,6 +322,25 @@ def test_windows_path_permission_audit_avoids_directory_descriptors(
         unexpected_descriptor_open,
     )
 
+    # Windows DirEntry.stat() returns zero for the identity/link-count fields
+    # used by the audit.  Make any regression to that API fail on every CI
+    # platform; the Windows fallback must make a real no-follow path stat.
+    class _EntryWithoutReliableStat:
+        name = artifact.name
+
+        def stat(self, *, follow_symlinks: bool = True):
+            del follow_symlinks
+            raise AssertionError("Windows audit must not rely on DirEntry.stat()")
+
+    class _Entries:
+        def __enter__(self):
+            return iter([_EntryWithoutReliableStat()])
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(transcript_module.os, "scandir", lambda _path: _Entries())
+
     preview = inspect_transcript_permissions(runs)
     repaired = inspect_transcript_permissions(runs, repair=True)
 

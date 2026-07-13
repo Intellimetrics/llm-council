@@ -9,13 +9,20 @@ and validation-error wiring in isolation.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path as _Path
+from unittest.mock import patch as _patch
 
 import llm_council.adapters as adapters_module
 from llm_council.adapters import (
     INCOMPLETE_RESPONSE_PREFIX,
     KNOWN_ERROR_KINDS,
+    UNTAGGED_EVIDENCE_PREFIX,
+    ParticipantResult as _ParticipantResult,
+    _merge_cli_section_retry,
+    _merge_hosted_section_retry,
     _response_validation_error,
     classify_error,
+    run_cli_participant,
     run_ollama_participant,
     run_openai_compatible_participant,
 )
@@ -868,17 +875,6 @@ def test_openai_compatible_section_repair_respects_retries_zero(monkeypatch):
 # `untagged_evidence`) with both attempts in the merged transcript,
 # and sets `section_repair_attempted=True` to guard the
 # strict-evidence wrapper from chaining a third call.
-
-from pathlib import Path as _Path
-from unittest.mock import patch as _patch
-
-from llm_council.adapters import (
-    UNTAGGED_EVIDENCE_PREFIX,
-    ParticipantResult as _ParticipantResult,
-    _merge_cli_section_retry,
-    _merge_hosted_section_retry,
-    run_cli_participant,
-)
 
 
 _UNTAGGED_AFTER_SECTIONS_OUTPUT = (

@@ -5,11 +5,8 @@ wiring). See the v0.10 plan §7 test list.
 from __future__ import annotations
 
 import asyncio
-import io
-import os
 from unittest.mock import MagicMock
 
-import pytest
 
 from llm_council import display
 from llm_council.cli import _make_progress_printer

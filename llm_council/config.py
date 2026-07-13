@@ -1120,9 +1120,9 @@ def select_participants(
             # Resolve the Gemini-family seat from the configured participant
             # map, not from unrelated binaries that merely happen to be on
             # PATH.  A project that configures `gemini` but not `antigravity`
-            # must remain usable after `agy` is installed globally.  Prefer
-            # Gemini's flag-enforced plan mode over Antigravity's softer,
-            # prompt-enforced read-only posture when both are available.
+            # must remain usable after `agy` is installed globally. When both
+            # participants are configured and available, the compatibility
+            # policy below intentionally prefers Antigravity.
             current_exclusion_families = {
                 "claude": {"claude"},
                 "codex": {"codex"},
