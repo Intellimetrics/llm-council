@@ -9,8 +9,6 @@ import binascii
 import json
 import os
 import re
-import sys
-from io import TextIOWrapper
 from pathlib import Path
 from typing import Any
 
@@ -2377,7 +2375,6 @@ def run_config(arguments: dict[str, Any]) -> dict[str, Any]:
 
 async def _serve() -> None:
     try:
-        import anyio
         from mcp.server import Server
         from mcp.server.stdio import stdio_server
         from mcp.types import TextContent, Tool
@@ -2541,32 +2538,7 @@ async def _serve() -> None:
             return text_blocks, result
         return text_blocks
 
-    # mcp-python currently wraps stdout with ``newline=None``. On Windows that
-    # translates the protocol's terminating LF to CRLF; with Proactor pipes the
-    # JSON body and delimiter can then be exposed separately, leaving clients
-    # blocked in ``readline()`` even though the complete response is buffered.
-    # Supply explicit UTF-8 wrappers with translation disabled so every MCP
-    # response is framed by one literal LF on every platform.
-    stdin = anyio.wrap_file(
-        TextIOWrapper(
-            sys.stdin.buffer,
-            encoding="utf-8",
-            errors="replace",
-            newline="",
-        )
-    )
-    stdout = anyio.wrap_file(
-        TextIOWrapper(
-            sys.stdout.buffer,
-            encoding="utf-8",
-            newline="",
-            write_through=True,
-        )
-    )
-    async with stdio_server(stdin=stdin, stdout=stdout) as (
-        read_stream,
-        write_stream,
-    ):
+    async with stdio_server() as (read_stream, write_stream):
         await app.run(
             read_stream,
             write_stream,
