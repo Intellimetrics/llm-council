@@ -109,10 +109,7 @@ Preset choices:
   CLI are available; otherwise choose `openrouter` when `OPENROUTER_API_KEY` is
   available.
 - `tri-cli`: native CLI participants from the Claude/Codex and Gemini families.
-  Runtime routing prefers Antigravity for current-client compatibility. Its
-  read-only posture is prompt-enforced; select Gemini explicitly when its
-  harder plan-mode boundary is available and `doctor --probe-native` confirms
-  the client is eligible.
+  Runtime routing prefers Antigravity for current-client compatibility.
 - `openrouter`: hosted OpenRouter participants only.
 - `tri-cli-openrouter`: native CLI and hosted OpenRouter participants.
 - `private-local`: Ollama-only participants, no hosted or native CLI
@@ -475,11 +472,6 @@ leave the local-only route.
 `origin_policy: us` filters non-US participants. If the filter removes every
 participant, the run fails clearly.
 
-The temporary `opus-versions` mode runs `claude_4_6` and `claude_4_7`
-side-by-side for a head-to-head comparison of Opus 4.6 vs 4.7 on the same
-prompt. Both ship as part of the native preset and can also be added to other
-modes via `include: [claude_4_6]`.
-
 ## Images
 
 Council can review screenshots and other UI artifacts. Pass `image_paths` (list
@@ -611,12 +603,14 @@ Transcript pruning is a dry run unless `--delete` is present. The deprecated
 
 ## Safety notes
 
-The built-in Claude, Codex, and Gemini participants use CLI-enforced read-only
-or plan modes, and prompts are sent over stdin where the CLI supports it.
-Antigravity has no equivalent write-disable flag; its `--sandbox` restricts
-shell commands, while the council prompt supplies a softer read-only directive.
-Prefer Gemini for untrusted content. Subprocess environments are sanitized;
-only configured `env_passthrough` variables are forwarded.
+All four built-in native CLI participants use CLI-enforced read-only or plan
+modes (`--permission-mode default` Claude, `--sandbox read-only` Codex,
+`--approval-mode plan` Gemini, `--mode plan` Antigravity), and prompts are
+sent over stdin where the CLI supports it (Antigravity stopped reading stdin
+in agy 1.1.1, so its prompt is passed as the `--print` argument instead; its
+`--sandbox` additionally restricts shell commands). The council prompt's
+read-only directive rides on top as defense in depth. Subprocess environments
+are sanitized; only configured `env_passthrough` variables are forwarded.
 
 > [!WARNING]
 > Do not include secrets in diffs or context files. OpenRouter participants

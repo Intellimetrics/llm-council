@@ -2102,19 +2102,6 @@ async def _run_openai_compatible_inner(
         )
 
 
-async def run_openrouter_participant(
-    name: str,
-    cfg: dict[str, Any],
-    prompt: str,
-    *,
-    image_manifest: list[dict[str, Any]] | None = None,
-    cache_ctx: CacheContext | None = None,
-) -> ParticipantResult:
-    return await run_openai_compatible_participant(
-        name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx
-    )
-
-
 _RESERVED_HEADER_LOWER = frozenset(
     {"authorization", "content-type", "http-referer", "x-title"}
 )

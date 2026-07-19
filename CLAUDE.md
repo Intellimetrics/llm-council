@@ -82,8 +82,9 @@ Key modules:
   via `config.deep_merge`. The set of legal participant types (`cli`,
   `openrouter`, `openai_compatible`, `ollama`) and built-in modes (`quick`,
   `peer-only`, `plan`, `review`, `review-cheap`, `diverse`, `private-local`,
-  `local-only`, `us-only`, `deliberate`, `consensus`, `fable`, plus the
-  temporary `opus-versions`) live here.
+  `us-only`, `deliberate`, `consensus`, `fable`, `review-with-tools`,
+  `single-llm`, `adversarial-red-team`, `test-gap-analysis`, `deep-audit`)
+  live here.
 - `config.py` — config discovery (`find_config` walks up from cwd looking for
   `.llm-council.yaml` etc.), validation, the `other_cli_peers` strategy used by
   most modes, `detect_current_agent` (parent-process walk on `/proc`), and
@@ -91,7 +92,9 @@ Key modules:
   unsafe Claude/Codex args at load time.
 - `adapters.py` — three execution paths. CLI participants run via
   `asyncio.create_subprocess_exec` with `{prompt}`/`{cwd}` template
-  substitution and prompt-on-stdin by default; OpenRouter uses `httpx`;
+  substitution and prompt-on-stdin by default (antigravity is the exception:
+  agy 1.1.1+ ignores stdin, so its prompt rides in argv via `{prompt}`);
+  OpenRouter uses `httpx`;
   Ollama hits a local `/api/chat`. Successful CLI output without a
   `RECOMMENDATION: yes|no|tradeoff` label is treated as failure
   (`_response_validation_error`).
@@ -145,24 +148,23 @@ Key modules:
 
 ## Invariants worth preserving
 
-- **Read-only by default (hard for most peers, SOFT for antigravity).**
-  Council participants must not edit files. claude/codex/gemini get a HARD
-  guarantee from CLI flags that physically disable the write tool
+- **Read-only by default (hard for all four native CLI peers).**
+  Council participants must not edit files. Each native CLI gets a HARD
+  guarantee from flags that physically disable the write tool
   (`--permission-mode default` Claude, `--sandbox read-only` Codex,
-  `--approval-mode plan` Gemini) — a misbehaving model or a prompt-injected
-  diff cannot write. Don't remove these from `defaults.py` without an explicit
-  reason. **antigravity (`agy`) is the exception: its read-only-ness is SOFT
-  (prompt-enforced).** `agy` exposes no read-only / approval-mode / tools-
-  allowlist flag, and `--sandbox` only restricts the terminal (shell), not the
-  model's native write tool — agy CAN write files when ordered with no
-  read-only framing. What keeps it read-only is the prompt directive in
-  `context.build_prompt` ("Do not edit files. Do not run write operations."),
-  which agy reliably honors (verified 4/4). We still omit
-  `--dangerously-skip-permissions` so a stray write isn't auto-approved. The
-  residual risk: a prompt-injection in reviewed content could override the
-  directive with no hard backstop. The opt-in canary
-  `tests/test_live_agy_readonly.py` (gated by `LLM_COUNCIL_LIVE_AGY_TEST=1`)
-  guards that agy still honors the directive across upstream releases.
+  `--approval-mode plan` Gemini, `--mode plan` Antigravity) — a misbehaving
+  model or a prompt-injected diff cannot write. Don't remove these from
+  `defaults.py` without an explicit reason. Antigravity's `--mode plan` flag
+  exists as of agy 1.1.0 (verified live on 1.1.4: an explicitly ordered write
+  produces no file, and agy's shell-command fallback is denied in headless
+  print mode); before that its read-only-ness was only SOFT (prompt-enforced).
+  The prompt directive in `context.build_prompt` ("Do not edit files. Do not
+  run write operations.") remains as defense in depth, and we still omit
+  `--dangerously-skip-permissions` so residual tool attempts are denied, not
+  auto-approved. The opt-in canary `tests/test_live_agy_readonly.py` (gated by
+  `LLM_COUNCIL_LIVE_AGY_TEST=1`) guards this across upstream agy releases.
+  Note agy also ignores stdin since 1.1.1, so its prompt is delivered via
+  argv (`{prompt}`), not stdin.
 - **`RECOMMENDATION:` label.** CLI output is rejected if it lacks the label;
   prompts in `context.py` ask for it. Adapter and prompt changes must keep
   these in sync. The label match is fence-aware: a `RECOMMENDATION:` line

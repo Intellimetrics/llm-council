@@ -67,10 +67,6 @@ Routing rules:
 - Treat "with deepseek" as including `deepseek_v4_pro`.
 - Treat "with qwen" as including `qwen_coder_plus`.
 - Treat "with glm" as including `glm_5_1`.
-- Treat "with opus 4.6" or "with claude 4.6" as including `claude_4_6`.
-- Treat "with opus 4.7" or "with claude 4.7" as including `claude_4_7`.
-- Treat "compare opus versions", "opus 4.6 vs 4.7", or "both opus versions"
-  as `opus-versions` mode (head-to-head; temporary feature).
 
 Reviewing UI, screenshots, or browser state:
 - Council CLI participants share the project filesystem, so they can Read any
@@ -138,10 +134,6 @@ def project_config(
     participant_names: set[str] = set()
     if include_native:
         participant_names.update({"claude", "codex", "gemini", "antigravity"})
-        # Temporary: ship pinned-version Claude variants so `opus-versions`
-        # mode is reachable without manual config edits. Remove when version
-        # drift no longer warrants direct comparison.
-        participant_names.update({"claude_4_6", "claude_4_7"})
     if include_openrouter:
         participant_names.update(OPENROUTER_PARTICIPANTS)
     if include_local:
@@ -183,7 +175,7 @@ def project_config(
         config["defaults"]["origin_policy"] = "us"
         modes.pop("us-only", None)
     if include_native:
-        for name in ("claude", "codex", "gemini", "antigravity", "claude_4_6", "claude_4_7"):
+        for name in ("claude", "codex", "gemini", "antigravity"):
             config["participants"][name] = DEFAULT_CONFIG["participants"][name]
     if include_openrouter:
         for name in OPENROUTER_PARTICIPANTS:

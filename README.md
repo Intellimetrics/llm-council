@@ -5,7 +5,7 @@
 [![MCP](https://img.shields.io/badge/MCP-ready-2f855a)](docs/llm-council.md)
 [![Source read-only peers](https://img.shields.io/badge/peers-source--read--only-6b7280)](#read-only-safety)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.17.0-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.18.0-111827)](CHANGELOG.md)
 
 Your coding agent is incredibly fast, capable, and confident. 
 
@@ -159,7 +159,7 @@ The setup wizard (`llm-council setup --plan`) automatically probes your environm
 | Preset | Description / Use Case |
 | :--- | :--- |
 | `auto` | Selects `tri-cli` when a Gemini-family CLI and at least one Claude/Codex CLI are available; otherwise selects `openrouter` when its key is set. |
-| `tri-cli` | Configures native CLI participants from the Claude/Codex and Gemini families. Runtime routing prefers Antigravity for current-client compatibility; its read-only posture is prompt-enforced, so select Gemini explicitly when its harder plan-mode boundary is available. |
+| `tri-cli` | Configures native CLI participants from the Claude/Codex and Gemini families. Runtime routing prefers Antigravity for current-client compatibility. |
 | `openrouter` | Uses hosted API models through a single OpenRouter key. |
 | `tri-cli-openrouter` | Configures native CLI and hosted OpenRouter participants. |
 | `private-local` | Configures Ollama-only participants, excludes hosted and native CLI participants, and makes `private-local` the generated default mode. |
@@ -198,10 +198,9 @@ See [Review Focus Bundles](#review-focus-bundles) for the `--focus` / `focus:` b
 
 Peers act strictly as advisors, not co-authors. How strongly that's enforced differs by peer type — know the difference before reviewing untrusted code:
 
-*   **Flag-enforced (hard) — `claude`, `codex`, `gemini`**: invoked with flags that disable their write tools at the CLI level (`--permission-mode default` for Claude, `--sandbox read-only` for Codex, `--approval-mode plan` for Gemini). A misbehaving model — or a prompt-injected diff — *cannot* write files.
+*   **Flag-enforced (hard) — `claude`, `codex`, `gemini`, `antigravity`**: invoked with flags that disable their write tools at the CLI level (`--permission-mode default` for Claude, `--sandbox read-only` for Codex, `--approval-mode plan` for Gemini, `--mode plan` for Antigravity, available since agy 1.1.0). A misbehaving model — or a prompt-injected diff — *cannot* write files. The council prompt's read-only directive remains as defense in depth, and `--dangerously-skip-permissions` is deliberately **omitted** for `agy` so residual tool attempts are denied, not auto-approved.
 *   **Hosted & local models** (OpenRouter / Ollama): plain API calls with no filesystem access at all — inherently read-only.
-*   **Prompt-enforced (soft) — `antigravity` (`agy`)**: `agy` exposes no read-only / approval-mode / tools-allowlist flag, and its `--sandbox` only restricts the *terminal*, not the model's native file-write tool — so `agy` *can* write files. Its read-only behavior is carried by the council prompt's read-only directive, which `agy` reliably honors (it refuses write requests). `--dangerously-skip-permissions` is deliberately **omitted** so a stray write isn't auto-approved. This is a **softer** guarantee than the flag-enforced peers: a determined prompt-injection in reviewed content could in principle override the directive with no hard backstop. If you review untrusted code, prefer `gemini` (hard) over `antigravity`.
-*   **Stdin isolation**: peers receive the codebase or diff via standard input.
+*   **Stdin isolation**: peers receive the codebase or diff via standard input (except `agy`, which stopped reading stdin in 1.1.1 and receives the prompt as a command-line argument instead).
 
 ---
 

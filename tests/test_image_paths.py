@@ -77,8 +77,7 @@ def test_estimate_schema_accepts_image_paths():
 
 def test_schema_mode_description_lists_all_built_in_modes():
     """Regression: mode description must include every DEFAULT_CONFIG mode so
-    new modes don't fall off (4.7 caught opus-versions missing from the
-    hardcoded list)."""
+    new modes don't fall off the hardcoded list (caught once in 0.3.x)."""
     from llm_council.defaults import DEFAULT_CONFIG
 
     desc_run = council_run_schema()["properties"]["mode"]["description"]
@@ -266,18 +265,6 @@ def test_cli_image_dry_run_shows_image_in_prompt(tmp_path: Path, capsys):
     assert rc == 0
     captured = capsys.readouterr().out
     assert "prompt_chars" in captured
-
-
-def test_build_cli_command_pins_claude_4_7_model_flag():
-    """Symmetry counterpart to test_claude_4_6_cli_command_pins_model_via_flag."""
-    from llm_council.adapters import _build_cli_command
-    from llm_council.config import load_config
-
-    cfg = load_config(None)["participants"]["claude_4_7"]
-    cmd = _build_cli_command("claude_4_7", cfg, "prompt", Path("/tmp"))
-    assert "--model" in cmd
-    assert "claude-opus-4-7" in cmd
-    assert cmd[0] == "claude"
 
 
 def test_run_participants_default_slow_warn_threshold_is_75_percent_of_timeout(

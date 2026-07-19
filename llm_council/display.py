@@ -33,7 +33,6 @@ ANSI_GUTTER = "\x1b[1;36m"  # bold cyan
 ANSI_OK = "\x1b[32m"  # green
 ANSI_FAIL = "\x1b[31m"  # red
 ANSI_WARN = "\x1b[33m"  # yellow
-ANSI_DIM = "\x1b[2m"
 
 # Identity token shared by CLI and MCP surfaces. Plain ASCII so it
 # survives any host's rendering (markdown / plain / ANSI-stripped) and

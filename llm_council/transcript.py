@@ -32,12 +32,6 @@ from llm_council.deliberation import (
 ROUND_SUFFIX_RE = re.compile(r":round(\d+)$")
 
 
-def safe_slug(text: str, max_len: int = 60) -> str:
-    cleaned = "".join(ch if ch.isalnum() else "-" for ch in text.lower())
-    cleaned = "-".join(part for part in cleaned.split("-") if part)
-    return (cleaned or "council")[:max_len].strip("-")
-
-
 def transcript_paths(base_dir: Path, question: str) -> tuple[Path, Path]:
     # Keep the timestamp prefix for sorting and continuation-prefix lookup, but
     # never place question text in a filename. Questions can contain source,

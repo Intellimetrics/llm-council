@@ -1771,11 +1771,6 @@ def _print_setup_next_steps(
                 "neither gemini nor antigravity was found on PATH; native "
                 "CLI modes need one Gemini-family participant."
             )
-        elif has_agy and not has_gemini:
-            warnings.append(
-                "using Antigravity's prompt-enforced compatibility route; "
-                "install Gemini CLI for flag-enforced plan mode."
-            )
     if include_openrouter and not os.environ.get("OPENROUTER_API_KEY"):
         warnings.append(
             "OPENROUTER_API_KEY is not exported; hosted OpenRouter modes need it."

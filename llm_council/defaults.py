@@ -99,7 +99,6 @@ DEFAULT_CONFIG: dict = {
         # requester does not bias the chair by accident. Valid values:
         # a participant name | "neutral_peer" | "current".
         "synthesizer": None,
-        "synthesizer_max_prompt_chars": 60_000,
         # Entire MCP request wall-clock contract. Individual peer timeouts
         # remain independently configurable, but a stuck multi-round request
         # cannot outlive this top-level deadline unless the caller overrides it.
@@ -236,57 +235,6 @@ DEFAULT_CONFIG: dict = {
             "stdin_prompt": True,
             "env_passthrough": ["ANTHROPIC_API_KEY"],
         },
-        # Temporary: pinned-version Claude participants for opt-in head-to-head
-        # review when the user wants a specific Opus version's perspective.
-        # Remove (or merge back into `claude`) once version-to-version drift is
-        # no longer interesting. Both reuse the host `claude` CLI; only the
-        # `--model` flag differs from the default `claude` participant.
-        "claude_4_6": {
-            "type": "cli",
-            "family": "claude",
-            "origin": "US / Anthropic",
-            "command": "claude",
-            "args": [
-                "-p",
-                "--permission-mode",
-                "default",
-                "--tools",
-                "Read,Grep,Glob,LS",
-                "--no-session-persistence",
-            ],
-            "model": "claude-opus-4-6",
-            "timeout": 240,
-            "max_prompt_chars": 120_000,
-            "read_only": True,
-            "stdin_prompt": True,
-            "env_passthrough": ["ANTHROPIC_API_KEY"],
-            # claude_4_6 IS opus-4-6 — chain[0] is the natural next-tier
-            # step-down (sonnet-4-6, same version).
-            "fallback_chain": ["claude-sonnet-4-6", "claude-haiku-4-5"],
-        },
-        "claude_4_7": {
-            "type": "cli",
-            "family": "claude",
-            "origin": "US / Anthropic",
-            "command": "claude",
-            "args": [
-                "-p",
-                "--permission-mode",
-                "default",
-                "--tools",
-                "Read,Grep,Glob,LS",
-                "--no-session-persistence",
-            ],
-            "model": "claude-opus-4-7",
-            "timeout": 240,
-            "max_prompt_chars": 120_000,
-            "read_only": True,
-            "stdin_prompt": True,
-            "env_passthrough": ["ANTHROPIC_API_KEY"],
-            # claude_4_7 IS opus-4-7 — step down to opus-4-6 first (same
-            # tier, one version back), then sonnet-4-6 if 4-6 also overload.
-            "fallback_chain": ["claude-opus-4-6", "claude-sonnet-4-6"],
-        },
         "codex": {
             "type": "cli",
             "family": "codex",
@@ -397,7 +345,6 @@ DEFAULT_CONFIG: dict = {
             "api_key_env": "OPENROUTER_API_KEY",
             "timeout": 180,
             "read_only": True,
-            "deprecated": "Account-dependent free route; use qwen_coder_flash for reliable cheap defaults.",
         },
         "glm_5_1": {
             "type": "openrouter",
@@ -446,35 +393,36 @@ DEFAULT_CONFIG: dict = {
             "family": "antigravity",
             "origin": "US / Google",
             "command": "agy",
-            # READ-ONLY ENFORCEMENT IS SOFT (prompt-enforced), not hard.
-            # `agy` has NO --approval-mode / --tools allowlist / read-only flag
-            # like claude/codex/gemini, so there is no way to physically disable
-            # its file-write tool from the CLI. `--sandbox` only restricts the
-            # TERMINAL (shell commands); it does NOT block the model's native
-            # write tool — empirically agy can and will write files (even
-            # outside cwd) when a prompt explicitly orders it with no read-only
-            # framing. What actually keeps agy read-only is the council prompt's
-            # read-only directive (see context.build_prompt: "Do not edit files.
-            # Do not run write operations."), which agy reliably honors
-            # (verified 4/4: refuses an explicit write request when the directive
-            # is present). We still OMIT --dangerously-skip-permissions: with it,
-            # any stray write the model attempts is auto-approved; without it the
-            # directive governs. CAVEAT: this is a SOFTER guarantee than the
-            # flag-enforced peers — a prompt-injection embedded in reviewed
-            # content could in principle override the directive with no hard
-            # backstop. The live canary test/tests/test_live_agy_readonly.py
-            # guards that agy still honors the directive. Do NOT re-add
-            # --dangerously-skip-permissions.
+            # READ-ONLY ENFORCEMENT IS HARD as of agy 1.1.x: `--mode plan`
+            # disables the model's native file-write tool (verified live on
+            # 1.1.4: an explicitly ordered write produces no file; agy falls
+            # back to a shell command, which headless print mode auto-denies).
+            # `--sandbox` additionally restricts the TERMINAL (shell commands).
+            # The council prompt's read-only directive (context.build_prompt)
+            # remains as defense in depth. We still OMIT
+            # --dangerously-skip-permissions so residual tool attempts are
+            # denied, not auto-approved — do NOT re-add it. The live canary
+            # tests/test_live_agy_readonly.py guards this across upstream
+            # releases.
+            #
+            # PROMPT DELIVERY IS ARGV, not stdin: agy 1.1.1 stopped reading
+            # stdin ("-" is now a literal prompt), so the prompt is passed as
+            # the --print value. Linux caps a single argv string at 128 KiB
+            # (MAX_ARG_STRLEN); max_prompt_chars 120_000 fits for ASCII but a
+            # heavily non-ASCII prompt near the cap can fail exec with E2BIG
+            # (fail-fast, surfaced as a peer error).
             "args": [
                 "--print",
+                "{prompt}",
                 "--sandbox",
-                "-",
+                "--mode",
+                "plan",
             ],
             "model": None,
             "timeout": 240,
             "max_prompt_chars": 120_000,
             "read_only": True,
-            "stdin_prompt": True,
+            "stdin_prompt": False,
             "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTIGRAVITY_API_KEY"],
             # agy 1.0.x accepts --model, but its display-name ids are not
             # portable and an unknown id silently falls back to session
@@ -671,12 +619,6 @@ DEFAULT_CONFIG: dict = {
             "deliberate": True,
             "max_rounds": 3,
             "description": "Multi-phase deep audit mode running up to 3 rounds of peer review.",
-        },
-        # Temporary: head-to-head review using both Opus versions. Remove or
-        # collapse once version drift between 4.6 and 4.7 is no longer notable.
-        "opus-versions": {
-            "participants": ["claude_4_6", "claude_4_7"],
-            "description": "Compare Claude Opus 4.6 vs 4.7 directly. Temporary; may be removed.",
         },
     },
 }

@@ -24,7 +24,7 @@ from llm_council.adapters import (
     _format_arg,
     clean_subprocess_env,
     redact_prompt_args,
-    run_openrouter_participant,
+    run_openai_compatible_participant,
     run_participants,
 )
 from llm_council.cli import build_parser, cmd_doctor, cmd_setup, cmd_transcripts, main
@@ -38,7 +38,7 @@ from llm_council.config import (
     select_participants,
 )
 from llm_council.context import build_prompt
-from llm_council.context import read_context_file, read_git_diff
+from llm_council.context import _read_git_diff_sections, read_context_file
 from llm_council.defaults import DEFAULT_CONFIG
 from llm_council.deliberation import (
     build_deliberation_prompt,
@@ -89,7 +89,6 @@ from llm_council.transcript import (
     markdown_fence,
     normalize_run_id,
     result_to_dict,
-    safe_slug,
     transcript_records,
     write_transcript,
 )
@@ -1836,19 +1835,15 @@ def test_git_diff_includes_staged_changes(tmp_path: Path):
     source.write_text("new\n", encoding="utf-8")
     subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True)
 
-    diff = read_git_diff(tmp_path)
+    diff = "\n".join(_read_git_diff_sections(tmp_path)[0])
     assert "### Staged Changes" in diff
     assert "+new" in diff
     assert "[no diff]" not in diff
 
 
 def test_git_diff_outside_repo_is_prompt_placeholder(tmp_path: Path):
-    diff = read_git_diff(tmp_path)
+    diff = "\n".join(_read_git_diff_sections(tmp_path)[0])
     assert "git diff unavailable: not a git repository" in diff
-
-
-def test_safe_slug():
-    assert safe_slug("Hello, World!") == "hello-world"
 
 
 def test_result_to_dict_includes_usage():
@@ -2606,7 +2601,7 @@ def test_openrouter_retries_missing_label_and_recovers(monkeypatch):
     monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
 
     result = asyncio.run(
-        run_openrouter_participant(
+        run_openai_compatible_participant(
             "glm",
             {"type": "openrouter", "model": "z-ai/glm-test"},
             "prompt",
@@ -2670,7 +2665,7 @@ def test_openrouter_retry_failure_preserves_failure(monkeypatch):
     monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
 
     result = asyncio.run(
-        run_openrouter_participant(
+        run_openai_compatible_participant(
             "glm",
             {"type": "openrouter", "model": "z-ai/glm-test"},
             "prompt",
@@ -2728,7 +2723,7 @@ def test_openrouter_retry_rejects_truncated_retry_response(monkeypatch):
     monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
 
     result = asyncio.run(
-        run_openrouter_participant(
+        run_openai_compatible_participant(
             "glm",
             {"type": "openrouter", "model": "z-ai/glm-test"},
             "prompt",
@@ -2771,7 +2766,7 @@ def test_openrouter_retry_does_not_fire_on_finish_reason_length(monkeypatch):
     monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
 
     result = asyncio.run(
-        run_openrouter_participant(
+        run_openai_compatible_participant(
             "glm",
             {"type": "openrouter", "model": "z-ai/glm-test"},
             "prompt",
@@ -2813,7 +2808,7 @@ def test_openrouter_retry_does_not_fire_on_empty_content(monkeypatch):
     monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
 
     result = asyncio.run(
-        run_openrouter_participant(
+        run_openai_compatible_participant(
             "glm",
             {"type": "openrouter", "model": "z-ai/glm-test"},
             "prompt",
@@ -2849,7 +2844,7 @@ def test_openrouter_retry_does_not_fire_on_api_error(monkeypatch):
     monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
 
     result = asyncio.run(
-        run_openrouter_participant(
+        run_openai_compatible_participant(
             "glm",
             {"type": "openrouter", "model": "z-ai/glm-test"},
             "prompt",
@@ -2890,7 +2885,7 @@ def test_openrouter_retry_disabled_via_config(monkeypatch):
     monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
 
     result = asyncio.run(
-        run_openrouter_participant(
+        run_openai_compatible_participant(
             "glm",
             {
                 "type": "openrouter",
@@ -2952,7 +2947,7 @@ def test_openrouter_empty_content_is_graceful(monkeypatch):
     monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
 
     result = asyncio.run(
-        run_openrouter_participant(
+        run_openai_compatible_participant(
             "glm",
             {"type": "openrouter", "model": "z-ai/glm-test"},
             "prompt",
@@ -3548,57 +3543,29 @@ def test_validate_config_rejects_negative_slow_warn_after_seconds():
         raise AssertionError("expected validate_config to reject negative slow_warn_after_seconds")
 
 
-def test_default_config_ships_pinned_opus_version_participants():
-    """Temporary feature: claude_4_6 and claude_4_7 are pinned-model variants."""
-    config = load_config(None)
-    participants = config["participants"]
-    assert participants["claude_4_6"]["model"] == "claude-opus-4-6"
-    assert participants["claude_4_6"]["family"] == "claude"
-    assert participants["claude_4_7"]["model"] == "claude-opus-4-7"
-    assert participants["claude_4_7"]["family"] == "claude"
-
-
-def test_opus_versions_mode_resolves_to_both_pinned_participants():
-    config = load_config(None)
-    selected = select_participants(config, "opus-versions", current=None)
-    assert selected == ["claude_4_6", "claude_4_7"]
-
-
-def test_claude_4_6_cli_command_pins_model_via_flag():
+def test_pinned_model_claude_cli_command_pins_model_via_flag():
     """Regression: family=claude must add --model <id> when model is set."""
     from llm_council.adapters import _build_cli_command
 
-    cfg = load_config(None)["participants"]["claude_4_6"]
-    cmd = _build_cli_command("claude_4_6", cfg, "prompt", Path("/tmp"))
+    cfg = load_config(None)["participants"]["claude_fable"]
+    cmd = _build_cli_command("claude_fable", cfg, "prompt", Path("/tmp"))
     assert "--model" in cmd
-    assert "claude-opus-4-6" in cmd
+    assert "claude-fable-5" in cmd
     assert cmd[0] == "claude"
 
 
-def test_quick_mode_can_include_pinned_opus_variant_via_include(monkeypatch):
+def test_quick_mode_can_include_extra_participant_via_include(monkeypatch):
+    """`include=` adds a configured participant that the mode itself omits."""
     config = load_config(None)
     monkeypatch.setattr(
         "shutil.which",
         lambda name: f"/bin/{name}" if name in {"claude", "codex", "agy"} else None,
     )
     selected = select_participants(
-        config, "quick", current="claude", include=["claude_4_6"]
+        config, "quick", current="claude", include=["claude_fable"]
     )
-    assert "claude_4_6" in selected
+    assert "claude_fable" in selected
     assert {"claude", "codex", "antigravity"}.issubset(set(selected))
-
-
-def test_setup_wizard_writes_pinned_opus_participants_under_native_preset():
-    """Ensure `setup --preset tri-cli` produces a config that lets
-    `opus-versions` mode resolve."""
-    cfg = project_config(include_native=True, include_openrouter=False, include_local=False)
-    assert "claude_4_6" in cfg["participants"]
-    assert "claude_4_7" in cfg["participants"]
-    assert "opus-versions" in cfg["modes"]
-    assert cfg["modes"]["opus-versions"]["participants"] == [
-        "claude_4_6",
-        "claude_4_7",
-    ]
 
 
 def test_validate_config_accepts_float_slow_warn_after_seconds():
@@ -5343,15 +5310,12 @@ def test_tri_cli_setup_loaded_config_does_not_restore_defaults(tmp_path: Path):
         "codex",
         "gemini",
         "antigravity",
-        "claude_4_6",
-        "claude_4_7",
     }
     assert set(config["modes"]) == {
         "quick",
         "peer-only",
         "us-only",
         "consensus",
-        "opus-versions",
         "single-llm",
         "adversarial-red-team",
         "test-gap-analysis",
@@ -5394,8 +5358,6 @@ def test_setup_interactive_uses_preset_and_suppression_flags(
         "codex",
         "gemini",
         "antigravity",
-        "claude_4_6",
-        "claude_4_7",
     }
     assert config["defaults"]["origin_policy"] == "us"
     assert not (tmp_path / ".mcp.json").exists()
@@ -5427,8 +5389,6 @@ def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path, monkeypatch
         "codex",
         "gemini",
         "antigravity",
-        "claude_4_6",
-        "claude_4_7",
     }
     # `review-with-tools` (v0.8 Phase E, experimental) routes only to CLI
     # peers, so tri-cli setup retains it alongside the other CLI-only modes.
@@ -5437,7 +5397,6 @@ def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path, monkeypatch
         "quick",
         "peer-only",
         "consensus",
-        "opus-versions",
         "single-llm",
         "adversarial-red-team",
         "test-gap-analysis",
@@ -5468,15 +5427,12 @@ def test_setup_yes_auto_selects_tri_cli_when_native_clis_exist(
         "codex",
         "gemini",
         "antigravity",
-        "claude_4_6",
-        "claude_4_7",
     }
     assert set(config["modes"]) == {
         "quick",
         "peer-only",
         "us-only",
         "consensus",
-        "opus-versions",
         "single-llm",
         "adversarial-red-team",
         "test-gap-analysis",
@@ -7271,7 +7227,7 @@ def test_openrouter_request_includes_referer_header(monkeypatch):
     monkeypatch.setattr(adapters_module, "_request_with_retries", fake_request)
 
     result = asyncio.run(
-        run_openrouter_participant(
+        run_openai_compatible_participant(
             "glm",
             {
                 "type": "openai_compatible",

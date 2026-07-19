@@ -71,11 +71,11 @@ participants:
     - GEMINI_API_KEY
     - GOOGLE_API_KEY
 
-  # Antigravity is the default Gemini-family compatibility route. Select the
-  # Gemini participant explicitly when its hard plan-mode boundary is usable.
-  # Its read-only posture is prompt-enforced, not flag-enforced: --sandbox
-  # restricts shell commands but does not disable Antigravity's file-write
-  # tool. Keep --dangerously-skip-permissions out of this participant.
+  # Antigravity is the default Gemini-family compatibility route. --mode plan
+  # (agy 1.1.0+) disables its file-write tool; --sandbox restricts shell
+  # commands. agy ignores stdin since 1.1.1, so the prompt is passed as the
+  # --print argument. Keep --dangerously-skip-permissions out of this
+  # participant.
   antigravity:
     type: cli
     family: antigravity
@@ -83,13 +83,15 @@ participants:
     command: agy
     args:
     - --print
+    - "{prompt}"
     - --sandbox
-    - "-"
+    - --mode
+    - plan
     model:
     timeout: 240
     max_prompt_chars: 120000
     read_only: true
-    stdin_prompt: true
+    stdin_prompt: false
     env_passthrough:
     - GEMINI_API_KEY
     - GOOGLE_API_KEY

@@ -13,7 +13,7 @@ from llm_council.context import (
     MAX_CONTEXT_FILE_CHARS,
     build_prompt,
     read_context_file,
-    read_git_diff,
+    _read_git_diff_sections,
     resolve_acceptance_contract,
 )
 from llm_council.env import (
@@ -300,7 +300,7 @@ def test_read_git_diff_surfaces_capture_truncation(
     source.write_text("new\n" + ("z" * 10_000), encoding="utf-8")
     monkeypatch.setattr(context_module, "MAX_GIT_DIFF_CAPTURE_BYTES", 512)
 
-    rendered = read_git_diff(tmp_path)
+    rendered = "\n".join(_read_git_diff_sections(tmp_path)[0])
     assert "Git Diff" in rendered
     assert "truncated after 512 bytes" in rendered
 

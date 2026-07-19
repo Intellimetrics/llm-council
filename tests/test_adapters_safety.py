@@ -413,12 +413,10 @@ def test_redact_prompt_args_removes_full_prompt_and_large_fragments():
 def test_no_default_cli_peer_auto_approves_tool_calls():
     """Read-only invariant guard. A default CLI peer must never ship a blanket
     auto-approve flag (--dangerously-skip-permissions and friends), which would
-    let a misbehaving or prompt-injected peer Write/Edit files. agy in
-    particular has no --approval-mode / --tools allowlist, so its read-only-ness
-    is SOFT (prompt-enforced via the council read-only directive, which it
-    honors) rather than flag-enforced — keeping the skip-permissions flag OFF is
-    what stops a stray write from being auto-approved. (The soft guarantee is
-    checked live by the opt-in tests/test_live_agy_readonly.py canary.) This
+    let a misbehaving or prompt-injected peer Write/Edit files. For agy,
+    keeping the skip-permissions flag OFF is what makes residual tool attempts
+    denied rather than auto-approved on top of `--mode plan`'s write disable.
+    (Checked live by the opt-in tests/test_live_agy_readonly.py canary.) This
     test fails loudly if anyone re-adds such a flag to a default peer."""
     from llm_council.defaults import DEFAULT_CONFIG
 
@@ -444,5 +442,8 @@ def test_antigravity_default_is_sandboxed_without_skip_permissions():
 
     args = DEFAULT_CONFIG["participants"]["antigravity"]["args"]
     assert "--sandbox" in args
+    # `--mode plan` is the hard write-disable (agy 1.1.0+); --sandbox only
+    # restricts the terminal.
+    assert args[args.index("--mode") + 1] == "plan"
     assert "--dangerously-skip-permissions" not in args
     assert DEFAULT_CONFIG["participants"]["antigravity"]["read_only"] is True

@@ -294,11 +294,6 @@ def render_image_section(manifest: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def read_git_diff(cwd: Path) -> str:
-    sections, _raw = _read_git_diff_sections(cwd)
-    return "\n".join(sections)
-
-
 def _filter_semantic_diff(diff_text: str | None) -> str:
     """Filter out lockfiles and binary/asset files from the diff to save tokens."""
     if not diff_text:
