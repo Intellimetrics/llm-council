@@ -4,11 +4,12 @@ from unittest.mock import patch
 from llm_council.orchestrator import execute_council
 from llm_council.config import select_participants
 from llm_council.adapters import ParticipantResult
-from llm_council.context import build_prompt
 
 
 @pytest.mark.asyncio
-async def test_deep_review_single_llm_multiplex(tmp_path):
+async def test_deep_review_single_peer_consensus_multiplex(tmp_path):
+    """A lone peer in a stance/debate mode multiplexes into three virtual
+    stanced peers (the machinery behind README's single-model isolation)."""
     config = {
         "version": 1,
         "participants": {
@@ -20,15 +21,14 @@ async def test_deep_review_single_llm_multiplex(tmp_path):
             }
         },
         "modes": {
-            "single-llm": {
+            "consensus": {
                 "participants": ["claude"],
-                "single_llm_multiplex": True,
             }
         }
     }
     
     question = "Is this code safe?"
-    mode = "single-llm"
+    mode = "consensus"
     
     selected = select_participants(config, mode, current=None)
     assert selected == ["claude_for", "claude_against", "claude_neutral"]
@@ -78,7 +78,9 @@ async def test_deep_review_single_llm_multiplex(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_deep_review_adversarial_red_team(tmp_path):
+async def test_deep_review_user_defined_stance_mode(tmp_path):
+    """A project-defined mode carrying `stances` assigns the generic
+    for/against/neutral stance prompts to the named peers."""
     config = {
         "version": 1,
         "participants": {
@@ -102,7 +104,7 @@ async def test_deep_review_adversarial_red_team(tmp_path):
             }
         },
         "modes": {
-            "adversarial-red-team": {
+            "attack-defend": {
                 "participants": ["claude", "codex", "gemini"],
                 "stances": {
                     "claude": "against",
@@ -114,7 +116,7 @@ async def test_deep_review_adversarial_red_team(tmp_path):
     }
     
     question = "Should we merge this PR?"
-    mode = "adversarial-red-team"
+    mode = "attack-defend"
     
     selected = select_participants(config, mode, current=None)
     mode_cfg = config["modes"][mode]
@@ -149,82 +151,18 @@ async def test_deep_review_adversarial_red_team(tmp_path):
         assert "=== INDIVIDUAL ASSIGNMENT ===" in prompt
         if name == "claude":
             assert "representing stance: AGAINST" in prompt
-            assert "Stance: ATTACKER (Red Team)" in prompt
+            assert "Stance: AGAINST. Argue the strongest case" in prompt
         elif name == "codex":
             assert "representing stance: FOR" in prompt
-            assert "Stance: DEFENDER (Blue Team)" in prompt
+            assert "Stance: FOR. Argue the strongest case" in prompt
         elif name == "gemini":
             assert "representing stance: NEUTRAL" in prompt
             assert "Stance: NEUTRAL. Weigh both" in prompt
 
 
 @pytest.mark.asyncio
-async def test_deep_review_test_gap_analysis(tmp_path):
-    config = {
-        "version": 1,
-        "participants": {
-            "claude": {
-                "type": "cli",
-                "family": "claude",
-                "command": "claude",
-                "model": "anthropic/claude-sonnet-4-6",
-            }
-        },
-        "modes": {
-            "test-gap-analysis": {
-                "participants": ["claude"],
-            }
-        }
-    }
-    
-    question = "Let's review this commit."
-    mode = "test-gap-analysis"
-    
-    selected = select_participants(config, mode, current=None)
-    
-    # Resolve the prompt through build_prompt, matching CLI/MCP flow
-    prompt = build_prompt(
-        question,
-        mode=mode,
-        cwd=tmp_path,
-        context_paths=[],
-        include_diff=False,
-        stdin_text=None,
-        stances=None,
-        participants=config["participants"],
-    )
-    
-    captured_calls = []
-    
-    async def fake_run_participant(name, cfg, prompt, cwd, **kwargs):
-        captured_calls.append((name, cfg, prompt))
-        return ParticipantResult(
-            name=name,
-            ok=True,
-            output="RECOMMENDATION: yes\nChecked tests.",
-            error="",
-            elapsed_seconds=0.5
-        )
-        
-    with patch("llm_council.adapters.run_participant", side_effect=fake_run_participant):
-        results, metadata = await execute_council(
-            selected,
-            config["participants"],
-            prompt,
-            tmp_path,
-            config,
-            mode=mode,
-        )
-        
-    assert len(captured_calls) == 1
-    prompt_sent = captured_calls[0][2]
-    assert "TEST GAP ANALYSIS INSTRUCTION:" in prompt_sent
-    assert "gaps in test coverage" in prompt_sent
-    assert "If logic is modified but no tests are added or updated" in prompt_sent
-
-
-@pytest.mark.asyncio
-async def test_deep_review_deep_audit_rounds(tmp_path):
+async def test_deep_review_custom_three_round_mode(tmp_path):
+    """A project-defined mode with deliberate+max_rounds=3 runs three rounds."""
     config = {
         "version": 1,
         "participants": {
@@ -242,7 +180,7 @@ async def test_deep_review_deep_audit_rounds(tmp_path):
             }
         },
         "modes": {
-            "deep-audit": {
+            "audit3": {
                 "participants": ["claude", "codex"],
                 "deliberate": True,
                 "max_rounds": 3,
@@ -251,7 +189,7 @@ async def test_deep_review_deep_audit_rounds(tmp_path):
     }
     
     question = "Perform a deep audit of this PR."
-    mode = "deep-audit"
+    mode = "audit3"
     
     selected = select_participants(config, mode, current=None)
     assert selected == ["claude", "codex"]

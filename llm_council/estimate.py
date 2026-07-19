@@ -17,14 +17,10 @@ from llm_council.config import (
     select_participants,
 )
 from llm_council.context import (
-    CROSS_RANK_MIN_PEERS,
     MAX_PROMPT_CHARS,
-    SAFE_CONTEXT_DIRECTIVE,
     apply_per_peer_directives,
-    build_anonymization_map,
     build_image_manifest,
     build_prompt,
-    build_ranking_prompt,
 )
 from llm_council.deliberation import MAX_DELIBERATION_PROMPT_CHARS
 from llm_council.model_catalog import fetch_openrouter_models
@@ -89,51 +85,6 @@ def _bounded_prompt_chars(candidate_chars: int, cfg: dict[str, Any]) -> int:
     return min(max(0, int(candidate_chars)), max(0, int(cap)))
 
 
-def cross_rank_prompt_char_bounds(
-    *,
-    participants: list[str],
-    participant_cfg: dict[str, Any],
-    question: str,
-    completion_tokens: int,
-    focus_directive: str | None,
-    safe_context: bool,
-) -> dict[str, int]:
-    """Return conservative per-peer ranking prompt character bounds.
-
-    The exact fixed framing comes from ``build_ranking_prompt``. Dynamic peer
-    bodies are modeled arithmetically so a very large completion assumption
-    cannot force an equally large temporary string allocation.
-    """
-
-    anonymization_map = build_anonymization_map(participants)
-    assumed_output_chars = max(0, int(completion_tokens)) * ESTIMATED_CHARS_PER_TOKEN
-    placeholder = "x" if assumed_output_chars else ""
-    bounds: dict[str, int] = {}
-    for name in participants:
-        other_peers = {
-            peer: placeholder for peer in participants if peer != name
-        }
-        ranking_prompt = build_ranking_prompt(
-            peer_name=name,
-            own_response=placeholder,
-            other_peers=other_peers,
-            anonymization_map=anonymization_map,
-            question=question,
-        )
-        if focus_directive:
-            ranking_prompt += "\n\n" + focus_directive
-        if safe_context:
-            ranking_prompt = SAFE_CONTEXT_DIRECTIVE + "\n\n" + ranking_prompt
-        candidate_chars = len(ranking_prompt)
-        if assumed_output_chars > 1:
-            candidate_chars += len(other_peers) * (assumed_output_chars - 1)
-        bounds[name] = _bounded_prompt_chars(
-            candidate_chars,
-            participant_cfg.get(name, {}),
-        )
-    return bounds
-
-
 def synthesis_prompt_char_bound(chair_cfg: dict[str, Any]) -> int:
     """Worst-case synthesis prompt chars under runtime builder/peer caps."""
 
@@ -150,7 +101,6 @@ def deliberation_prompt_char_bounds(
     mode: str,
     tool_call_voting: bool,
     stances: Mapping[str, str] | None = None,
-    focus_directive: str | None = None,
 ) -> dict[str, int]:
     """Worst-case successful prompt size for every extra council round.
 
@@ -176,7 +126,6 @@ def deliberation_prompt_char_bounds(
             stance=assigned_stance,
             persona=cfg.get("persona"),
             persona_prompt=cfg.get("persona_prompt"),
-            focus_directive=focus_directive,
         )
         bounds[name] = _bounded_prompt_chars(
             MAX_DELIBERATION_PROMPT_CHARS + len(directive_suffix),
@@ -209,11 +158,8 @@ def estimate_council(
     prepared_prompt: str | None = None,
     prepared_participants: list[str] | None = None,
     participant_prompts: Mapping[str, str] | None = None,
-    cross_rank: bool = False,
     synthesize: bool = False,
     synthesizer_name: str | None = None,
-    focus_directive: str | None = None,
-    cross_rank_prompt_chars: Mapping[str, int] | None = None,
     synthesis_prompt_chars: int | None = None,
     deliberation_prompt_chars: Mapping[str, int] | None = None,
     chunk_strategy: str = "fail",
@@ -349,7 +295,6 @@ def estimate_council(
                 ),
                 persona=cfg.get("persona"),
                 persona_prompt=cfg.get("persona_prompt"),
-                focus_directive=focus_directive,
             )
     extra_models = list(openrouter_models or [])
     needs_catalog = bool(extra_models) or any(
@@ -414,7 +359,6 @@ def estimate_council(
                 stances=(
                     mode_stances if isinstance(mode_stances, Mapping) else None
                 ),
-                focus_directive=focus_directive,
             )
         )
         extra_rounds = budgeted_rounds - 1
@@ -438,44 +382,6 @@ def estimate_council(
             row["phase"] = "deliberation"
             row["participant"] = name
             row["prompt_bound_chars"] = deliberation_bounds[name]
-            rows.append(row)
-
-    # Cross-rank content depends on peer outputs that do not exist at
-    # preflight time. Bound it conservatively by assuming every selected peer
-    # produces a label and reaches the configured completion-token assumption;
-    # the runtime prompt builder supplies the exact fixed framing. Participant
-    # prompt caps bound each row because an over-cap runtime call is skipped.
-    if cross_rank and len(participants) >= CROSS_RANK_MIN_PEERS:
-        ranking_prompt_chars = (
-            dict(cross_rank_prompt_chars)
-            if cross_rank_prompt_chars is not None
-            else cross_rank_prompt_char_bounds(
-                participants=participants,
-                participant_cfg=participant_cfg,
-                question=question or prompt,
-                completion_tokens=completion_tokens,
-                focus_directive=focus_directive,
-                safe_context=bool(mode_cfg.get("safe_context")),
-            )
-        )
-        for name in participants:
-            if name not in ranking_prompt_chars:
-                raise ValueError(
-                    f"Missing cross-rank prompt bound for participant '{name}'."
-                )
-            row = _estimate_participant_row(
-                name=f"{name}:rank",
-                cfg=participant_cfg.get(name, {}),
-                catalog_by_id=catalog_by_id,
-                prompt_tokens=math.ceil(
-                    ranking_prompt_chars[name] / ESTIMATED_CHARS_PER_TOKEN
-                ),
-                completion_tokens=completion_tokens,
-                rounds=1,
-            )
-            row["phase"] = "cross_rank"
-            row["participant"] = name
-            row["prompt_bound_chars"] = ranking_prompt_chars[name]
             rows.append(row)
 
     # The synthesis builder hard-caps its dynamic final-round envelope at
@@ -539,7 +445,7 @@ def estimate_council(
             continue
         terse_retry = peer_cfg.get("terse_retry_on_timeout", True) is not False
         validation_retry = (
-            row.get("phase") not in {"cross_rank", "synthesis"}
+            row.get("phase") != "synthesis"
             and peer_cfg.get("retry_on_missing_label", True) is not False
         )
         if not terse_retry and not validation_retry:
@@ -560,12 +466,6 @@ def estimate_council(
             "Deliberation rows count round 1 exactly, then conservatively bound "
             "each additional round by the 80,000-character deliberation body "
             "plus exact per-peer directives, subject to a lower participant cap."
-        )
-    if cross_rank and len(participants) >= CROSS_RANK_MIN_PEERS:
-        notes.append(
-            "Cross-rank rows conservatively assume every selected peer labels, "
-            "every peer response reaches the completion-token assumption, and "
-            "the resulting ranking prompt runs up to any participant prompt cap."
         )
     if synthesize and synthesizer_name:
         notes.append(

@@ -275,7 +275,6 @@ PROGRESS_ADVANCING_EVENTS = frozenset(
     {
         "participant_finish",
         "preflight_failed",
-        "cross_rank_complete",
         "synthesis_finish",
     }
 )
@@ -339,16 +338,6 @@ def format_progress_message(event: dict) -> str | None:
     elif kind == "deliberation_finish":
         rounds_ = event.get("rounds")
         body = f"deliberation finished after {rounds_} rounds"
-    elif kind == "cross_rank_start":
-        count = event.get("peer_count") or "?"
-        body = f"cross-ranking {count} peers"
-    elif kind == "cross_rank_complete":
-        ranker = event.get("ranker_count")
-        body = (
-            f"cross-ranking complete ({ranker} rankers)"
-            if ranker is not None
-            else "cross-ranking complete"
-        )
     elif kind == "synthesis_start":
         chair = event.get("chair") or "?"
         body = f"synthesis chair: {chair}"

@@ -223,13 +223,6 @@ def build_deliberation_prompt(
     for result in results:
         if not result.ok:
             continue
-        # v0.9.0 Feature 2 (council risk #2): NEVER feed ranking-round
-        # responses back into the round-2 deliberation prompt. MAD
-        # literature (arxiv 2402.18272) warns that in-round
-        # convergence forcing depresses signal-to-noise; the
-        # finding-matrix follows the same rule, so does this.
-        if getattr(result, "is_ranking_round", False):
-            continue
         excerpt, was_truncated = _truncate_at_line_boundary(
             result.output, MAX_DELIBERATION_PEER_EXCERPT_CHARS
         )

@@ -61,8 +61,6 @@ def privacy_downgrade_error(
 
 
 __all__ = [
-    "PRIVATE_MODE_ALIASES",
-    "participants_are_private_local",
     "privacy_downgrade_error",
     "transcript_was_private_local",
 ]

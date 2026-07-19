@@ -37,8 +37,8 @@ def test_review_with_tools_mode_registered_in_defaults():
 def test_review_with_tools_mode_is_marked_experimental():
     mode_cfg = DEFAULT_CONFIG["modes"]["review-with-tools"]
     assert mode_cfg.get("experimental") is True, (
-        "review-with-tools must ship with experimental: true until the "
-        "eval-harness promotion gate passes."
+        "review-with-tools must ship with experimental: true until an "
+        "operator manually promotes it to non-experimental."
     )
 
 

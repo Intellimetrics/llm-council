@@ -191,7 +191,6 @@ def build_payload(
     evidence_verification_failures: list[str] | None = None,
     continue_debate: str | None = None,
     tool_call_status: str | None = None,
-    is_ranking_round: bool = False,
     model_fallback_used: str | None = None,
     recovered_after_quota: bool = False,
 ) -> dict[str, Any]:
@@ -257,13 +256,6 @@ def build_payload(
     # payloads).
     if tool_call_status is not None:
         payload["tool_call_status"] = str(tool_call_status)
-    # v0.9.0 Feature 2: persist the ranking-round flag so cache hits still
-    # surface as ranking-round and stay filtered from the deliberation
-    # round-2 prompt builder. Only written when True (default False);
-    # readers default-on-missing to False, so absence is semantically
-    # identical to "primary response, not a ranking pass".
-    if is_ranking_round:
-        payload["is_ranking_round"] = True
     # v0.11.6 Phase 2: persist quota-fallback receipts so a cache hit
     # surfaces the same fallback context as the original run. Only
     # written when the fallback fired (default state on a non-fallback

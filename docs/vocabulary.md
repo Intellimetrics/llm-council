@@ -10,7 +10,7 @@ selects it for a council run.
 | Setup Preset | A setup-time bundle that determines which participant routes and runtime modes are written to project config. | Setup Preset | Runtime Mode, route, profile |
 | Runtime Mode | A named runtime routing configuration selected by `--mode` or the project default. | Runtime Mode | Setup Preset, preset, workflow |
 | Participant | A configured CLI or model endpoint that is available for runtime selection. | Participant | Peer, reviewer, seat |
-| Peer | A participant selected to respond, deliberate, rank, or vote in one council run. | Peer | Participant when describing config, reviewer, seat |
+| Peer | A participant selected to respond, deliberate, or vote in one council run. | Peer | Participant when describing config, reviewer, seat |
 | Host | The primary developer agent that invokes the council and decides what to do with its advice. | Host | Current agent, orchestrator, reviewer |
 | Synthesis Chair | The optional participant that summarizes peer responses without replacing their votes. | Synthesis Chair | Judge, host, lead reviewer |
 | Transcript | The Markdown, JSON, or HTML record of one council run. | Transcript, HTML Transcript | Report, log, dashboard |

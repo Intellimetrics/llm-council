@@ -38,16 +38,8 @@ llm-council run --current codex --mode review --diff "Review this change"
 # Run as MCP server over stdio (what `.mcp.json` invokes)
 llm-council mcp-server
 
-# Eval harness (v0.8+)
-llm-council eval run --mode review --out scorecard.json
-llm-council eval run --mode review-with-tools --compare-against scorecard.json
-
-# Outcome tracking (v0.8+)
-llm-council outcome mark <run-id-or-prefix> --decision shipped|reverted|rejected|unknown [--bug-found yes|no] [--winning-peer X] [--note "..."]
-llm-council outcome list
-
-# Per-peer reliability counters from outcomes (v0.8+)
-llm-council stats --reliability [--peer claude]
+# Aggregate stats over persisted transcripts (incl. per-peer quota telemetry)
+llm-council stats
 ```
 
 CI (`.github/workflows/test.yml`) runs `pytest -q` on Python 3.11 and 3.12.
@@ -81,10 +73,10 @@ Key modules:
 - `defaults.py` — built-in `DEFAULT_CONFIG`. Project YAML is deep-merged on top
   via `config.deep_merge`. The set of legal participant types (`cli`,
   `openrouter`, `openai_compatible`, `ollama`) and built-in modes (`quick`,
-  `peer-only`, `plan`, `review`, `review-cheap`, `diverse`, `private-local`,
-  `us-only`, `deliberate`, `consensus`, `fable`, `review-with-tools`,
-  `single-llm`, `adversarial-red-team`, `test-gap-analysis`, `deep-audit`)
-  live here.
+  `peer-only`, `plan`, `review`, `private-local`, `deliberate`, `consensus`,
+  `fable`, `review-with-tools`) live here. Near-zero-use modes were removed
+  in v0.19.0 after a 518-transcript usage audit; any of them can be
+  recreated per-project in `.llm-council.yaml` as plain mode entries.
 - `config.py` — config discovery (`find_config` walks up from cwd looking for
   `.llm-council.yaml` etc.), validation, the `other_cli_peers` strategy used by
   most modes, `detect_current_agent` (parent-process walk on `/proc`), and
@@ -120,23 +112,12 @@ Key modules:
   round; mutates each result's evidence list to stamp `verified` on
   `[VERIFIED:...]` entries and appends failed refs to
   `ParticipantResult.evidence_verification_failures`.
-- `outcomes.py` — `OutcomeRecord` sidecar persistence under
-  `.llm-council/outcomes/<run-id>.json`. Read via `read_outcome` /
-  `iter_outcomes`; powers the per-peer reliability layer in
-  `stats.aggregate_reliability`.
 - `findings.py` — `Finding`, `FindingCluster`, `FindingMatrix`,
   `extract_findings`, `cluster_findings`, `build_matrix_from_results`,
   `matrix_to_dict`. Parses the optional `FINDINGS:` envelope block and
   clusters across peers by overlapping verified line ranges + severity.
   Computed post-deliberation in `orchestrator.execute_council`; never
   fed back to peers in-round.
-- `eval/` package — `metrics.py` (`blocker_recall`,
-  `false_blocker_rate`, `citation_accuracy`, `evidence_density`,
-  `signal_to_noise_ratio`), `runner.py` (`load_fixture`, `run_suite`,
-  `to_json`, `check_promotion_gate`), bundled minimal `fixtures/`.
-  CLI: `llm-council eval run`. `check_promotion_gate` accepts optional
-  `cross_rank_correlation_floor` (v0.9.0) for future eval-driven flip
-  of `--cross-rank` defaults.
 - `query.py` (v0.9.0) — `SimilarMatch`, `search_similar()`. Jaccard
   token-overlap search over `.llm-council/runs/*.json` for prior
   council questions. Reuses `convergence.tokenize`,
@@ -226,7 +207,7 @@ Key modules:
   per-participant `timeout` stays the source of truth for the base; the
   multiplier is layered on top so users who raised the base for a stubborn
   host CLI also benefit on consensus/deliberate runs. Defaults: consensus
-  2.0x, deliberate 1.5x, diverse 1.5x; all other modes 1.0x (unchanged
+  2.0x, deliberate 1.5x; all other modes 1.0x (unchanged
   behavior). Helper: `adapters._resolve_effective_timeout`.
 - **Terse-retry on timeout.** When a peer times out
   (`is_timeout_error(error)`), the adapter performs one terse-retry with
@@ -289,58 +270,22 @@ Key modules:
   is NEVER fed back to peers during round-2 deliberation — MAD
   literature (arxiv 2402.18272) warns that in-round convergence
   forcing depresses signal-to-noise.
-- **Cross-ranking is a flag, not a mode, and ranking-round outputs
-  never enter deliberation.** `--cross-rank` (CLI) / `cross_rank: true`
-  (MCP) is composable with any existing mode. After round 1, the
-  orchestrator builds an anonymization map (`peer → "Response A|B|…"`,
-  Excel-column style for >26 peers), constructs per-peer ranking
-  prompts with OTHER peers' outputs relabeled, runs the ranking pass
-  via `run_participants`, parses `FINAL RANKING:` numbered lists, and
-  aggregates per-peer `rank_position_mean`. Surfaced top-level on the
-  transcript JSON (`cross_rank_scores`, `anonymization_map`,
-  `anonymization_map_reverse`, `cross_rank_rankings`), MCP
-  `structured_results`, and `stats.aggregate_reliability`. Ranking-
-  round results carry `is_ranking_round=True` on `ParticipantResult`,
-  are persisted and cached, and are EXCLUDED from the round-2
-  deliberation prompt builder (`transcript.final_round_results` filters
-  `is_ranking_round`) — same MAD-literature invariant as the finding
-  matrix. Promotion gate keeps an optional `cross_rank_correlation_floor`
-  slot for the eventual default flip.
-- **Acceptance-contract gate + independent-review isolation are
-  advisory-only flags.** Both default OFF, compose with any mode, and
-  change nothing when unused.
-  - `--acceptance-contract <text|path>` (CLI) /
-    `acceptance_contract` (MCP `council_run`): when non-empty,
-    `context.build_prompt(acceptance_contract=...)` injects an
-    "ACCEPTANCE CONTRACT" block immediately AFTER the user-question
-    block and BEFORE "Response format:". The directive instructs peers
-    to treat a finding as a blocker (`RECOMMENDATION: no`) ONLY when it
-    violates one of the numbered criteria; everything else is a
-    non-blocking concern (cuts drive-by nitpicks). It is advisory text
-    only — no control flow, no execution. The contract text is counted
-    toward `max_prompt_chars` like the rest of `head_sections` (same
-    length guard); it's expected to be small, so there is NO separate
-    chunking path. Resolution is text-or-path via
-    `context.resolve_acceptance_contract`: a file is read only when the
-    value names an existing regular file inside cwd (or anywhere with
-    `--allow-outside-cwd`) — reusing `ensure_inside_cwd` so an
-    out-of-cwd path raises rather than being reinterpreted as literal
-    text; an arbitrary sentence (no matching file) is treated as the
-    literal contract.
-  - `--independent-review` (CLI) / `independent_review` (MCP boolean),
-    resolved flag > per-mode `modes.<name>.independent_review` >
-    `defaults.independent_review` (validated as booleans in
-    `config.validate_config`). For continuation runs only: when ON AND a
-    `continuation_id` produced a `prior_context`, that `prior_context`
-    is set to `None` so the "independent" round is NOT anchored to the
-    prior council's per-peer labels/rationales. Because suppression is a
-    pre-run decision (before `execute_council`), it is recorded as
-    `metadata["prior_context_suppressed_for_independence"] = True`
-    (only when suppression actually occurred) rather than a mid-run
-    progress event; the CLI also prints a one-line stderr note and MCP
-    mirrors the flag top-level in the response. OFF, or no prior_context
-    to suppress, sets nothing and changes nothing — `prior_context`
-    flows exactly as before.
+- **Independent-review isolation is an advisory-only flag.**
+  `--independent-review` (CLI) / `independent_review` (MCP boolean),
+  resolved flag > per-mode `modes.<name>.independent_review` >
+  `defaults.independent_review` (validated as booleans in
+  `config.validate_config`). Defaults OFF, composes with any mode, and
+  changes nothing when unused. For continuation runs only: when ON AND a
+  `continuation_id` produced a `prior_context`, that `prior_context`
+  is set to `None` so the "independent" round is NOT anchored to the
+  prior council's per-peer labels/rationales. Because suppression is a
+  pre-run decision (before `execute_council`), it is recorded as
+  `metadata["prior_context_suppressed_for_independence"] = True`
+  (only when suppression actually occurred) rather than a mid-run
+  progress event; the CLI also prints a one-line stderr note and MCP
+  mirrors the flag top-level in the response. OFF, or no prior_context
+  to suppress, sets nothing and changes nothing — `prior_context`
+  flows exactly as before.
 - **Tool-call voting is opt-in even within `review-with-tools`.**
   `tool_call_voting: false` by default on the `review-with-tools` mode
   (`DEFAULT_CONFIG["modes"]["review-with-tools"]` in `defaults.py`).
@@ -352,41 +297,27 @@ Key modules:
   on `ParticipantResult` (`absent` / `ok` / `malformed` / `None`)
   makes parser behavior operator-visible — serialized in transcripts
   and MCP `structured_results` (Phase 5b fix). Promotion to default
-  requires eval-harness lift on the same gate that governs
-  `review-with-tools` itself; no family-specific extraction code is
-  added until concrete CLI tool-call payloads exist to validate
-  against.
+  is a manual operator decision pending real-world signal; no
+  family-specific extraction code is added until concrete CLI
+  tool-call payloads exist to validate against.
 - **Per-mode model overrides.**
   `modes.<name>.model_overrides: {peer: model_id}` in
   `.llm-council.yaml`. Resolution order: base
   `participants.<peer>.model` → `--tier` swap → mode override
   (highest priority within a mode). Validated at config-load; honored
   in `config.select_participants`. Built-in modes ship NO overrides —
-  operators add their own once eval-harness signal supports the
+  operators add their own with real-world evidence of a per-mode
   affinity. This replaces the cut auto-routed-persona feature (PRISM
   evidence: persona prompting net-negative for knowledge/coding
   accuracy).
-- **Experimental mode promotion gate.** A mode marked
-  `experimental: true` in `DEFAULT_CONFIG["modes"]` stays experimental
-  until the eval harness shows on a canonical fixture set: ≥5pp
-  `blocker_recall` lift AND ≤15% SNR collapse vs the baseline mode.
-  `eval/runner.py:check_promotion_gate` is the computational gate;
-  flipping the flag in `defaults.py` is a manual operator decision
-  pinned to scorecard evidence. `review-with-tools` is the first mode
-  that ships under this discipline. CLI flags:
-  `--compare-against <baseline.json>`, `--promotion-recall-lift`,
-  `--promotion-snr-floor-ratio`. The `[EXPERIMENTAL]` marker is
-  surfaced in `llm-council list` (`cli.cmd_list`) and visible via MCP
-  `council_list_modes` (the raw `modes` dict carries the flag).
-- **Outcome tracking is sidecar.**
-  `.llm-council/outcomes/<run-id>.json` is persisted separately from
-  transcripts so transcript JSON shape stays immutable. Reliability
-  counters in `stats.aggregate_reliability` are mutually exclusive: a
-  peer voting `yes`/`tradeoff` on a shipped+no-bug outcome →
-  `useful_count`; voting `no` → `false_blocker_count`; no usable
-  label → neither. `verified_citation_rate` is the only counter that
-  does NOT require user outcome labels — it's mechanical from
-  `evidence_verification_failures`.
+- **Experimental mode marker.** A mode marked `experimental: true` in
+  `DEFAULT_CONFIG["modes"]` may change or be cut; promoting it to
+  non-experimental (flipping the flag in `defaults.py`) is a manual
+  operator decision based on real-world usage. `review-with-tools` is
+  the one mode currently shipping under this discipline. The
+  `[EXPERIMENTAL]` marker is surfaced in `llm-council list`
+  (`cli.cmd_list`) and visible via MCP `council_list_modes` (the raw
+  `modes` dict carries the flag).
 - **Timeout-by-prompt-size telemetry.** `stats.aggregate` buckets
   timed-out runs into `timeout_by_prompt_size` (small / medium / large /
   xlarge, char cutoffs at 4K / 20K / 60K) and tracks `timeout_recoveries`
@@ -431,7 +362,7 @@ Key modules:
   for text-mode CLI peers is *failures we caught*: `quota_incidents` (how
   many times the peer hit a quota wall) and `quota_recoveries` (how many
   of those the fallback rescued), surfaced per-peer via `llm-council
-  stats --reliability`. Hosted OpenRouter peers always report real
+  stats`. Hosted OpenRouter peers always report real
   token-level usage (the `usage` field on API responses populates
   `prompt_tokens` / `completion_tokens` / `cost_usd` on
   `ParticipantResult`).
@@ -524,38 +455,6 @@ Key modules:
   `metadata` like `degraded`), persisted in the transcript JSON via the
   whole-`metadata` serialization, and rendered as a one-line ⚠️ note in
   the markdown transcript near the quorum/degraded summary.
-- **Review-focus bundles are advisory-only, compose (not fuse), and
-  carry provenance.** Operator-authored focus bundles live at
-  `.llm-council/review-skills/<name>/SKILL.md` (frontmatter `name:` +
-  `description:`, markdown body) and are discovered by
-  `review_skills.discover_review_skills` (walks up from cwd, first
-  `.llm-council/review-skills/` wins — mirrors `config.find_config`).
-  The bundle body is **INERT PROMPT TEXT only** — it shapes WHAT peers
-  scrutinize and grants NO tool / write / exec capability; it rides on
-  top of the existing read-only invariant, never weakening it.
-  `--focus a,b` (CLI) / `focus: [...]` (MCP `council_run`) resolves via
-  `resolve_focus`, which raises `FocusNotFound` (listing available
-  names) BEFORE any subprocess launches; discovery itself is LENIENT
-  (a malformed bundle is skipped with a reason, never raised). Name
-  validation is STRICT (M12): `^[a-z0-9-]+$`, ≤ 64 chars, equal to the
-  dir name. Focus **composes additively** with any mode — it is
-  appended LAST in `context.apply_per_peer_directives` (after the
-  review-with-tools / stance / persona blocks; those are deliberately
-  NOT collapsed into bundles) via a new `focus_directive` kwarg threaded
-  through `adapters.run_participants` and rendered once in
-  `orchestrator.execute_council` (passed to round 1, the ranking pass,
-  and round-2 deliberation so it persists across rounds). Provenance
-  (M11): `metadata["applied_focus"] = [{name, sha256}]` is stamped only
-  when focus is applied (omitted otherwise), serialized wholesale into
-  the transcript JSON, rendered as a markdown summary line, and lifted
-  top-level in the `council_run` MCP response. With no `--focus`/`focus`,
-  every path behaves EXACTLY as before (the directive resolves to `""`).
-  Interaction to know (codex WU4 review): the rendered directive is part of
-  the peer prompt, and the section-coverage validator scans that combined
-  prompt — so a bundle body containing a `PART N — TITLE (REQUIRED)` header
-  WILL be enforced as a required section on every peer response. That is
-  opt-in by the author, not incidental; shipped example bundles are guarded
-  against it (`test_shipped_example_bundles_do_not_trip_required_section_validator`).
 - **Fable peer: reduce false-positive refusals, detect the silent
   Opus fallback (v0.16.0).** Claude Fable 5 runs request-side safety
   classifiers (research-bio + most cybersecurity content) that
@@ -570,8 +469,8 @@ Key modules:
     from the mode config at the CLI and MCP call sites via
     `config["modes"][mode]["safe_context"]` for `build_prompt`; inside
     `execute_council` the flag is re-derived from the same mode config —
-    like `timeout_multiplier` — so a caller can't desync the round-1 and
-    ranking-pass framings). The block states ONLY facts the tool can vouch
+    like `timeout_multiplier` — so a caller can't desync the per-round
+    framings). The block states ONLY facts the tool can vouch
     for: the review is operator-invoked, read-only, and analysis-only. It
     deliberately does NOT claim the reviewed content is the operator's own
     work or benign — the content may be an untrusted third-party patch, and
@@ -598,8 +497,8 @@ Key modules:
     retry instead of falling through to the original error, and combine
     both attempts' outputs so the original pinned-model response stays
     auditable; detection runs live per round via
-    `_detect_and_emit_substitutions` (round 1, the --cross-rank ranking
-    pass, round-2 deliberation — dedup on peer+served_by, each
+    `_detect_and_emit_substitutions` (round 1 and round-2
+    deliberation — dedup on peer+served_by, each
     `peer_model_substituted` event stamped with the round the swap actually
     happened in) plus a post-synthesis scan of the chair payload (the chair
     turn never enters `results`; a substituted chair memo gets
@@ -662,7 +561,7 @@ failure path; do not let strings drift.
 | `incomplete_response` | Response had the `RECOMMENDATION:` label but missed one or more `(REQUIRED)` sections from the prompt after one repair-retry. Prefix: `IncompleteResponse:` |
 | `untagged_evidence`  | `defaults.strict_evidence: true` AND one or more EVIDENCE bullets lacked a `[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]` tag after one repair-retry. Prefix: `UntaggedEvidence:` |
 | `quota_exhausted`    | Peer hit a known quota / rate-limit signal (`RESOURCE_EXHAUSTED`, `quota_exceeded`, `Individual quota reached`, `rate_limit_exceeded`, `insufficient_quota`, `insufficient credits`, `usage limit`, `5-hour limit`, HTTP 429 with quota-adjacent text). Detected by `adapters.is_quota_exhausted_error` over the raw error string — no prefix synthesized. Surfaced top-level in transcripts and MCP `structured_results` as `quota_throttled_peers: [{peer, family, model, message}]`; orchestrator emits a `peer_quota_throttled` progress event per peer (deduped across rounds). A peer with a non-empty `cfg.fallback_chain` walks up to three next-in-chain models before landing in quorum. On success the peer recovers (`recovered_after_quota=True`, `model_fallback_used=<id>`, appears in `quota_recoveries` not `quota_throttled_peers`). On failure the peer drops with this error kind. Skipped for the Claude family because Claude's own `--fallback-model` CLI flag handles overload natively (auto-injected by `_build_cli_command` when chain non-empty). |
-| `model_substituted`  | A CLI peer with `require_pinned_model: true` was served by a model other than its pinned `model` — e.g. Claude Fable 5 refused and the Claude Code surface silently fell back to Opus 4.8. Prefix: `ModelSubstituted:`. Only observable when `usage_from_json: true` surfaces the served model id (the `modelUsage` key with the most `outputTokens` — the answer's author); the served model must fail the lenient variant-tolerant `adapters._model_pin_satisfied` check. Terminal for the peer (ok=False, drops quorum) so a substituted model's answer is never recorded as the requested model's vote; `result.model` still reports the REAL served model, and substituted outputs are excluded from the finding matrix. Detected live per round (round 1, the --cross-rank ranking pass, round-2 deliberation) plus the synthesis-chair turn, and preserved through repair-retry merges (with combined original+retry output). Surfaced as `metadata['model_substituted_peers']: [{peer, requested, served_by, ranking_round?, synthesis?}]` (omitted when empty), lifted top-level in the MCP `council_run` payload + schema (v7), with a per-round `peer_model_substituted` progress event. Opt-in — a peer without `require_pinned_model` or without JSON usage never trips it. Known limit: attribution is by max cumulative `outputTokens`, so a mid-turn refusal fallback inside a long agentic turn can evade it. |
+| `model_substituted`  | A CLI peer with `require_pinned_model: true` was served by a model other than its pinned `model` — e.g. Claude Fable 5 refused and the Claude Code surface silently fell back to Opus 4.8. Prefix: `ModelSubstituted:`. Only observable when `usage_from_json: true` surfaces the served model id (the `modelUsage` key with the most `outputTokens` — the answer's author); the served model must fail the lenient variant-tolerant `adapters._model_pin_satisfied` check. Terminal for the peer (ok=False, drops quorum) so a substituted model's answer is never recorded as the requested model's vote; `result.model` still reports the REAL served model, and substituted outputs are excluded from the finding matrix. Detected live per round (round 1, round-2 deliberation) plus the synthesis-chair turn, and preserved through repair-retry merges (with combined original+retry output). Surfaced as `metadata['model_substituted_peers']: [{peer, requested, served_by, synthesis?}]` (omitted when empty), lifted top-level in the MCP `council_run` payload + schema, with a per-round `peer_model_substituted` progress event. Opt-in — a peer without `require_pinned_model` or without JSON usage never trips it. Known limit: attribution is by max cumulative `outputTokens`, so a mid-turn refusal fallback inside a long agentic turn can evade it. |
 | `pinned_model_unverified` | A peer required pinned-model verification but the CLI output did not report a served model. Prefix: `PinnedModelUnverified:`. The answer is excluded from quorum rather than being attributed without evidence. |
 | `client_ineligible` | A native client is installed but durably ineligible for the configured account/tier, currently Gemini's `IneligibleTierError` with `UNSUPPORTED_CLIENT`. Doctor's opt-in native probe surfaces the compatible fallback. |
 | `unknown`            | Non-empty error that did not match any known prefix — file a dogfood note            |
@@ -750,8 +649,8 @@ swap (when set) -> `modes.<name>.model_overrides` (highest priority).
 Overrides naming a peer absent from the resolved roster are silent
 no-ops, and only the `model` field is touched (args, timeout, type,
 family, origin are untouched). Built-in modes ship without
-`model_overrides` on purpose — do NOT add vendor-affinity defaults until
-the eval harness shows real lift on the relevant fixture set.
+`model_overrides` on purpose — do NOT add vendor-affinity defaults
+without real-world evidence of a per-mode affinity.
 
 **Per-CLI model identity is not observable.** Native CLI peers
 (claude/codex/gemini/antigravity) ship `model: None` intentionally so each

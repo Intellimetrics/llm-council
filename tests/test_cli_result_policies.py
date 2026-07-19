@@ -215,12 +215,6 @@ async def test_tied_final_vote_is_stamped_unknown_before_transcript(
     transcript_calls = _patch_run_scaffolding(monkeypatch, tmp_path, config)
     execute_kwargs: dict = {}
     estimate_kwargs: dict = {}
-    focus_dir = tmp_path / ".llm-council" / "review-skills" / "security"
-    focus_dir.mkdir(parents=True)
-    (focus_dir / "SKILL.md").write_text(
-        "---\nname: security\ndescription: Security checks.\n---\nCheck authorization.",
-        encoding="utf-8",
-    )
 
     def fake_estimate(**kwargs):
         estimate_kwargs.update(kwargs)
@@ -242,9 +236,6 @@ async def test_tied_final_vote_is_stamped_unknown_before_transcript(
             str(tmp_path),
             "--mode",
             "custom",
-            "--cross-rank",
-            "--focus",
-            "security",
             "Ship it?",
         ]
     )
@@ -259,12 +250,8 @@ async def test_tied_final_vote_is_stamped_unknown_before_transcript(
     assert execute_kwargs["synthesizer_name"] == "a"
     assert estimate_kwargs["synthesize"] is True
     assert estimate_kwargs["synthesizer_name"] == "a"
-    assert estimate_kwargs["cross_rank"] is True
-    assert "Check authorization" in estimate_kwargs["focus_directive"]
     assert estimate_kwargs["prepared_participants"] == ["a", "b"]
     assert estimate_kwargs["prepared_prompt"]
-    assert "Check authorization" in estimate_kwargs["participant_prompts"]["a"]
-    assert execute_kwargs["focus"][0].name == "security"
 
 
 @pytest.mark.asyncio

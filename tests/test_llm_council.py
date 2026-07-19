@@ -1266,7 +1266,7 @@ def test_us_origin_policy_filters_non_us_additions(monkeypatch):
         "shutil.which",
         lambda name: f"/bin/{name}" if name in {"claude", "codex", "agy"} else None,
     )
-    selected = select_participants(config, "diverse", "codex", origin_policy="us")
+    selected = select_participants(config, "plan", "codex", origin_policy="us")
     assert selected == ["claude", "codex", "antigravity"]
 
 
@@ -1289,92 +1289,6 @@ def test_build_prompt_contains_read_only_rules(tmp_path: Path):
     assert "Do not edit files" in prompt
     assert "What should we do?" in prompt
 
-
-def test_build_prompt_acceptance_contract_injects_gate_block(tmp_path: Path):
-    prompt = build_prompt(
-        "Review this change",
-        mode="review",
-        cwd=tmp_path,
-        context_paths=[],
-        include_diff=False,
-        stdin_text=None,
-        acceptance_contract="1. Must not break the public API.",
-    )
-    assert "ACCEPTANCE CONTRACT" in prompt
-    # The gate-blockers-on-criteria wording must be present.
-    assert "ONLY against the numbered criteria" in prompt
-    assert "only when it violates one of these criteria" in prompt
-    assert "1. Must not break the public API." in prompt
-    # Block is positioned AFTER the user question and BEFORE Response format.
-    q_idx = prompt.index("Review this change")
-    contract_idx = prompt.index("ACCEPTANCE CONTRACT")
-    fmt_idx = prompt.index("Response format:")
-    assert q_idx < contract_idx < fmt_idx
-
-
-def test_build_prompt_without_acceptance_contract_unchanged(tmp_path: Path):
-    base = build_prompt(
-        "Review this change",
-        mode="review",
-        cwd=tmp_path,
-        context_paths=[],
-        include_diff=False,
-        stdin_text=None,
-    )
-    explicit_none = build_prompt(
-        "Review this change",
-        mode="review",
-        cwd=tmp_path,
-        context_paths=[],
-        include_diff=False,
-        stdin_text=None,
-        acceptance_contract=None,
-    )
-    assert base == explicit_none
-    assert "ACCEPTANCE CONTRACT" not in base
-    # An empty/whitespace contract is also a no-op.
-    blank = build_prompt(
-        "Review this change",
-        mode="review",
-        cwd=tmp_path,
-        context_paths=[],
-        include_diff=False,
-        stdin_text=None,
-        acceptance_contract="   ",
-    )
-    assert blank == base
-
-
-def test_resolve_acceptance_contract_text_path_and_safety(tmp_path: Path):
-    from llm_council.context import resolve_acceptance_contract
-
-    # None / blank -> None.
-    assert resolve_acceptance_contract(None, cwd=tmp_path) is None
-    assert resolve_acceptance_contract("   ", cwd=tmp_path) is None
-    # A literal sentence (no matching file) -> literal text.
-    assert (
-        resolve_acceptance_contract("1. ship safely", cwd=tmp_path)
-        == "1. ship safely"
-    )
-    # An existing in-cwd file -> file contents.
-    contract_file = tmp_path / "contract.md"
-    contract_file.write_text("1. no API break\n2. tests pass\n", encoding="utf-8")
-    assert (
-        resolve_acceptance_contract("contract.md", cwd=tmp_path)
-        == "1. no API break\n2. tests pass"
-    )
-    # A path that resolves to an existing file OUTSIDE cwd raises unless allowed.
-    outside_dir = tmp_path.parent / "outside_contract_dir"
-    outside_dir.mkdir(exist_ok=True)
-    outside_file = outside_dir / "c.md"
-    outside_file.write_text("secret", encoding="utf-8")
-    rel = Path("..") / "outside_contract_dir" / "c.md"
-    with pytest.raises(ValueError, match="outside working directory"):
-        resolve_acceptance_contract(str(rel), cwd=tmp_path)
-    assert (
-        resolve_acceptance_contract(str(rel), cwd=tmp_path, allow_outside_cwd=True)
-        == "secret"
-    )
 
 
 def test_consensus_mode_default_assigns_for_against_neutral():
@@ -1800,7 +1714,7 @@ def test_estimate_cwd_without_config_uses_defaults_not_process_cwd_config(
             "--current",
             "claude",
             "--mode",
-            "review-cheap",
+            "review",
             "--completion-tokens",
             "100",
             "check",
@@ -1808,7 +1722,7 @@ def test_estimate_cwd_without_config_uses_defaults_not_process_cwd_config(
     ) == 0
 
     output = capsys.readouterr().out
-    assert "qwen/qwen3-coder-flash" in output
+    assert "qwen/qwen3-coder-plus" in output
     assert "qwen/qwen3-coder:free" not in output
 
 
@@ -5284,7 +5198,6 @@ def test_tri_cli_setup_omits_openrouter_modes():
     config = project_config(include_openrouter=False, include_local=False)
     assert "quick" in config["modes"]
     assert "peer-only" in config["modes"]
-    assert "us-only" in config["modes"]
     assert "plan" not in config["modes"]
     assert "private-local" not in config["modes"]
 
@@ -5314,15 +5227,9 @@ def test_tri_cli_setup_loaded_config_does_not_restore_defaults(tmp_path: Path):
     assert set(config["modes"]) == {
         "quick",
         "peer-only",
-        "us-only",
         "consensus",
-        "single-llm",
-        "adversarial-red-team",
-        "test-gap-analysis",
-        "deep-audit",
-        # Experimental `review-with-tools` (v0.8 Phase E) — CLI-peers-only,
-        # so it survives tri-cli pruning. Still ships flagged
-        # `experimental: true` until the eval harness gate promotes it.
+        # Experimental `review-with-tools` is CLI-peers-only, so it
+        # survives tri-cli pruning.
         "review-with-tools",
     }
 
@@ -5392,15 +5299,12 @@ def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path, monkeypatch
     }
     # `review-with-tools` (v0.8 Phase E, experimental) routes only to CLI
     # peers, so tri-cli setup retains it alongside the other CLI-only modes.
-    # `us-only` is dropped by the `us_only_default=True` branch above.
     assert set(config["modes"]) == {
         "quick",
         "peer-only",
         "consensus",
-        "single-llm",
-        "adversarial-red-team",
-        "test-gap-analysis",
-        "deep-audit",
+        # Experimental `review-with-tools` is CLI-peers-only, so it
+        # survives tri-cli pruning.
         "review-with-tools",
     }
     assert config["defaults"]["origin_policy"] == "us"
@@ -5431,14 +5335,9 @@ def test_setup_yes_auto_selects_tri_cli_when_native_clis_exist(
     assert set(config["modes"]) == {
         "quick",
         "peer-only",
-        "us-only",
         "consensus",
-        "single-llm",
-        "adversarial-red-team",
-        "test-gap-analysis",
-        "deep-audit",
-        # `review-with-tools` (v0.8 Phase E, experimental) is CLI-only and
-        # therefore retained in tri-cli setups.
+        # Experimental `review-with-tools` is CLI-peers-only, so it
+        # survives tri-cli pruning.
         "review-with-tools",
     }
     assert "Auto preset selected: tri-cli" in capsys.readouterr().out
@@ -6177,18 +6076,6 @@ def test_transcripts_show_missing_path_exits_without_traceback(tmp_path: Path):
     with pytest.raises(SystemExit) as exc:
         cmd_transcripts(args)
     assert "Failed to read transcript" in str(exc.value)
-
-
-def test_outcome_list_rejects_nonpositive_last(tmp_path: Path):
-    from llm_council.cli import cmd_outcome
-
-    parser = build_parser()
-    args = parser.parse_args(
-        ["outcome", "list", "--cwd", str(tmp_path), "--last", "0"]
-    )
-    with pytest.raises(SystemExit) as exc:
-        cmd_outcome(args)
-    assert "--last must be a positive integer" in str(exc.value)
 
 
 def test_models_openrouter_fetch_failure_returns_1_without_traceback(monkeypatch, capsys):
@@ -7816,9 +7703,8 @@ def test_council_run_schema_advertises_continuation_id():
     assert schema["properties"]["continuation_id"]["type"] == "string"
 
 
-def test_council_run_schema_advertises_independent_and_contract():
+def test_council_run_schema_advertises_independent_review():
     schema = council_run_schema()
-    assert schema["properties"]["acceptance_contract"]["type"] == "string"
     assert schema["properties"]["independent_review"]["type"] == "boolean"
 
 
@@ -11273,11 +11159,127 @@ def test_stats_counts_quota_recoveries():
     assert by_peer["claude"]["quota_recoveries"] == 0
 
 
+# --- quota_incidents / quota_recovery_rate (relocated from the removed
+# stats.aggregate_reliability in v0.19.0 — the mechanical quota telemetry
+# is the only observable usage signal for text-mode CLI peers, so it moved
+# into stats.aggregate's per-peer output rather than dying with the rest
+# of the outcome-tracking + reliability layer). --------------------------
+
+
+def test_stats_quota_incidents_counted_from_quota_exhausted_error():
+    """A final-round result with `error_kind=quota_exhausted` must count
+    as a quota incident even though it never recovered."""
+    from llm_council.stats import aggregate
+
+    records = [
+        {
+            "mtime": 1_700_000_000,
+            "data": {
+                "mode": "quick",
+                "results": [
+                    {
+                        "name": "antigravity",
+                        "ok": False,
+                        "model": "gemini-3-flash",
+                        "output": "",
+                        "error": "Error: RESOURCE_EXHAUSTED: Quota exceeded",
+                        "error_kind": "quota_exhausted",
+                    }
+                ],
+            },
+        }
+    ]
+    result = aggregate(records)
+    row = {r["name"]: r for r in result["participants"]}["antigravity"]
+    assert row["quota_incidents"] == 1
+    assert row["quota_recoveries"] == 0
+    assert row["quota_recovery_rate"] == 0.0
+
+
+def test_stats_quota_recoveries_count_both_as_incident_and_recovery():
+    """A `recovered_after_quota=True` result counts as 1 incident AND 1
+    recovery — the call DID hit quota; the fallback rescued it."""
+    from llm_council.stats import aggregate
+
+    records = [
+        {
+            "mtime": 1_700_000_000,
+            "data": {
+                "mode": "quick",
+                "results": [
+                    {
+                        "name": "codex",
+                        "ok": True,
+                        "output": "RECOMMENDATION: yes - ship",
+                        "model": "gpt-5-mini",
+                        "recovered_after_quota": True,
+                        "model_fallback_used": "gpt-5-mini",
+                    }
+                ],
+            },
+        }
+    ]
+    result = aggregate(records)
+    row = {r["name"]: r for r in result["participants"]}["codex"]
+    assert row["quota_incidents"] == 1
+    assert row["quota_recoveries"] == 1
+    assert row["quota_recovery_rate"] == 1.0
+
+
+def test_stats_quota_recovery_rate_with_mixed_outcomes():
+    """Three transcripts for the same peer: 2 recovered + 1 hard-failed
+    quota_exhausted → 3 incidents, 2 recoveries, rate == 2/3."""
+    from llm_council.stats import aggregate
+
+    def _recovered_record(mtime):
+        return {
+            "mtime": mtime,
+            "data": {
+                "mode": "quick",
+                "results": [
+                    {
+                        "name": "codex",
+                        "ok": True,
+                        "output": "RECOMMENDATION: yes - ok",
+                        "model": "gpt-5-mini",
+                        "recovered_after_quota": True,
+                    }
+                ],
+            },
+        }
+
+    records = [
+        _recovered_record(1_700_000_000),
+        _recovered_record(1_700_000_001),
+        {
+            "mtime": 1_700_000_002,
+            "data": {
+                "mode": "quick",
+                "results": [
+                    {
+                        "name": "codex",
+                        "ok": False,
+                        "output": "",
+                        "model": "gpt-5-mini",
+                        "error": "Error: rate_limit_exceeded",
+                        "error_kind": "quota_exhausted",
+                    }
+                ],
+            },
+        },
+    ]
+    result = aggregate(records)
+    row = {r["name"]: r for r in result["participants"]}["codex"]
+    assert row["quota_incidents"] == 3
+    assert row["quota_recoveries"] == 2
+    assert row["quota_recovery_rate"] == pytest.approx(2 / 3)
+
+
 def test_stats_aggregate_does_not_double_count_cross_rank(tmp_path: Path):
-    """A single-round --cross-rank transcript carries `<peer>:rank` ranking
-    results alongside the primary votes. stats.aggregate must fold their
-    cost/latency into the base peer and must NOT count them as extra runs or
-    phantom `<peer>:rank` participant rows."""
+    """Historical transcripts from the removed `--cross-rank` feature (pre
+    v0.19.0) carry `<peer>:rank` ranking results alongside the primary votes.
+    stats.aggregate must fold their cost/latency into the base peer and must
+    NOT count them as extra runs or phantom `<peer>:rank` participant rows."""
     from llm_council.stats import aggregate
 
     records = [
@@ -11634,7 +11636,6 @@ modes:
         evidence_verification_failures=["foo.py:1-3"],
         terse_retry_attempted=True,
         section_repair_attempted=True,
-        is_ranking_round=False,
         prompt_chars=42,
     )
 
@@ -11660,7 +11661,6 @@ modes:
         "evidence_verification_failures",
         "terse_retry_attempted",
         "section_repair_attempted",
-        "is_ranking_round",
     ):
         assert key in item, f"{key} missing from structured_results"
         assert key in declared, f"{key} not declared in outputSchema"

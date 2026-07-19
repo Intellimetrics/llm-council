@@ -40,15 +40,12 @@ from llm_council.context import (
     apply_per_peer_directives,
     build_image_manifest,
     build_prompt,
-    resolve_acceptance_contract,
 )
 from llm_council import display
 from llm_council.doctor import check_environment, checks_to_dict
 from llm_council.env import load_project_env, project_env_context
 from llm_council.estimate import (
-    DEFAULT_COMPLETION_TOKENS,
     IMAGE_TOKEN_HEURISTIC,
-    cross_rank_prompt_char_bounds,
     deliberation_prompt_char_bounds,
     estimate_council,
     synthesis_prompt_char_bound,
@@ -60,7 +57,7 @@ from llm_council.orchestrator import (
 )
 from llm_council import policy
 from llm_council.recommend_judge import grade_difficulty
-from llm_council.stats import aggregate_reliability, compute_stats
+from llm_council.stats import compute_stats
 from llm_council.transcript import (
     continuation_depth_limit_error,
     find_transcript_by_id,
@@ -282,44 +279,6 @@ def council_run_schema() -> dict[str, Any]:
                     "tier map keep their default model."
                 ),
             },
-            "cross_rank": {
-                "type": "boolean",
-                "default": False,
-                "description": (
-                    "Opt-in anonymized cross-ranking pass (v0.9.0, "
-                    "experimental). After round 1, each peer ranks the "
-                    "OTHER peers' responses blindly via a stable "
-                    "anonymization map. Aggregates as per-peer mean rank "
-                    "position in `cross_rank_scores`. Composes with any "
-                    "existing mode; ranking outputs are NEVER fed back "
-                    "into round-2 deliberation."
-                ),
-            },
-            "focus": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "Review-focus bundle names to compose onto the selected "
-                    "mode. Bundles live at "
-                    ".llm-council/review-skills/<name>/SKILL.md and are INERT "
-                    "prompt text only (advisory, read-only — they grant no "
-                    "tool or write capability). They shape WHAT peers "
-                    "scrutinize, compose with any mode, and persist across "
-                    "rounds. Unknown names fail the call before any peer is "
-                    "launched."
-                ),
-            },
-            "acceptance_contract": {
-                "type": "string",
-                "description": (
-                    "Acceptance criteria to anchor the review (advisory-only). "
-                    "Either literal text or a path to a file inside the working "
-                    "directory. Peers treat a finding as a blocker "
-                    "(RECOMMENDATION: no) only when it violates one of the "
-                    "numbered criteria; everything else is surfaced as a "
-                    "non-blocking concern. Composes with any mode."
-                ),
-            },
             "independent_review": {
                 "type": "boolean",
                 "description": (
@@ -337,7 +296,7 @@ def council_run_schema() -> dict[str, Any]:
     }
 
 
-COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 8  # v8 = wall time + client/pin eligibility; v7 = model substitutions
+COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 9  # v9 = cross-rank subsystem removed (also covers v0.19.0 removal of focus bundles + acceptance-contract, which dropped fields but did not add any); v8 = wall time + client/pin eligibility; v7 = model substitutions
 COUNCIL_RUN_VALID_STANCES = ("for", "against", "neutral")
 COUNCIL_RUN_VALID_ERROR_KINDS = (
     "timeout",
@@ -524,14 +483,6 @@ def council_run_output_schema() -> dict[str, Any]:
                                 "a section-repair retry was attempted."
                             ),
                         },
-                        "is_ranking_round": {
-                            "type": "boolean",
-                            "description": (
-                                "True for `--cross-rank` ranking-pass results, "
-                                "which are post-deliberation telemetry and are not "
-                                "primary votes."
-                            ),
-                        },
                         "continue_debate": {
                             "type": ["string", "null"],
                             "enum": ["yes", "no", None],
@@ -708,30 +659,6 @@ def council_run_output_schema() -> dict[str, Any]:
                     "required": ["peer", "severity", "claim"],
                 },
             },
-            "cross_rank_scores": {
-                "type": "object",
-                "description": (
-                    "v0.9.0 Feature 2 (experimental). Per-peer mean rank "
-                    "position from the opt-in anonymized cross-ranking "
-                    "pass. Keys are peer names; values are floats where "
-                    "1.0 = unanimously ranked first (lower is better). "
-                    "Omitted entirely when `--cross-rank` was not set or "
-                    "fewer than 2 peers produced labeled responses."
-                ),
-                "additionalProperties": {"type": "number"},
-            },
-            "anonymization_map": {
-                "type": "object",
-                "description": (
-                    "v0.9.0 Feature 2 (experimental). Stable map from "
-                    "peer name to anonymization label (`Response A`, "
-                    "`Response B`, ...) used by the cross-ranking pass. "
-                    "Persisted so operators reading the transcript can "
-                    "de-anonymize the rank-position scores. Omitted when "
-                    "`--cross-rank` was not set."
-                ),
-                "additionalProperties": {"type": "string"},
-            },
             "quota_throttled_peers": {
                 "type": "array",
                 "description": (
@@ -806,9 +733,8 @@ def council_run_output_schema() -> dict[str, Any]:
                     "to Opus. The peer's answer was dropped so the "
                     "substituted model is never counted as the pinned "
                     "model's vote. `served_by` is the model the CLI "
-                    "actually reported; `ranking_round: true` marks a swap "
-                    "during the --cross-rank ranking pass. Omitted entirely "
-                    "when no substitution was detected (the common case)."
+                    "actually reported. Omitted entirely when no "
+                    "substitution was detected (the common case)."
                 ),
                 "items": {
                     "type": "object",
@@ -816,28 +742,8 @@ def council_run_output_schema() -> dict[str, Any]:
                         "peer": {"type": "string"},
                         "requested": {"type": ["string", "null"]},
                         "served_by": {"type": ["string", "null"]},
-                        "ranking_round": {"type": "boolean"},
                     },
                     "required": ["peer", "served_by"],
-                },
-            },
-            "applied_focus": {
-                "type": "array",
-                "description": (
-                    "Operator-authored review-focus bundles applied to this "
-                    "run (M11 provenance). Each entry is the bundle name + "
-                    "the hex sha256 of its (inert, advisory-only) directive "
-                    "body. Bundles compose with any mode and grant no tool "
-                    "or write capability. Omitted entirely when no focus "
-                    "was applied (the common no-focus path)."
-                ),
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "sha256": {"type": "string"},
-                    },
-                    "required": ["name", "sha256"],
                 },
             },
             "metadata": {"type": "object"},
@@ -1297,12 +1203,6 @@ async def _run_council_scoped(
     if independent_review and prior_context:
         prior_context = None
         prior_context_suppressed = True
-    # Acceptance contract (advisory). Resolve <text|path>: read the file only
-    # when the value names an existing regular file inside cwd; otherwise treat
-    # it as literal contract text. A failed in-cwd path check raises.
-    acceptance_contract = resolve_acceptance_contract(
-        arguments.get("acceptance_contract"), cwd=cwd, allow_outside_cwd=False
-    )
     mode_stances = mode_cfg.get("stances")
     arg_stances = arguments.get("stances")
     if isinstance(arg_stances, dict) and arg_stances:
@@ -1345,7 +1245,6 @@ async def _run_council_scoped(
         stances=mode_stances if isinstance(mode_stances, dict) else None,
         participants=participant_cfg_for_prompt or None,
         prior_context=prior_context,
-        acceptance_contract=acceptance_contract,
         safe_context=safe_context,
         chunk_strategy=str(arguments.get("chunk_strategy") or "fail"),
         chunk_progress=chunk_events.append,
@@ -1404,21 +1303,6 @@ async def _run_council_scoped(
         min_quorum_arg = mode_cfg.get("min_quorum")
     min_quorum_value = int(min_quorum_arg) if min_quorum_arg is not None else None
 
-    # Resolve review-focus bundles before estimating so their per-peer framing
-    # is included in hard token/cost caps as well as the actual calls.
-    resolved_focus = None
-    focus_directive = ""
-    _focus_arg = arguments.get("focus")
-    if _focus_arg:
-        from llm_council import review_skills as _review_skills
-
-        _focus_names = [str(name) for name in _focus_arg]
-        try:
-            resolved_focus, _ = _review_skills.resolve_focus(_focus_names, cwd)
-        except _review_skills.FocusNotFound as exc:
-            raise ValueError(str(exc)) from exc
-        focus_directive = _review_skills.render_focus_directive(resolved_focus)
-
     tool_call_voting = bool(mode_cfg.get("tool_call_voting"))
     apply_contextual_persona_recruitment(
         participants,
@@ -1459,7 +1343,6 @@ async def _run_council_scoped(
             stance=assigned_stance,
             persona=peer_cfg.get("persona"),
             persona_prompt=peer_cfg.get("persona_prompt"),
-            focus_directive=focus_directive,
         )
     budget_prompt_chars = max(
         [len(prompt), *(len(text) for text in participant_prompts.values())]
@@ -1474,7 +1357,6 @@ async def _run_council_scoped(
             mode=mode,
             tool_call_voting=tool_call_voting,
             stances=mode_stances if isinstance(mode_stances, dict) else None,
-            focus_directive=focus_directive,
         )
         if deliberate and max_rounds > 1
         else {}
@@ -1485,19 +1367,6 @@ async def _run_council_scoped(
         else 0
         for name in participants
     }
-    cross_rank_enabled = bool(arguments.get("cross_rank"))
-    ranking_prompt_bounds = (
-        cross_rank_prompt_char_bounds(
-            participants=participants,
-            participant_cfg=participant_cfg_for_prompt,
-            question=persisted_question or prompt,
-            completion_tokens=DEFAULT_COMPLETION_TOKENS,
-            focus_directive=focus_directive,
-            safe_context=safe_context,
-        )
-        if cross_rank_enabled and len(participants) >= 2
-        else {}
-    )
     synthesis_prompt_bound = (
         synthesis_prompt_char_bound(
             participant_cfg_for_prompt.get(resolved_synthesizer, {})
@@ -1511,12 +1380,10 @@ async def _run_council_scoped(
         prompt_chars=budget_prompt_chars,
         deliberate=deliberate,
         max_rounds=max_rounds,
-        cross_rank=cross_rank_enabled,
         synthesize=synthesize,
         synthesizer_name=resolved_synthesizer,
         participant_prompt_chars=participant_prompt_char_counts,
         deliberation_prompt_chars=deliberation_prompt_bounds,
-        cross_rank_prompt_chars=ranking_prompt_bounds,
         synthesis_prompt_chars=synthesis_prompt_bound,
         image_prompt_tokens=image_prompt_tokens,
     )
@@ -1557,11 +1424,8 @@ async def _run_council_scoped(
             prepared_prompt=prompt,
             prepared_participants=participants,
             participant_prompts=participant_prompts,
-            cross_rank=cross_rank_enabled,
             synthesize=synthesize,
             synthesizer_name=resolved_synthesizer,
-            focus_directive=focus_directive,
-            cross_rank_prompt_chars=ranking_prompt_bounds,
             synthesis_prompt_chars=synthesis_prompt_bound,
             deliberation_prompt_chars=deliberation_prompt_bounds,
         )
@@ -1686,7 +1550,7 @@ async def _run_council_scoped(
     # own dict, but hold the list locally so it doesn't fall out of scope.
     _pending_config_warnings = warnings
     # Plan §5 progress semantics: `total = peers * effective_rounds + 1`
-    # (the +1 reserves headroom for synthesis or cross-rank). Clamps
+    # (the +1 reserves headroom for synthesis). Clamps
     # apply on `council_finish`. Skipped entirely when no progressToken
     # was set by the client (silent no-op fallback).
     _effective_rounds = max_rounds if deliberate else 1
@@ -1711,8 +1575,6 @@ async def _run_council_scoped(
         synthesizer_name=resolved_synthesizer,
         current=current,
         question=persisted_question,
-        cross_rank=bool(arguments.get("cross_rank")),
-        focus=resolved_focus,
     )
     if image_manifest:
         metadata["images"] = [
@@ -1814,7 +1676,6 @@ async def _run_council_scoped(
                 "section_repair_attempted": bool(
                     getattr(result, "section_repair_attempted", False)
                 ),
-                "is_ranking_round": bool(getattr(result, "is_ranking_round", False)),
                 "continue_debate": getattr(result, "continue_debate", None),
                 "evidence_verification_failures": list(
                     getattr(result, "evidence_verification_failures", None) or []
@@ -1899,11 +1760,6 @@ async def _run_council_scoped(
     metadata, model_substituted_peers = _lift(
         metadata, "model_substituted_peers", []
     )
-    # M11 provenance: lift applied review-focus bundles top-level (name +
-    # short content hash) so a calling agent sees which inert focus
-    # directives shaped the run without parsing metadata. Absent entirely
-    # when no --focus / focus was applied (default no-focus path).
-    metadata, applied_focus = _lift(metadata, "applied_focus", [])
     payload: dict[str, Any] = {
         "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
         "recommendation": recommendation,
@@ -1940,14 +1796,6 @@ async def _run_council_scoped(
         payload["missing_key_peers"] = missing_key_peers
     if model_substituted_peers:
         payload["model_substituted_peers"] = model_substituted_peers
-    if applied_focus:
-        payload["applied_focus"] = applied_focus
-    # v0.9.0 Feature 2: lift cross-rank fields to the top-level payload
-    # mirroring finding_matrix. Strip them from metadata to avoid
-    # double-serialization (same data appearing under metadata.* AND
-    # top-level keys).
-    metadata, cross_rank_scores_out = _lift(metadata, "cross_rank_scores", {})
-    metadata, anonymization_map_out = _lift(metadata, "anonymization_map", {})
     # L7 / M6: lift the compact cost-estimate echo and the soft cost-warning
     # to top-level so a calling agent sees the cost signal without parsing
     # metadata. Omit-when-absent (the common no-cap-no-warn path leaves both
@@ -1959,10 +1807,6 @@ async def _run_council_scoped(
     # (pre- and post-payload); a single assignment here keeps
     # `payload["metadata"]` in sync without per-key re-anchors.
     payload["metadata"] = metadata
-    if cross_rank_scores_out:
-        payload["cross_rank_scores"] = cross_rank_scores_out
-    if anonymization_map_out:
-        payload["anonymization_map"] = anonymization_map_out
     # L7: surface the compact cost-estimate block top-level (still present in
     # metadata too). M6: surface the soft cost-warning top-level when triggered.
     if isinstance(metadata, dict) and metadata.get("cost_estimate"):
@@ -2049,32 +1893,13 @@ def run_doctor(arguments: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _peers_to_consider_dropping(cwd: Path, config: dict[str, Any]) -> list[str]:
-    """L6 advisory: peer names whose recorded reliability suggests they be
-    reconsidered. Defensive — never raises; returns [] on any failure or
-    when there is no data. Advisory only: does NOT change participant
-    selection or the run.
-    """
-    try:
-        reliability = aggregate_reliability(
-            cwd,
-            transcripts_dir=transcript_dir_within_root(
-                cwd, config, root=_mcp_root()
-            ),
-        )
-        return policy.peers_to_consider_dropping(reliability)
-    except Exception:
-        return []
-
-
 async def _run_recommend(arguments: dict[str, Any]) -> dict[str, Any]:
     """`council_recommend` handler.
 
     Primary verdict is always the mechanical, zero-cost `policy.recommend`
-    output (M10). Two advisory enrichments layer on top — both are loaded
-    from config but neither changes the council run or participant selection:
+    output (M10). One advisory enrichment layers on top, loaded from
+    config but never changing the council run or participant selection:
 
-      - L6: `peers_to_consider_dropping` from recorded reliability.
       - M9: an optional LLM difficulty `judge` (default OFF, fail-open),
         attached as `result["judge"]` only when `defaults.recommend_judge`
         is set and the call succeeds. The mechanical verdict is NEVER
@@ -2087,8 +1912,8 @@ async def _run_recommend(arguments: dict[str, Any]) -> dict[str, Any]:
         files_touched=int(arguments.get("files_touched") or 0),
         risk=arguments.get("risk") or "medium",
     )
-    # Config is needed for both L6 and the optional M9 judge. A config-load
-    # failure must not break the always-on mechanical verdict.
+    # Config is needed for the optional M9 judge. A config-load failure
+    # must not break the always-on mechanical verdict.
     config: dict[str, Any] | None = None
     try:
         cwd = _resolve_working_directory(arguments)
@@ -2098,7 +1923,6 @@ async def _run_recommend(arguments: dict[str, Any]) -> dict[str, Any]:
         config = None
 
     if config is not None:
-        result["peers_to_consider_dropping"] = _peers_to_consider_dropping(cwd, config)
         # M9 judge: only when explicitly enabled via defaults.recommend_judge.
         defaults_cfg = config.get("defaults") or {}
         if defaults_cfg.get("recommend_judge"):
@@ -2109,8 +1933,6 @@ async def _run_recommend(arguments: dict[str, Any]) -> dict[str, Any]:
                     "rationale": judge.get("rationale"),
                     "suggested_mode": judge.get("suggested_mode"),
                 }
-    else:
-        result["peers_to_consider_dropping"] = []
     return result
 
 
@@ -2187,7 +2009,6 @@ def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
     return {
         "ok": True,
         "config_warnings": warnings,
-        "peers_to_consider_dropping": _peers_to_consider_dropping(cwd, config),
         **estimate,
     }
 

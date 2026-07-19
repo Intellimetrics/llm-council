@@ -446,4 +446,19 @@ def test_antigravity_default_is_sandboxed_without_skip_permissions():
     # restricts the terminal.
     assert args[args.index("--mode") + 1] == "plan"
     assert "--dangerously-skip-permissions" not in args
-    assert DEFAULT_CONFIG["participants"]["antigravity"]["read_only"] is True
+
+
+def test_antigravity_peer_prompt_carries_native_read_tool_hint():
+    """agy in headless --sandbox mode auto-denies shell reads; the per-family
+    directive steers it to its native file-read tool. Other families must not
+    receive the hint."""
+    from llm_council.context import (
+        ANTIGRAVITY_READ_TOOL_HINT,
+        apply_per_peer_directives,
+    )
+
+    agy = apply_per_peer_directives("Q", mode="quick", family="antigravity")
+    assert ANTIGRAVITY_READ_TOOL_HINT in agy
+    for family in ("claude", "codex", "gemini", None):
+        other = apply_per_peer_directives("Q", mode="quick", family=family)
+        assert ANTIGRAVITY_READ_TOOL_HINT not in other

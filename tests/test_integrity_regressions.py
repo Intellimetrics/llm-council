@@ -32,7 +32,6 @@ from llm_council.cache import (
     compute_key,
     write_cache,
 )
-from llm_council.context import resolve_acceptance_contract
 from llm_council.display import wants_color, wants_quiet
 from llm_council.env import project_env_context
 from llm_council.model_catalog import openrouter_cache_path
@@ -623,13 +622,6 @@ def test_preflight_failed_peer_is_not_reintroduced_during_deliberation(
         if event.get("event") == "deliberation_skip_participants"
     )
     assert skip_event["skipped"] == ["dead"]
-
-
-def test_long_literal_acceptance_contract_is_not_statted_as_a_path(
-    tmp_path: Path,
-) -> None:
-    contract = "accept when " + ("x" * 10_000)
-    assert resolve_acceptance_contract(contract, cwd=tmp_path) == contract
 
 
 def test_request_local_environment_reaches_all_runtime_consumers(

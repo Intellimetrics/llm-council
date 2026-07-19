@@ -589,23 +589,11 @@ async def execute_council(
     synthesizer_name: str | None = None,
     current: str | None = None,
     question: str | None = None,
-    cross_rank: bool = False,
-    focus: list[Any] | None = None,
 ) -> tuple[list[ParticipantResult], dict[str, Any]]:
     run_started_monotonic = time.monotonic()
     run_started_at = _utc_progress_timestamp()
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
 
-    # Operator-authored review-focus bundles (review_skills.ReviewSkill).
-    # Rendered once into an inert prompt directive appended to EVERY round
-    # (round 1, the ranking pass, round-2 deliberation) so the focus
-    # persists across rounds. When ``focus`` is None the directive is ""
-    # and behavior is unchanged. Imported lazily to avoid an import cycle.
-    focus_directive = ""
-    if focus:
-        from llm_council.review_skills import render_focus_directive
-
-        focus_directive = render_focus_directive(focus)
     convergence_thresholds = _resolve_convergence_thresholds(config, mode)
 
     # Push run-wide validation toggles from config["defaults"] into each
@@ -666,8 +654,6 @@ async def execute_council(
             )
         if kind in {"council_start", "council_finish"}:
             return ("council",)
-        if kind in {"cross_rank_start", "cross_rank_complete"}:
-            return ("cross_rank",)
         if kind in {"synthesis_start", "synthesis_finish", "synthesis_error"}:
             return ("synthesis", event.get("chair"))
         if kind in {
@@ -692,7 +678,6 @@ async def execute_council(
         kind = str(stamped.get("event") or "")
         is_finish = kind.endswith("_finish") or kind in {
             "participant_finish",
-            "cross_rank_complete",
             "synthesis_error",
         }
         phase_key = _phase_key(stamped, finish=is_finish)
@@ -823,16 +808,6 @@ async def execute_council(
         isinstance(mode_cfg_for_timeout, dict)
         and mode_cfg_for_timeout.get("tool_call_voting")
     )
-    # M-fable safe-context framing: resolved from the mode config here (like
-    # `timeout_multiplier` / `tool_call_voting` above) rather than threaded in
-    # by each caller — deriving it internally makes a caller-side desync
-    # (round-1 prompt framed, ranking prompt bare) impossible. Callers still
-    # resolve the same key themselves for `build_prompt`, which runs before
-    # this function.
-    safe_context = bool(
-        isinstance(mode_cfg_for_timeout, dict)
-        and mode_cfg_for_timeout.get("safe_context")
-    )
 
     if run_targets:
         run_results = await run_participants(
@@ -848,7 +823,6 @@ async def execute_council(
             mode_multiplier=mode_multiplier,
             mode=mode,
             tool_call_voting=tool_call_voting,
-            focus_directive=focus_directive,
         )
         verify_evidence_citations(run_results, cwd)
     else:
@@ -862,12 +836,11 @@ async def execute_council(
             name, error, model=cfg.get("model")
         )
     results = [by_name[name] for name in participants if name in by_name]
-    # `round_results` is a separate list from `results` so the v0.9.0
-    # cross-rank pass (which appends ranking-round entries to `results`
-    # via `results.extend(ranking_results)`) does NOT pollute the
-    # round-1 view used by `has_disagreement` / `build_deliberation_prompt`.
-    # Before v0.9.0 these were aliases; the cross-rank pass is the
-    # only mutation site that requires the split.
+    # `round_results` is a separate list from `results`: `round_results` is
+    # reassigned each round to hold only that round's outputs (the view
+    # `has_disagreement` / `build_deliberation_prompt` need), while `results`
+    # accumulates the full cross-round history via `results.extend(...)`
+    # in the deliberation loop below.
     round_results = list(results)
     round_number = 1
     # Track peers that hit a quota wall during this run. Accumulated across
@@ -909,9 +882,9 @@ async def execute_council(
     # Pinned-model substitutions (M-fable), mirrored on the quota pattern.
     # A `require_pinned_model` peer served by a different model (e.g. Claude
     # Fable 5 refused -> Claude Code silently fell back to Opus) drops with
-    # `error_kind=model_substituted`; accumulate those across rounds + the
-    # --cross-rank ranking pass with (peer, served_by) dedup. `served_by` is
-    # the REAL model the CLI reported.
+    # `error_kind=model_substituted`; accumulate those across rounds with
+    # (peer, served_by) dedup. `served_by` is the REAL model the CLI
+    # reported.
     model_substituted_peers: list[dict[str, Any]] = []
     substitution_seen: set[tuple[str, str | None]] = set()
 
@@ -929,8 +902,8 @@ async def execute_council(
         for r in round_outputs:
             if classify_error(r.error) != ERROR_KIND_MODEL_SUBSTITUTED:
                 continue
-            # Strip both the ":roundN" deliberation suffix and the ":rank"
-            # ranking-pass suffix back to the configured peer name.
+            # Strip the ":roundN" deliberation suffix back to the
+            # configured peer name.
             base = _base_name(r.name).split(":")[0]
             key = (base, r.model)
             if key in substitution_seen:
@@ -941,8 +914,6 @@ async def execute_council(
                 "requested": (participant_cfg.get(base, {}) or {}).get("model"),
                 "served_by": r.model,
             }
-            if getattr(r, "is_ranking_round", False):
-                entry["ranking_round"] = True
             model_substituted_peers.append(entry)
             emit({"event": "peer_model_substituted", "round": round_number, **entry})
 
@@ -959,12 +930,6 @@ async def execute_council(
         "deliberation_status": "not_requested",
         "progress_events": progress_events,
     }
-    # M11 provenance: record which focus bundles shaped this run (name +
-    # short content hash). Omitted entirely when no focus was applied.
-    if focus:
-        metadata["applied_focus"] = [
-            {"name": s.name, "sha256": s.sha256} for s in focus
-        ]
     if deliberate:
         if not initial_disagreement:
             metadata["deliberation_status"] = "skipped_no_labeled_disagreement"
@@ -1004,179 +969,6 @@ async def execute_council(
                 "abdicated_peers": _early_abdication["abdicated_peers"],
             }
         )
-
-    # v0.9.0 Feature 2 — Anonymized cross-ranking. Opt-in flag composable
-    # with any mode. After round 1, peers with usable RECOMMENDATION
-    # labels rank each other's anonymized outputs. The ranking outputs
-    # are tagged `is_ranking_round=True` and intentionally NOT fed back
-    # to round-2 deliberation (MAD literature risk — see
-    # `deliberation.build_deliberation_prompt`). Skipped when:
-    #   - the flag is off (default),
-    #   - fewer than `CROSS_RANK_MIN_PEERS` peers produced usable labels
-    #     (you cannot rank one response against itself),
-    #   - the universal-abdication short-circuit fired (no signal to rank).
-    if (
-        cross_rank
-        and not metadata.get("universal_abdication")
-    ):
-        from llm_council.context import (
-            CROSS_RANK_MIN_PEERS,
-            build_anonymization_map,
-            build_ranking_prompt,
-            compute_rank_position_means,
-            parse_final_ranking,
-        )
-
-        labeled_results = [r for r in round_results if _is_labeled_vote(r)]
-        if len(labeled_results) >= CROSS_RANK_MIN_PEERS:
-            labeled_names = [r.name for r in labeled_results]
-            anonymization_map = build_anonymization_map(labeled_names)
-            metadata["anonymization_map"] = dict(anonymization_map)
-            # Reverse map for de-anonymization: "A" -> "claude".
-            metadata["anonymization_map_reverse"] = {
-                full_label.replace("Response ", "").strip(): name
-                for name, full_label in anonymization_map.items()
-            }
-            valid_label_set = {
-                full_label.replace("Response ", "").strip()
-                for full_label in anonymization_map.values()
-            }
-            response_by_peer = {r.name: r.output for r in labeled_results}
-            ranking_question = question or prompt
-            emit(
-                {
-                    "event": "cross_rank_start",
-                    "round": round_number,
-                    "peer_count": len(labeled_names),
-                }
-            )
-
-            async def _rank_one(peer_name: str) -> ParticipantResult:
-                ranking_prompt = build_ranking_prompt(
-                    peer_name=peer_name,
-                    own_response=response_by_peer.get(peer_name, ""),
-                    other_peers={
-                        name: text
-                        for name, text in response_by_peer.items()
-                        if name != peer_name
-                    },
-                    anonymization_map=anonymization_map,
-                    question=ranking_question,
-                )
-                # Carry the operator's review focus into the ranking pass so
-                # the scrutiny lens persists across rounds. The ranking pass
-                # uses run_participant (singular) with a freshly-built prompt
-                # rather than run_participants, so we append the inert focus
-                # directive directly. No-op when focus is unset.
-                if focus_directive:
-                    ranking_prompt = ranking_prompt + "\n\n" + focus_directive
-                # Same persistence rule for the defensive-review framing: the
-                # ranking prompt quotes other peers' (possibly security-heavy)
-                # findings verbatim, making it the most refusal-prone request
-                # of the run — without the framing, a safe_context mode's
-                # ranking turn would be MORE likely to trip the pinned peer's
-                # refusal fallback than round 1 was. No-op when unset.
-                if safe_context:
-                    from llm_council.context import SAFE_CONTEXT_DIRECTIVE
-
-                    ranking_prompt = (
-                        SAFE_CONTEXT_DIRECTIVE + "\n\n" + ranking_prompt
-                    )
-                from llm_council.adapters import run_participant
-
-                # Ranking pass intentionally bypasses tool-call voting:
-                # the response shape is `FINAL RANKING:`, not a
-                # `record_recommendation` tool call. We also turn off
-                # cache writes for ranking-round results (cache_ctx
-                # mirrors `cache_ctx_deliberation`) to avoid cross-run
-                # bleed when the operator re-runs without --cross-rank.
-                cfg_for_peer = participant_cfg.get(peer_name) or {}
-                # Disable label/section/strict-evidence validation for
-                # the ranking pass: the response is intentionally a
-                # one-line FINAL RANKING with no RECOMMENDATION envelope.
-                ranking_cfg = dict(cfg_for_peer)
-                ranking_cfg["require_recommendation"] = False
-                ranking_cfg["require_sections"] = False
-                ranking_cfg["strict_evidence"] = False
-                rank_result = await run_participant(
-                    peer_name,
-                    ranking_cfg,
-                    ranking_prompt,
-                    cwd,
-                    image_manifest=None,
-                    cache_ctx=cache_ctx_deliberation,
-                    mode_multiplier=mode_multiplier,
-                    mode=mode,
-                    tool_call_voting=False,
-                )
-                return replace(
-                    rank_result,
-                    name=f"{peer_name}:rank",
-                    is_ranking_round=True,
-                )
-
-            # The ranking pass launches one run_participant (subprocess / HTTP
-            # call) per labeled peer. Cap it with the same max_concurrency the
-            # primary rounds use so a wide council doesn't fan out N unbounded
-            # subprocesses (each of which can itself walk the quota fallback
-            # chain). return_exceptions keeps a single ranking failure from
-            # aborting the whole council run — cross-rank is post-deliberation
-            # telemetry, so a peer that errors here simply casts no ranking vote.
-            rank_semaphore = asyncio.Semaphore(max(1, max_concurrency))
-
-            async def _rank_one_guarded(peer_name: str) -> ParticipantResult:
-                async with rank_semaphore:
-                    return await _rank_one(peer_name)
-
-            ranking_results_raw = await asyncio.gather(
-                *[_rank_one_guarded(name) for name in labeled_names],
-                return_exceptions=True,
-            )
-            ranking_results = [
-                r for r in ranking_results_raw if isinstance(r, ParticipantResult)
-            ]
-            for raw in ranking_results_raw:
-                if isinstance(raw, BaseException):
-                    emit(
-                        {
-                            "event": "cross_rank_peer_error",
-                            "round": round_number,
-                            "error": f"{type(raw).__name__}: {raw}",
-                        }
-                    )
-            results.extend(ranking_results)
-            _detect_and_emit_substitutions(ranking_results)
-
-            rankings_by_peer: dict[str, list[str]] = {}
-            for r in ranking_results:
-                base = r.name.split(":rank", 1)[0]
-                if not r.ok:
-                    continue
-                # Each peer's valid labels = ALL bare labels MINUS its own.
-                own_label = (
-                    anonymization_map.get(base, "")
-                    .replace("Response ", "")
-                    .strip()
-                )
-                peer_valid = {lbl for lbl in valid_label_set if lbl != own_label}
-                parsed = parse_final_ranking(r.output, peer_valid)
-                if parsed is not None:
-                    rankings_by_peer[base] = parsed
-
-            cross_rank_scores = compute_rank_position_means(
-                anonymization_map, rankings_by_peer
-            )
-            if cross_rank_scores:
-                metadata["cross_rank_scores"] = cross_rank_scores
-            metadata["cross_rank_rankings"] = rankings_by_peer
-            emit(
-                {
-                    "event": "cross_rank_complete",
-                    "round": round_number,
-                    "scores": cross_rank_scores,
-                    "ranker_count": len(rankings_by_peer),
-                }
-            )
 
     # v0.8.1 CONTINUE_DEBATE unanimity short-circuit. After round 1, if
     # every label-producing peer voted ``CONTINUE_DEBATE: no``, skip the
@@ -1290,7 +1082,6 @@ async def execute_council(
             mode_multiplier=mode_multiplier,
             mode=mode,
             tool_call_voting=tool_call_voting,
-            focus_directive=focus_directive,
         )
         verify_evidence_citations(next_results, cwd)
         prior_round_results = list(round_results)
@@ -1333,8 +1124,8 @@ async def execute_council(
         # about to exit anyway after this single deliberation round, so
         # firing here would relabel a normally-completed run as
         # `stopped_no_new_movement` without skipping anything (codex WU9
-        # review). Gating on a remaining round keeps the "deep-audit
-        # (max_rounds>=3) only" contract honest.
+        # review). Gating on a remaining round keeps the "max_rounds>=3
+        # only" contract honest.
         if early_stop_enabled and round_number < max_rounds:
             no_divergence = not any(
                 (rec.get("state") == "diverging")
@@ -1595,11 +1386,10 @@ async def execute_council(
 
     # Surface pinned-model substitutions (M-fable) top-level, mirroring
     # `quota_throttled_peers`. Entries were accumulated live per round
-    # (round 1, the --cross-rank ranking pass, round-2 deliberation) plus
-    # the synthesis-chair scan above; lift them out of the per-result error
-    # strings so the transcript JSON / MCP `structured_results` show the
-    # swap plainly. Omit the key entirely when empty so the common case
-    # leaves the schema unchanged.
+    # (round 1, round-2 deliberation) plus the synthesis-chair scan above;
+    # lift them out of the per-result error strings so the transcript JSON /
+    # MCP `structured_results` show the swap plainly. Omit the key entirely
+    # when empty so the common case leaves the schema unchanged.
     if model_substituted_peers:
         metadata["model_substituted_peers"] = model_substituted_peers
 

@@ -16,22 +16,15 @@ def _base_config() -> dict:
             }
         },
         "modes": {
-            "single-llm": {
-                "participants": ["claude"],
-                "single_llm_multiplex": True,
-            },
             "consensus": {
                 "participants": ["claude"],
             },
-            "adversarial-red-team": {
-                "participants": ["claude"],
-            }
         },
     }
 
-def test_single_llm_multiplex_generates_three_virtual_peers():
+def test_single_peer_debate_mode_generates_three_virtual_peers():
     config = _base_config()
-    selected = select_participants(config, "single-llm", current=None)
+    selected = select_participants(config, "consensus", current=None)
     
     # Assert we got the three virtual peers
     assert selected == ["claude_for", "claude_against", "claude_neutral"]
@@ -46,8 +39,8 @@ def test_single_llm_multiplex_generates_three_virtual_peers():
     assert config["participants"]["claude_against"]["stance"] == "against"
     assert config["participants"]["claude_neutral"]["stance"] == "neutral"
     
-    # Assert they are configured in modes.single-llm.stances
-    assert config["modes"]["single-llm"]["stances"] == {
+    # Assert they are configured in modes.consensus.stances
+    assert config["modes"]["consensus"]["stances"] == {
         "claude_for": "for",
         "claude_against": "against",
         "claude_neutral": "neutral",
@@ -79,14 +72,13 @@ def test_semantic_diff_filtering_ignores_lockfiles_and_assets():
     assert "uv.lock" not in filtered
     assert "image.png" not in filtered
 
-def test_adversarial_stance_prompts():
-    against_prompt = resolve_stance_prompt("against", mode="adversarial-red-team")
-    assert "ATTACKER" in against_prompt
-    assert "Red Team" in against_prompt
-    
-    for_prompt = resolve_stance_prompt("for", mode="adversarial-red-team")
-    assert "DEFENDER" in for_prompt
-    assert "Blue Team" in for_prompt
+def test_stance_prompts_are_mode_independent():
+    """Stance prose comes from DEFAULT_STANCE_PROMPTS regardless of mode."""
+    against_prompt = resolve_stance_prompt("against", mode="any-user-mode")
+    assert "Stance: AGAINST" in against_prompt
+
+    for_prompt = resolve_stance_prompt("for", mode="any-user-mode")
+    assert "Stance: FOR" in for_prompt
 
 
 def test_apply_per_peer_directives_appends_stance():

@@ -288,7 +288,7 @@ def test_estimate_separates_exact_round_one_from_deliberation_bounds_and_images(
     )
 
 
-def test_retry_safety_covers_timeout_recovery_for_ranking_and_synthesis(
+def test_retry_safety_covers_timeout_recovery_for_synthesis(
     tmp_path: Path,
 ) -> None:
     config = {
@@ -321,14 +321,13 @@ def test_retry_safety_covers_timeout_recovery_for_ranking_and_synthesis(
         "participant_prompts": {"a": "base", "b": "base"},
         "completion_tokens": 100,
         "allow_network": False,
-        "cross_rank": True,
         "synthesize": True,
         "synthesizer_name": "b",
     }
     estimate = estimate_council(**common)
 
-    # Ranking/synthesis turn off recommendation repair at runtime, but both
-    # still inherit the adapter's default terse retry on timeout.
+    # Synthesis turns off recommendation repair at runtime, but it still
+    # inherits the adapter's default terse retry on timeout.
     assert estimate["known_total_with_retry_safety_usd"] == pytest.approx(
         estimate["known_total_usd"] * 2,
         abs=1e-6,
@@ -401,7 +400,7 @@ def test_estimate_canonicalizes_legacy_mode_alias(tmp_path: Path):
     assert estimate["mode"] == "private-local"
 
 
-def test_estimate_counts_cross_rank_and_synthesis_cap_rows(tmp_path: Path):
+def test_estimate_counts_synthesis_cap_rows(tmp_path: Path):
     config = {
         "defaults": {"synthesizer": "b"},
         "participants": {
@@ -424,7 +423,7 @@ def test_estimate_counts_cross_rank_and_synthesis_cap_rows(tmp_path: Path):
     common = {
         "config": config,
         "cwd": tmp_path,
-        "question": "rank and synthesize",
+        "question": "synthesize",
         "mode": "custom",
         "current": None,
         "prepared_prompt": "base",
@@ -437,15 +436,11 @@ def test_estimate_counts_cross_rank_and_synthesis_cap_rows(tmp_path: Path):
     base = estimate_council(**common)
     expanded = estimate_council(
         **common,
-        cross_rank=True,
         synthesize=True,
         synthesizer_name="b",
     )
 
     rows = {row["name"]: row for row in expanded["rows"]}
-    assert rows["a:rank"]["phase"] == "cross_rank"
-    assert rows["a:rank"]["prompt_bound_chars"] == 900
-    assert rows["b:rank"]["phase"] == "cross_rank"
     assert rows["b:synthesis"]["phase"] == "synthesis"
     assert rows["b:synthesis"]["prompt_bound_chars"] == 60_000
     assert expanded["paid_peer_count"] == 2
@@ -738,17 +733,12 @@ async def test_orchestrator_preflight_failed_chair_is_not_reinvoked_for_synthesi
     )
 
 
-@pytest.mark.parametrize(
-    "phase_arguments",
-    [{"cross_rank": True}, {"synthesize": True}],
-    ids=["cross-rank", "synthesis"],
-)
 @pytest.mark.asyncio
 async def test_mcp_default_cost_cap_counts_dynamic_phase_bounds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    phase_arguments: dict[str, bool],
 ):
+    phase_arguments: dict[str, bool] = {"synthesize": True}
     (tmp_path / ".llm-council.yaml").write_text(
         """
 replace_defaults: true
@@ -962,49 +952,6 @@ modes:
                 "working_directory": str(tmp_path),
                 "dry_run": True,
                 "max_tokens": 1,
-            }
-        )
-    assert called is False
-
-
-@pytest.mark.asyncio
-async def test_mcp_hard_token_cap_uses_final_acceptance_contract_prompt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    (tmp_path / "contract.md").write_text("A" * 30_000, encoding="utf-8")
-    (tmp_path / ".llm-council.yaml").write_text(
-        """
-replace_defaults: true
-defaults:
-  mode: custom
-participants:
-  p:
-    type: cli
-    command: true
-    args: []
-modes:
-  custom:
-    participants: [p]
-""".lstrip(),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
-    called = False
-
-    async def fake_execute(*args, **kwargs):
-        nonlocal called
-        called = True
-        raise AssertionError("hard cap must fire before execute_council")
-
-    monkeypatch.setattr(mcp_server, "execute_council", fake_execute)
-
-    with pytest.raises(ValueError, match="exceeds max_tokens"):
-        await mcp_server.run_council(
-            {
-                "question": "review",
-                "working_directory": str(tmp_path),
-                "acceptance_contract": "contract.md",
-                "max_tokens": 4_000,
             }
         )
     assert called is False

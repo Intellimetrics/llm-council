@@ -1,9 +1,8 @@
-"""Tests for the advisory enrichments to council_recommend / council_estimate.
+"""Tests for the advisory enrichments to council_recommend.
 
 Covers:
   - M10: policy.recommend mechanical difficulty_class + suggested_mode_reason_codes
   - M9:  optional LLM difficulty judge (default OFF, fail-open)
-  - L6:  reliability-based "consider dropping" advisory
   - config: defaults.recommend_judge validation
 """
 
@@ -12,12 +11,8 @@ from pathlib import Path
 import pytest
 
 from llm_council.config import validate_config
-from llm_council.mcp_server import _run_recommend, estimate_run
-from llm_council.policy import (
-    recommend,
-    peers_to_consider_dropping,
-    should_use_council,
-)
+from llm_council.mcp_server import _run_recommend
+from llm_council.policy import recommend, should_use_council
 from llm_council.recommend_judge import grade_difficulty
 
 
@@ -281,167 +276,6 @@ participants:
     )
     assert invoked["count"] == 0
     assert "judge" not in result
-
-
-# ---------------------------------------------------------------------------
-# L6 — reliability-based "consider dropping" advisory
-# ---------------------------------------------------------------------------
-
-
-def _reliability(peers):
-    return {
-        "total_outcomes": 0,
-        "transcripts_considered": 0,
-        "filters": {"peer": None},
-        "peers": peers,
-    }
-
-
-def test_peers_to_consider_dropping_flags_bad_peer():
-    rel = _reliability(
-        [
-            {
-                "name": "noisy",
-                "useful_count": 1,
-                "false_blocker_count": 4,
-                "verified_citation_rate": 0.2,
-            },
-            {
-                "name": "healthy",
-                "useful_count": 5,
-                "false_blocker_count": 0,
-                "verified_citation_rate": 0.9,
-            },
-            {
-                "name": "no_signal",
-                "useful_count": 0,
-                "false_blocker_count": 3,
-                "verified_citation_rate": None,
-            },
-        ]
-    )
-    assert peers_to_consider_dropping(rel) == ["noisy"]
-
-
-def test_peers_to_consider_dropping_skips_high_rate():
-    # false_blocker > useful but verified rate is NOT low -> not flagged.
-    rel = _reliability(
-        [
-            {
-                "name": "x",
-                "useful_count": 0,
-                "false_blocker_count": 2,
-                "verified_citation_rate": 0.7,
-            }
-        ]
-    )
-    assert peers_to_consider_dropping(rel) == []
-
-
-def test_peers_to_consider_dropping_empty_on_no_data():
-    assert peers_to_consider_dropping(_reliability([])) == []
-    assert peers_to_consider_dropping({}) == []
-    assert peers_to_consider_dropping(None) == []
-
-
-@pytest.mark.asyncio
-async def test_council_recommend_surfaces_drop_advisory(tmp_path, monkeypatch):
-    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
-    _write_config(
-        tmp_path,
-        """
-participants:
-  or:
-    type: openrouter
-    model: some/model
-""",
-    )
-
-    def fake_rel(cwd, *, transcripts_dir=None, peer=None):
-        return _reliability(
-            [
-                {
-                    "name": "noisy",
-                    "useful_count": 0,
-                    "false_blocker_count": 3,
-                    "verified_citation_rate": 0.1,
-                }
-            ]
-        )
-
-    monkeypatch.setattr("llm_council.mcp_server.aggregate_reliability", fake_rel)
-    result = await _run_recommend(
-        {"task": "do a thing", "working_directory": str(tmp_path)}
-    )
-    assert result["peers_to_consider_dropping"] == ["noisy"]
-
-
-def test_estimate_run_surfaces_drop_advisory(tmp_path, monkeypatch):
-    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
-    _write_config(
-        tmp_path,
-        """
-participants:
-  or:
-    type: openrouter
-    model: some/model
-modes:
-  solo:
-    participants:
-    - or
-""",
-    )
-
-    def fake_rel(cwd, *, transcripts_dir=None, peer=None):
-        return _reliability(
-            [
-                {
-                    "name": "noisy",
-                    "useful_count": 0,
-                    "false_blocker_count": 3,
-                    "verified_citation_rate": 0.1,
-                }
-            ]
-        )
-
-    monkeypatch.setattr("llm_council.mcp_server.aggregate_reliability", fake_rel)
-    result = estimate_run(
-        {
-            "question": "do a thing",
-            "mode": "solo",
-            "current": "codex",
-            "working_directory": str(tmp_path),
-        }
-    )
-    assert result["ok"] is True
-    assert result["peers_to_consider_dropping"] == ["noisy"]
-
-
-def test_estimate_run_empty_drop_advisory_on_no_data(tmp_path, monkeypatch):
-    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
-    _write_config(
-        tmp_path,
-        """
-participants:
-  or:
-    type: openrouter
-    model: some/model
-modes:
-  solo:
-    participants:
-    - or
-""",
-    )
-    result = estimate_run(
-        {
-            "question": "do a thing",
-            "mode": "solo",
-            "current": "codex",
-            "working_directory": str(tmp_path),
-        }
-    )
-    assert result["ok"] is True
-    assert result["peers_to_consider_dropping"] == []
 
 
 # ---------------------------------------------------------------------------

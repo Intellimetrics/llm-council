@@ -967,8 +967,6 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
         payload["recovered_after_quota"] = True
     if result.section_repair_attempted:
         payload["section_repair_attempted"] = True
-    if getattr(result, "is_ranking_round", False):
-        payload["is_ranking_round"] = True
     if getattr(result, "tool_call_status", None) is not None:
         payload["tool_call_status"] = result.tool_call_status
     if result.prompt_chars is not None:
@@ -1011,29 +1009,6 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
     if error_kind is not None:
         payload["error_kind"] = error_kind
     return payload
-
-
-def _applied_focus_bullet(metadata: dict[str, Any]) -> list[str]:
-    """Render a one-line bullet naming applied review-focus bundles.
-
-    Lists each bundle's name + a short (8-char) sha prefix so the human
-    transcript records which inert focus directives shaped the run. Returns
-    an empty list when no focus was applied (the no-focus path).
-    """
-
-    applied = metadata.get("applied_focus")
-    if not isinstance(applied, list) or not applied:
-        return []
-    parts: list[str] = []
-    for entry in applied:
-        if not isinstance(entry, dict):
-            continue
-        name = entry.get("name") or "?"
-        sha = str(entry.get("sha256") or "")[:8]
-        parts.append(f"`{name}` ({sha})" if sha else f"`{name}`")
-    if not parts:
-        return []
-    return [f"- Applied review focus: {', '.join(parts)}"]
 
 
 def convergence_summary_lines(metadata: dict[str, Any]) -> list[str]:
@@ -1095,20 +1070,8 @@ def result_round(name: str) -> int:
 def final_round_results(results: list[ParticipantResult]) -> list[ParticipantResult]:
     if not results:
         return []
-    # v0.9.0 Feature 2: ranking-round results (`peer:rank`) are
-    # post-deliberation telemetry only; they are NOT part of the
-    # peer-vote final-round view consumed by synthesis, recommendation
-    # counts, and the headline label aggregation. Filter them out
-    # before computing the final round so a `--cross-rank` run cannot
-    # accidentally have the ranking responses double-counted as
-    # primary votes.
-    primary = [
-        r for r in results if not getattr(r, "is_ranking_round", False)
-    ]
-    if not primary:
-        return []
-    final_round = max(result_round(result.name) for result in primary)
-    return [result for result in primary if result_round(result.name) == final_round]
+    final_round = max(result_round(result.name) for result in results)
+    return [result for result in results if result_round(result.name) == final_round]
 
 
 def final_decision_label(results: list[ParticipantResult]) -> str:
@@ -1377,7 +1340,6 @@ def write_transcript(
         f"{recommendations['tradeoff']} tradeoff / {recommendations['unknown']} unknown`",
         quorum_bullet,
         *overflow_bullet,
-        *_applied_focus_bullet(metadata),
         "",
         "## Question",
         "",
@@ -1567,30 +1529,6 @@ def write_transcript(
                     lines.append(f"  - {claim}")
             lines.append("")
 
-    cross_rank_scores_md = metadata.get("cross_rank_scores")
-    anonymization_map_md = metadata.get("anonymization_map")
-    if isinstance(cross_rank_scores_md, dict) and cross_rank_scores_md:
-        lines.extend(["## Cross-Rank Scores", ""])
-        lines.append(
-            "Lower mean rank position = ranked higher by peers (1.0 = "
-            "unanimously first). Anonymization map persisted below for "
-            "de-anonymization."
-        )
-        lines.append("")
-        lines.append("| Peer | Mean Rank Position |")
-        lines.append("| --- | --- |")
-        for name, score in sorted(
-            cross_rank_scores_md.items(), key=lambda kv: kv[1]
-        ):
-            lines.append(f"| {name} | {score:.2f} |")
-        lines.append("")
-        if isinstance(anonymization_map_md, dict) and anonymization_map_md:
-            lines.append("Anonymization map:")
-            lines.append("")
-            for name, label in sorted(anonymization_map_md.items()):
-                lines.append(f"- {name} → {label}")
-            lines.append("")
-
     synthesis_md = metadata.get("synthesis")
     if (
         isinstance(synthesis_md, dict)
@@ -1633,23 +1571,15 @@ def write_transcript(
     _atomic_write_private(markdown_path, "\n".join(lines))
 
     # These keys live at the TOP level of the JSON payload for downstream
-    # consumers (eval harness, dashboards). We extract them from `metadata`
+    # consumers (dashboards, external tooling). We extract them from `metadata`
     # and remove them there to avoid double-serialization (the same dict
     # appearing under both `metadata.<key>` and `json_payload.<key>`).
-    # v0.9.0 Feature 2: cross-rank scores and the anonymization map are
-    # lifted alongside finding_matrix; all are omitted entirely when the
-    # producing pass (findings / `--cross-rank`) did not run.
+    # Omitted entirely when the producing pass (findings) did not run.
     # Shallow copy so the in-memory `metadata` mutation does not surprise
     # the caller (orchestrator continues to use its own reference after
     # `write_transcript` returns).
     metadata = dict(metadata)
-    LIFTED_KEYS = (
-        "finding_matrix",
-        "cross_rank_scores",
-        "anonymization_map",
-        "anonymization_map_reverse",
-        "cross_rank_rankings",
-    )
+    LIFTED_KEYS = ("finding_matrix",)
     lifted = {k: metadata.pop(k) for k in LIFTED_KEYS if k in metadata}
 
     json_payload: dict[str, Any] = {
@@ -1677,29 +1607,6 @@ def write_transcript(
     ):
         # Mirrors the shape used in MCP `structured_results`.
         json_payload["finding_matrix"] = finding_matrix_payload
-    cross_rank_scores_payload = lifted.get("cross_rank_scores")
-    if isinstance(cross_rank_scores_payload, dict) and cross_rank_scores_payload:
-        json_payload["cross_rank_scores"] = cross_rank_scores_payload
-    anonymization_map_payload = lifted.get("anonymization_map")
-    if (
-        isinstance(anonymization_map_payload, dict)
-        and anonymization_map_payload
-    ):
-        json_payload["anonymization_map"] = anonymization_map_payload
-    anonymization_map_reverse_payload = lifted.get("anonymization_map_reverse")
-    if (
-        isinstance(anonymization_map_reverse_payload, dict)
-        and anonymization_map_reverse_payload
-    ):
-        json_payload["anonymization_map_reverse"] = (
-            anonymization_map_reverse_payload
-        )
-    cross_rank_rankings_payload = lifted.get("cross_rank_rankings")
-    if (
-        isinstance(cross_rank_rankings_payload, dict)
-        and cross_rank_rankings_payload
-    ):
-        json_payload["cross_rank_rankings"] = cross_rank_rankings_payload
     _atomic_write_private(json_path, json.dumps(json_payload, indent=2) + "\n")
 
     # Generate and write HTML transcript

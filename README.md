@@ -5,7 +5,7 @@
 [![MCP](https://img.shields.io/badge/MCP-ready-2f855a)](docs/llm-council.md)
 [![Source read-only peers](https://img.shields.io/badge/peers-source--read--only-6b7280)](#read-only-safety)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.18.0-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.19.0-111827)](CHANGELOG.md)
 
 Your coding agent is incredibly fast, capable, and confident. 
 
@@ -54,7 +54,7 @@ graph TD
 *   **Anti-Herding Deliberation**: Round-2 deliberation asks peers to converge toward what is *correct* rather than toward agreement — no capitulating to the group, no digging in out of consistency bias — and to critique each other rather than re-defend their own prior answer (mitigating the multi-agent-debate herding failure mode).
 *   **Dissent-Preserving Synthesis** *(opt-in)*: With `--synthesize`, the Synthesis Chair attributes blockers to the peers who raised them, narrates position changes, and names genuine remaining disagreement instead of papering it over.
 *   **Cross-Vendor Independence Warning** *(opt-in)*: When every labeled vote comes from a single vendor family, the council flags it (`min_distinct_vendors`) so correlated same-vendor agreement isn't mistaken for independent corroboration.
-*   **Contract-Scoped & Independent Review** *(opt-in)*: Anchor a review on numbered acceptance criteria (`--acceptance-contract`) so only real violations block, and suppress prior-round verdicts on a continuation (`--independent-review`) so re-reviews aren't anchored to past opinions.
+*   **Independent Review** *(opt-in)*: suppress prior-round verdicts on a continuation (`--independent-review`) so re-reviews aren't anchored to past opinions.
 *   **Observable Per-CLI Usage** *(opt-in)*: `usage_from_json` reads real token counts and cost from the Claude/Codex JSON output modes — recovering usage telemetry that is otherwise invisible for native CLI peers — while preserving the read-only invocation.
 
 ---
@@ -119,8 +119,6 @@ While most interaction happens transparently via the MCP server inside your agen
 | :--- | :--- |
 | **`llm-council run`** | Run a council query. <br>`llm-council run --mode quick "Why is this test flaky?"` |
 | **`llm-council run --diff`** | Review the current git diff. <br>`llm-council run --mode review --diff "Is this migration safe to run?"` |
-| **`llm-council run --focus`** | Compose operator-authored review-focus bundles onto any mode (comma-separated). <br>`llm-council run --mode review --focus security-review,test-gaps --diff "Safe to merge?"` |
-| **`llm-council run --acceptance-contract`** | Anchor review on stated acceptance criteria (advisory). Pass literal text or a file path inside cwd; a finding blocks only when it violates a numbered criterion. <br>`llm-council run --mode review --acceptance-contract ./CRITERIA.md --diff "Does this meet the contract?"` |
 | **`llm-council run --independent-review`** | On a `--continue` run, suppress the prior council's verdicts/rationales so the round forms its opinion independently. <br>`llm-council run --mode review --continue 20260101_120000 --independent-review --diff "Re-review"` |
 | **`llm-council run --continue`** | Continue a prior run. A private-local parent stays private-local when mode is omitted; moving its context to hosted/native peers is refused unless `--allow-privacy-downgrade` is explicit. |
 | **`llm-council run --cost-warn-usd`** | Attach a non-fatal warning when the pre-flight estimate exceeds a threshold (complements, never replaces, the hard `--max-cost-usd` gate). <br>`llm-council run --mode consensus --cost-warn-usd 0.50 --diff "Worth a full debate?"` |
@@ -139,9 +137,9 @@ The `llm-council` server exposes the following tools to your developer agents:
 
 | MCP Tool Name | Description / Inputs |
 | :--- | :--- |
-| **`council_run`** | Run a council query with custom modes, context files, and optional diffs. Supports `open: true` to open the HTML transcript, `focus: ["security-review", ...]` to compose review-focus bundles, `acceptance_contract: "<text or path>"` to gate blockers on numbered criteria, `independent_review: true` to suppress prior-council context on a continuation run, and `cost_warn_usd` for a non-fatal cost heads-up. Surfaces advisory signals in the result when present (`independence_warning`, `cost_warning`, `cost_estimate`, `applied_focus`). |
+| **`council_run`** | Run a council query with custom modes, context files, and optional diffs. Supports `open: true` to open the HTML transcript, `independent_review: true` to suppress prior-council context on a continuation run, and `cost_warn_usd` for a non-fatal cost heads-up. Surfaces advisory signals in the result when present (`independence_warning`, `cost_warning`, `cost_estimate`). |
 | **`council_estimate`** | Check token sizes and estimated OpenRouter cost before launching. |
-| **`council_recommend`** | Evaluates a task, risk level, and files touched to recommend whether to consult the council. Also returns a mechanical `difficulty_class` and the matched trigger keywords (`suggested_mode_reason_codes`), an optional LLM-graded `judge` verdict when `recommend_judge` is configured, and a reliability-based `peers_to_consider_dropping` advisory drawn from your recorded outcomes. |
+| **`council_recommend`** | Evaluates a task, risk level, and files touched to recommend whether to consult the council. Also returns a mechanical `difficulty_class` and the matched trigger keywords (`suggested_mode_reason_codes`) and an optional LLM-graded `judge` verdict when `recommend_judge` is configured. |
 | **`council_doctor`** | Diagnoses connection issues, API key status, and CLI path resolution. |
 | **`council_models`** | Lists the cached OpenRouter model catalog. |
 | **`council_list_modes`** | Lists configured runtime modes and participants. |
@@ -185,12 +183,12 @@ These optional keys are **off by default** and **advisory-only** — they sharpe
 | `min_distinct_vendors` / `require_distinct_vendors` | `defaults` / per-mode | Emit an `independence_warning` when fewer than N distinct vendor families produced a labeled vote (never affects quorum or `degraded`). |
 | `cost_warn_usd` | `defaults` (or `--cost-warn-usd`) | Attach a non-fatal `cost_warning` when the pre-flight estimate exceeds the threshold; complements the hard `--max-cost-usd` gate. |
 | `recommend_judge` | `defaults` | Name a hosted peer to add an LLM difficulty grade to `council_recommend`. Fail-open: any error falls back to the mechanical heuristic. |
-| `deliberation_early_stop` | `defaults` / per-mode | In multi-round modes (e.g. `deep-audit`, `max_rounds ≥ 3`), stop deliberating early once a round shows no divergence **and** an unchanged vote tally. |
+| `deliberation_early_stop` | `defaults` / per-mode | In multi-round modes (`max_rounds ≥ 3`), stop deliberating early once a round shows no divergence **and** an unchanged vote tally. |
 | `usage_from_json` | per-peer | Invoke `claude` / `codex` in their JSON output modes to record real token usage and cost; fails soft to raw text and keeps the read-only flags. |
 
 > `litellm` pricing fallback is automatic when the optional `litellm` package is installed — it prices hosted models absent from the OpenRouter catalog. It is never a hard dependency.
 
-See [Review Focus Bundles](#review-focus-bundles) for the `--focus` / `focus:` bundle system, and `CLAUDE.md` for the full invariant notes behind each knob.
+See `CLAUDE.md` for the full invariant notes behind each knob.
 
 ---
 
@@ -202,47 +200,7 @@ Peers act strictly as advisors, not co-authors. How strongly that's enforced dif
 *   **Hosted & local models** (OpenRouter / Ollama): plain API calls with no filesystem access at all — inherently read-only.
 *   **Stdin isolation**: peers receive the codebase or diff via standard input (except `agy`, which stopped reading stdin in 1.1.1 and receives the prompt as a command-line argument instead).
 
----
-
-## Review Focus Bundles
-
-Operator-authored "review focus" bundles let you express *what* a council should scrutinize without editing source. A bundle composes onto **any** mode and is **inert prompt text only** — it shapes the review angle but grants **no tool, write, or exec capability**. It rides on top of the same read-only guarantees described above.
-
-**Layout** — drop a bundle under your project's `.llm-council/` directory (discovery walks up from cwd, first match wins, exactly like config discovery):
-
-```
-.llm-council/review-skills/<name>/SKILL.md
-```
-
-Each `SKILL.md` is YAML-ish frontmatter (`name:` + `description:`) followed by a markdown body of read-only scrutiny directives:
-
-```markdown
----
-name: security-review
-description: Read-only security scrutiny lens.
----
-Scrutinize for authz/authn gaps, injection, secrets in code, unsafe
-deserialization. Cite file:line. Do not propose edits, only flag.
-```
-
-**Usage** — name one or more bundles; they compose with the active mode and persist across deliberation rounds:
-
-```bash
-llm-council run --mode review --focus security-review,test-gaps --diff "Safe to merge?"
-```
-
-MCP equivalent: pass `"focus": ["security-review", "test-gaps"]` to `council_run`.
-
-**Validation & discovery semantics**:
-
-*   **Strict names**: `name` must match `^[a-z0-9-]+$`, be ≤ 64 chars, and equal the directory name.
-*   **Lenient discovery**: a malformed bundle is *skipped* (with a reason), never fatal — one bad bundle can't break a run. The CLI prints a one-line warning naming skipped bundles.
-*   **Fail fast on typos**: an unknown `--focus` name aborts the run with the list of available bundles **before any peer is launched**.
-*   **Provenance (M11)**: applied bundles are recorded in the transcript (`metadata.applied_focus`, markdown summary line) and surfaced top-level in the `council_run` MCP response as `applied_focus` (bundle name + content `sha256`).
-
-Ready-to-copy examples live in [`examples/review-skills/`](examples/review-skills/) (`security-review`, `test-gaps`). Copy one into your project's `.llm-council/review-skills/` and edit the body to taste — they are documentation, not auto-applied.
-
----
+--
 
 ## Manual Driver Configuration
 

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import locale
 import mimetypes
 import os
-import re as _re_cross_rank
 import subprocess
 import tempfile
 from pathlib import Path
@@ -30,7 +28,6 @@ MAX_CONTEXT_FILES = 32
 MAX_CONTEXT_PATH_CHARS = 4_096
 MAX_CONTEXT_FILE_CHARS = 120_000
 MAX_CONTEXT_TOTAL_CHARS = 480_000
-MAX_ACCEPTANCE_CONTRACT_CHARS = 120_000
 MAX_GIT_DIFF_CAPTURE_BYTES = 2_000_000
 MAX_GIT_DIFF_TOTAL_CAPTURE_BYTES = MAX_GIT_DIFF_CAPTURE_BYTES * 2
 MAX_GIT_STDERR_CAPTURE_BYTES = 64_000
@@ -54,8 +51,7 @@ GIT_DIFF_TRUNCATION_PREFIX = "[git diff output truncated after "
 # `reasoning_extraction` refusal category — the structured response format is
 # all the council consumes, so peers never need to expose raw
 # chain-of-thought. Used by `build_prompt` (round 1 / deliberation task
-# capsule) and by the orchestrator's ranking-pass prompt so the framing
-# persists across rounds.
+# capsule) so the framing persists across rounds.
 SAFE_CONTEXT_DIRECTIVE = (
     "Context and authorization: This is an operator-invoked, read-only "
     "second-opinion code review running inside a local developer tool "
@@ -162,50 +158,6 @@ def read_context_file(
         max_chars=MAX_CONTEXT_FILE_CHARS,
     )
     return rendered
-
-
-def resolve_acceptance_contract(
-    value: str | None, *, cwd: Path, allow_outside_cwd: bool = False
-) -> str | None:
-    """Resolve an acceptance-contract <text|path> value to its contract text.
-
-    Prefer file-read only when the value resolves to an existing regular file
-    (inside cwd unless ``allow_outside_cwd``); otherwise treat it as literal
-    contract text. So an arbitrary sentence is never misread as a path. A value
-    that looks like a path but fails the cwd safety check still raises (via
-    ``ensure_inside_cwd``) rather than being silently reinterpreted as text.
-    """
-
-    if value is None:
-        return None
-    stripped = value.strip()
-    if not stripped:
-        return None
-    source = Path(value)
-    if not source.is_absolute():
-        source = cwd / source
-    # Only attempt a file-read when the value resolves to an existing regular
-    # file. A multi-line contract or an arbitrary sentence won't, so it falls
-    # through to literal text below.
-    try:
-        source_is_file = source.is_file()
-    except OSError as exc:
-        # A long inline contract is text, not a path. POSIX stat(2) raises
-        # ENAMETOOLONG before ``is_file`` can return False; treating that one
-        # path-shape error as literal preserves the advertised <text|path>
-        # contract without masking permission or I/O failures for real paths.
-        if exc.errno != errno.ENAMETOOLONG:
-            raise
-        source_is_file = False
-    if source_is_file:
-        if not allow_outside_cwd:
-            ensure_inside_cwd(source, cwd)
-        text, _chars_read, _truncated = _read_text_bounded(
-            source, MAX_ACCEPTANCE_CONTRACT_CHARS
-        )
-        return text.strip() or None
-    bounded, _truncated = _truncate_text(stripped, MAX_ACCEPTANCE_CONTRACT_CHARS)
-    return bounded.strip()
 
 
 def resolve_image_path(
@@ -521,22 +473,6 @@ def resolve_stance_prompt(
         text = override.strip()
         if text:
             return text
-    if mode in ("adversarial-red-team", "deep-audit"):
-        if stance == "against":
-            return (
-                "Stance: ATTACKER (Red Team). Your sole objective is to find security vulnerabilities, "
-                "logic flaws, race conditions, edge-case crashes, performance regressions, or test gaps "
-                "in the proposed changes. Do not be agreeable. Act as a critical adversary trying to "
-                "break the code. You MUST emit `RECOMMENDATION: no` if you find any potential issues, "
-                "or `RECOMMENDATION: tradeoff` if the risks are present but manageable."
-            )
-        elif stance == "for":
-            return (
-                "Stance: DEFENDER (Blue Team). Your objective is to defend the implementation. Explain "
-                "why the changes are robust, how they handle edge cases, and why the proposed approach "
-                "is correct and safe. However, do not blindly defend if there is a critical exploit "
-                "or safety issue — invariants always apply."
-            )
     if stance in DEFAULT_STANCE_PROMPTS:
         return DEFAULT_STANCE_PROMPTS[stance]
     raise ValueError(
@@ -617,7 +553,6 @@ def build_prompt(
     stances: dict[str, str] | None = None,
     participants: dict[str, dict[str, Any]] | None = None,
     prior_context: str | None = None,
-    acceptance_contract: str | None = None,
     safe_context: bool = False,
     chunk_strategy: str = "fail",
     chunk_progress: Callable[[dict[str, Any]], None] | None = None,
@@ -648,10 +583,7 @@ def build_prompt(
         f"Council mode: {mode}",
     ]
     # Defensive-review "safe context" framing (opt-in; the `fable` mode sets
-    # it). See SAFE_CONTEXT_DIRECTIVE for the rationale. The orchestrator
-    # reuses the same constant for the --cross-rank ranking prompt — the most
-    # refusal-prone request of the run (it quotes peers' security findings
-    # verbatim) — so the framing persists across rounds like focus directives.
+    # it). See SAFE_CONTEXT_DIRECTIVE for the rationale.
     if safe_context:
         head_sections.append(SAFE_CONTEXT_DIRECTIVE)
     if prior_context:
@@ -663,29 +595,6 @@ def build_prompt(
             question.strip(),
         ]
     )
-    # Acceptance-contract gate (advisory-only). When present, peers review
-    # the change ONLY against the numbered criteria below: a finding blocks
-    # (RECOMMENDATION: no) only when it violates a criterion; everything else
-    # is surfaced as a non-blocking concern. Counted toward max_prompt_chars
-    # like the rest of head_sections (same length guard); kept small by
-    # design, so no separate chunking path. Placed after the user question
-    # and before the response-format block.
-    if acceptance_contract and acceptance_contract.strip():
-        contract_text, _contract_truncated = _truncate_text(
-            acceptance_contract.strip(), MAX_ACCEPTANCE_CONTRACT_CHARS
-        )
-        head_sections.extend(
-            [
-                "",
-                "ACCEPTANCE CONTRACT — Review the change ONLY against the "
-                "numbered criteria below. Treat a finding as a blocker (and "
-                "vote `RECOMMENDATION: no`) only when it violates one of these "
-                "criteria; surface anything else as a non-blocking concern or "
-                "suggestion, not a blocker.",
-                "Criteria:",
-                contract_text,
-            ]
-        )
     head_sections.extend(
         [
             "",
@@ -714,18 +623,6 @@ def build_prompt(
             "without `BLOCKERS:` is treated as abdication and dropped from quorum.",
         ]
     )
-
-    if mode == "test-gap-analysis":
-        head_sections.extend(
-            [
-                "",
-                "TEST GAP ANALYSIS INSTRUCTION:",
-                "Analyze the proposed changes and identify any missing test cases or gaps in test coverage.",
-                "If logic is modified but no tests are added or updated, you should point this out.",
-                "If the code change lacks tests, you MUST vote `RECOMMENDATION: no` or `RECOMMENDATION: tradeoff`",
-                "and list the missing tests under the `TESTS_TO_RUN:` section.",
-            ]
-        )
 
     # Surface REQUIRED section markers found in the question body so peers
     # know up-front that section coverage will be enforced. The validator
@@ -966,6 +863,14 @@ def build_prompt(
 # tool-mode run via `--include`.
 _TOOL_CAPABLE_CLI_FAMILIES = frozenset({"claude", "codex", "gemini"})
 
+# Steers agy toward its native file-read tool: in headless --sandbox print
+# mode a shell `cat` is auto-denied, silently costing the peer its file
+# access (empty or degraded response instead of a read).
+ANTIGRAVITY_READ_TOOL_HINT = (
+    "When you need to open files, use your built-in file reading tool, not "
+    "terminal commands; terminal commands are restricted in this sandbox."
+)
+
 REVIEW_WITH_TOOLS_DIRECTIVE = (
     "You have file-read, grep, and glob tools available via your CLI "
     "sandbox. Use them when the diff alone is insufficient to verify a "
@@ -1013,24 +918,19 @@ def apply_per_peer_directives(
     stance: str | None = None,
     persona: str | None = None,
     persona_prompt: str | None = None,
-    focus_directive: str | None = None,
 ) -> str:
     """Append per-peer prompt directives based on mode + peer family + stance + persona.
 
     Returns the prompt unchanged when no directive applies. Backward-compatible
     by design.
-
-    ``focus_directive`` is the optional, operator-authored "review focus"
-    block (see ``review_skills.render_focus_directive``). It is INERT PROMPT
-    TEXT only — it shapes WHAT peers scrutinize and grants no tool or
-    write/exec capability. It composes additively with (does not replace)
-    every existing mode/stance/persona block and is appended LAST.
-
-    # TODO(focus): existing mode-specific branches (review-with-tools /
-    # stance / persona / the test-gap-analysis mode prose) could later
-    # migrate to bundles; leave them wired today to avoid regressing voting.
     """
     result = prompt
+    if family == "antigravity":
+        # agy in headless --sandbox mode sometimes reaches for a shell `cat`
+        # to read files, which the sandbox + headless print mode auto-deny
+        # (observed live on agy 1.1.4). Its native file-read tool works fine
+        # under --mode plan; steer it there.
+        result = result + "\n\n" + ANTIGRAVITY_READ_TOOL_HINT
     if mode == "review-with-tools" and family in _TOOL_CAPABLE_CLI_FAMILIES:
         result = result + "\n\n" + REVIEW_WITH_TOOLS_DIRECTIVE
         if tool_call_voting:
@@ -1054,272 +954,4 @@ def apply_per_peer_directives(
             f"{persona_prompt}\n"
         )
 
-    # Operator-authored review focus, appended AFTER the existing
-    # review-with-tools / stance / persona blocks so it composes with them.
-    if focus_directive:
-        result = result + "\n\n" + focus_directive
     return result
-
-
-# --- v0.9.0 Feature 2: Anonymized cross-ranking helpers --------------------
-#
-# Opt-in `--cross-rank` flag (composable with ANY existing mode) runs an
-# extra stage between round 1 and the optional deliberation. Each peer
-# receives the OTHER peers' round-1 responses relabeled per a stable
-# anonymization map ("Response A" / "Response B" / ...) and is asked to
-# emit a `FINAL RANKING:` line ordering the labels from best to worst.
-#
-# Critical MAD-literature constraint (council risk #2): the ranking-round
-# outputs MUST NOT leak into round-2 deliberation. Each ranking-round
-# `ParticipantResult` is tagged `is_ranking_round=True`; the round-2
-# deliberation builder filters those out. We DO NOT feed ranking
-# results back to peers in-round — they are post-deliberation telemetry
-# only, mirroring how the v0.8 finding-matrix is handled.
-
-CROSS_RANK_MIN_PEERS = 2
-
-
-def build_anonymization_map(peer_names: list[str]) -> dict[str, str]:
-    """Build a stable name -> "Response A|B|C|..." map.
-
-    Sort the peer names alphabetically before assigning letters so the
-    map is deterministic across runs; persisting it into transcript
-    metadata makes the ranking replayable / de-anonymizable by the
-    operator. Labels go A, B, ..., Z, AA, AB, ... (zero peers returns
-    `{}`; the orchestrator guard prevents the >26-peer case from
-    arising in practice but the helper degrades gracefully).
-    """
-    sorted_names = sorted({n for n in peer_names if isinstance(n, str) and n})
-    out: dict[str, str] = {}
-    for idx, name in enumerate(sorted_names):
-        out[name] = f"Response {_anonymization_label(idx)}"
-    return out
-
-
-def _anonymization_label(idx: int) -> str:
-    # 0 -> A, 1 -> B, ..., 25 -> Z, 26 -> AA, ... (excel-column style).
-    out = ""
-    n = idx
-    while True:
-        out = chr(ord("A") + (n % 26)) + out
-        n = n // 26 - 1
-        if n < 0:
-            break
-    return out
-
-
-def build_ranking_prompt(
-    peer_name: str,
-    own_response: str,
-    other_peers: dict[str, str],
-    anonymization_map: dict[str, str],
-    question: str,
-) -> str:
-    """Build the stage-2 ranking prompt sent to `peer_name`.
-
-    Shows each OTHER peer's round-1 output relabeled per the
-    `anonymization_map` (the peer's own response is excluded — no
-    self-rank). Asks for a single `FINAL RANKING:` line followed by
-    labels from best to worst. `own_response` is currently unused
-    (peers do not self-rank) but accepted for API symmetry so future
-    variants can inject the peer's prior position for context if
-    needed.
-
-    The prompt is intentionally terse: ranking is a small structural
-    task, not a re-review. Long preambles risk the peer re-arguing the
-    underlying question instead of ranking. We also explicitly forbid
-    chain-of-thought spillage into the response body — only the
-    `FINAL RANKING:` line is needed.
-    """
-    del own_response  # reserved for future variants; see docstring.
-    if not other_peers:
-        # Defensive: orchestrator already gates on `>= 2 labeled peers`,
-        # but be permissive at the helper boundary.
-        other_peers = {}
-
-    lines: list[str] = [
-        "You are participating in a council ranking pass.",
-        "",
-        "The original question was:",
-        question.strip() if isinstance(question, str) else "",
-        "",
-        "Below are the other council members' anonymized responses.",
-        "Read each one, then emit a single `FINAL RANKING:` line ranking",
-        "them from best (most accurate and insightful) to worst.",
-        "",
-    ]
-    for original_name, label in sorted(
-        anonymization_map.items(), key=lambda kv: kv[1]
-    ):
-        if original_name == peer_name:
-            continue
-        body = other_peers.get(original_name, "")
-        lines.append(f"{label}:")
-        lines.append("```")
-        lines.append(body.strip() or "(empty response)")
-        lines.append("```")
-        lines.append("")
-    lines.extend(
-        [
-            "Respond with exactly one line in this format (no preamble,",
-            "no analysis, no closing remarks):",
-            "",
-            "FINAL RANKING: <best> <next> ... <worst>",
-            "",
-            "Example: `FINAL RANKING: B A C` (best is B, worst is C).",
-            "Use only the response letters (the part after `Response `).",
-            "Keep your reply short — a single line is sufficient.",
-        ]
-    )
-    return "\n".join(lines)
-
-
-_FINAL_RANKING_LINE_RE = _re_cross_rank.compile(
-    r"(?im)^[ \t]*[*_]*[ \t]*final\s+ranking[*_]*[ \t]*:[ \t]*(.+?)[ \t]*$"
-)
-# Inline / colon variants — captures "FINAL RANKING: B A C" or "FINAL RANKING: B, A, C"
-_FINAL_RANKING_BLOCK_HEAD_RE = _re_cross_rank.compile(
-    r"(?im)^[ \t]*[*_]*[ \t]*final\s+ranking[*_]*[ \t]*:[ \t]*$"
-)
-_NUMBERED_TOKEN_RE = _re_cross_rank.compile(
-    r"^\s*(?:\d+[\.\)]\s*)?\*?\*?([A-Za-z]{1,4})\*?\*?\s*$"
-)
-
-
-def parse_final_ranking(
-    output: str, valid_labels: set[str]
-) -> list[str] | None:
-    """Parse a `FINAL RANKING:` line from a peer's stage-2 output.
-
-    Accepts (tolerant of markdown bold + bullets + commas + numbered):
-    - ``FINAL RANKING: B A C``
-    - ``FINAL RANKING: B, A, C``
-    - ``**FINAL RANKING:** B A C``
-    - ``FINAL RANKING:\n1. B\n2. A\n3. C``
-
-    `valid_labels` is the set of bare letter labels ("A", "B", ...)
-    derived from the anonymization map MINUS the responding peer's
-    own label (the ranking prompt asks for n-1 entries). Returns the
-    ordered list of labels (best first) or ``None`` when:
-    - No `FINAL RANKING:` line is found, or
-    - Extracted tokens contain duplicates, OR
-    - Extracted tokens are not a permutation/subset of `valid_labels`
-    """
-    if not isinstance(output, str) or not output.strip():
-        return None
-    if not valid_labels:
-        return None
-
-    candidate_tokens: list[str] = []
-    text = output
-
-    inline_match = _FINAL_RANKING_LINE_RE.search(text)
-    if inline_match:
-        payload = inline_match.group(1)
-        # Strip trailing markdown / punctuation noise.
-        payload = payload.strip().strip("*_`")
-        candidate_tokens = _split_ranking_tokens(payload)
-
-    if not candidate_tokens:
-        # Try the numbered-block form: "FINAL RANKING:\n1. B\n2. A\n3. C"
-        head = _FINAL_RANKING_BLOCK_HEAD_RE.search(text)
-        if head is not None:
-            tail = text[head.end():].splitlines()
-            for raw_line in tail:
-                stripped = raw_line.strip()
-                if not stripped:
-                    if candidate_tokens:
-                        break
-                    continue
-                m = _NUMBERED_TOKEN_RE.match(stripped)
-                if not m:
-                    if candidate_tokens:
-                        break
-                    continue
-                candidate_tokens.append(m.group(1).upper())
-
-    if not candidate_tokens:
-        return None
-
-    # Reject duplicates — a coherent ranking has no repeats.
-    if len(set(candidate_tokens)) != len(candidate_tokens):
-        return None
-    # Subset/permutation check: every emitted token must be in
-    # valid_labels. Missing entries are NOT auto-filled — we surface
-    # the partial-rank decision up to the caller.
-    upper_valid = {label.upper() for label in valid_labels}
-    if not set(candidate_tokens).issubset(upper_valid):
-        return None
-    return candidate_tokens
-
-
-def _split_ranking_tokens(payload: str) -> list[str]:
-    """Tokenize a `FINAL RANKING:` payload tolerantly.
-
-    Accepts space-separated, comma-separated, ``>`` / ``→`` separated,
-    or numbered (``1. B  2. A``) forms. Returns uppercase labels with
-    markdown noise stripped.
-    """
-    # Normalize separators to whitespace.
-    normalized = payload
-    for sep in (",", "→", "->", "->", ">", ";"):
-        normalized = normalized.replace(sep, " ")
-    raw_parts = [p for p in normalized.split() if p]
-    out: list[str] = []
-    for part in raw_parts:
-        # Strip leading numbering ("1.", "2)") and markdown noise.
-        stripped = part.strip().lstrip("0123456789.()").strip()
-        stripped = stripped.strip("*_`").strip()
-        if not stripped:
-            continue
-        # A valid ranking token is 1-4 ASCII letters.
-        if not stripped.isalpha() or len(stripped) > 4:
-            return []
-        out.append(stripped.upper())
-    return out
-
-
-def compute_rank_position_means(
-    anonymization_map: dict[str, str],
-    rankings_by_peer: dict[str, list[str]],
-) -> dict[str, float]:
-    """Aggregate per-peer mean rank position from individual rankings.
-
-    `rankings_by_peer[name]` is the ordered list of labels returned by
-    that peer (best first). Position 1 = best. Each peer's score is
-    the average rank position assigned to them across all OTHER peers'
-    rankings. Lower is better (1.0 = unanimously ranked first).
-
-    Returns `{peer_name: mean_position}` for every peer the anonymization
-    map names that received at least one ranking from another peer. Peers
-    that received zero rankings (every other peer failed to emit a parsable
-    `FINAL RANKING:` line) are omitted — they have no signal to score.
-    """
-    # Build the reverse map ("Response A" -> "claude") and the bare-label
-    # lookup ("A" -> "claude") used to translate token sequences back.
-    bare_to_name: dict[str, str] = {}
-    for name, full_label in anonymization_map.items():
-        bare = full_label.replace("Response ", "").strip()
-        if bare:
-            bare_to_name[bare.upper()] = name
-
-    accumulators: dict[str, list[int]] = {name: [] for name in anonymization_map}
-    for ranker, ordered_labels in rankings_by_peer.items():
-        if not isinstance(ordered_labels, list):
-            continue
-        for position, label in enumerate(ordered_labels, start=1):
-            target_name = bare_to_name.get(str(label).upper())
-            if target_name is None:
-                continue
-            if target_name == ranker:
-                # Self-rank should not happen (prompt excludes own
-                # response), but guard against malformed peer output.
-                continue
-            accumulators[target_name].append(position)
-
-    means: dict[str, float] = {}
-    for name, positions in accumulators.items():
-        if not positions:
-            continue
-        means[name] = round(sum(positions) / len(positions), 4)
-    return means

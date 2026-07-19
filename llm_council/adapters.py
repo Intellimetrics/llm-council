@@ -248,17 +248,6 @@ class ParticipantResult:
     # silently masking parser failures as "fallback succeeded" would hide
     # parser bugs. Surface this in stats so eval can audit.
     tool_call_status: str | None = None
-    # v0.9.0 Feature 2 — Anonymized cross-ranking flag. True when this
-    # ParticipantResult was produced by the stage-2 ranking pass (peer
-    # was asked to rank the OTHER peers' round-1 outputs). False for
-    # the primary round-1 / round-2 deliberation responses. The
-    # `deliberation.build_deliberation_prompt` builder filters these
-    # out so ranking-round outputs CANNOT leak into round-2
-    # deliberation prompts (MAD-literature risk #2: in-round
-    # convergence forcing depresses signal-to-noise). Persisted
-    # through the cache only when True so payloads stay tight for the
-    # overwhelming majority of runs that do not enable `--cross-rank`.
-    is_ranking_round: bool = False
     # Phase 2 quota-fallback retry. `model_fallback_used` records the
     # next-in-chain model that ultimately ran when a quota_exhausted
     # error fired and the adapter retried with a stepped-down model
@@ -317,11 +306,12 @@ _TOOL_CAPABLE_CLI_FAMILIES_ADAPTER = frozenset({"claude", "codex", "gemini", "an
 # fully-distinct parsers right now risks getting them all wrong without
 # real CLI tool-call payloads to validate against — none of the three
 # CLIs currently emit `record_recommendation` calls in dogfood
-# transcripts, and the eval harness is what gates promotion-to-default.
+# transcripts, and promotion of this feature to default-on is a manual
+# operator decision pending that real-world signal.
 # We ship a single forgiving "find `record_recommendation` token +
 # nearest balanced JSON object" parser instead. Family-specific
-# wrappers can be layered on later as the v0.9.x eval corpus surfaces
-# concrete payload shapes. Hosted/local families are explicitly
+# wrappers can be layered on later as dogfooding surfaces concrete
+# payload shapes. Hosted/local families are explicitly
 # unsupported (the council layer never gives them tool access).
 _TOOL_CALL_TOKEN = "record_recommendation"
 _VALID_VERDICTS = frozenset({"yes", "no", "tradeoff"})
@@ -511,7 +501,6 @@ def _result_from_cache_payload(
         ),
         continue_debate=payload.get("continue_debate"),
         tool_call_status=payload.get("tool_call_status"),
-        is_ranking_round=bool(payload.get("is_ranking_round", False)),
         model_fallback_used=payload.get("model_fallback_used"),
         recovered_after_quota=bool(payload.get("recovered_after_quota", False)),
     )
@@ -594,7 +583,6 @@ def _maybe_persist_cache(
         evidence_verification_failures=result.evidence_verification_failures or None,
         continue_debate=result.continue_debate,
         tool_call_status=result.tool_call_status,
-        is_ranking_round=result.is_ranking_round,
         model_fallback_used=result.model_fallback_used,
         recovered_after_quota=result.recovered_after_quota,
     )
@@ -2598,7 +2586,6 @@ async def run_participants(
     mode_multiplier: float | None = None,
     mode: str | None = None,
     tool_call_voting: bool = False,
-    focus_directive: str | None = None,
 ) -> list[ParticipantResult]:
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
@@ -2618,7 +2605,6 @@ async def run_participants(
                 stance=cfg.get("stance"),
                 persona=cfg.get("persona"),
                 persona_prompt=cfg.get("persona_prompt"),
-                focus_directive=focus_directive,
             )
             timeout = _resolve_effective_timeout(
                 cfg, mode_multiplier, prompt_chars=len(peer_prompt)

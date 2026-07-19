@@ -29,7 +29,7 @@ OPENAI_COMPATIBLE_TYPES = frozenset({"openrouter", "openai_compatible"})
 _LOOPBACK_HOSTNAMES = frozenset({"localhost"})
 _TRUSTED_PUBLIC_HOSTS = frozenset({"openrouter.ai"})
 BUILTIN_FULL_TRIAD_MODES = frozenset(
-    {"quick", "plan", "review", "diverse", "us-only", "deliberate"}
+    {"quick", "plan", "review", "deliberate"}
 )
 CONFIG_NAMES = (
     ".llm-council.yaml",
@@ -1295,17 +1295,13 @@ def select_participants(
             )
         )
 
-    # Multiplex single participant if needed
+    # Multiplex a lone participant into three virtual stanced peers so
+    # stance/debate modes still form a council with a single available model.
     mode_cfg = config.get("modes", {}).get(mode, {})
     has_stances = isinstance(mode_cfg, dict) and mode_cfg.get("stances") is not None
-    is_debate_mode = mode in ("consensus", "adversarial-red-team", "deliberate", "deep-audit")
-    force_multiplex = isinstance(mode_cfg, dict) and mode_cfg.get("single_llm_multiplex") is True
+    is_debate_mode = mode in ("consensus", "deliberate")
 
-    if mode == "single-llm" or force_multiplex:
-        if deduped:
-            deduped = [deduped[0]]
-
-    if len(deduped) == 1 and (has_stances or is_debate_mode or force_multiplex or mode == "single-llm"):
+    if len(deduped) == 1 and (has_stances or is_debate_mode):
         base_name = deduped[0]
         base_cfg = participants.get(base_name)
         if isinstance(base_cfg, dict):

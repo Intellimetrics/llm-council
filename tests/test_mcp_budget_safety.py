@@ -227,32 +227,6 @@ def test_summarize_preflight_caps_falls_back_to_known_total():
     assert unpriced == []
 
 
-def test_mcp_budget_report_counts_cross_rank_extra_round():
-    """cross_rank runs an extra ranking pass per peer; the pre-flight estimate
-    must count it (~+1 round) so a hosted run that should be blocked isn't
-    under-counted into passing."""
-    from llm_council.budget import mcp_budget_report
-
-    config = {
-        "participants": {
-            "p": {"type": "openrouter", "model": "m", "input_per_million": 1.0}
-        },
-        "defaults": {},
-    }
-    base = mcp_budget_report(
-        config=config, participants=["p"], prompt_chars=1000,
-        deliberate=False, max_rounds=1,
-    )
-    ranked = mcp_budget_report(
-        config=config, participants=["p"], prompt_chars=1000,
-        deliberate=False, max_rounds=1, cross_rank=True,
-    )
-    assert ranked["estimated_billable_prompt_chars"] == (
-        2 * base["estimated_billable_prompt_chars"]
-    )
-    assert ranked["estimated_input_cost_usd"] > base["estimated_input_cost_usd"]
-
-
 def test_mcp_budget_report_counts_synthesize_chair_call():
     """A paid-hosted synthesis chair adds one extra call to the estimate."""
     from llm_council.budget import mcp_budget_report

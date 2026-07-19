@@ -146,12 +146,10 @@ def mcp_budget_report(
     prompt_chars: int,
     deliberate: bool,
     max_rounds: int,
-    cross_rank: bool = False,
     synthesize: bool = False,
     synthesizer_name: str | None = None,
     participant_prompt_chars: Mapping[str, int] | None = None,
     deliberation_prompt_chars: Mapping[str, int] | None = None,
-    cross_rank_prompt_chars: Mapping[str, int] | None = None,
     synthesis_prompt_chars: int | None = None,
     image_prompt_tokens: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
@@ -195,19 +193,6 @@ def mcp_budget_report(
         )
         for name in participants
     }
-    # `--cross-rank` runs one additional call per labeled peer. When the MCP
-    # caller supplies conservative dynamic prompt bounds, use them directly;
-    # legacy/direct callers retain the old one-base-prompt fallback.
-    if not cross_rank:
-        cross_rank_chars: dict[str, int] = {}
-    elif cross_rank_prompt_chars is None:
-        cross_rank_chars = {name: prompt_chars for name in participants}
-    else:
-        cross_rank_chars = {
-            name: max(0, int(cross_rank_prompt_chars[name]))
-            for name in participants
-            if name in cross_rank_prompt_chars
-        }
     # `synthesize` fires at most one extra chair call; it only adds hosted
     # spend when the configured synthesizer is itself a paid-hosted peer.
     # Callers that already resolved the special ``current`` / ``neutral_peer``
@@ -237,12 +222,6 @@ def mcp_budget_report(
         billable_prompt_chars += extra_deliberation_rounds * sum(
             deliberation_chars[name] for name in paid_hosted
         )
-    if cross_rank:
-        billable_prompt_chars += sum(
-            cross_rank_chars[name]
-            for name in paid_hosted
-            if name in cross_rank_chars
-        )
     if synth_billable:
         billable_prompt_chars += synth_call_chars
     billable_image_tokens = budgeted_rounds * sum(
@@ -251,7 +230,6 @@ def mcp_budget_report(
     auxiliary_prompt_chars = [
         *base_prompt_chars.values(),
         *deliberation_chars.values(),
-        *cross_rank_chars.values(),
     ]
     if synthesize and synth_peer:
         auxiliary_prompt_chars.append(synth_call_chars)
@@ -262,7 +240,6 @@ def mcp_budget_report(
         "prompt_chars": prompt_chars,
         "max_call_prompt_chars": max_call_prompt_chars,
         "budgeted_rounds": budgeted_rounds,
-        "cross_rank": bool(cross_rank),
         "synthesize_billable": synth_billable,
         "paid_hosted_participants": paid_hosted,
         "estimated_billable_prompt_chars": billable_prompt_chars,
@@ -276,7 +253,6 @@ def mcp_budget_report(
         bool(paid_hosted)
         or deliberate
         or budgeted_rounds > 1
-        or cross_rank
         or synthesize
     )
     if (
@@ -318,20 +294,6 @@ def mcp_budget_report(
             unpriced_paid.extend(deliberation_unpriced)
             if deliberation_cost is not None:
                 cost = (cost or 0.0) + deliberation_cost
-    if cross_rank:
-        for name in paid_hosted:
-            if name not in cross_rank_chars:
-                continue
-            rank_cost, rank_unpriced = _estimate_input_cost_usd(
-                [name],
-                participant_cfg,
-                prompt_chars=cross_rank_chars[name],
-                rounds=1,
-                catalog_path=catalog_path,
-            )
-            unpriced_paid.extend(rank_unpriced)
-            if rank_cost is not None:
-                cost = (cost or 0.0) + rank_cost
     # Fold in the synthesis chair call (one extra single-round call) when it is
     # paid-hosted. Missing chair pricing is part of the same fail-closed check;
     # never silently price the base roster while omitting the chair.
@@ -392,8 +354,8 @@ def apply_preflight_cost_to_mcp_budget(
 
     ``mcp_budget_report`` can cheaply guard prompt size and known input spend
     before the richer estimator runs.  The configured MCP cost ceiling is a
-    run ceiling, though, so output tokens, outer-retry headroom, cross-rank,
-    and synthesis must all be folded in before enforcement.  This mutates the
+    run ceiling, though, so output tokens, outer-retry headroom, and
+    synthesis must all be folded in before enforcement.  This mutates the
     report so dry-run and real-run callers expose and enforce the same result.
     """
 

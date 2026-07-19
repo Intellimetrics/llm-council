@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.19.0 - 2026-07-19
+
+v0.19.0 is a usage-driven simplification release. A 518-transcript audit
+across 14 real projects showed several shipped subsystems and modes with
+zero-to-negligible real-world use; all of them are removed. Everything cut
+remains recoverable from git history, and custom per-project modes can
+recreate any removed built-in mode shape.
+
+**Removed: seven near-zero-use built-in modes**
+* `single-llm`, `adversarial-red-team`, `test-gap-analysis`, `deep-audit`
+  (0 uses each), `us-only` (1), `review-cheap` (1), and `diverse` (3 uses in
+  518 runs). Nine built-ins remain: quick, peer-only, plan, review, fable,
+  review-with-tools, private-local, deliberate, consensus. The
+  single-peer stance-multiplex machinery survives for `consensus` /
+  `deliberate` / any user-defined stance mode; the `single_llm_multiplex`
+  config key and the red-team/test-gap prompt prose are gone.
+  `--us-only-default` (setup) and `origin_policy: us` are unaffected.
+
+**Removed: cross-rank subsystem** (2 uses ever)
+* `--cross-rank` / MCP `cross_rank`, the anonymized ranking pass,
+  `FINAL RANKING` parsing, `rank_position_mean` aggregation,
+  `is_ranking_round`, and the transcript/MCP `cross_rank_*` fields.
+  Historical transcripts containing ranking rounds are still read
+  tolerantly by stats. MCP `council_run` output schema bumps to v9.
+
+**Removed: review-focus bundles and acceptance contracts** (0 uses each)
+* `--focus` / MCP `focus`, `.llm-council/review-skills/` discovery,
+  `applied_focus` provenance, `examples/review-skills/`; and
+  `--acceptance-contract` / MCP `acceptance_contract` with its prompt
+  block. `--independent-review` is KEPT. The separate Claude Code skill
+  installer (`.llm-council/skills/`) is unrelated and KEPT.
+
+**Removed: outcome tracking + reliability layer** (1 record ever)
+* `llm-council outcome mark/list`, `.llm-council/outcomes/` sidecars,
+  `stats --reliability`, `aggregate_reliability`, and the
+  `peers_to_consider_dropping` advisory in `council_recommend`. The
+  per-peer quota telemetry (`quota_incidents` / `quota_recoveries` /
+  `quota_recovery_rate`) — the only observable usage signal for
+  text-mode CLI peers — moved into plain `llm-council stats` output.
+
+**Removed: eval harness** (dogfood-only)
+* `llm-council eval run`, metrics, fixtures, scorecards, the promotion
+  gate and its CLI flags, and `stats --eval`. The `experimental: true`
+  mode marker stays; promoting an experimental mode is now an explicit
+  manual operator decision.
+
+**Also**
+* Inert per-participant `read_only:` config key removed everywhere —
+  read-only enforcement lives in each CLI's own flags, which are
+  unchanged.
+* New per-family prompt hint steers Antigravity to its native file-read
+  tool (headless `--sandbox` auto-denies its shell-`cat` fallback,
+  observed live on agy 1.1.4).
+* Internal-only names dropped from `privacy`/`safety` `__all__` exports.
+
+Full suite: 1281 passed (from 1441 — the delta is deleted feature tests),
+ruff clean, sdist build verified without the eval package-data entry.
+
 ## 0.18.0 - 2026-07-19
 
 v0.18.0 is a cruft-removal and simplification pass, plus an Antigravity

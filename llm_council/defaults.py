@@ -92,7 +92,6 @@ DEFAULT_CONFIG: dict = {
     "transcripts_dir": ".llm-council/runs",
     "defaults": {
         "mode": "quick",
-        "read_only": True,
         "synthesize": False,
         # When synthesize=True, this names the chair. No silent default —
         # `select_synthesizer` raises ValueError when this is None so the
@@ -171,7 +170,6 @@ DEFAULT_CONFIG: dict = {
             "model": None,
             "timeout": 240,
             "max_prompt_chars": 120_000,
-            "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["ANTHROPIC_API_KEY"],
             # Quota / overload fallback chain — capability-graceful step-down.
@@ -231,7 +229,6 @@ DEFAULT_CONFIG: dict = {
             # and size-scaling applies on top.
             "timeout": 360,
             "max_prompt_chars": 120_000,
-            "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["ANTHROPIC_API_KEY"],
         },
@@ -257,7 +254,6 @@ DEFAULT_CONFIG: dict = {
             "model": None,
             "timeout": 240,
             "max_prompt_chars": 120_000,
-            "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["OPENAI_API_KEY"],
             # Capability-graceful step-down: same-tier minor version back
@@ -280,7 +276,6 @@ DEFAULT_CONFIG: dict = {
             "model": None,
             "timeout": 240,
             "max_prompt_chars": 120_000,
-            "read_only": True,
             "stdin_prompt": True,
             "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
             # Within Google's tiering, Pro > Flash for capability — so
@@ -302,7 +297,6 @@ DEFAULT_CONFIG: dict = {
             "output_per_million": 0.87,
             "api_key_env": "OPENROUTER_API_KEY",
             "timeout": 180,
-            "read_only": True,
         },
         "deepseek_v4_flash": {
             "type": "openrouter",
@@ -313,7 +307,6 @@ DEFAULT_CONFIG: dict = {
             "output_per_million": 0.28,
             "api_key_env": "OPENROUTER_API_KEY",
             "timeout": 180,
-            "read_only": True,
         },
         "qwen_coder_plus": {
             "type": "openrouter",
@@ -324,7 +317,6 @@ DEFAULT_CONFIG: dict = {
             "output_per_million": 3.25,
             "api_key_env": "OPENROUTER_API_KEY",
             "timeout": 180,
-            "read_only": True,
         },
         "qwen_coder_flash": {
             "type": "openrouter",
@@ -335,7 +327,6 @@ DEFAULT_CONFIG: dict = {
             "output_per_million": 0.975,
             "api_key_env": "OPENROUTER_API_KEY",
             "timeout": 180,
-            "read_only": True,
         },
         "qwen_coder_free": {
             "type": "openrouter",
@@ -344,7 +335,6 @@ DEFAULT_CONFIG: dict = {
             "model": "qwen/qwen3-coder:free",
             "api_key_env": "OPENROUTER_API_KEY",
             "timeout": 180,
-            "read_only": True,
         },
         "glm_5_1": {
             "type": "openrouter",
@@ -355,7 +345,6 @@ DEFAULT_CONFIG: dict = {
             "output_per_million": 3.50,
             "api_key_env": "OPENROUTER_API_KEY",
             "timeout": 180,
-            "read_only": True,
         },
         "glm_4_7_flash": {
             "type": "openrouter",
@@ -366,7 +355,6 @@ DEFAULT_CONFIG: dict = {
             "output_per_million": 0.40,
             "api_key_env": "OPENROUTER_API_KEY",
             "timeout": 180,
-            "read_only": True,
         },
         "kimi_k2_6": {
             "type": "openrouter",
@@ -377,7 +365,6 @@ DEFAULT_CONFIG: dict = {
             "output_per_million": 4.655,
             "api_key_env": "OPENROUTER_API_KEY",
             "timeout": 180,
-            "read_only": True,
         },
         "local_qwen_coder": {
             "type": "ollama",
@@ -386,7 +373,6 @@ DEFAULT_CONFIG: dict = {
             "model": "qwen3-coder-next:q4_K_M",
             "base_url": "http://localhost:11434",
             "timeout": 180,
-            "read_only": True,
         },
         "antigravity": {
             "type": "cli",
@@ -421,7 +407,6 @@ DEFAULT_CONFIG: dict = {
             "model": None,
             "timeout": 240,
             "max_prompt_chars": 120_000,
-            "read_only": True,
             "stdin_prompt": False,
             "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTIGRAVITY_API_KEY"],
             # agy 1.0.x accepts --model, but its display-name ids are not
@@ -443,9 +428,9 @@ DEFAULT_CONFIG: dict = {
     #   min_quorum: int                                      — quorum floor
     #   timeout_multiplier: float                            — per-mode * base
     #   experimental: bool                                   — surfaces a
-    #       warning in list-modes / council_list_modes that the mode is
-    #       gated behind eval-harness promotion criteria and may change
-    #       or be cut. Mode still runs normally.
+    #       warning in list-modes / council_list_modes that the mode may
+    #       still change or be cut; promoting it to non-experimental is a
+    #       manual operator decision. Mode still runs normally.
     #   model_overrides: dict[peer_name, model_id]           — pin per-peer
     #       model for THIS mode only. Resolution order:
     #       participants.<peer>.model (base) -> tiers.<tier>.<peer>
@@ -453,7 +438,7 @@ DEFAULT_CONFIG: dict = {
     #       (highest priority). Override is silent: a stale entry naming
     #       a peer not in the resolved roster is a no-op. Built-in modes
     #       intentionally ship without model_overrides — users add their
-    #       own once eval-harness data supports the pin.
+    #       own once real-world usage supports the pin.
     #   description: str                                     — human note
     "modes": {
         "quick": {
@@ -506,11 +491,10 @@ DEFAULT_CONFIG: dict = {
         # gemini `--approval-mode plan`), but the standard prompt never asks
         # them to use them. This mode activates that latent autonomy.
         #
-        # Stays `experimental: true` until the eval harness shows on the
-        # canonical fixture set:
-        #   blocker_recall(review-with-tools) >= blocker_recall(review) + 0.05
-        #   signal_to_noise_ratio(review-with-tools) >= 0.85 * signal_to_noise_ratio(review)
-        # Promotion is the release gate's call, not this mode's defaults.
+        # Stays `experimental: true` until an operator, on the strength of
+        # observed dogfooding results, decides it is reliable enough to
+        # promote to non-experimental. Promotion is a manual operator
+        # decision, not this mode's defaults.
         "review-with-tools": {
             "strategy": "other_cli_peers",
             "include_current": True,
@@ -523,31 +507,16 @@ DEFAULT_CONFIG: dict = {
             # tries to parse a structured tool-call payload from each
             # peer's stdout and, on success, populates the envelope from
             # that payload instead of (or alongside) the regex
-            # `RECOMMENDATION:` label. Default `false`: promotion to
-            # default-on requires eval-harness lift on blocker_recall /
-            # SNR vs the regex-only baseline. Operators flip per their
-            # verified CLI schema.
+            # `RECOMMENDATION:` label. Default `false`: flipping to
+            # default-on is a manual operator decision based on observed
+            # reliability vs the regex-only baseline. Operators flip per
+            # their verified CLI schema.
             "tool_call_voting": False,
             "description": (
                 "EXPERIMENTAL — Claude/Codex/Gemini directed to use their "
                 "file-read / grep / glob tools to verify diff claims before "
                 "voting. CLI participants only; hosted participants do not participate."
             ),
-        },
-        "review-cheap": {
-            "participants": [
-                "deepseek_v4_flash",
-                "qwen_coder_flash",
-                "glm_4_7_flash",
-            ],
-            "description": "Cheap hosted breadth participants.",
-        },
-        "diverse": {
-            "strategy": "other_cli_peers",
-            "include_current": True,
-            "add": ["deepseek_v4_pro", "glm_5_1", "kimi_k2_6"],
-            "timeout_multiplier": 1.5,
-            "description": "Native CLI participants plus cross-lab planning participants.",
         },
         "private-local": {
             "strategy": "local_only_peers",
@@ -558,12 +527,6 @@ DEFAULT_CONFIG: dict = {
                 "hosted API participants (openrouter). See "
                 "docs/local-models.md for adding local-server participants."
             ),
-        },
-        "us-only": {
-            "strategy": "other_cli_peers",
-            "include_current": True,
-            "origin_policy": "us",
-            "description": "Use only US-origin native CLI participants.",
         },
         "deliberate": {
             "strategy": "other_cli_peers",
@@ -589,36 +552,6 @@ DEFAULT_CONFIG: dict = {
                 "ethical-override clause keeps any peer from defending a "
                 "harmful proposal or contriving false objections."
             ),
-        },
-        "single-llm": {
-            "strategy": "other_cli_peers",
-            "include_current": True,
-            "single_llm_multiplex": True,
-            "description": "Orchestrates a 3-member virtual council using a single available model.",
-        },
-        "adversarial-red-team": {
-            "strategy": "other_cli_peers",
-            "include_current": True,
-            "stances": {
-                "claude": "against",
-                "codex": "for",
-                "gemini": "neutral",
-                "antigravity": "neutral",
-            },
-            "timeout_multiplier": 2.0,
-            "description": "Attack/Defend debate where Peer A is Attacker, Peer B is Defender, and others are Neutral.",
-        },
-        "test-gap-analysis": {
-            "strategy": "other_cli_peers",
-            "include_current": True,
-            "description": "Audit the git diff specifically for test coverage gaps or missing regression tests.",
-        },
-        "deep-audit": {
-            "strategy": "other_cli_peers",
-            "include_current": True,
-            "deliberate": True,
-            "max_rounds": 3,
-            "description": "Multi-phase deep audit mode running up to 3 rounds of peer review.",
         },
     },
 }

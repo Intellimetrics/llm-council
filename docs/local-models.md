@@ -122,7 +122,6 @@ participants:
     api_key_env: LOCAL_OPENAI_API_KEY
     allow_private: true
     timeout: 360                        # vLLM with long context can exceed 180s
-    read_only: true
 ```
 
 Long-context models (e.g., 131K) can have multi-second TTFT and minute-scale
@@ -145,7 +144,6 @@ participants:
     api_key_env: LOCAL_OPENAI_API_KEY
     allow_private: true
     timeout: 240
-    read_only: true
 ```
 
 ### llama.cpp `--api`
@@ -161,7 +159,6 @@ participants:
     api_key_env: LOCAL_OPENAI_API_KEY
     allow_private: true
     timeout: 360
-    read_only: true
 ```
 
 Some llama.cpp builds return `404` on `/v1/models` even when
@@ -182,7 +179,6 @@ participants:
     api_key_env: LOCAL_OPENAI_API_KEY
     allow_private: true
     timeout: 360
-    read_only: true
 ```
 
 ### TGI (Text Generation Inference)
@@ -198,7 +194,6 @@ participants:
     api_key_env: LOCAL_OPENAI_API_KEY
     allow_private: true
     timeout: 360
-    read_only: true
 ```
 
 ### Ollama via its `/v1` shim
@@ -218,7 +213,6 @@ participants:
     api_key_env: LOCAL_OPENAI_API_KEY    # Ollama ignores it but the adapter requires one
     allow_private: true
     timeout: 240
-    read_only: true
 ```
 
 The dedicated `type: ollama` participant (e.g., the built-in `local_qwen_coder`)
@@ -238,7 +232,6 @@ participants:
     api_key_env: LOCAL_OPENAI_API_KEY
     allow_private: true
     timeout: 240
-    read_only: true
 ```
 
 ## Wiring local participants into modes

@@ -43,8 +43,8 @@ def test_tool_call_voting_defaults_to_false():
     """The opt-in flag must default False so v0.8.1 behavior is preserved."""
     mode_cfg = DEFAULT_CONFIG["modes"]["review-with-tools"]
     assert mode_cfg.get("tool_call_voting") is False, (
-        "review-with-tools must ship with tool_call_voting=False until the "
-        "eval-harness promotion gate clears the regex baseline."
+        "review-with-tools must ship with tool_call_voting=False until an "
+        "operator manually flips it based on observed reliability."
     )
 
 

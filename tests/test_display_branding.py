@@ -62,7 +62,6 @@ def test_progress_message_always_prefixed_with_brand_token():
         {"event": "participant_finish", "participant": "claude", "status": "ok", "elapsed_seconds": 12.3},
         {"event": "participant_slow", "participant": "codex", "elapsed_seconds": 90, "timeout_seconds": 180},
         {"event": "deliberation_round_start", "round": 2},
-        {"event": "cross_rank_start", "peer_count": 4},
         {"event": "synthesis_start", "chair": "claude"},
         {"event": "council_finish", "ok": 4, "total": 4},
     ]
@@ -101,7 +100,6 @@ def test_progress_advancing_events_set_matches_doc():
         {
             "participant_finish",
             "preflight_failed",
-            "cross_rank_complete",
             "synthesis_finish",
         }
     )

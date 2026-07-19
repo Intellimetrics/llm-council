@@ -235,7 +235,6 @@ def apply_secret_scan_policy(
 
 __all__ = [
     "DEFAULT_ALLOWLIST_FILENAME",
-    "VALID_POLICIES",
     "apply_secret_scan_policy",
     "redact_secrets",
     "scan_prompt_for_secrets",

@@ -8,13 +8,11 @@ import pytest
 from llm_council import context as context_module
 from llm_council.config import find_config, resolve_config_data
 from llm_council.context import (
-    MAX_ACCEPTANCE_CONTRACT_CHARS,
     MAX_CONTEXT_FILES,
     MAX_CONTEXT_FILE_CHARS,
     build_prompt,
     read_context_file,
     _read_git_diff_sections,
-    resolve_acceptance_contract,
 )
 from llm_council.env import (
     env_get,
@@ -146,33 +144,6 @@ def test_context_file_streams_only_bounded_character_prefix(
     rendered = read_context_file(source, cwd=tmp_path)
     assert rendered.count("é") == MAX_CONTEXT_FILE_CHARS
     assert "[truncated]" in rendered
-
-
-def test_acceptance_contract_file_and_literal_share_character_cap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = tmp_path / "contract.md"
-    source.write_text(
-        "c" * (MAX_ACCEPTANCE_CONTRACT_CHARS + 25), encoding="utf-8"
-    )
-
-    def fail_unbounded_read(*_args, **_kwargs):
-        raise AssertionError("Path.read_text must not be used for bounded contracts")
-
-    monkeypatch.setattr(Path, "read_text", fail_unbounded_read)
-    from_file = resolve_acceptance_contract("contract.md", cwd=tmp_path)
-    assert from_file is not None
-    file_prefix, _marker = from_file.split("\n\n[truncated]", 1)
-    assert file_prefix == "c" * MAX_ACCEPTANCE_CONTRACT_CHARS
-    assert from_file.endswith("[truncated]")
-
-    literal = resolve_acceptance_contract(
-        "l" * (MAX_ACCEPTANCE_CONTRACT_CHARS + 25), cwd=tmp_path
-    )
-    assert literal is not None
-    literal_prefix, _marker = literal.split("\n\n[truncated]", 1)
-    assert literal_prefix == "l" * MAX_ACCEPTANCE_CONTRACT_CHARS
-    assert literal.endswith("[truncated]")
 
 
 def test_context_symlink_target_outside_cwd_is_rejected(tmp_path: Path) -> None:

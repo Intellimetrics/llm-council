@@ -1,9 +1,0 @@
-{
-  "blockers": [
-    {
-      "path": "src/auth/middleware.py",
-      "severity": "blocker",
-      "claim": "tenant filter missing on user query allows cross-tenant data access"
-    }
-  ]
-}

@@ -59,7 +59,6 @@ Routing rules:
   `peer-only` only when configured and the user wants to exclude this host.
 - Treat "on the diff", "current diff", or "review my changes" as
   `include_diff: true`.
-- Treat "cheap" or "budget" as `review-cheap`.
 - Treat "private", "local", or "offline" as `private-local`.
 - `private-local` routes only to loopback Ollama participants. It does not
   firewall the Ollama daemon itself; hard offline use also requires OS/network
@@ -173,7 +172,6 @@ def project_config(
         config["defaults"]["mode"] = "quick"
     if us_only_default:
         config["defaults"]["origin_policy"] = "us"
-        modes.pop("us-only", None)
     if include_native:
         for name in ("claude", "codex", "gemini", "antigravity"):
             config["participants"][name] = DEFAULT_CONFIG["participants"][name]

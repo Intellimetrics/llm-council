@@ -251,8 +251,8 @@ version and update status in the returned JSON.
 For hosted OpenRouter modes, estimate before running:
 
 ```bash
-llm-council estimate --mode review-cheap "Review this change"
-llm-council estimate --mode review-cheap --completion-tokens 2500 "Review this diff"
+llm-council estimate --mode review "Review this change"
+llm-council estimate --mode review --completion-tokens 2500 "Review this diff"
 ```
 
 ## Config model
@@ -339,7 +339,7 @@ For users with only one native CLI, the simplest expansion path is:
 export OPENROUTER_API_KEY=...
 llm-council setup --yes --preset openrouter
 llm-council doctor --probe-openrouter
-llm-council estimate --mode review-cheap "Review this plan"
+llm-council estimate --mode review "Review this plan"
 ```
 
 Use cheap OpenRouter modes first for breadth. Escalate to frontier hosted

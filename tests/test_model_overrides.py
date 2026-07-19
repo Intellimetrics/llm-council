@@ -233,7 +233,7 @@ def test_validate_config_rejects_empty_model_id():
 def test_default_config_has_no_model_overrides():
     """The shipped defaults intentionally carry NO model_overrides on
     any built-in mode. This pins the v0.8 invariant: do not ship
-    vendor-affinity defaults until eval-harness data supports them."""
+    vendor-affinity defaults until real-world usage supports them."""
     config = load_config(None, search=False)
     for mode_name, mode_cfg in config.get("modes", {}).items():
         assert "model_overrides" not in mode_cfg, (
