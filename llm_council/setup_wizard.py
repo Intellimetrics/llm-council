@@ -132,7 +132,7 @@ def project_config(
     extra_local_participants = extra_local_participants or {}
     participant_names: set[str] = set()
     if include_native:
-        participant_names.update({"claude", "codex", "gemini", "antigravity"})
+        participant_names.update({"claude", "codex", "antigravity"})
     if include_openrouter:
         participant_names.update(OPENROUTER_PARTICIPANTS)
     if include_local:
@@ -173,7 +173,7 @@ def project_config(
     if us_only_default:
         config["defaults"]["origin_policy"] = "us"
     if include_native:
-        for name in ("claude", "codex", "gemini", "antigravity"):
+        for name in ("claude", "codex", "antigravity"):
             config["participants"][name] = DEFAULT_CONFIG["participants"][name]
     if include_openrouter:
         for name in OPENROUTER_PARTICIPANTS:
@@ -321,7 +321,7 @@ def write_setup_files(
     if write_instructions:
         instructions_dir = root / ".llm-council" / "instructions"
         instructions_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("claude", "codex", "gemini", "antigravity"):
+        for name in ("claude", "codex", "antigravity"):
             path = instructions_dir / f"{name}.md"
             if force or not path.exists():
                 path.write_text(
@@ -441,7 +441,7 @@ def _read_json_mapping(path: Path) -> dict[str, Any]:
 
 
 def _generate_host_skill_files(skills_dir: Path) -> list[tuple[Path, str]]:
-    """Build host-specific agent-skill files for Claude Code, Codex, Gemini.
+    """Build host-specific agent-skill files for Claude Code, Codex, Antigravity.
 
     These are generated under `.llm-council/skills/<host>/` so the user can
     install them into their host's *global* skill location (vs. the
@@ -456,9 +456,6 @@ def _generate_host_skill_files(skills_dir: Path) -> list[tuple[Path, str]]:
     )
     files.append(
         (skills_dir / "codex-cli" / "AGENTS.md", _CODEX_CLI_AGENTS_MD)
-    )
-    files.append(
-        (skills_dir / "gemini-cli" / "GEMINI.md", _GEMINI_CLI_GEMINI_MD)
     )
     files.append(
         (skills_dir / "antigravity" / "GEMINI.md", _ANTIGRAVITY_SKILL_MD)
@@ -496,15 +493,6 @@ cat .llm-council/skills/codex-cli/AGENTS.md >> ~/.codex/AGENTS.md
 
 Codex CLI reads `~/.codex/AGENTS.md` as global agent instructions. Append
 (don't overwrite) so existing entries are preserved.
-
-## Gemini CLI
-
-```bash
-mkdir -p ~/.gemini
-cat .llm-council/skills/gemini-cli/GEMINI.md >> ~/.gemini/GEMINI.md
-```
-
-Gemini CLI reads `~/.gemini/GEMINI.md` as global instructions.
 
 ## Antigravity CLI
 
@@ -571,7 +559,7 @@ _CLAUDE_CODE_SKILL_MD = (
     "name: llm-council\n"
     "description: >-\n"
     "  Read-only multi-agent council for second opinions before risky\n"
-    "  edits. Routes to the local CLI triad (Claude / Codex / Gemini) plus\n"
+    "  edits. Routes to the local CLI triad (Claude / Codex / Antigravity) plus\n"
     "  optional OpenRouter / Ollama participants via the llm-council MCP server.\n"
     "---\n"
     "\n"
@@ -585,13 +573,6 @@ _CODEX_CLI_AGENTS_MD = (
     "# LLM Council (global agent instructions)\n"
     "\n"
     + _HOST_SKILL_BODY.format(current="codex")
-)
-
-
-_GEMINI_CLI_GEMINI_MD = (
-    "# LLM Council (global Gemini CLI instructions)\n"
-    "\n"
-    + _HOST_SKILL_BODY.format(current="gemini")
 )
 
 

@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.20.0 - 2026-07-19
+
+v0.20.0 removes the retired standalone Gemini CLI peer and adopts
+upstream capabilities surfaced by a changelog-plus-live-probe review of
+all three remaining native CLIs.
+
+**Removed: built-in `gemini` participant**
+* Google retired Gemini CLI for individual accounts on 2026-06-18
+  (superseded by Antigravity). The built-in peer only produced
+  `client_ineligible` failures, so it is gone from defaults, setup
+  detection (`agy` is now the Gemini-family route), generated configs,
+  instruction snippets, and the `current` enums. The family machinery
+  stays: an enterprise operator can re-add a custom `gemini`
+  participant (family `gemini`) and selection/exclusion/preference
+  logic still honors it — covered by new tests.
+
+**Antigravity: per-run isolation + matched internal timeout**
+* `--new-project` added to the shipped args. Verified live on agy
+  1.1.4: without it, a later `agy -p` run can recall PRIOR runs'
+  content from the global `~/.gemini/antigravity-cli/brain/` store —
+  breaking fresh-eyes and risking cross-project leakage under prompt
+  injection. The per-family directive now also tells the peer not to
+  consult prior conversations (residual native-tool reads of the brain
+  dir remain possible; isolation is strong, not absolute).
+* `_build_cli_command` injects `--print-timeout <effective+30>s` so
+  agy's internal 5-minute print cap can no longer silently truncate
+  longer council timeouts.
+* Stale comment fixes: since agy 1.1.2 an unresolvable `--model`
+  hard-fails print mode instead of silently falling back.
+
+**Claude Code (2.1.215) invocation refresh**
+* `--permission-mode manual` (the current-blessed name for the old
+  `default`, renamed in 2.1.200), `--strict-mcp-config` (peer never
+  connects to project `.mcp.json` servers — verified live: zero MCP
+  tools, no startup wait), and
+  `--exclude-dynamic-system-prompt-sections` (byte-stable system prompt
+  for cache reuse across same-cwd calls). Applied to both `claude` and
+  `claude_fable`. New `OLD_CLAUDE_DEFAULT_ARGS` migration silently
+  upgrades existing generated configs.
+
+**Codex (0.144.6) parser hardening + guidance**
+* `_parse_codex_usage_json` now accepts `item.completed` answer text
+  only when `item.type == "agent_message"` — codex 0.143/0.144 added
+  new canonical item types that could otherwise silently overwrite the
+  real answer.
+* Documented: codex has no native turn/wall-time cap; the lever for
+  shorter runs is `-c model_reasoning_effort=low` in the peer args
+  (~3x wall-time cut measured live), left as an operator opt-in.
+
+Full suite: 1284 passed; ruff clean; live agy canary 2/2 with the new
+invocation.
+
 ## 0.19.0 - 2026-07-19
 
 v0.19.0 is a usage-driven simplification release. A 518-transcript audit

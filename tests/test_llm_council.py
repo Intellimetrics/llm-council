@@ -111,7 +111,17 @@ def test_builtin_quick_selects_full_native_triad(monkeypatch):
     )
     assert select_participants(config, "quick", "codex") == ["claude", "codex", "antigravity"]
 
-    # Case B: Gemini is the available (and hard-read-only) neutral seat.
+    # Case B: a custom-configured gemini peer (enterprise re-add) is the
+    # available Gemini-family seat — the built-in was removed in v0.20.0.
+    config["participants"]["gemini"] = {
+        "type": "cli",
+        "family": "gemini",
+        "origin": "US / Google",
+        "command": "gemini",
+        "args": ["--approval-mode", "plan"],
+        "timeout": 240,
+        "stdin_prompt": True,
+    }
     monkeypatch.setattr(
         "shutil.which",
         lambda name: f"/bin/{name}" if name in {"claude", "codex", "gemini"} else None,
@@ -136,7 +146,16 @@ def test_peer_only_excludes_current(monkeypatch):
     assert select_participants(config, "peer-only", "antigravity") == ["claude", "codex"]
     assert select_participants(config, "peer-only", "gemini") == ["claude", "codex"]
 
-    # Case B: gemini only
+    # Case B: custom gemini peer (enterprise re-add) only
+    config["participants"]["gemini"] = {
+        "type": "cli",
+        "family": "gemini",
+        "origin": "US / Google",
+        "command": "gemini",
+        "args": ["--approval-mode", "plan"],
+        "timeout": 240,
+        "stdin_prompt": True,
+    }
     monkeypatch.setattr(
         "shutil.which",
         lambda name: f"/bin/{name}" if name in {"claude", "codex", "gemini"} else None,
@@ -156,7 +175,16 @@ def test_custom_other_cli_peers_stays_peer_only_by_default(monkeypatch):
     )
     assert select_participants(config, "custom-peer", "codex") == ["claude", "antigravity"]
 
-    # Case B: gemini only
+    # Case B: custom gemini peer (enterprise re-add) only
+    config["participants"]["gemini"] = {
+        "type": "cli",
+        "family": "gemini",
+        "origin": "US / Google",
+        "command": "gemini",
+        "args": ["--approval-mode", "plan"],
+        "timeout": 240,
+        "stdin_prompt": True,
+    }
     monkeypatch.setattr(
         "shutil.which",
         lambda name: f"/bin/{name}" if name in {"claude", "codex", "gemini"} else None,
@@ -169,7 +197,7 @@ def test_claude_prompt_goes_to_stdin():
     assert DEFAULT_CONFIG["participants"]["claude"]["args"][:3] == [
         "-p",
         "--permission-mode",
-        "default",
+        "manual",
     ]
 
 
@@ -206,11 +234,11 @@ def test_load_config_migrates_old_cli_args(tmp_path: Path):
                         "command": "codex",
                         "args": OLD_CODEX_APPROVAL_ARGS,
                     },
-                    "gemini": {
+                    "antigravity": {
                         "type": "cli",
-                        "family": "gemini",
-                        "command": "gemini",
-                        "args": ["--approval-mode", "plan"],
+                        "family": "antigravity",
+                        "command": "agy",
+                        "args": ["--print", "{prompt}", "--sandbox", "--mode", "plan"],
                     },
                 },
                 "modes": {"quick": {"strategy": "other_cli_peers"}},
@@ -225,7 +253,7 @@ def test_load_config_migrates_old_cli_args(tmp_path: Path):
     assert config["participants"]["claude"]["args"][:3] == [
         "-p",
         "--permission-mode",
-        "default",
+        "manual",
     ]
     assert config["participants"]["codex"]["args"] == [
         "exec",
@@ -1300,7 +1328,6 @@ def test_consensus_mode_default_assigns_for_against_neutral():
     assert consensus["stances"] == {
         "claude": "for",
         "codex": "against",
-        "gemini": "neutral",
         "antigravity": "neutral",
     }
 
@@ -5221,7 +5248,6 @@ def test_tri_cli_setup_loaded_config_does_not_restore_defaults(tmp_path: Path):
     assert set(config["participants"]) == {
         "claude",
         "codex",
-        "gemini",
         "antigravity",
     }
     assert set(config["modes"]) == {
@@ -5240,13 +5266,13 @@ def test_setup_interactive_uses_preset_and_suppression_flags(
     answers: list[str] = []
     monkeypatch.setattr("builtins.input", lambda _prompt: answers.pop(0) if answers else "")
     # `tri-cli` preset is gated by `_preset_status` on whether claude /
-    # codex / gemini are on PATH. CI runners don't ship those binaries,
+    # codex / agy are on PATH. CI runners don't ship those binaries,
     # so mock shutil.which the same way the adjacent passing setup
     # tests do.
     monkeypatch.setattr(
         cli_module.shutil,
         "which",
-        lambda name: f"/usr/bin/{name}" if name in {"claude", "codex", "gemini"} else None,
+        lambda name: f"/usr/bin/{name}" if name in {"claude", "codex", "agy"} else None,
     )
     args = argparse.Namespace(
         root=str(tmp_path),
@@ -5263,7 +5289,6 @@ def test_setup_interactive_uses_preset_and_suppression_flags(
     assert set(config["participants"]) == {
         "claude",
         "codex",
-        "gemini",
         "antigravity",
     }
     assert config["defaults"]["origin_policy"] == "us"
@@ -5272,12 +5297,12 @@ def test_setup_interactive_uses_preset_and_suppression_flags(
 
 
 def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path, monkeypatch):
-    # Same `_preset_status` gating as above — mock claude / codex / gemini
+    # Same `_preset_status` gating as above — mock claude / codex / agy
     # presence so the tri-cli preset passes on a clean CI runner.
     monkeypatch.setattr(
         cli_module.shutil,
         "which",
-        lambda name: f"/usr/bin/{name}" if name in {"claude", "codex", "gemini"} else None,
+        lambda name: f"/usr/bin/{name}" if name in {"claude", "codex", "agy"} else None,
     )
     args = argparse.Namespace(
         root=str(tmp_path),
@@ -5294,7 +5319,6 @@ def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path, monkeypatch
     assert set(config["participants"]) == {
         "claude",
         "codex",
-        "gemini",
         "antigravity",
     }
     # `review-with-tools` (v0.8 Phase E, experimental) routes only to CLI
@@ -5316,7 +5340,7 @@ def test_setup_yes_auto_selects_tri_cli_when_native_clis_exist(
     tmp_path: Path, monkeypatch, capsys
 ):
     def fake_which(name: str):
-        return f"/usr/bin/{name}" if name in {"claude", "gemini"} else None
+        return f"/usr/bin/{name}" if name in {"claude", "agy"} else None
 
     monkeypatch.setattr(cli_module.shutil, "which", fake_which)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -5329,7 +5353,6 @@ def test_setup_yes_auto_selects_tri_cli_when_native_clis_exist(
     assert set(config["participants"]) == {
         "claude",
         "codex",
-        "gemini",
         "antigravity",
     }
     assert set(config["modes"]) == {
@@ -5470,7 +5493,7 @@ def test_setup_writes_config_mcp_and_instructions(tmp_path: Path):
     assert ".mcp.json" in names
     assert ".llm-council/instructions/claude.md" in names
     assert ".llm-council/instructions/codex.md" in names
-    assert ".llm-council/instructions/gemini.md" in names
+    assert ".llm-council/instructions/antigravity.md" in names
     assert ".llm-council/.gitignore" in names
     assert ".gitignore" in names
     assert "llm-council" in (tmp_path / ".mcp.json").read_text()
@@ -12563,7 +12586,7 @@ def test_cmd_estimate_refuses_when_max_tokens_exceeded(
 
 def test_setup_writes_per_host_skill_files(tmp_path: Path):
     """Track C #5: setup must emit host-installable skill files for Claude
-    Code, Codex CLI, and Gemini CLI under .llm-council/skills/, not just
+    Code, Codex CLI, and Antigravity under .llm-council/skills/, not just
     project-level instructions under .llm-council/instructions/."""
     write_setup_files(
         tmp_path,
@@ -12583,8 +12606,8 @@ def test_setup_writes_per_host_skill_files(tmp_path: Path):
     assert "current` as `claude`" in claude_skill
     codex_md = (skills / "codex-cli" / "AGENTS.md").read_text(encoding="utf-8")
     assert "current` as `codex`" in codex_md
-    gemini_md = (skills / "gemini-cli" / "GEMINI.md").read_text(encoding="utf-8")
-    assert "current` as `gemini`" in gemini_md
+    agy_md = (skills / "antigravity" / "GEMINI.md").read_text(encoding="utf-8")
+    assert "current` as `antigravity`" in agy_md
 
 
 def test_cli_stance_flag_overrides_mode_stance(monkeypatch, tmp_path: Path):

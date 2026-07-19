@@ -45,6 +45,17 @@ OLD_CLAUDE_PLAN_ARGS = [
     "Read,Grep,Glob,LS",
     "--no-session-persistence",
 ]
+# The v0.19-and-earlier claude baseline: "default" permission mode (renamed
+# to "manual" in Claude Code 2.1.200) and no MCP/system-prompt isolation
+# flags. Migrated to the current baseline at load, like OLD_CLAUDE_PLAN_ARGS.
+OLD_CLAUDE_DEFAULT_ARGS = [
+    "-p",
+    "--permission-mode",
+    "default",
+    "--tools",
+    "Read,Grep,Glob,LS",
+    "--no-session-persistence",
+]
 OLD_CODEX_APPROVAL_ARGS = [
     "exec",
     "--sandbox",
@@ -776,7 +787,7 @@ def migrate_known_cli_defaults(config: dict[str, Any]) -> None:
     if isinstance(claude, dict) and (
         claude.get("type") == "cli"
         and claude.get("family") == "claude"
-        and claude.get("args") == OLD_CLAUDE_PLAN_ARGS
+        and claude.get("args") in (OLD_CLAUDE_PLAN_ARGS, OLD_CLAUDE_DEFAULT_ARGS)
     ):
         claude["args"] = list(DEFAULT_CONFIG["participants"]["claude"]["args"])
     codex = config.get("participants", {}).get("codex")
@@ -803,7 +814,7 @@ def migrate_known_cli_defaults(config: dict[str, Any]) -> None:
         return
     if (
         isinstance(participants, dict)
-        and all(name in participants for name in ("claude", "codex", "gemini"))
+        and all(name in participants for name in ("claude", "codex", "antigravity"))
         and "peer-only" not in modes
     ):
         modes["peer-only"] = copy.deepcopy(DEFAULT_CONFIG["modes"]["peer-only"])

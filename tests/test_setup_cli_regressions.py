@@ -87,18 +87,20 @@ def test_cost_cap_help_says_unknown_pricing_is_refused(
     assert "informational only" not in help_text
 
 
-def test_auto_route_and_selection_work_with_claude_and_gemini_only(
+def test_retired_gemini_binary_no_longer_provides_a_native_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """v0.20.0: the standalone gemini CLI is retired upstream; its binary on
+    PATH no longer satisfies the Gemini-family seat for auto setup or
+    selection — only agy does."""
     which = _which_for("claude", "gemini")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr("shutil.which", which)
 
-    assert _auto_setup_preset(which) == "tri-cli"
-    assert select_participants(_native_config(), "quick", current=None) == [
-        "claude",
-        "gemini",
-    ]
+    with pytest.raises(SystemExit, match="usable default council route"):
+        _auto_setup_preset(which)
+    with pytest.raises(ValueError, match="No configured Gemini-family CLI"):
+        select_participants(_native_config(), "quick", current=None)
 
 
 def test_native_selection_prefers_available_antigravity_fallback(
@@ -148,11 +150,22 @@ def test_antigravity_host_does_not_make_missing_gemini_look_available(
     assert "gemini" not in selected
 
 
-def test_unconfigured_antigravity_binary_does_not_replace_gemini(
+def test_unconfigured_antigravity_binary_does_not_replace_custom_gemini(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """An operator with a custom (enterprise) gemini peer and no antigravity
+    participant keeps gemini even when the agy binary is on PATH."""
     config = _native_config()
     config["participants"].pop("antigravity")
+    config["participants"]["gemini"] = {
+        "type": "cli",
+        "family": "gemini",
+        "origin": "US / Google",
+        "command": "gemini",
+        "args": ["--approval-mode", "plan"],
+        "timeout": 240,
+        "stdin_prompt": True,
+    }
     monkeypatch.setattr("shutil.which", _which_for("claude", "codex", "gemini", "agy"))
 
     assert select_participants(config, "quick", current=None) == [

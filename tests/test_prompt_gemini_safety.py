@@ -1,11 +1,9 @@
 import asyncio
-from copy import deepcopy
 from pathlib import Path
 
 
 from llm_council.adapters import run_cli_participant
 from llm_council.context import build_prompt
-from llm_council.defaults import DEFAULT_CONFIG
 
 
 def test_long_context_overflow_chunks_instead_of_truncating_silently(
@@ -67,7 +65,7 @@ def test_build_prompt_honors_configured_prompt_limit(tmp_path: Path) -> None:
     assert "[llm-council prompt truncated" not in prompt
 
 
-def test_gemini_default_sends_large_prompt_to_stdin_not_argv(
+def test_gemini_family_custom_peer_sends_large_prompt_to_stdin_not_argv(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -92,7 +90,14 @@ def test_gemini_default_sends_large_prompt_to_stdin_not_argv(
         fake_create_subprocess_exec,
     )
 
-    cfg = deepcopy(DEFAULT_CONFIG["participants"]["gemini"])
+    cfg = {
+        "type": "cli",
+        "family": "gemini",
+        "command": "gemini",
+        "args": ["--approval-mode", "plan"],
+        "timeout": 240,
+        "stdin_prompt": True,
+    }
     result = asyncio.run(run_cli_participant("gemini", cfg, prompt, tmp_path))
 
     command = captured["command"]

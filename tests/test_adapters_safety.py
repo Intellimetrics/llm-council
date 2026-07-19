@@ -462,3 +462,77 @@ def test_antigravity_peer_prompt_carries_native_read_tool_hint():
     for family in ("claude", "codex", "gemini", None):
         other = apply_per_peer_directives("Q", mode="quick", family=family)
         assert ANTIGRAVITY_READ_TOOL_HINT not in other
+
+
+def test_old_claude_default_args_migrate_to_current_baseline(tmp_path: Path):
+    """v0.20.0: the pre-manual claude baseline (--permission-mode default,
+    no --strict-mcp-config) is silently upgraded at load, like the older
+    plan-args migration."""
+    import yaml
+
+    from llm_council.config import OLD_CLAUDE_DEFAULT_ARGS, load_config
+    from llm_council.defaults import DEFAULT_CONFIG
+
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "replace_defaults": True,
+                "participants": {
+                    "claude": {
+                        "type": "cli",
+                        "family": "claude",
+                        "command": "claude",
+                        "args": list(OLD_CLAUDE_DEFAULT_ARGS),
+                    },
+                },
+                "modes": {"solo": {"participants": ["claude"]}},
+                "defaults": {"mode": "solo"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config["participants"]["claude"]["args"] == list(
+        DEFAULT_CONFIG["participants"]["claude"]["args"]
+    )
+    assert "--strict-mcp-config" in config["participants"]["claude"]["args"]
+
+
+def test_antigravity_command_injects_print_timeout_from_effective_timeout():
+    """agy self-caps print mode at 5m; the injected --print-timeout tracks
+    the effective per-run timeout (+30s slack) so agy never gives up before
+    the council's own timeout owns the failure."""
+    from llm_council.adapters import _build_cli_command
+    from llm_council.defaults import DEFAULT_CONFIG
+
+    cfg = DEFAULT_CONFIG["participants"]["antigravity"]
+    cmd = _build_cli_command(
+        "antigravity", cfg, "prompt", Path("/tmp"), effective_timeout_seconds=600
+    )
+    assert cmd[cmd.index("--print-timeout") + 1] == "630s"
+    # Without a timeout the flag is omitted (doctor probes, tests).
+    bare = _build_cli_command("antigravity", cfg, "prompt", Path("/tmp"))
+    assert "--print-timeout" not in bare
+    # New-project isolation ships in the default args.
+    assert "--new-project" in cmd
+
+
+def test_codex_json_parser_ignores_non_agent_item_completed_text():
+    """codex 0.143/0.144 added new canonical item types; only
+    item.type == "agent_message" may supply the answer text."""
+    from llm_council.adapters import _parse_cli_usage_json
+
+    stream = "\n".join(
+        [
+            '{"type":"thread.started","thread_id":"t1"}',
+            '{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"RECOMMENDATION: yes - real answer"}}',
+            '{"type":"item.completed","item":{"id":"i1","type":"collab_tool_call","text":"spurious trailing text"}}',
+            '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":5}}',
+        ]
+    )
+    parsed = _parse_cli_usage_json("codex", stream)
+    assert parsed is not None
+    assert parsed["text"] == "RECOMMENDATION: yes - real answer"

@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project
 
 `llm-council` is a Python 3.11+ MCP server and CLI that lets one coding agent
-ask a "council" of other LLMs (Claude Code, Codex CLI, Gemini CLI, OpenRouter
+ask a "council" of other LLMs (Claude Code, Codex CLI, Antigravity, OpenRouter
 hosted models, local Ollama) for read-only second opinions. It is published as
 the `llm-council` console script and as the `llm-council` MCP server.
 
@@ -129,11 +129,11 @@ Key modules:
 
 ## Invariants worth preserving
 
-- **Read-only by default (hard for all four native CLI peers).**
+- **Read-only by default (hard for all three native CLI peers).**
   Council participants must not edit files. Each native CLI gets a HARD
   guarantee from flags that physically disable the write tool
-  (`--permission-mode default` Claude, `--sandbox read-only` Codex,
-  `--approval-mode plan` Gemini, `--mode plan` Antigravity) — a misbehaving
+  (`--permission-mode manual` Claude, `--sandbox read-only` Codex,
+  `--mode plan` Antigravity) — a misbehaving
   model or a prompt-injected diff cannot write. Don't remove these from
   `defaults.py` without an explicit reason. Antigravity's `--mode plan` flag
   exists as of agy 1.1.0 (verified live on 1.1.4: an explicitly ordered write
@@ -146,6 +146,23 @@ Key modules:
   `LLM_COUNCIL_LIVE_AGY_TEST=1`) guards this across upstream agy releases.
   Note agy also ignores stdin since 1.1.1, so its prompt is delivered via
   argv (`{prompt}`), not stdin.
+- **Antigravity per-run isolation (`--new-project`) + matched print
+  timeout.** agy keeps a global conversation store under
+  `~/.gemini/antigravity-cli/brain/`, and a plain `agy -p` run can recall
+  PRIOR runs' content from it (verified live on 1.1.4) — breaking
+  fresh-eyes and, under prompt injection, risking cross-project leakage of
+  earlier council prompts. The shipped args include `--new-project` so
+  every invocation starts with no in-context carryover, and the
+  per-family directive (`context.ANTIGRAVITY_READ_TOOL_HINT`) tells the
+  peer not to consult prior conversations. Residual risk: agy's native
+  read tool can still open the brain dir by absolute path; treat
+  isolation as strong, not absolute. Separately,
+  `adapters._build_cli_command` injects `--print-timeout
+  <effective+30>s` for the antigravity family (agy's internal print cap
+  defaults to 5m and would silently truncate longer council timeouts;
+  the +30s slack keeps llm-council's own timeout as the one that fires
+  and owns the error). Omitted when the operator pins --print-timeout
+  in args, and when no effective timeout is passed (doctor probes).
 - **`RECOMMENDATION:` label.** CLI output is rejected if it lacks the label;
   prompts in `context.py` ask for it. Adapter and prompt changes must keep
   these in sync. The label match is fence-aware: a `RECOMMENDATION:` line
@@ -186,10 +203,11 @@ Key modules:
   once a transcript corpus exists to audit gaming risk (see the
   `CONTINUE_DEBATE` unanimity skip in `orchestrator.execute_council`).
 - **Config migration is silent.** `migrate_known_cli_defaults` rewrites old
-  `OLD_CLAUDE_PLAN_ARGS` / `OLD_CODEX_APPROVAL_ARGS` and back-fills
-  `peer-only` mode and `include_current` for built-in `other_cli_peers`
-  modes. When changing baseline args in defaults, update the migration
-  constants too.
+  `OLD_CLAUDE_PLAN_ARGS` / `OLD_CLAUDE_DEFAULT_ARGS` /
+  `OLD_CODEX_APPROVAL_ARGS` and back-fills `peer-only` mode and
+  `include_current` for built-in `other_cli_peers` modes. When changing
+  baseline args in defaults, add the outgoing baseline as a new OLD_*
+  constant so existing generated configs silently upgrade.
 - **Prompt-size guard.** `max_prompt_chars` is enforced both globally and
   per-participant before any subprocess launches; preserve this so oversized
   prompts fail fast rather than after a long hosted/CLI timeout. Both
@@ -354,7 +372,7 @@ Key modules:
   with the LAST attempted model so the transcript shows where the
   walker stopped.
 - **Per-CLI token usage is not observable in the default text-mode
-  invocation.** CLI participants (claude, codex, gemini, antigravity)
+  invocation.** CLI participants (claude, codex, antigravity)
   authenticate as the user and burn the user's own account quota. In the
   default invocation we run them in TEXT mode, where there is no metering
   hook — no way to read "X tokens consumed", "Y quota remaining", or "Z
@@ -375,13 +393,22 @@ Key modules:
   object: `result` text + `usage` + `total_cost_usd` + `modelUsage`) and
   **codex** (`exec --json`, JSONL stream: last `agent_message` text +
   `turn.completed` usage; billable `prompt_tokens = max(0, input_tokens -
-  cached_input_tokens)`; codex reports no cost so `cost_usd` stays None).
+  cached_input_tokens)`; codex reports no cost so `cost_usd` stays None;
+  `item.completed` events supply answer text ONLY when
+  `item.type == "agent_message"` — codex 0.143/0.144 added new canonical
+  item types that could otherwise overwrite the real answer). Codex has
+  NO native turn/tool-call/wall-time cap (verified against the full
+  config schema); llm-council's own timeouts are the only backstop, and
+  the operator-level lever for shorter runs is
+  `-c model_reasoning_effort=low` in the codex peer's args (~3x
+  wall-time cut measured; valid values are model-dependent, a bad value
+  cleanly fails the turn).
   Default OFF for every built-in peer → byte-identical text-mode command
   and parsing. The JSON flag is PURELY ADDITIVE: it never removes the
-  read-only flags (`--permission-mode default` / `--sandbox read-only`),
+  read-only flags (`--permission-mode manual` / `--sandbox read-only`),
   so peers still cannot write. Flag + parser ship together per family —
   `usage_from_json` is a NO-OP for any family without a JSON parser
-  (`_USAGE_JSON_FAMILIES = {claude, codex}`; gemini/others add no flag).
+  (`_USAGE_JSON_FAMILIES = {claude, codex}`; other families add no flag).
   Parsing is fail-soft: `_parse_cli_usage_json` returns None on malformed
   / changed JSON shapes and the adapter falls back to treating raw stdout
   as text (the `RECOMMENDATION:` label check still runs, token fields stay
@@ -563,7 +590,7 @@ failure path; do not let strings drift.
 | `quota_exhausted`    | Peer hit a known quota / rate-limit signal (`RESOURCE_EXHAUSTED`, `quota_exceeded`, `Individual quota reached`, `rate_limit_exceeded`, `insufficient_quota`, `insufficient credits`, `usage limit`, `5-hour limit`, HTTP 429 with quota-adjacent text). Detected by `adapters.is_quota_exhausted_error` over the raw error string — no prefix synthesized. Surfaced top-level in transcripts and MCP `structured_results` as `quota_throttled_peers: [{peer, family, model, message}]`; orchestrator emits a `peer_quota_throttled` progress event per peer (deduped across rounds). A peer with a non-empty `cfg.fallback_chain` walks up to three next-in-chain models before landing in quorum. On success the peer recovers (`recovered_after_quota=True`, `model_fallback_used=<id>`, appears in `quota_recoveries` not `quota_throttled_peers`). On failure the peer drops with this error kind. Skipped for the Claude family because Claude's own `--fallback-model` CLI flag handles overload natively (auto-injected by `_build_cli_command` when chain non-empty). |
 | `model_substituted`  | A CLI peer with `require_pinned_model: true` was served by a model other than its pinned `model` — e.g. Claude Fable 5 refused and the Claude Code surface silently fell back to Opus 4.8. Prefix: `ModelSubstituted:`. Only observable when `usage_from_json: true` surfaces the served model id (the `modelUsage` key with the most `outputTokens` — the answer's author); the served model must fail the lenient variant-tolerant `adapters._model_pin_satisfied` check. Terminal for the peer (ok=False, drops quorum) so a substituted model's answer is never recorded as the requested model's vote; `result.model` still reports the REAL served model, and substituted outputs are excluded from the finding matrix. Detected live per round (round 1, round-2 deliberation) plus the synthesis-chair turn, and preserved through repair-retry merges (with combined original+retry output). Surfaced as `metadata['model_substituted_peers']: [{peer, requested, served_by, synthesis?}]` (omitted when empty), lifted top-level in the MCP `council_run` payload + schema, with a per-round `peer_model_substituted` progress event. Opt-in — a peer without `require_pinned_model` or without JSON usage never trips it. Known limit: attribution is by max cumulative `outputTokens`, so a mid-turn refusal fallback inside a long agentic turn can evade it. |
 | `pinned_model_unverified` | A peer required pinned-model verification but the CLI output did not report a served model. Prefix: `PinnedModelUnverified:`. The answer is excluded from quorum rather than being attributed without evidence. |
-| `client_ineligible` | A native client is installed but durably ineligible for the configured account/tier, currently Gemini's `IneligibleTierError` with `UNSUPPORTED_CLIENT`. Doctor's opt-in native probe surfaces the compatible fallback. |
+| `client_ineligible` | A native client is installed but durably ineligible for the configured account/tier — e.g. the retired standalone Gemini CLI's `IneligibleTierError` with `UNSUPPORTED_CLIENT` (Google ended individual-tier service 2026-06-18; the built-in `gemini` peer was removed in v0.20.0). Doctor's opt-in native probe surfaces the compatible fallback. |
 | `unknown`            | Non-empty error that did not match any known prefix — file a dogfood note            |
 
 ## Custom CLI participant: minimal template
@@ -585,7 +612,7 @@ participants:
     max_prompt_chars: 120000  # per-peer prompt cap (chunking targets this)
     read_only: true        # advisory marker; the read-only invariant is
                            # actually enforced by the per-CLI args baked
-                           # into defaults.py (e.g. --permission-mode default
+                           # into defaults.py (e.g. --permission-mode manual
                            # for Claude, --sandbox read-only for Codex), so
                            # custom CLIs need to pass equivalent flags via
                            # `args` for the invariant to hold
@@ -653,7 +680,7 @@ family, origin are untouched). Built-in modes ship without
 without real-world evidence of a per-mode affinity.
 
 **Per-CLI model identity is not observable.** Native CLI peers
-(claude/codex/gemini/antigravity) ship `model: None` intentionally so each
+(claude/codex/antigravity) ship `model: None` intentionally so each
 runs under the user's own account-default model. llm-council has no hook to
 read which concrete model the CLI actually executed, so `result.model` stays
 `None` — the transcript renders `cli default (unreported)` and the JSON shows

@@ -99,7 +99,7 @@ def council_run_schema() -> dict[str, Any]:
             },
             "current": {
                 "type": "string",
-                "enum": ["claude", "codex", "gemini", "antigravity"],
+                "enum": ["claude", "codex", "antigravity"],
             },
             "participants": {
                 "type": "array",
@@ -816,7 +816,7 @@ def estimate_schema() -> dict[str, Any]:
             },
             "current": {
                 "type": "string",
-                "enum": ["claude", "codex", "gemini", "antigravity"],
+                "enum": ["claude", "codex", "antigravity"],
             },
             "participants": {
                 "type": "array",

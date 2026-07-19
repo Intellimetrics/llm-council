@@ -121,7 +121,7 @@ def select_synthesizer(
 
     Valid values for ``defaults.synthesizer``:
 
-    - **a participant name** in ``participant_cfg`` (e.g. ``"gemini"``).
+    - **a participant name** in ``participant_cfg`` (e.g. ``"codex"``).
     - **``"neutral_peer"``**: pick whichever peer was assigned
       ``stance=neutral`` for this run. Requires a stance-assigning mode
       (``consensus``/``deliberate``); raises otherwise.

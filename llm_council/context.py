@@ -868,7 +868,9 @@ _TOOL_CAPABLE_CLI_FAMILIES = frozenset({"claude", "codex", "gemini"})
 # access (empty or degraded response instead of a read).
 ANTIGRAVITY_READ_TOOL_HINT = (
     "When you need to open files, use your built-in file reading tool, not "
-    "terminal commands; terminal commands are restricted in this sandbox."
+    "terminal commands; terminal commands are restricted in this sandbox. "
+    "Base your answer only on this prompt and files in the working "
+    "directory; do not consult prior conversations or session history."
 )
 
 REVIEW_WITH_TOOLS_DIRECTIVE = (

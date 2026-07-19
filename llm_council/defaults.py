@@ -1,8 +1,9 @@
 """Default configuration for llm-council.
 
 The defaults assume the user has native CLI access to Claude Code, Codex, and
-Gemini CLI. OpenRouter and local providers are available only when explicitly
-selected by mode or participant name.
+Antigravity (the Gemini-family CLI; Google retired the standalone Gemini CLI
+for individual accounts in 2026-06). OpenRouter and local providers are
+available only when explicitly selected by mode or participant name.
 """
 
 VALID_STANCES = ("for", "against", "neutral")
@@ -154,13 +155,24 @@ DEFAULT_CONFIG: dict = {
             "family": "claude",
             "origin": "US / Anthropic",
             "command": "claude",
+            # --permission-mode manual is the current-blessed name for the
+            # old "default" mode (rename in Claude Code 2.1.200; behavior
+            # identical). --strict-mcp-config with no --mcp-config yields
+            # ZERO MCP servers (verified live on 2.1.215): the peer never
+            # connects to project .mcp.json servers — isolation plus no MCP
+            # startup wait. --exclude-dynamic-system-prompt-sections keeps
+            # the system prompt byte-stable across calls sharing a cwd for
+            # prompt-cache reuse (2.1.98; inert only if --system-prompt is
+            # used, which we don't).
             "args": [
                 "-p",
                 "--permission-mode",
-                "default",
+                "manual",
                 "--tools",
                 "Read,Grep,Glob,LS",
                 "--no-session-persistence",
+                "--strict-mcp-config",
+                "--exclude-dynamic-system-prompt-sections",
             ],
             # Opt-in: set `usage_from_json: true` (per-peer, in
             # .llm-council.yaml) to invoke claude as `-p --output-format json`
@@ -209,13 +221,24 @@ DEFAULT_CONFIG: dict = {
             "family": "claude",
             "origin": "US / Anthropic",
             "command": "claude",
+            # --permission-mode manual is the current-blessed name for the
+            # old "default" mode (rename in Claude Code 2.1.200; behavior
+            # identical). --strict-mcp-config with no --mcp-config yields
+            # ZERO MCP servers (verified live on 2.1.215): the peer never
+            # connects to project .mcp.json servers — isolation plus no MCP
+            # startup wait. --exclude-dynamic-system-prompt-sections keeps
+            # the system prompt byte-stable across calls sharing a cwd for
+            # prompt-cache reuse (2.1.98; inert only if --system-prompt is
+            # used, which we don't).
             "args": [
                 "-p",
                 "--permission-mode",
-                "default",
+                "manual",
                 "--tools",
                 "Read,Grep,Glob,LS",
                 "--no-session-persistence",
+                "--strict-mcp-config",
+                "--exclude-dynamic-system-prompt-sections",
             ],
             "model": "claude-fable-5",
             # Observability + guard for the silent Fable->Opus refusal fallback.
@@ -263,30 +286,6 @@ DEFAULT_CONFIG: dict = {
             # an unknown model id just makes that step fail and the walk
             # continues (or the peer drops if chain is exhausted).
             "fallback_chain": ["gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"],
-        },
-        "gemini": {
-            "type": "cli",
-            "family": "gemini",
-            "origin": "US / Google",
-            "command": "gemini",
-            "args": [
-                "--approval-mode",
-                "plan",
-            ],
-            "model": None,
-            "timeout": 240,
-            "max_prompt_chars": 120_000,
-            "stdin_prompt": True,
-            "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-            # Within Google's tiering, Pro > Flash for capability — so
-            # falling from 3.5-flash to 3.1-pro is actually an UPGRADE
-            # in many tasks while sidestepping the throttled flash quota.
-            # Then progressively step down through older flash variants.
-            "fallback_chain": [
-                "gemini-3.1-pro-preview",
-                "gemini-3-flash-preview",
-                "gemini-2.5-flash",
-            ],
         },
         "deepseek_v4_pro": {
             "type": "openrouter",
@@ -403,16 +402,28 @@ DEFAULT_CONFIG: dict = {
                 "--sandbox",
                 "--mode",
                 "plan",
+                # Per-run project isolation (agy 1.1.x): without this, agy
+                # keeps global conversation history under
+                # ~/.gemini/antigravity-cli/brain and a later -p run can
+                # recall PRIOR runs' content (verified live on 1.1.4) —
+                # breaking fresh-eyes and risking cross-project leakage
+                # under prompt injection. --new-project starts each council
+                # invocation with no in-context carryover; residual native-
+                # tool reads of the brain dir remain possible, so the
+                # per-family prompt directive also says not to consult
+                # history.
+                "--new-project",
             ],
             "model": None,
             "timeout": 240,
             "max_prompt_chars": 120_000,
             "stdin_prompt": False,
             "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTIGRAVITY_API_KEY"],
-            # agy 1.0.x accepts --model, but its display-name ids are not
-            # portable and an unknown id silently falls back to session
-            # state. Keep the built-in chain empty rather than pretend a
-            # cross-install fallback is reliable.
+            # agy accepts --model, but its display-name ids are not
+            # portable across installs (since 1.1.2 an unresolvable value
+            # hard-fails print mode with a non-zero exit instead of
+            # silently falling back). Keep the built-in chain empty rather
+            # than pretend a cross-install fallback is reliable.
             "fallback_chain": [],
         },
     },
@@ -444,7 +455,7 @@ DEFAULT_CONFIG: dict = {
         "quick": {
             "strategy": "other_cli_peers",
             "include_current": True,
-            "description": "Ask available native CLI participants from the Claude/Codex and Gemini families.",
+            "description": "Ask available native CLI participants from the Claude/Codex and Gemini (Antigravity) families.",
         },
         "peer-only": {
             "strategy": "other_cli_peers",
@@ -488,7 +499,7 @@ DEFAULT_CONFIG: dict = {
         # file-read / grep / glob tools before voting. The CLIs already have
         # tool access via their sandbox flags (claude `--permission-mode
         # default` + `--tools Read,Grep,Glob,LS`; codex `--sandbox read-only`;
-        # gemini `--approval-mode plan`), but the standard prompt never asks
+        # antigravity `--mode plan`), but the standard prompt never asks
         # them to use them. This mode activates that latent autonomy.
         #
         # Stays `experimental: true` until an operator, on the strength of
@@ -501,7 +512,7 @@ DEFAULT_CONFIG: dict = {
             "experimental": True,
             "timeout_multiplier": 1.8,
             # v0.9.0 Feature 3 — strictly opt-in tool-call voting. When
-            # True, CLI peers (claude/codex/gemini) additionally receive a
+            # True, CLI peers (claude/codex/antigravity) additionally receive a
             # directive describing a `record_recommendation(verdict,
             # blockers, evidence)` tool they can invoke. The adapter then
             # tries to parse a structured tool-call payload from each
@@ -513,7 +524,7 @@ DEFAULT_CONFIG: dict = {
             # their verified CLI schema.
             "tool_call_voting": False,
             "description": (
-                "EXPERIMENTAL — Claude/Codex/Gemini directed to use their "
+                "EXPERIMENTAL — Claude/Codex/Antigravity directed to use their "
                 "file-read / grep / glob tools to verify diff claims before "
                 "voting. CLI participants only; hosted participants do not participate."
             ),
@@ -523,7 +534,7 @@ DEFAULT_CONFIG: dict = {
             "description": (
                 "All configured same-machine loopback `type: ollama` "
                 "participants. Excludes OpenAI-compatible gateways, LAN "
-                "endpoints, hosted-inference CLIs (claude/codex/gemini), and "
+                "endpoints, hosted-inference CLIs (claude/codex/antigravity), and "
                 "hosted API participants (openrouter). See "
                 "docs/local-models.md for adding local-server participants."
             ),
@@ -542,7 +553,6 @@ DEFAULT_CONFIG: dict = {
             "stances": {
                 "claude": "for",
                 "codex": "against",
-                "gemini": "neutral",
                 "antigravity": "neutral",
             },
             "timeout_multiplier": 2.0,

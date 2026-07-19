@@ -91,7 +91,7 @@ def test_claude_fable_participant_shape():
     assert cf["fallback_chain"] == []
     # Read-only flags preserved.
     assert "--permission-mode" in cf["args"]
-    assert cf["args"][cf["args"].index("--permission-mode") + 1] == "default"
+    assert cf["args"][cf["args"].index("--permission-mode") + 1] == "manual"
 
 
 def test_fable_mode_shape_and_config_valid():

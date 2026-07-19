@@ -93,8 +93,8 @@ llm-council doctor
 Agent installs should run `llm-council setup --plan` first and ask the user
 which preset to write. `setup --yes` uses `--preset auto` only when the user has
 explicitly accepted the default. Auto setup writes a default config only when it
-finds a route that runtime participant selection can use: Gemini CLI or
-Antigravity plus at least one of Claude Code or Codex CLI, or
+finds a route that runtime participant selection can use: Antigravity plus
+at least one of Claude Code or Codex CLI, or
 `OPENROUTER_API_KEY` in your shell or project env files. This protects an
 incomplete native installation from getting a council that cannot run.
 
@@ -108,8 +108,9 @@ Preset choices:
 - `auto`: choose `tri-cli` when a Gemini-family CLI and at least one Claude/Codex
   CLI are available; otherwise choose `openrouter` when `OPENROUTER_API_KEY` is
   available.
-- `tri-cli`: native CLI participants from the Claude/Codex and Gemini families.
-  Runtime routing prefers Antigravity for current-client compatibility.
+- `tri-cli`: native CLI participants from the Claude/Codex families plus
+  Antigravity (the Gemini-family CLI; Google retired the standalone Gemini
+  CLI for individual accounts in June 2026).
 - `openrouter`: hosted OpenRouter participants only.
 - `tri-cli-openrouter`: native CLI and hosted OpenRouter participants.
 - `private-local`: Ollama-only participants, no hosted or native CLI
@@ -167,8 +168,6 @@ Instruction snippet mapping:
   the full contents of `.llm-council/instructions/claude.md` to it.
 - Codex CLI: create `AGENTS.md` in the project root if needed, then append the
   full contents of `.llm-council/instructions/codex.md` to it.
-- Gemini CLI: create `GEMINI.md` in the project root if needed, then append the
-  full contents of `.llm-council/instructions/gemini.md` to it.
 - Antigravity: create `GEMINI.md` in the project root if needed, then append the
   full contents of `.llm-council/instructions/antigravity.md` to it.
 
@@ -328,7 +327,7 @@ Hosted paid MCP calls fail closed when pricing is unknown. Add
 ## Model and cost selection
 
 Native CLI participants use the user's installed Claude Code, Codex CLI,
-Gemini CLI, or Antigravity account. That cost is external to `llm-council`; it may be a
+or Antigravity account. That cost is external to `llm-council`; it may be a
 subscription, a rate limit, or a CLI-specific API setup. OpenRouter participants
 are hosted API calls billed by token. Ollama participants are local runtime
 calls.
@@ -604,7 +603,7 @@ Transcript pruning is a dry run unless `--delete` is present. The deprecated
 ## Safety notes
 
 All four built-in native CLI participants use CLI-enforced read-only or plan
-modes (`--permission-mode default` Claude, `--sandbox read-only` Codex,
+modes (`--permission-mode manual` Claude, `--sandbox read-only` Codex,
 `--approval-mode plan` Gemini, `--mode plan` Antigravity), and prompts are
 sent over stdin where the CLI supports it (Antigravity stopped reading stdin
 in agy 1.1.1, so its prompt is passed as the `--print` argument instead; its

@@ -121,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--config", help="Path to config YAML")
     run.add_argument("--mode", default=None, help="Council mode")
-    run.add_argument("--current", choices=["claude", "codex", "gemini", "antigravity"])
+    run.add_argument("--current", choices=["claude", "codex", "antigravity"])
     run.add_argument("--participants", help="Comma-separated explicit participants")
     run.add_argument("--include", help="Comma-separated extra participants")
     run.add_argument(
@@ -461,7 +461,7 @@ def build_parser() -> argparse.ArgumentParser:
     estimate.add_argument("question", nargs="*", help="Question or prompt")
     estimate.add_argument("--config", help="Path to config YAML")
     estimate.add_argument("--mode", default=None, help="Council mode")
-    estimate.add_argument("--current", choices=["claude", "codex", "gemini", "antigravity"])
+    estimate.add_argument("--current", choices=["claude", "codex", "antigravity"])
     estimate.add_argument("--participants", help="Comma-separated explicit participants")
     estimate.add_argument("--include", help="Comma-separated extra participants")
     estimate.add_argument(
@@ -1331,7 +1331,7 @@ def _auto_setup_preset(which=None) -> str:
         which = _make_which_cache()
     has_claude = bool(which("claude"))
     has_codex = bool(which("codex"))
-    has_neutral = bool(which("agy") or which("gemini"))
+    has_neutral = bool(which("agy"))
     if has_neutral and (has_claude or has_codex):
         return "tri-cli"
     if os.environ.get("OPENROUTER_API_KEY"):
@@ -1344,14 +1344,12 @@ def _auto_setup_preset(which=None) -> str:
         found_list.append("codex")
     if which("agy"):
         found_list.append("antigravity")
-    elif which("gemini"):
-        found_list.append("gemini")
     found = ", ".join(found_list) or "none"
 
     raise SystemExit(
         "Auto setup could not find a usable default council route. "
         f"Found native CLIs: {found}. "
-        "Install Gemini or Antigravity plus at least one of Claude or Codex, or set "
+        "Install Antigravity plus at least one of Claude or Codex, or set "
         "OPENROUTER_API_KEY in your shell, .env, .env.local, or .llm-council.env "
         "and rerun setup. Advanced users who intentionally want to stage an "
         "incomplete config can choose an explicit preset with --allow-incomplete."
@@ -1360,11 +1358,16 @@ def _auto_setup_preset(which=None) -> str:
 
 def _detect_setup_routes() -> dict[str, object]:
     which = _make_which_cache()
+    # `gemini` stays in native_paths purely for informational display (a
+    # legacy/enterprise binary may still be on PATH) but no longer feeds
+    # route gating below: standalone Gemini CLI was retired for individual
+    # accounts in 2026-06, so only Antigravity satisfies the Gemini-family
+    # seat for auto-detection purposes.
     native_names = ("claude", "codex", "gemini", "antigravity")
     native_paths = {name: which("agy" if name == "antigravity" else name) for name in native_names}
     has_claude = bool(native_paths.get("claude"))
     has_codex = bool(native_paths.get("codex"))
-    has_neutral = bool(native_paths.get("antigravity") or native_paths.get("gemini"))
+    has_neutral = bool(native_paths.get("antigravity"))
     native_count = sum([has_claude, has_codex, has_neutral])
     native_usable = has_neutral and (has_claude or has_codex)
     has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
@@ -1397,12 +1400,12 @@ def _preset_status(preset: str, routes: dict[str, object]) -> tuple[str, str]:
             return "recommended", f"would select `{selected}`"
         return (
             "blocked",
-            "needs Gemini/Antigravity plus Claude/Codex, or OPENROUTER_API_KEY",
+            "needs Antigravity plus Claude/Codex, or OPENROUTER_API_KEY",
         )
     if preset == "tri-cli":
         if native_usable:
             return "available", "uses installed native CLI participants"
-        return "blocked", "needs Gemini or Antigravity plus at least one of Claude or Codex"
+        return "blocked", "needs Antigravity plus at least one of Claude or Codex"
     if preset == "openrouter":
         if has_openrouter:
             return "available", "uses hosted OpenRouter participants"
@@ -1517,10 +1520,6 @@ def _print_setup_next_steps(
         )
         print(
             "     Append the full contents of "
-            f"{root / '.llm-council/instructions/gemini.md'} to GEMINI.md."
-        )
-        print(
-            "     Append the full contents of "
             f"{root / '.llm-council/instructions/antigravity.md'} to GEMINI.md."
         )
     else:
@@ -1553,11 +1552,10 @@ def _print_setup_next_steps(
                 "modes need at least one."
             )
         has_agy = bool(shutil.which("agy"))
-        has_gemini = bool(shutil.which("gemini"))
-        if not has_agy and not has_gemini:
+        if not has_agy:
             warnings.append(
-                "neither gemini nor antigravity was found on PATH; native "
-                "CLI modes need one Gemini-family participant."
+                "antigravity (agy) was not found on PATH; native CLI modes "
+                "need a Gemini-family participant."
             )
     if include_openrouter and not os.environ.get("OPENROUTER_API_KEY"):
         warnings.append(

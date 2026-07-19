@@ -22,10 +22,12 @@ participants:
     args:
     - -p
     - --permission-mode
-    - default
+    - manual
     - --tools
     - Read,Grep,Glob,LS
     - --no-session-persistence
+    - --strict-mcp-config
+    - --exclude-dynamic-system-prompt-sections
     model:
     timeout: 240
     max_prompt_chars: 120000
@@ -83,6 +85,7 @@ participants:
     - --sandbox
     - --mode
     - plan
+    - --new-project
     model:
     timeout: 240
     max_prompt_chars: 120000

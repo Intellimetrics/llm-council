@@ -666,7 +666,14 @@ def _quota_fallback_walk(cfg: dict[str, Any]) -> list[str]:
     return chain[idx : idx + QUOTA_FALLBACK_MAX_STEPS]
 
 
-def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -> list[str]:
+def _build_cli_command(
+    name: str,
+    cfg: dict[str, Any],
+    prompt: str,
+    cwd: Path,
+    *,
+    effective_timeout_seconds: float | None = None,
+) -> list[str]:
     command = [cfg.get("command", name)]
     args = [_format_arg(str(arg), prompt=prompt, cwd=cwd) for arg in cfg.get("args", [])]
 
@@ -697,10 +704,11 @@ def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -
             # agy 1.0.x ("Model for the current CLI session"), which also
             # makes the quota fallback_chain walk effective for agy — the
             # pre-1.0 "no --model flag" skip is retired. CAUTION: agy
-            # silently falls back to its session default on an unrecognized
-            # model string (no hard error), so config values must match
-            # `agy models` display names exactly (e.g.
-            # "Gemini 3.5 Flash (Medium)").
+            # model ids are account-specific display names (e.g.
+            # "Gemini 3.5 Flash (Medium)"); since agy 1.1.2 an
+            # unresolvable value hard-fails print mode with a non-zero
+            # exit and a list of valid names, so a typo is a clean,
+            # detectable failure rather than a silent session-default swap.
             command.extend(["--model", str(model)])
 
     # Claude's native `--fallback-model` flag: when the user-selected model
@@ -743,6 +751,21 @@ def _build_cli_command(name: str, cfg: dict[str, Any], prompt: str, cwd: Path) -
                 command.insert(command.index("exec") + 1, "--json")
             elif args and args[0] == "exec":
                 args = [args[0], "--json", *args[1:]]
+
+    # agy's print mode has its OWN internal wall clock (--print-timeout,
+    # default 5m). A council timeout above 300s would otherwise be silently
+    # truncated by the CLI before our subprocess timeout fires. Match agy's
+    # cap to the effective per-run timeout (plus slack so ours still fires
+    # first and owns the error message). Skipped when the operator already
+    # pins --print-timeout in args.
+    if (
+        family == "antigravity"
+        and effective_timeout_seconds
+        and "--print-timeout" not in args
+    ):
+        command_args = command + args
+        if "--print-timeout" not in command_args:
+            args = [*args, "--print-timeout", f"{int(effective_timeout_seconds) + 30}s"]
 
     return command + args
 
@@ -1038,7 +1061,9 @@ async def _run_cli_once(
 ) -> tuple[ParticipantResult, dict[str, Any]]:
     base_timeout = int(cfg.get("timeout") or 240)
     timeout = _resolve_effective_timeout(cfg, mode_multiplier, prompt_chars=len(prompt))
-    command = _build_cli_command(name, cfg, prompt, cwd)
+    command = _build_cli_command(
+        name, cfg, prompt, cwd, effective_timeout_seconds=timeout
+    )
     max_prompt_chars = cfg.get("max_prompt_chars")
     if max_prompt_chars is not None and len(prompt) > int(max_prompt_chars):
         return (
@@ -2867,7 +2892,16 @@ def _parse_codex_usage_json(out: str) -> dict[str, Any] | None:
         event_type = _codex_event_type(event)
 
         # Last completed agent message wins (the final assistant turn).
-        if event_type in {"agent_message", "item.completed", "agent_message.completed"}:
+        # For `item.completed` wrappers, require item.type == "agent_message":
+        # codex 0.143/0.144 added new canonical item types (collab tool calls,
+        # sub-agent activity, review items) that could carry a trailing `text`
+        # field and silently overwrite the real answer under the old
+        # accept-any-item match.
+        if event_type in {"agent_message", "agent_message.completed"} or (
+            event_type == "item.completed"
+            and isinstance(event.get("item"), dict)
+            and event["item"].get("type") == "agent_message"
+        ):
             candidate = _codex_event_text(event)
             if candidate:
                 text = candidate

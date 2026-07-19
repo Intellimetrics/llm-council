@@ -249,7 +249,7 @@ this machine. No further wiring is needed:
 llm-council run --mode private-local --diff "Review this change"
 ```
 
-Hosted-inference CLI participants (claude/codex/gemini/antigravity) and hosted API participants
+Hosted-inference CLI participants (claude/codex/antigravity) and hosted API participants
 (openrouter) are excluded — `private-local` is for offline/private review.
 Proxy environment variables are ignored for loopback calls. The Ollama daemon
 is still a separate process whose own egress council cannot enforce; firewall
