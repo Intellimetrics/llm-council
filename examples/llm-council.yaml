@@ -35,6 +35,9 @@ participants:
     env_passthrough:
     - ANTHROPIC_API_KEY
 
+  # `-c mcp_servers={}` keeps a council-spawned codex from booting ANY MCP
+  # servers from the operator's global codex config — including llm-council
+  # itself, which would recurse (a council must never start another council).
   codex:
     type: cli
     family: codex
@@ -45,6 +48,8 @@ participants:
     - --sandbox
     - read-only
     - --ephemeral
+    - -c
+    - mcp_servers={}
     - --cd
     - "{cwd}"
     - "-"
@@ -54,24 +59,11 @@ participants:
     env_passthrough:
     - OPENAI_API_KEY
 
-  gemini:
-    type: cli
-    family: gemini
-    origin: US / Google
-    command: gemini
-    args:
-    - --approval-mode
-    - plan
-    model:
-    timeout: 240
-    stdin_prompt: true
-    env_passthrough:
-    - GEMINI_API_KEY
-    - GOOGLE_API_KEY
-
-  # Antigravity is the default Gemini-family compatibility route. --mode plan
+  # Antigravity is the Gemini-family route (Google retired the standalone
+  # `gemini` CLI for individual accounts in June 2026). --mode plan
   # (agy 1.1.0+) disables its file-write tool; --sandbox restricts shell
-  # commands. agy ignores stdin since 1.1.1, so the prompt is passed as the
+  # commands; --new-project isolates each run from agy's global conversation
+  # store. agy ignores stdin since 1.1.1, so the prompt is passed as the
   # --print argument. Keep --dangerously-skip-permissions out of this
   # participant.
   antigravity:
@@ -95,6 +87,9 @@ participants:
     - GOOGLE_API_KEY
     - ANTIGRAVITY_API_KEY
 
+  # Hosted OpenRouter peers are DEFINED here as opt-in material but no mode
+  # below seats them by default — the default council is local-CLI only.
+  # Seat one per-run (`--include deepseek_v4_pro`) or per-mode via `add`.
   deepseek_v4_pro:
     type: openrouter
     family: deepseek
@@ -129,13 +124,12 @@ modes:
   plan:
     strategy: other_cli_peers
     include_current: true
-    add:
-    - deepseek_v4_pro
-    description: Native CLI participants plus DeepSeek V4 Pro for independent planning.
+    description: Native CLI participants for independent planning.
 
+  # To seat a hosted peer in a mode, add it explicitly, e.g.:
+  #   review:
+  #     add: [qwen_coder_plus]
   review:
     strategy: other_cli_peers
     include_current: true
-    add:
-    - qwen_coder_plus
-    description: Native CLI participants plus Qwen Coder Plus for code review.
+    description: Native CLI participants reviewing the change.

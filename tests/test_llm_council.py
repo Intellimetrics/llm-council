@@ -5263,12 +5263,18 @@ def test_example_config_loads_exact_modes():
     assert set(config["participants"]) == {
         "claude",
         "codex",
-        "gemini",
         "antigravity",
         "deepseek_v4_pro",
         "qwen_coder_plus",
     }
     assert set(config["modes"]) == {"quick", "peer-only", "plan", "review"}
+    # The example mirrors the local-CLI-only default rosters: hosted peers
+    # are defined for opt-in but no example mode seats one.
+    for mode_cfg in config["modes"].values():
+        assert not mode_cfg.get("add")
+    # And the example codex args carry the nested-council MCP starvation.
+    codex_args = config["participants"]["codex"]["args"]
+    assert "mcp_servers={}" in codex_args
 
 
 def test_tri_cli_setup_loaded_config_does_not_restore_defaults(tmp_path: Path):

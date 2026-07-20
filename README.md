@@ -26,7 +26,7 @@ graph TD
     Server -- "2. Parse prompt / git diff" --> Orchestrator[Orchestrator]
     Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerA[Peer A: Claude]
     Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerB[Peer B: Codex]
-    Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerC[Peer C: Gemini-family CLI]
+    Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerC[Peer C: Antigravity]
     PeerA -- "4. YES/NO/TRADEOFF" --> Consensus[Consensus Evaluator]
     PeerB -- "4. YES/NO/TRADEOFF" --> Consensus
     PeerC -- "4. YES/NO/TRADEOFF" --> Consensus
@@ -47,7 +47,9 @@ graph TD
     *   `RECOMMENDATION: tradeoff` — Plausible, but note critical trade-offs.
 *   **Assigned-Stance Review**: `consensus` assigns for/against/neutral stances in the first round. Add `--deliberate` for multi-round critique and `--synthesize` for an optional **Synthesis Chair** decision memo.
 *   **Host-Aware Routing**: Detects the active developer agent. `quick` includes that host for an explicit council pass; `peer-only` excludes the host's family when the user wants only outside perspectives.
-*   **Rigorous Sandboxing & Read-Only Safety**: Native CLI peers are invoked with binary-level flags disabling file writes (`--permission-mode manual` for Claude, `--sandbox read-only` for Codex).
+*   **Rigorous Sandboxing & Read-Only Safety**: Native CLI peers are invoked with binary-level flags disabling file writes (`--permission-mode manual` for Claude, `--sandbox read-only` for Codex, `--mode plan` for Antigravity).
+*   **Recursion-Proof**: A council can never start another council. Every peer subprocess carries a `LLM_COUNCIL_NESTED` marker that makes any nested `council_run` refuse outright, and codex peers boot with an empty MCP server table so a globally registered llm-council can't spawn inside a peer. Without this, one prompt-injected `council_run` would fan out exponentially.
+*   **Local-CLI-Only Defaults**: Every built-in mode rosters only the native CLIs (Claude, Codex, Antigravity) running under your own accounts — no hosted, per-token-billed peer ever runs unless you explicitly opt in (`--include`, per-mode `add`, or a hosted setup preset).
 *   **Cost Controls & Caching**: Pre-flight token and USD cost estimation (`llm-council estimate`) plus response caching prevents unexpected hosted API charges. A hard `--max-cost-usd` / `--max-tokens` gate refuses a run before launch; an optional soft `cost_warn_usd` tier warns (but never blocks) when an estimate gets pricey, and an optional `litellm` fallback prices hosted models missing from the OpenRouter catalog.
 *   **Credential Secret Scanning**: Scans all prompt content for API keys, tokens, or private keys, with configurable responses (`warn`, `block`, `redact`, or `off`).
 *   **HTML Transcript**: Every run generates a formatted HTML transcript. Opening it in the default browser is opt-in through `--open` or `defaults.auto_open_browser: true`.
@@ -56,6 +58,24 @@ graph TD
 *   **Cross-Vendor Independence Warning** *(opt-in)*: When every labeled vote comes from a single vendor family, the council flags it (`min_distinct_vendors`) so correlated same-vendor agreement isn't mistaken for independent corroboration.
 *   **Independent Review** *(opt-in)*: suppress prior-round verdicts on a continuation (`--independent-review`) so re-reviews aren't anchored to past opinions.
 *   **Observable Per-CLI Usage** *(opt-in)*: `usage_from_json` reads real token counts and cost from the Claude/Codex JSON output modes — recovering usage telemetry that is otherwise invisible for native CLI peers — while preserving the read-only invocation.
+
+---
+
+## Built-in Modes
+
+All built-in rosters are local-CLI only; hosted peers join only by explicit opt-in.
+
+| Mode | What it does |
+| :--- | :--- |
+| `quick` | Ask all available native CLI peers (includes a fresh instance of the host's own family for a clean-context pass). |
+| `peer-only` | Exclude the host CLI's family — outside perspectives only. |
+| `plan` | Independent planning review. |
+| `review` | Code/diff review (pair with `--diff`). |
+| `review-with-tools` | *Experimental.* CLI peers use their own read-only file/grep tools to verify claims against the repo before voting, instead of relying solely on pasted context. |
+| `deliberate` | Adds a second round when first-round votes disagree. |
+| `consensus` | Assigned-stance debate (for / against / neutral) to attack groupthink; 2x timeouts. |
+| `fable` | Read-only second opinion from Claude Fable 5, with defensive-review framing and a silent-model-substitution guard. |
+| `private-local` | Routes only to same-machine loopback Ollama participants. |
 
 ---
 
@@ -200,7 +220,7 @@ Peers act strictly as advisors, not co-authors. How strongly that's enforced dif
 *   **Hosted & local models** (OpenRouter / Ollama): plain API calls with no filesystem access at all — inherently read-only.
 *   **Stdin isolation**: peers receive the codebase or diff via standard input (except `agy`, which stopped reading stdin in 1.1.1 and receives the prompt as a command-line argument instead).
 
---
+---
 
 ## Manual Driver Configuration
 
