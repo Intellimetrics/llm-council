@@ -129,6 +129,15 @@ Key modules:
 
 ## Invariants worth preserving
 
+- **Built-in mode rosters are local-CLI only.** No built-in mode seats a
+  hosted (openrouter/billed) participant via `participants` or `add` —
+  the shipped default council is claude / codex / antigravity everywhere.
+  Hosted baselines stay DEFINED in `defaults.py` for explicit opt-in
+  (`include`, per-project `modes.<name>.add`, setup presets), but never
+  run unless the operator asks. Guarded by
+  `tests/test_llm_council.py::test_no_built_in_mode_seats_hosted_peers`.
+  Side effect worth keeping: tri-cli setups retain plan/review/deliberate
+  (previously pruned because their rosters referenced hosted peers).
 - **Read-only by default (hard for all three native CLI peers).**
   Council participants must not edit files. Each native CLI gets a HARD
   guarantee from flags that physically disable the write tool
@@ -219,6 +228,22 @@ Key modules:
   tiebreak). A single file larger than `max_prompt_chars - framing` is
   dropped entirely with a `context_files_chunked` progress event listing
   `oversize_files` — operator-visible rather than silently truncated.
+  The round-2 deliberation body budget is DERIVED, not fixed:
+  `deliberation.deliberation_body_budget(effective_cap, largest_suffix)`
+  returns `min(MAX_DELIBERATION_PROMPT_CHARS, cap) - largest per-peer
+  directive suffix`, and both the runtime builder
+  (`build_deliberation_prompt(max_chars=...)`, cap threaded via
+  `execute_council(deliberation_prompt_cap=...)` — MCP passes
+  `min(default_max, mcp_max)`, CLI passes `defaults.max_prompt_chars`)
+  and the preflight bound
+  (`estimate.deliberation_prompt_char_bounds(effective_prompt_cap=...)`)
+  use the same derivation. This keeps `final round-2 prompt = body +
+  directive suffix <= effective cap` true by construction for any peer
+  family, directive length, or configured cap — never re-introduce a
+  fixed body constant compared against an independently defined cap
+  (pre-fix, agy's 268-char hint made the worst-case bound 80,268 vs the
+  80,000 MCP cap, structurally refusing every deliberate MCP run that
+  rostered it; regression tests in `tests/test_deliberation_budget.py`).
 - **Mode-aware timeouts.** `defaults.py:DEFAULT_CONFIG["modes"]` may carry
   an optional `timeout_multiplier: float`. Resolution:
   `effective = per_participant_timeout * mode_multiplier`. The
@@ -562,6 +587,22 @@ Key modules:
     feature is opt-in/default-OFF: no built-in mode except `fable` selects
     the peer, and a peer without `require_pinned_model` (or without JSON
     usage) never trips the guard.
+- **A council must never start another council.** Two independent layers,
+  both required. (1) Guard: `adapters.clean_subprocess_env` unconditionally
+  sets `LLM_COUNCIL_NESTED=1` in every CLI child env (sieve AND strict
+  modes; it inherits down the whole process tree), and
+  `orchestrator.execute_council` refuses to run (`NestedCouncilRefused:`
+  ValueError) when the marker is present in its own environment. (2)
+  Starvation: the codex baseline args include `-c mcp_servers={}` so a
+  council-spawned codex boots NO MCP servers — the observed real-world
+  recursion path is an operator's global `~/.codex/config.toml` registering
+  llm-council itself as an MCP server, which made every codex council peer
+  start a nested llm-council server (plus headless-browser servers) per
+  run. Claude peers already isolate via `--strict-mcp-config` with no
+  `--mcp-config`. The outgoing codex baseline is preserved as
+  `config.OLD_CODEX_EPHEMERAL_ARGS` so previously generated configs
+  silently upgrade at load. Without both layers a prompt-injected peer
+  calling `council_run` recurses exponentially (each level spawns N peers).
 - **`.mcp.json` stays local.** Setup adds it to `.gitignore`. It contains
   absolute paths and must not be committed.
 - **Version bumps.** `__version__` in `llm_council/__init__.py` and the

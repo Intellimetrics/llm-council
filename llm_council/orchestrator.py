@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 from dataclasses import replace
@@ -40,9 +41,11 @@ from llm_council.convergence import (
     resolve_thresholds,
     tokenize,
 )
+from llm_council.context import apply_per_peer_directives
 from llm_council.deliberation import (
     build_deliberation_prompt,
     default_min_quorum,
+    deliberation_body_budget,
     has_disagreement,
     labeled_quorum_count,
     recommendation_counts,
@@ -441,135 +444,6 @@ def _detect_quota_recoveries(
     return new_entries
 
 
-def apply_contextual_persona_recruitment(
-    participants: list[str],
-    participant_cfg: dict[str, Any],
-    cwd: Path,
-    *,
-    stances: dict[str, str] | None = None,
-) -> str | None:
-    """Apply the changed-file persona assignment used by runtime prompts.
-
-    The function deliberately mutates ``participant_cfg`` just as the
-    historical inline implementation did. Preflight callers can invoke it
-    before constructing per-peer prompts, and :func:`execute_council` invokes
-    it again harmlessly so every entry point shares the same recruitment and
-    target-selection rules.
-
-    Returns the participant receiving the persona, or ``None`` when the diff
-    does not match a contextual specialty (or no selected config is usable).
-    """
-
-    changed_files: list[str] = []
-    from llm_council.context import _git_output
-
-    try:
-        git_staged = _git_output(cwd, ["diff", "--cached", "--name-only"])
-        if git_staged:
-            changed_files.extend(git_staged.splitlines())
-        git_unstaged = _git_output(cwd, ["diff", "--name-only"])
-        if git_unstaged:
-            changed_files.extend(git_unstaged.splitlines())
-    except Exception:
-        return None
-
-    persona: str | None = None
-    persona_prompt: str | None = None
-    for filename in changed_files:
-        lowered = filename.lower()
-        if any(
-            marker in lowered
-            for marker in (".sql", "db/", "migrations/", "models.py")
-        ):
-            persona = "database_architect"
-            persona_prompt = (
-                "Role: DATABASE ARCHITECT. Focus on schema design, query "
-                "efficiency, indexes, migration safety, race conditions, and "
-                "transaction safety."
-            )
-            break
-        if any(
-            marker in lowered
-            for marker in (
-                "auth",
-                "login",
-                "security",
-                "perm",
-                "crypt",
-                ".env",
-                "key",
-            )
-        ):
-            persona = "security_auditor"
-            persona_prompt = (
-                "Role: SECURITY AUDITOR. Focus on vulnerability detection, "
-                "authentication, input validation, encryption, secrets "
-                "leakage, and authorization bypasses."
-            )
-            break
-        if any(
-            marker in lowered
-            for marker in (".css", ".html", ".scss", "styles/", "components/")
-        ):
-            persona = "frontend_specialist"
-            persona_prompt = (
-                "Role: FRONTEND & UX SPECIALIST. Focus on semantic HTML, "
-                "accessibility (a11y), responsive styling, layout shifts, "
-                "bundle size, and browser compatibility."
-            )
-            break
-        if any(
-            marker in lowered
-            for marker in (
-                "dockerfile",
-                "workflow",
-                ".github",
-                "yaml",
-                "yml",
-                "toml",
-            )
-        ):
-            persona = "devops_engineer"
-            persona_prompt = (
-                "Role: DEVOPS & CI/CD ENGINEER. Focus on build pipelines, "
-                "container safety, environment variable management, "
-                "dependencies, resource limits, and deployment sanity."
-            )
-            break
-
-    if not persona or not persona_prompt:
-        return None
-
-    target: str | None = None
-    for name in participants:
-        cfg = participant_cfg.get(name)
-        if not isinstance(cfg, dict):
-            continue
-        assigned_stance = (
-            stances.get(name)
-            if isinstance(stances, dict) and name in stances
-            else cfg.get("stance")
-        )
-        if assigned_stance in ("for", "against"):
-            target = name
-            break
-    if target is None:
-        target = next(
-            (
-                name
-                for name in participants
-                if isinstance(participant_cfg.get(name), dict)
-            ),
-            None,
-        )
-    if target is None:
-        return None
-
-    participant_cfg[target]["persona"] = persona
-    participant_cfg[target]["persona_prompt"] = persona_prompt
-    return target
-
-
 async def execute_council(
     participants: list[str],
     participant_cfg: dict[str, Any],
@@ -589,7 +463,22 @@ async def execute_council(
     synthesizer_name: str | None = None,
     current: str | None = None,
     question: str | None = None,
+    deliberation_prompt_cap: int | None = None,
 ) -> tuple[list[ParticipantResult], dict[str, Any]]:
+    # Presence semantics, not truthiness: ANY value (including "" or "0")
+    # marks this process as descended from a council participant. The only
+    # escape hatch is unsetting the variable entirely.
+    if os.environ.get("LLM_COUNCIL_NESTED") is not None:
+        raise ValueError(
+            "NestedCouncilRefused: this process is running inside a council "
+            "participant (LLM_COUNCIL_NESTED is set in the environment). A "
+            "council must never start another council — each level would "
+            "spawn its own peers, so recursion grows exponentially. If a "
+            "peer CLI's own MCP config registers llm-council, that nested "
+            "server may run read-only tools but not council_run. Unset "
+            "LLM_COUNCIL_NESTED only if you are certain this process is not "
+            "a council participant."
+        )
     run_started_monotonic = time.monotonic()
     run_started_at = _utc_progress_timestamp()
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
@@ -617,13 +506,6 @@ async def execute_council(
             _peer_cfg = participant_cfg.get(_peer_name)
             if isinstance(_peer_cfg, dict) and _peer_name in stances:
                 _peer_cfg["stance"] = stances[_peer_name]
-
-    apply_contextual_persona_recruitment(
-        participants,
-        participant_cfg,
-        cwd,
-        stances=stances,
-    )
 
     cache_disabled_for_mode = is_caching_disabled_for_mode(mode)
     cache_ctx_round1 = CacheContext(
@@ -1058,7 +940,31 @@ async def execute_council(
                 }
             )
             break
-        next_prompt, truncated_peers = build_deliberation_prompt(prompt, round_results)
+        # The per-peer directives run_participants will append must fit
+        # inside the surface's prompt cap alongside the body, so the body
+        # budget is derived from the cap minus the largest suffix.
+        directive_suffix_chars = max(
+            (
+                len(
+                    apply_per_peer_directives(
+                        "",
+                        mode=mode,
+                        family=(participant_cfg.get(name) or {}).get("family"),
+                        tool_call_voting=tool_call_voting,
+                        stance=(participant_cfg.get(name) or {}).get("stance"),
+                    )
+                )
+                for name in deliberation_participants
+            ),
+            default=0,
+        )
+        next_prompt, truncated_peers = build_deliberation_prompt(
+            prompt,
+            round_results,
+            max_chars=deliberation_body_budget(
+                deliberation_prompt_cap, directive_suffix_chars
+            ),
+        )
         deliberation_prompts[round_number + 1] = next_prompt
         for peer_name in truncated_peers:
             emit(

@@ -1740,11 +1740,6 @@ def cmd_estimate(args: argparse.Namespace) -> int:
     mode = canonical_mode_name(
         config, args.mode or config.get("defaults", {}).get("mode", "quick")
     )
-    from llm_council.config import apply_smart_routing
-
-    # Match `run`: automatic low-risk routing establishes the baseline, then
-    # an explicit tier remains the operator's final model pin.
-    apply_smart_routing(config, mode, cwd)
     tier = getattr(args, "tier", None)
     if tier:
         try:
@@ -2376,11 +2371,6 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         or inherited_mode
         or config.get("defaults", {}).get("mode", "quick"),
     )
-    from llm_council.config import apply_smart_routing
-
-    # Automatic cost routing is a baseline convenience.  An explicit --tier
-    # is an operator decision and therefore applies last.
-    apply_smart_routing(config, mode, cwd)
     tier = getattr(args, "tier", None)
     if tier:
         try:
@@ -2612,14 +2602,6 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         min_quorum_value = None
     participant_cfg = config.get("participants", {})
 
-    from llm_council.orchestrator import apply_contextual_persona_recruitment
-
-    apply_contextual_persona_recruitment(
-        participants,
-        participant_cfg,
-        cwd,
-        stances=mode_stances if isinstance(mode_stances, dict) else None,
-    )
     tool_call_voting = bool(mode_cfg.get("tool_call_voting"))
     participant_prompts: dict[str, str] = {}
     for name in participants:
@@ -2635,8 +2617,6 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             family=peer_cfg.get("family"),
             tool_call_voting=tool_call_voting,
             stance=assigned_stance,
-            persona=peer_cfg.get("persona"),
-            persona_prompt=peer_cfg.get("persona_prompt"),
         )
 
     deliberation_prompt_bounds = (
@@ -2646,6 +2626,9 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             mode=mode,
             tool_call_voting=tool_call_voting,
             stances=mode_stances if isinstance(mode_stances, dict) else None,
+            effective_prompt_cap=config.get("defaults", {}).get(
+                "max_prompt_chars"
+            ),
         )
         if deliberate and max_rounds > 1
         else {}
@@ -2827,25 +2810,35 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         config.setdefault("defaults", {})["require_sections"] = bool(_cli_require_sections)
     if _cli_strict_evidence is not None:
         config.setdefault("defaults", {})["strict_evidence"] = bool(_cli_strict_evidence)
-    results, metadata = await execute_council(
-        participants,
-        participant_cfg,
-        prompt,
-        cwd,
-        config,
-        deliberate=deliberate,
-        max_rounds=max_rounds,
-        progress=None if args.json else _make_progress_printer(participants),
-        image_manifest=image_manifest or None,
-        min_quorum=min_quorum_value,
-        mode=mode,
-        cache_mode=getattr(args, "cache_mode", "on"),
-        stances=mode_stances if isinstance(mode_stances, dict) else None,
-        synthesize=synthesize,
-        synthesizer_name=synthesizer_name,
-        current=current,
-        question=persisted_question,
-    )
+    try:
+        results, metadata = await execute_council(
+            participants,
+            participant_cfg,
+            prompt,
+            cwd,
+            config,
+            deliberate=deliberate,
+            max_rounds=max_rounds,
+            progress=None if args.json else _make_progress_printer(participants),
+            image_manifest=image_manifest or None,
+            min_quorum=min_quorum_value,
+            mode=mode,
+            cache_mode=getattr(args, "cache_mode", "on"),
+            stances=mode_stances if isinstance(mode_stances, dict) else None,
+            synthesize=synthesize,
+            synthesizer_name=synthesizer_name,
+            current=current,
+            question=persisted_question,
+            deliberation_prompt_cap=config.get("defaults", {}).get(
+                "max_prompt_chars"
+            ),
+        )
+    except ValueError as exc:
+        # The nested-council refusal is an operator-facing guard, not a bug;
+        # present it as a clean CLI error instead of a traceback.
+        if str(exc).startswith("NestedCouncilRefused:"):
+            raise SystemExit(str(exc)) from exc
+        raise
     from llm_council.deliberation import summarize_recommendations
 
     final_results = final_round_results(results)

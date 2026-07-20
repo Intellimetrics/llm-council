@@ -459,154 +459,6 @@ def test_estimate_counts_synthesis_cap_rows(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_contextual_persona_is_included_in_hard_cap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    (tmp_path / ".llm-council.yaml").write_text(
-        """
-replace_defaults: true
-defaults:
-  mode: custom
-participants:
-  p:
-    type: cli
-    command: true
-modes:
-  custom:
-    participants: [p]
-""".lstrip(),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
-
-    from llm_council import context as context_module
-
-    monkeypatch.setattr(
-        context_module,
-        "_git_output",
-        lambda _cwd, args: (
-            "src/security/auth.py\n" if "--cached" in args else ""
-        ),
-    )
-    real_estimate = estimate_council
-    captured: dict[str, int | str] = {}
-
-    def spy_estimate(**kwargs):
-        full = real_estimate(**kwargs)
-        base_kwargs = dict(kwargs)
-        base_kwargs["participant_prompts"] = {
-            name: kwargs["prepared_prompt"]
-            for name in kwargs["prepared_participants"]
-        }
-        without_persona = real_estimate(**base_kwargs)
-        _, captured["full_tokens"], _ = summarize_preflight_caps(full)
-        _, captured["base_tokens"], _ = summarize_preflight_caps(without_persona)
-        captured["peer_prompt"] = kwargs["participant_prompts"]["p"]
-        return full
-
-    execute_calls = 0
-
-    async def fake_execute(*args, **kwargs):
-        nonlocal execute_calls
-        execute_calls += 1
-        return (
-            [_result("p", "yes")],
-            {"rounds": 1, "deliberated": False, "degraded": False},
-        )
-
-    monkeypatch.setattr(mcp_server, "estimate_council", spy_estimate)
-    monkeypatch.setattr(mcp_server, "execute_council", fake_execute)
-    monkeypatch.setattr(mcp_server, "write_transcript", lambda *a, **k: None)
-
-    await mcp_server.run_council(
-        {"question": "review", "working_directory": str(tmp_path)}
-    )
-    assert "CONTEXTUAL ROLE ASSIGNMENT" in str(captured["peer_prompt"])
-    assert int(captured["full_tokens"]) > int(captured["base_tokens"])
-
-    with pytest.raises(ValueError, match="exceeds max_tokens"):
-        await mcp_server.run_council(
-            {
-                "question": "review",
-                "working_directory": str(tmp_path),
-                "max_tokens": int(captured["base_tokens"]),
-            }
-        )
-    assert execute_calls == 1
-
-
-def test_cli_contextual_persona_is_included_in_hard_cap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    (tmp_path / ".llm-council.yaml").write_text(
-        """
-replace_defaults: true
-defaults:
-  mode: custom
-participants:
-  p:
-    type: cli
-    command: true
-modes:
-  custom:
-    participants: [p]
-""".lstrip(),
-        encoding="utf-8",
-    )
-    from llm_council import cli as cli_module
-    from llm_council import context as context_module
-    from llm_council.cli import build_parser
-
-    monkeypatch.setattr(cli_module, "maybe_print_update_nag", lambda *_a: None)
-    monkeypatch.setattr(cli_module, "build_prompt", lambda *_a, **_k: "base")
-    monkeypatch.setattr(
-        context_module,
-        "_git_output",
-        lambda _cwd, args: (
-            "src/security/auth.py\n" if "--cached" in args else ""
-        ),
-    )
-    captured: dict[str, str] = {}
-
-    def fake_estimate(**kwargs):
-        prompts = kwargs.get("participant_prompts") or {}
-        peer_prompt = prompts.get("p", kwargs.get("prepared_prompt") or "base")
-        captured["peer_prompt"] = peer_prompt
-        return {
-            "known_total_usd": 0.0,
-            "known_total_with_retry_safety_usd": 0.0,
-            "rows": [
-                {
-                    "name": "p",
-                    "type": "cli",
-                    "estimated_input_tokens": (len(peer_prompt) + 3) // 4,
-                    "estimated_output_tokens": 0,
-                    "estimated_total_cost_usd": None,
-                }
-            ],
-        }
-
-    monkeypatch.setattr(cli_module, "estimate_council", fake_estimate)
-    args = build_parser().parse_args(
-        [
-            "run",
-            "--cwd",
-            str(tmp_path),
-            "--mode",
-            "custom",
-            "--max-tokens",
-            "1",
-            "--dry-run",
-            "review",
-        ]
-    )
-
-    with pytest.raises(SystemExit, match="exceeds --max-tokens"):
-        cli_module.cmd_run(args)
-    assert "CONTEXTUAL ROLE ASSIGNMENT" in captured["peer_prompt"]
-
-
-@pytest.mark.asyncio
 async def test_mcp_invalid_synthesis_chair_fails_before_execute(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1014,7 +866,149 @@ modes:
 
 
 @pytest.mark.asyncio
-async def test_mcp_explicit_tier_wins_after_smart_routing(
+async def test_mcp_stance_directives_included_in_hard_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The max_tokens hard cap must be computed over the directive-decorated
+    per-peer prompts, not the base prompt. Stance directives are the
+    surviving per-peer decoration exercising that property."""
+    (tmp_path / ".llm-council.yaml").write_text(
+        """
+replace_defaults: true
+defaults:
+  mode: custom
+participants:
+  p:
+    type: cli
+    command: true
+modes:
+  custom:
+    participants: [p]
+    stances:
+      p: for
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
+
+    real_estimate = estimate_council
+    captured: dict[str, int | str] = {}
+
+    def spy_estimate(**kwargs):
+        full = real_estimate(**kwargs)
+        base_kwargs = dict(kwargs)
+        base_kwargs["participant_prompts"] = {
+            name: kwargs["prepared_prompt"]
+            for name in kwargs["prepared_participants"]
+        }
+        without_directives = real_estimate(**base_kwargs)
+        _, captured["full_tokens"], _ = summarize_preflight_caps(full)
+        _, captured["base_tokens"], _ = summarize_preflight_caps(
+            without_directives
+        )
+        captured["peer_prompt"] = kwargs["participant_prompts"]["p_for"]
+        return full
+
+    execute_calls = 0
+
+    async def fake_execute(*args, **kwargs):
+        nonlocal execute_calls
+        execute_calls += 1
+        return (
+            [_result("p_for", "yes")],
+            {"rounds": 1, "deliberated": False, "degraded": False},
+        )
+
+    monkeypatch.setattr(mcp_server, "estimate_council", spy_estimate)
+    monkeypatch.setattr(mcp_server, "execute_council", fake_execute)
+    monkeypatch.setattr(mcp_server, "write_transcript", lambda *a, **k: None)
+
+    await mcp_server.run_council(
+        {"question": "review", "working_directory": str(tmp_path)}
+    )
+    assert "INDIVIDUAL ASSIGNMENT" in str(captured["peer_prompt"])
+    assert int(captured["full_tokens"]) > int(captured["base_tokens"])
+
+    with pytest.raises(ValueError, match="exceeds max_tokens"):
+        await mcp_server.run_council(
+            {
+                "question": "review",
+                "working_directory": str(tmp_path),
+                "max_tokens": int(captured["base_tokens"]),
+            }
+        )
+    assert execute_calls == 1
+
+
+def test_cli_stance_directives_included_in_hard_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    (tmp_path / ".llm-council.yaml").write_text(
+        """
+replace_defaults: true
+defaults:
+  mode: custom
+participants:
+  p:
+    type: cli
+    command: true
+modes:
+  custom:
+    participants: [p]
+    stances:
+      p: for
+""".lstrip(),
+        encoding="utf-8",
+    )
+    from llm_council import cli as cli_module
+    from llm_council.cli import build_parser
+
+    monkeypatch.setattr(cli_module, "maybe_print_update_nag", lambda *_a: None)
+    monkeypatch.setattr(cli_module, "build_prompt", lambda *_a, **_k: "base")
+    captured: dict[str, str] = {}
+
+    def fake_estimate(**kwargs):
+        prompts = kwargs.get("participant_prompts") or {}
+        peer_prompt = next(
+            iter(prompts.values()), kwargs.get("prepared_prompt") or "base"
+        )
+        captured["peer_prompt"] = peer_prompt
+        return {
+            "known_total_usd": 0.0,
+            "known_total_with_retry_safety_usd": 0.0,
+            "rows": [
+                {
+                    "name": "p",
+                    "type": "cli",
+                    "estimated_input_tokens": (len(peer_prompt) + 3) // 4,
+                    "estimated_output_tokens": 0,
+                    "estimated_total_cost_usd": None,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(cli_module, "estimate_council", fake_estimate)
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "custom",
+            "--max-tokens",
+            "1",
+            "--dry-run",
+            "review",
+        ]
+    )
+
+    with pytest.raises(SystemExit, match="exceeds --max-tokens"):
+        cli_module.cmd_run(args)
+    assert "INDIVIDUAL ASSIGNMENT" in captured["peer_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_explicit_tier_overrides_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     (tmp_path / ".llm-council.yaml").write_text(
@@ -1038,13 +1032,6 @@ modes:
     )
     monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
 
-    import llm_council.config as config_module
-
-    def fake_smart_routing(config, mode, cwd):
-        config["participants"]["p"]["model"] = "cheap-model"
-
-    monkeypatch.setattr(config_module, "apply_smart_routing", fake_smart_routing)
-
     payload = await mcp_server.run_council(
         {
             "question": "review",
@@ -1056,7 +1043,7 @@ modes:
     assert payload["metadata"]["participant_models"]["p"] == "premium-model"
 
 
-def test_standalone_estimates_apply_smart_routing_before_explicit_tier(
+def test_standalone_estimates_honor_explicit_tier(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     (tmp_path / ".llm-council.yaml").write_text(
@@ -1081,16 +1068,10 @@ modes:
     )
     monkeypatch.setenv("LLM_COUNCIL_MCP_ROOT", str(tmp_path))
 
-    import llm_council.config as config_module
     from llm_council import cli as cli_module
     from llm_council.cli import build_parser
 
-    smart_calls: list[str] = []
     estimated_models: list[str] = []
-
-    def fake_smart_routing(config, mode, cwd):
-        smart_calls.append(mode)
-        config["participants"]["p"]["model"] = "cheap-model"
 
     def fake_estimate(**kwargs):
         model = kwargs["config"]["participants"]["p"]["model"]
@@ -1103,7 +1084,6 @@ modes:
             "rows": [],
         }
 
-    monkeypatch.setattr(config_module, "apply_smart_routing", fake_smart_routing)
     monkeypatch.setattr(cli_module, "estimate_council", fake_estimate)
     monkeypatch.setattr(mcp_server, "estimate_council", fake_estimate)
 
@@ -1129,7 +1109,6 @@ modes:
     )
     assert mcp_estimate["ok"] is True
     assert mcp_estimate["captured_model"] == "premium-model"
-    assert smart_calls == ["custom", "custom"]
     assert estimated_models == ["premium-model", "premium-model"]
 
 

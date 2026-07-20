@@ -64,7 +64,7 @@ graph TD
 Even if you only have access to a single LLM (due to offline constraints, local setup, or API key limits), running a council session provides substantial value:
 
 1.  **Fresh Eyes / Context Separation**: In a typical developer agent session, the context window accumulates tools, history, and reasoning, leading to confirmation bias. The council calls a fresh, isolated API process containing *only* the diff and prompt, forcing a clean evaluation.
-2.  **Persona & State Splitting**: By invoking multiple calls to the same model concurrently with different persona prompts (e.g., Peer A as the *Attacker*, Peer B as the *Defender*, Peer C as the *Judge*), you isolate their states. Peers see one another's arguments only if deliberation or synthesis is enabled.
+2.  **Stance & State Splitting**: By invoking multiple calls to the same model concurrently with different stance prompts (e.g., Peer A as the *Attacker*, Peer B as the *Defender*, Peer C as the *Judge*), you isolate their states. Peers see one another's arguments only if deliberation or synthesis is enabled.
 3.  **Adversarial Extraction**: Forcing the model to adopt contrarian stances (e.g. "Find 3 security flaws in this diff") bypasses its default cooperative/agreeable bias, extracting a deeper critique than a standard prompt.
 
 ---

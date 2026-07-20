@@ -22,7 +22,7 @@ from llm_council.context import (
     build_image_manifest,
     build_prompt,
 )
-from llm_council.deliberation import MAX_DELIBERATION_PROMPT_CHARS
+from llm_council.deliberation import deliberation_body_budget
 from llm_council.model_catalog import fetch_openrouter_models
 from llm_council.synthesis import MAX_SYNTHESIS_PROMPT_CHARS_DEFAULT
 
@@ -101,16 +101,19 @@ def deliberation_prompt_char_bounds(
     mode: str,
     tool_call_voting: bool,
     stances: Mapping[str, str] | None = None,
+    effective_prompt_cap: int | None = None,
 ) -> dict[str, int]:
     """Worst-case successful prompt size for every extra council round.
 
-    The shared deliberation builder caps its dynamic task/peer body at 80k
-    characters. ``run_participants`` then appends peer-specific directives,
-    so those exact suffixes must sit outside that cap in the estimate. A lower
-    participant prompt cap bounds the largest call that could actually run.
+    Mirrors the runtime exactly: the deliberation builder truncates its
+    body to ``deliberation_body_budget(cap, largest suffix)`` and
+    ``run_participants`` appends each peer's directive suffix on top, so
+    the bound is ``body budget + that peer's suffix`` — never above the
+    effective cap, by construction. A lower participant prompt cap bounds
+    the largest call that could actually run.
     """
 
-    bounds: dict[str, int] = {}
+    suffix_chars: dict[str, int] = {}
     for name in participants:
         cfg = participant_cfg.get(name, {}) or {}
         assigned_stance = (
@@ -118,18 +121,23 @@ def deliberation_prompt_char_bounds(
             if stances is not None and name in stances
             else cfg.get("stance")
         )
-        directive_suffix = apply_per_peer_directives(
-            "",
-            mode=mode,
-            family=cfg.get("family"),
-            tool_call_voting=tool_call_voting,
-            stance=assigned_stance,
-            persona=cfg.get("persona"),
-            persona_prompt=cfg.get("persona_prompt"),
+        suffix_chars[name] = len(
+            apply_per_peer_directives(
+                "",
+                mode=mode,
+                family=cfg.get("family"),
+                tool_call_voting=tool_call_voting,
+                stance=assigned_stance,
+            )
         )
+    body_budget = deliberation_body_budget(
+        effective_prompt_cap, max(suffix_chars.values(), default=0)
+    )
+    bounds: dict[str, int] = {}
+    for name in participants:
         bounds[name] = _bounded_prompt_chars(
-            MAX_DELIBERATION_PROMPT_CHARS + len(directive_suffix),
-            cfg,
+            body_budget + suffix_chars[name],
+            participant_cfg.get(name, {}) or {},
         )
     return bounds
 
@@ -270,16 +278,8 @@ def estimate_council(
     completion_tokens = max(0, int(completion_tokens))
 
     if participant_prompts is None:
-        # Match `run`: changed-file persona recruitment and every static
-        # per-peer directive contribute to input tokens and hosted cost.
-        from llm_council.orchestrator import apply_contextual_persona_recruitment
-
-        apply_contextual_persona_recruitment(
-            participants,
-            participant_cfg,
-            cwd,
-            stances=mode_stances,
-        )
+        # Match `run`: every static per-peer directive contributes to input
+        # tokens and hosted cost.
         participant_prompts = {}
         for name in participants:
             cfg = participant_cfg.get(name) or {}
@@ -293,8 +293,6 @@ def estimate_council(
                     if isinstance(mode_stances, dict)
                     else cfg.get("stance")
                 ),
-                persona=cfg.get("persona"),
-                persona_prompt=cfg.get("persona_prompt"),
             )
     extra_models = list(openrouter_models or [])
     needs_catalog = bool(extra_models) or any(
@@ -342,10 +340,11 @@ def estimate_council(
         )
 
     # Round 1 uses the exact finalized peer prompts above. Every additional
-    # deliberation round is dynamic: prior peer responses can fill the shared
-    # 80k builder cap, after which run_participants appends the same per-peer
-    # directives (and vision inputs) again. Represent that separately instead
-    # of multiplying a tiny round-1 question across all rounds.
+    # deliberation round is dynamic: prior peer responses can fill the derived
+    # body budget, after which run_participants appends the same per-peer
+    # directives (and vision inputs) again — the derivation reserves room for
+    # those suffixes inside the effective cap. Represent that separately
+    # instead of multiplying a tiny round-1 question across all rounds.
     if deliberate and budgeted_rounds > 1:
         mode_stances = mode_cfg.get("stances")
         deliberation_bounds = (
@@ -358,6 +357,9 @@ def estimate_council(
                 tool_call_voting=bool(mode_cfg.get("tool_call_voting")),
                 stances=(
                     mode_stances if isinstance(mode_stances, Mapping) else None
+                ),
+                effective_prompt_cap=config.get("defaults", {}).get(
+                    "max_prompt_chars"
                 ),
             )
         )

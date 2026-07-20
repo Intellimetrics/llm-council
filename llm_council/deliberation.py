@@ -10,6 +10,30 @@ MAX_DELIBERATION_PROMPT_CHARS = 80_000
 DELIBERATION_TRUNCATION_SUFFIX = (
     "\n\n[deliberation prompt truncated by llm-council]\n"
 )
+
+
+def deliberation_body_budget(
+    effective_prompt_cap: int | None, directive_suffix_chars: int
+) -> int:
+    """Derive the round-2 body budget from the cap that governs the run.
+
+    ``run_participants`` appends per-peer directive suffixes AFTER the
+    deliberation body is built, so the final prompt a peer receives is
+    ``body + suffix``. For that sum to respect both the builder ceiling
+    (``MAX_DELIBERATION_PROMPT_CHARS``) and the surface's effective prompt
+    cap (``defaults.max_prompt_chars`` / ``mcp_max_prompt_chars``), the
+    body budget must be the smaller of the two minus the largest suffix
+    that will be appended. Derived here — never tuned per peer or per cap —
+    so the invariant holds for any directive length and any configured cap.
+    """
+
+    ceiling = MAX_DELIBERATION_PROMPT_CHARS
+    if effective_prompt_cap is not None:
+        ceiling = min(ceiling, int(effective_prompt_cap))
+    return max(
+        len(DELIBERATION_TRUNCATION_SUFFIX),
+        ceiling - max(0, int(directive_suffix_chars)),
+    )
 # Per-peer excerpt cap for deliberation rounds. Sized so a 3-peer council
 # fits inside MAX_DELIBERATION_PROMPT_CHARS alongside the question text and
 # pointer preamble (the bulky `Context:` payload from round 1 is stripped);
@@ -190,7 +214,7 @@ def _truncate_at_line_boundary(text: str, limit: int) -> tuple[str, bool]:
 def _strip_context_payload(original_prompt: str) -> str:
     """Drop the ``Context:`` section (diff, files, stdin) but keep the question.
 
-    Round-2 peers need the task wording — output constraints, persona, etc. —
+    Round-2 peers need the task wording — output constraints, stance, etc. —
     but not the bulky diff/file blobs that are paid for in round 1. The
     prompt builder always emits a literal ``\\nContext:\\n`` line before
     these sections; if it is absent (no context attached), return the prompt
@@ -207,7 +231,10 @@ def _strip_context_payload(original_prompt: str) -> str:
 
 
 def build_deliberation_prompt(
-    original_prompt: str, results: list[ParticipantResult]
+    original_prompt: str,
+    results: list[ParticipantResult],
+    *,
+    max_chars: int | None = None,
 ) -> tuple[str, list[str]]:
     """Build a slim round-2 prompt + list of peers whose excerpts were truncated.
 
@@ -216,6 +243,11 @@ def build_deliberation_prompt(
     keep the question/instructions but drop the bulky ``Context:`` section
     (diff, files, stdin) since peers reasoned over it in round 1 and their
     excerpts carry forward the relevant findings.
+
+    ``max_chars`` is the body budget — callers pass
+    :func:`deliberation_body_budget` so the per-peer directive suffixes
+    appended downstream still fit inside the run's prompt cap. ``None``
+    falls back to the bare builder ceiling.
     """
     truncated_peers: list[str] = []
     excerpts = []
@@ -271,13 +303,15 @@ def build_deliberation_prompt(
         "without blockers is treated as abdication and dropped from quorum.",
     ]
     prompt = "\n".join(pointer_lines) + "\n\n" + "\n\n".join(excerpts)
-    if len(prompt) <= MAX_DELIBERATION_PROMPT_CHARS:
+    budget = (
+        MAX_DELIBERATION_PROMPT_CHARS
+        if max_chars is None
+        else max(len(DELIBERATION_TRUNCATION_SUFFIX), int(max_chars))
+    )
+    if len(prompt) <= budget:
         return prompt, truncated_peers
     return (
-        prompt[
-            : MAX_DELIBERATION_PROMPT_CHARS
-            - len(DELIBERATION_TRUNCATION_SUFFIX)
-        ].rstrip()
+        prompt[: budget - len(DELIBERATION_TRUNCATION_SUFFIX)].rstrip()
         + DELIBERATION_TRUNCATION_SUFFIX,
         truncated_peers,
     )

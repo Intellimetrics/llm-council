@@ -255,25 +255,17 @@ async def test_tied_final_vote_is_stamped_unknown_before_transcript(
 
 
 @pytest.mark.asyncio
-async def test_explicit_tier_applies_after_smart_routing(
+async def test_explicit_tier_applies_on_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path)
-    order: list[str] = []
-
-    def smart(cfg: dict, _mode: str, _cwd: Path) -> None:
-        order.append("smart")
-        cfg["participants"]["a"]["model"] = "smart-model"
 
     def tier(cfg: dict, name: str) -> list[str]:
         assert name == "operator"
-        assert cfg["participants"]["a"]["model"] == "smart-model"
-        order.append("tier")
         cfg["participants"]["a"]["model"] = "operator-model"
         return ["a"]
 
-    monkeypatch.setattr("llm_council.config.apply_smart_routing", smart)
     monkeypatch.setattr(cli_module, "apply_tier_override", tier)
     _patch_run_scaffolding(monkeypatch, tmp_path, config)
     args = build_parser().parse_args(
@@ -291,5 +283,4 @@ async def test_explicit_tier_applies_after_smart_routing(
     )
 
     assert await cmd_run_async(args) == 0
-    assert order == ["smart", "tier"]
     assert config["participants"]["a"]["model"] == "operator-model"

@@ -51,10 +51,7 @@ from llm_council.estimate import (
     synthesis_prompt_char_bound,
 )
 from llm_council.model_catalog import fetch_openrouter_models
-from llm_council.orchestrator import (
-    apply_contextual_persona_recruitment,
-    execute_council,
-)
+from llm_council.orchestrator import execute_council
 from llm_council import policy
 from llm_council.recommend_judge import grade_difficulty
 from llm_council.stats import compute_stats
@@ -1121,12 +1118,6 @@ async def _run_council_scoped(
         or inherited_mode
         or config.get("defaults", {}).get("mode", "quick"),
     )
-    from llm_council.config import apply_smart_routing
-
-    apply_smart_routing(config, mode, cwd)
-    # An explicit tier is an operator pin and therefore has higher precedence
-    # than automatic low-risk routing. Applying it last prevents `tier: deep`
-    # from being silently stepped down to a cheaper model.
     tier = arguments.get("tier")
     if tier:
         apply_tier_override(config, str(tier))
@@ -1304,12 +1295,6 @@ async def _run_council_scoped(
     min_quorum_value = int(min_quorum_arg) if min_quorum_arg is not None else None
 
     tool_call_voting = bool(mode_cfg.get("tool_call_voting"))
-    apply_contextual_persona_recruitment(
-        participants,
-        participant_cfg_for_prompt,
-        cwd,
-        stances=mode_stances if isinstance(mode_stances, dict) else None,
-    )
 
     resolved_synthesizer: str | None = None
     if synthesize:
@@ -1341,8 +1326,6 @@ async def _run_council_scoped(
             family=peer_cfg.get("family"),
             tool_call_voting=tool_call_voting,
             stance=assigned_stance,
-            persona=peer_cfg.get("persona"),
-            persona_prompt=peer_cfg.get("persona_prompt"),
         )
     budget_prompt_chars = max(
         [len(prompt), *(len(text) for text in participant_prompts.values())]
@@ -1357,6 +1340,7 @@ async def _run_council_scoped(
             mode=mode,
             tool_call_voting=tool_call_voting,
             stances=mode_stances if isinstance(mode_stances, dict) else None,
+            effective_prompt_cap=min(int(default_max), int(mcp_max)),
         )
         if deliberate and max_rounds > 1
         else {}
@@ -1575,6 +1559,7 @@ async def _run_council_scoped(
         synthesizer_name=resolved_synthesizer,
         current=current,
         question=persisted_question,
+        deliberation_prompt_cap=min(int(default_max), int(mcp_max)),
     )
     if image_manifest:
         metadata["images"] = [
@@ -1947,11 +1932,6 @@ def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
             arguments.get("mode")
             or config.get("defaults", {}).get("mode", "quick"),
         )
-        from llm_council.config import apply_smart_routing
-
-        # Match `council_run`: automatic low-risk routing first, explicit tier
-        # last so an operator pin cannot be silently downgraded.
-        apply_smart_routing(config, mode, cwd)
         tier = arguments.get("tier")
         if tier:
             apply_tier_override(config, str(tier))

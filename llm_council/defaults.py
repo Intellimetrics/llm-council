@@ -79,15 +79,6 @@ DEFAULT_STANCE_PROMPTS: dict[str, str] = {
     ),
 }
 
-DEFAULT_CHEAPER_MODELS: dict[str, str] = {
-    "anthropic/claude-sonnet-4-6": "anthropic/claude-haiku-4-5",
-    "openai/gpt-4o": "openai/gpt-4o-mini",
-    "google/gemini-1.5-pro": "google/gemini-1.5-flash",
-    "anthropic/claude-sonnet": "anthropic/claude-haiku",
-    "openai/gpt-4": "openai/gpt-4o-mini",
-}
-
-
 DEFAULT_CONFIG: dict = {
     "version": 1,
     "transcripts_dir": ".llm-council/runs",
@@ -265,6 +256,13 @@ DEFAULT_CONFIG: dict = {
                 "--sandbox",
                 "read-only",
                 "--ephemeral",
+                # Never boot MCP servers inside a council peer: an operator's
+                # global codex config may register llm-council itself as an
+                # MCP server, so without this a council-spawned codex starts
+                # a nested llm-council (recursion risk) plus any other
+                # configured servers (headless browsers, etc.) per run.
+                "-c",
+                "mcp_servers={}",
                 "--cd",
                 "{cwd}",
                 "-",
@@ -462,17 +460,20 @@ DEFAULT_CONFIG: dict = {
             "include_current": False,
             "description": "Ask only other available native CLI participants, excluding the current host.",
         },
+        # Default rosters are local-CLI only (claude / codex / antigravity).
+        # Hosted openrouter participants are DEFINED below as opt-in
+        # baselines but never seated by a built-in mode — add them per-run
+        # via `include` or per-project via `modes.<name>.add` when hosted
+        # breadth is worth the token cost.
         "plan": {
             "strategy": "other_cli_peers",
             "include_current": True,
-            "add": ["deepseek_v4_pro"],
-            "description": "Native CLI participants plus DeepSeek for independent planning.",
+            "description": "Native CLI participants for independent planning.",
         },
         "review": {
             "strategy": "other_cli_peers",
             "include_current": True,
-            "add": ["qwen_coder_plus"],
-            "description": "Native CLI participants plus the Qwen coding participant.",
+            "description": "Native CLI participants reviewing the change.",
         },
         # Consult Claude Fable 5 as a single read-only reviewer. `safe_context:
         # true` injects the defensive-review framing (context.build_prompt) that
@@ -542,7 +543,6 @@ DEFAULT_CONFIG: dict = {
         "deliberate": {
             "strategy": "other_cli_peers",
             "include_current": True,
-            "add": ["deepseek_v4_pro"],
             "deliberate": True,
             "timeout_multiplier": 1.5,
             "description": "Expensive opt-in second round when first-round responses disagree.",

@@ -2628,8 +2628,6 @@ async def run_participants(
                 family=cfg.get("family"),
                 tool_call_voting=tool_call_voting,
                 stance=cfg.get("stance"),
-                persona=cfg.get("persona"),
-                persona_prompt=cfg.get("persona_prompt"),
             )
             timeout = _resolve_effective_timeout(
                 cfg, mode_multiplier, prompt_chars=len(peer_prompt)
@@ -4059,6 +4057,13 @@ def clean_subprocess_env(
 
     `LC_*` locale vars and `TERM` always pass through regardless of mode
     so the child renders correctly. `CLAUDECODE` is always stripped.
+
+    Both modes always set ``LLM_COUNCIL_NESTED=1`` in the child env. The
+    marker inherits down the whole process tree, so any llm-council that
+    ends up running inside a council participant (e.g. a peer CLI whose
+    own MCP config registers llm-council) sees it and refuses to start a
+    nested council — the recursion guard in
+    :func:`llm_council.orchestrator.execute_council`.
     """
     allowed = {key.upper() for key in (env_passthrough or [])}
     env: dict[str, str] = {}
@@ -4078,6 +4083,7 @@ def clean_subprocess_env(
         if _is_secret_env_name(key) and upper not in allowed:
             continue
         env[key] = value
+    env["LLM_COUNCIL_NESTED"] = "1"
     return env
 
 

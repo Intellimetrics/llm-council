@@ -918,13 +918,10 @@ def apply_per_peer_directives(
     family: str | None,
     tool_call_voting: bool = False,
     stance: str | None = None,
-    persona: str | None = None,
-    persona_prompt: str | None = None,
 ) -> str:
-    """Append per-peer prompt directives based on mode + peer family + stance + persona.
+    """Append per-peer prompt directives based on mode + peer family + stance.
 
-    Returns the prompt unchanged when no directive applies. Backward-compatible
-    by design.
+    Returns the prompt unchanged when no directive applies.
     """
     result = prompt
     if family == "antigravity":
@@ -946,14 +943,6 @@ def apply_per_peer_directives(
             f"\n\n=== INDIVIDUAL ASSIGNMENT ===\n"
             f"You are participating under the identity representing stance: {stance.upper()}.\n"
             f"Your specific stance instructions for this run:\n{stance_desc}\n"
-        )
-        
-    if persona_prompt:
-        result = (
-            result +
-            f"\n\n=== CONTEXTUAL ROLE ASSIGNMENT ===\n"
-            f"You have been recruited for this run due to the nature of the files changed.\n"
-            f"{persona_prompt}\n"
         )
 
     return result

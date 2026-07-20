@@ -207,6 +207,8 @@ def test_codex_default_uses_current_read_only_exec_flags():
         "--sandbox",
         "read-only",
         "--ephemeral",
+        "-c",
+        "mcp_servers={}",
         "--cd",
         "{cwd}",
         "-",
@@ -260,6 +262,8 @@ def test_load_config_migrates_old_cli_args(tmp_path: Path):
         "--sandbox",
         "read-only",
         "--ephemeral",
+        "-c",
+        "mcp_servers={}",
         "--cd",
         "{cwd}",
         "-",
@@ -766,25 +770,40 @@ def test_prompt_arg_is_redacted_and_literal_braces_are_safe(tmp_path: Path):
     ]
 
 
-def test_plan_mode_adds_deepseek(monkeypatch):
+def test_plan_mode_is_cli_only(monkeypatch):
     config = load_config(None)
     monkeypatch.setattr(
         "shutil.which",
         lambda name: f"/bin/{name}" if name in {"claude", "codex", "agy"} else None,
     )
     selected = select_participants(config, "plan", "claude")
-    assert selected == ["claude", "codex", "antigravity", "deepseek_v4_pro"]
+    assert selected == ["claude", "codex", "antigravity"]
 
 
-def test_deliberate_mode_adds_deepseek_and_marks_expensive(monkeypatch):
+def test_deliberate_mode_is_cli_only_and_marks_expensive(monkeypatch):
     config = load_config(None)
     monkeypatch.setattr(
         "shutil.which",
         lambda name: f"/bin/{name}" if name in {"claude", "codex", "agy"} else None,
     )
     selected = select_participants(config, "deliberate", "claude")
-    assert selected == ["claude", "codex", "antigravity", "deepseek_v4_pro"]
+    assert selected == ["claude", "codex", "antigravity"]
     assert config["modes"]["deliberate"]["deliberate"] is True
+
+
+def test_no_built_in_mode_seats_hosted_peers():
+    """Defaults are local-CLI only: no built-in mode may seat an
+    openrouter/hosted participant via `participants` or `add`. Hosted
+    baselines stay DEFINED for explicit opt-in, but never run by default."""
+    participants = DEFAULT_CONFIG["participants"]
+    for mode_name, mode_cfg in DEFAULT_CONFIG["modes"].items():
+        seated = list(mode_cfg.get("participants") or []) + list(
+            mode_cfg.get("add") or []
+        )
+        for name in seated:
+            assert participants[name].get("type") == "cli", (
+                f"built-in mode '{mode_name}' seats non-CLI peer '{name}'"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1749,8 +1768,12 @@ def test_estimate_cwd_without_config_uses_defaults_not_process_cwd_config(
     ) == 0
 
     output = capsys.readouterr().out
-    assert "qwen/qwen3-coder-plus" in output
-    assert "qwen/qwen3-coder:free" not in output
+    # Built-in review is local-CLI only: the three native peers estimate,
+    # and no hosted OpenRouter row may appear.
+    for peer in ("claude", "codex", "antigravity"):
+        assert peer in output
+    assert "qwen" not in output
+    assert "deepseek" not in output
 
 
 def test_legacy_qwen_free_participant_remains_explicitly_available():
@@ -5221,12 +5244,18 @@ def test_local_openai_port_scan_surfaces_wrong_shape_responder(monkeypatch):
     assert "vLLM/sglang" in checks[0].name  # the port label tells the user where
 
 
-def test_tri_cli_setup_omits_openrouter_modes():
+def test_tri_cli_setup_omits_modes_needing_absent_peers():
     config = project_config(include_openrouter=False, include_local=False)
     assert "quick" in config["modes"]
     assert "peer-only" in config["modes"]
-    assert "plan" not in config["modes"]
+    # plan/review/deliberate are CLI-only since the hosted `add` seats were
+    # removed from the built-in rosters, so tri-cli setups keep them.
+    assert "plan" in config["modes"]
+    assert "review" in config["modes"]
+    assert "deliberate" in config["modes"]
+    # Modes whose rosters need peers outside the tri-cli set stay pruned.
     assert "private-local" not in config["modes"]
+    assert "fable" not in config["modes"]
 
 
 def test_example_config_loads_exact_modes():
@@ -5253,6 +5282,9 @@ def test_tri_cli_setup_loaded_config_does_not_restore_defaults(tmp_path: Path):
     assert set(config["modes"]) == {
         "quick",
         "peer-only",
+        "plan",
+        "review",
+        "deliberate",
         "consensus",
         # Experimental `review-with-tools` is CLI-peers-only, so it
         # survives tri-cli pruning.
@@ -5326,6 +5358,9 @@ def test_setup_yes_uses_preset_and_suppression_flags(tmp_path: Path, monkeypatch
     assert set(config["modes"]) == {
         "quick",
         "peer-only",
+        "plan",
+        "review",
+        "deliberate",
         "consensus",
         # Experimental `review-with-tools` is CLI-peers-only, so it
         # survives tri-cli pruning.
@@ -5358,6 +5393,9 @@ def test_setup_yes_auto_selects_tri_cli_when_native_clis_exist(
     assert set(config["modes"]) == {
         "quick",
         "peer-only",
+        "plan",
+        "review",
+        "deliberate",
         "consensus",
         # Experimental `review-with-tools` is CLI-peers-only, so it
         # survives tri-cli pruning.
@@ -8751,7 +8789,7 @@ def test_build_prompt_chunking_preserves_question_and_response_format(tmp_path: 
         max_prompt_chars=3_000,
         chunk_strategy="head",
     )
-    # Question, persona, response-format guarantees survive chunking.
+    # Question, framing, response-format guarantees survive chunking.
     assert "what is wrong here?" in prompt
     assert "RECOMMENDATION: yes" in prompt
     assert "read-only participant" in prompt

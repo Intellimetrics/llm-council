@@ -67,6 +67,19 @@ OLD_CODEX_APPROVAL_ARGS = [
     "{cwd}",
     "-",
 ]
+# The v0.20-and-earlier codex baseline: no `-c mcp_servers={}` override, so a
+# council-spawned codex booted every MCP server in the operator's global codex
+# config — including llm-council itself when registered there (nested-council
+# recursion risk). Migrated to the current baseline at load.
+OLD_CODEX_EPHEMERAL_ARGS = [
+    "exec",
+    "--sandbox",
+    "read-only",
+    "--ephemeral",
+    "--cd",
+    "{cwd}",
+    "-",
+]
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -794,7 +807,7 @@ def migrate_known_cli_defaults(config: dict[str, Any]) -> None:
     if isinstance(codex, dict) and (
         codex.get("type") == "cli"
         and codex.get("family") == "codex"
-        and codex.get("args") == OLD_CODEX_APPROVAL_ARGS
+        and codex.get("args") in (OLD_CODEX_APPROVAL_ARGS, OLD_CODEX_EPHEMERAL_ARGS)
     ):
         codex["args"] = list(DEFAULT_CONFIG["participants"]["codex"]["args"])
     participants = config.get("participants", {})
@@ -1416,76 +1429,3 @@ def balance_stances(active_participants: list[str], mode_stances: dict[str, str]
                 break
 
     return assigned
-
-
-def apply_smart_routing(config: dict[str, Any], mode: str, cwd: Path) -> None:
-    """Scan the git diff and context files to dynamically downgrade premium models to cheaper alternatives if changes are low-risk."""
-    smart_cfg = config.get("smart_routing", {})
-    if isinstance(smart_cfg, dict) and smart_cfg.get("enabled", True) is False:
-        return
-
-    # Get changed files
-    from llm_council.context import _git_output
-    changed_files = []
-    try:
-        git_staged = _git_output(cwd, ["diff", "--cached", "--name-only"])
-        if git_staged:
-            changed_files.extend(git_staged.splitlines())
-        git_unstaged = _git_output(cwd, ["diff", "--name-only"])
-        if git_unstaged:
-            changed_files.extend(git_unstaged.splitlines())
-    except Exception:
-        pass
-
-    if not changed_files:
-        return
-
-    # Count lines changed
-    lines_changed = 0
-    try:
-        diff_summary = _git_output(cwd, ["diff", "--shortstat"])
-        if diff_summary:
-            import re
-            m = re.search(r"(\d+) insertion", diff_summary)
-            if m:
-                lines_changed += int(m.group(1))
-            m = re.search(r"(\d+) deletion", diff_summary)
-            if m:
-                lines_changed += int(m.group(1))
-    except Exception:
-        pass
-
-    low_risk_extensions = smart_cfg.get("low_risk_extensions") or [".md", ".txt", ".png", ".jpg", ".css", ".html", ".scss"]
-    max_lines = smart_cfg.get("max_lines_changed", 30)
-
-    all_low_risk_ext = all(
-        any(f.endswith(ext) for ext in low_risk_extensions)
-        for f in changed_files
-    )
-    
-    is_low_risk = all_low_risk_ext or (0 < lines_changed <= max_lines)
-    
-    if is_low_risk:
-        from llm_council.defaults import DEFAULT_CHEAPER_MODELS
-        cheaper_mapping = dict(DEFAULT_CHEAPER_MODELS)
-        if isinstance(smart_cfg.get("cheaper_models"), dict):
-            cheaper_mapping.update(smart_cfg["cheaper_models"])
-            
-        participants = config.get("participants", {})
-        if isinstance(participants, dict):
-            swapped = []
-            for p_name, p_cfg in participants.items():
-                if isinstance(p_cfg, dict) and p_cfg.get("model"):
-                    orig_model = p_cfg["model"]
-                    if orig_model in cheaper_mapping:
-                        cheaper_model = cheaper_mapping[orig_model]
-                        p_cfg["model"] = cheaper_model
-                        swapped.append(f"{p_name} ({orig_model} -> {cheaper_model})")
-            if swapped:
-                import sys
-                print(
-                    f"[Smart Routing] Swapped premium models for cheaper alternatives (low-risk diff detected): "
-                    f"{', '.join(swapped)}",
-                    file=sys.stderr,
-                    flush=True
-                )
