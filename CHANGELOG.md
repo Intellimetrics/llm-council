@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.21.0 - 2026-07-20
+
+Council-integrity hardening driven by a full 3-CLI self-review dogfood:
+the council reviewed its own codebase, and everything it (or the runs
+themselves) surfaced was fixed and re-verified live through MCP.
+
+**A council must never start another council**
+* Every CLI child environment now carries `LLM_COUNCIL_NESTED`
+  (presence semantics: any value — including `""` or `"0"` — refuses;
+  unsetting is the only escape hatch). `execute_council` raises
+  `NestedCouncilRefused` when marked, and the CLI converts exactly that
+  error to a clean one-line exit while other ValueErrors keep their
+  tracebacks for debuggability.
+* The codex baseline args add `-c mcp_servers={}` so a council-spawned
+  codex boots no MCP servers at all — the observed real-world recursion
+  path was an operator's global `~/.codex/config.toml` registering
+  llm-council itself, making every codex peer boot a nested council
+  server per run. Existing generated configs silently upgrade via the
+  new `OLD_CODEX_EPHEMERAL_ARGS` migration.
+
+**Removed: two undocumented subsystems**
+* `apply_contextual_persona_recruitment` (filename-substring persona
+  injection on any dirty git tree) and `apply_smart_routing`
+  (default-ON silent downgrade of premium models on "low-risk" diffs)
+  are excised along with `DEFAULT_CHEAPER_MODELS` and all
+  `persona`/`persona_prompt` plumbing. Both ran unconditionally with no
+  enable flag and neither was documented; the council flagged them as
+  trust violations. A leftover `smart_routing:`/`persona` YAML block is
+  now an inert no-op.
+
+**Deliberation prompt budget is now derived, not fixed**
+* Every `deliberate: true` MCP run rostering antigravity had been
+  structurally refused since v0.18.0: the worst-case round-2 bound was
+  `MAX_DELIBERATION_PROMPT_CHARS` (80,000) plus agy's 268-char
+  directive suffix, compared against the 80,000-char MCP cap —
+  refused regardless of actual prompt size. The round-2 body budget is
+  now `deliberation_body_budget(effective_cap, largest_suffix)`, used
+  by BOTH the runtime builder and the preflight bound, so
+  `body + directive suffix <= cap` holds by construction for any peer
+  family, directive length, or configured cap. A lowered
+  `mcp_max_prompt_chars` now genuinely bounds round-2 prompts too.
+
+**Built-in mode rosters are local-CLI only**
+* `plan`, `review`, and `deliberate` no longer seat hosted peers by
+  default (previously deepseek/qwen via `add`). The shipped default
+  council is claude / codex / antigravity everywhere, guarded by
+  `test_no_built_in_mode_seats_hosted_peers`. Hosted baselines stay
+  defined for explicit opt-in (`include`, per-project `add`, setup
+  presets). Side effect: tri-cli setups now retain plan / review /
+  deliberate instead of pruning them for referencing hosted peers.
+
+**Coverage restored**
+* Stance-based hard-cap tests replace the coverage lost with the
+  persona tests: `--max-tokens` / `max_tokens` caps are verified to be
+  computed over directive-decorated per-peer prompts, not the base
+  prompt.
+
 ## 0.20.0 - 2026-07-19
 
 v0.20.0 removes the retired standalone Gemini CLI peer and adopts
