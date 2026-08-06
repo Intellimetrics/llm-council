@@ -136,6 +136,17 @@ TERSE_RETRY_FAILED_SUFFIX = (
     "this prompt-size band keeps tripping the timeout wall."
 )
 
+# Suffix appended instead of retrying when the round already has labeled
+# quorum from the other peers (field issue #1, 2026-08: the terse retry on
+# a chronically slow peer doubled the wasted wall time on a run that was
+# already viable without it). Same visibility rationale as
+# TERSE_RETRY_FAILED_SUFFIX — the transcript must show WHY no retry fired.
+TERSE_RETRY_SKIPPED_QUORUM_SUFFIX = (
+    " Terse-retry-on-timeout was SKIPPED: the round already reached labeled "
+    "quorum from the other peers. Set "
+    "`defaults.skip_terse_retry_when_quorum_met: false` to always retry."
+)
+
 CLI_LAUNCH_RETRY_STDERR_LIMIT = 4096
 
 CONTEXT_OVERFLOW_ERROR_PREFIX = "ContextOverflowExcluded:"
@@ -805,6 +816,7 @@ async def _run_cli_participant_pipeline(
     cache_ctx: CacheContext | None = None,
     mode_multiplier: float | None = None,
     mode: str | None = None,
+    quorum_tracker: "QuorumTracker | None" = None,
 ) -> ParticipantResult:
     overflow = _context_overflow_result(name, cfg, prompt)
     if overflow is not None:
@@ -822,11 +834,29 @@ async def _run_cli_participant_pipeline(
     # The retry budget is now PROPORTIONAL to the original timeout
     # (v0.12.0) so a 240s original doesn't get a structurally-doomed
     # 60s retry — see `_terse_retry_budget` for the math.
-    if (
+    timeout_retry_wanted = (
         not result.ok
         and is_timeout_error(result.error)
         and _terse_retry_enabled(cfg)
+    )
+    if (
+        timeout_retry_wanted
+        and quorum_tracker is not None
+        and quorum_tracker.met()
     ):
+        # Field issue #1 (2026-08): the round already has labeled quorum
+        # without this peer, so the retry would burn another 30-120s of
+        # wall time chasing a vote the run no longer needs to stay viable
+        # (and which, in every observed chronic-timeout case, re-timed-out
+        # anyway). Annotate rather than retry; the error keeps its
+        # `Timeout:` prefix so `classify_error` / quorum math are
+        # unchanged.
+        from dataclasses import replace as _replace
+        result = _replace(
+            result, error=result.error + TERSE_RETRY_SKIPPED_QUORUM_SUFFIX
+        )
+        timeout_retry_wanted = False
+    if timeout_retry_wanted:
         original_timeout = _resolve_effective_timeout(
             cfg, mode_multiplier, prompt_chars=len(prompt)
         )
@@ -1034,6 +1064,7 @@ async def run_cli_participant(
     cache_ctx: CacheContext | None = None,
     mode_multiplier: float | None = None,
     mode: str | None = None,
+    quorum_tracker: "QuorumTracker | None" = None,
 ) -> ParticipantResult:
     """Run the complete CLI pipeline and record its true wall time.
 
@@ -1052,6 +1083,7 @@ async def run_cli_participant(
         cache_ctx=cache_ctx,
         mode_multiplier=mode_multiplier,
         mode=mode,
+        quorum_tracker=quorum_tracker,
     )
     result.wall_elapsed_seconds = time.monotonic() - wall_start
     return result
@@ -2543,6 +2575,7 @@ async def run_participant(
     mode_multiplier: float | None = None,
     mode: str | None = None,
     tool_call_voting: bool = False,
+    quorum_tracker: "QuorumTracker | None" = None,
 ) -> ParticipantResult:
     wall_start = time.monotonic()
     ptype = cfg.get("type")
@@ -2556,6 +2589,7 @@ async def run_participant(
         result = await run_cli_participant(
             name, cfg, prompt, cwd, cache_ctx=cache_ctx,
             mode_multiplier=mode_multiplier, mode=mode,
+            quorum_tracker=quorum_tracker,
         )
     elif ptype in ("openrouter", "openai_compatible"):
         result = await run_openai_compatible_participant(
@@ -2623,6 +2657,30 @@ async def _request_with_retries(
     raise last_exc
 
 
+class QuorumTracker:
+    """Single-round, cross-peer count of usable labeled votes.
+
+    Written by ``run_participants`` as each peer's pipeline finishes;
+    consulted by the CLI pipeline's terse-retry gate so a straggler that
+    times out AFTER the round already has labeled quorum doesn't burn
+    another 30-120s retrying for a vote the run no longer needs to stay
+    viable (field issue #1, 2026-08). One tracker per round — labeled
+    counts never carry across rounds. Single-event-loop access only; no
+    locking needed.
+    """
+
+    def __init__(self, min_quorum: int) -> None:
+        self.min_quorum = max(1, int(min_quorum))
+        self.labeled = 0
+
+    def record(self, result: ParticipantResult) -> None:
+        if result.ok and _has_recommendation_label(result.output):
+            self.labeled += 1
+
+    def met(self) -> bool:
+        return self.labeled >= self.min_quorum
+
+
 async def run_participants(
     selected: list[str],
     participant_cfg: dict[str, Any],
@@ -2637,6 +2695,7 @@ async def run_participants(
     mode_multiplier: float | None = None,
     mode: str | None = None,
     tool_call_voting: bool = False,
+    quorum_tracker: QuorumTracker | None = None,
 ) -> list[ParticipantResult]:
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
@@ -2695,6 +2754,7 @@ async def run_participants(
                     mode_multiplier=mode_multiplier,
                     mode=mode,
                     tool_call_voting=tool_call_voting,
+                    quorum_tracker=quorum_tracker,
                 )
             finally:
                 if slow_task is not None and not slow_task.done():
@@ -2703,6 +2763,21 @@ async def run_participants(
                         await slow_task
                     except asyncio.CancelledError:
                         pass
+            if quorum_tracker is not None:
+                quorum_tracker.record(result)
+                if progress and result.error.endswith(
+                    TERSE_RETRY_SKIPPED_QUORUM_SUFFIX
+                ):
+                    progress(
+                        {
+                            "event": "terse_retry_skipped",
+                            "participant": name,
+                            "round": round_number,
+                            "reason": "quorum_met",
+                            "labeled_quorum": quorum_tracker.labeled,
+                            "min_quorum": quorum_tracker.min_quorum,
+                        }
+                    )
             status = "ok" if result.ok else "error"
             if result.error.startswith("PromptTooLarge:"):
                 status = "skipped"
@@ -3714,8 +3789,11 @@ def _format_timeout_error(
         f"Timeout: `{name}` did not respond within {timeout}s"
         f"{multiplier_note} "
         f"(prompt was {prompt_chars} chars). "
+        # No angle brackets here: some MCP hosts HTML-escape tool-result
+        # strings, so a `<seconds>` placeholder arrives garbled as
+        # `&lt;seconds&gt;` in the consumer's view of the advice.
         "To raise the limit, set `participants."
-        f"{name}.timeout: <seconds>` in `.llm-council.yaml`. "
+        f"{name}.timeout` (a value in seconds) in `.llm-council.yaml`. "
         "To skip this participant for one run, pass an explicit participant "
         "list that omits it. To shorten the prompt, drop large `--context` "
         "files or use `--diff` more selectively."

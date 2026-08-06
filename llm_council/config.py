@@ -471,6 +471,14 @@ def validate_config(config: dict[str, Any]) -> None:
         defaults["independent_review"], bool
     ):
         raise ValueError("defaults.independent_review must be a boolean")
+    # Quorum-aware terse-retry skip. Boolean; a quoted "false" in YAML would
+    # otherwise silently keep the feature on.
+    if "skip_terse_retry_when_quorum_met" in defaults and not isinstance(
+        defaults["skip_terse_retry_when_quorum_met"], bool
+    ):
+        raise ValueError(
+            "defaults.skip_terse_retry_when_quorum_met must be a boolean"
+        )
     # M9 optional LLM difficulty judge: peer NAME of a hosted participant to
     # consult in `council_recommend`. String when present (absent = feature
     # off). Existence / hosted-ness / key resolution is checked lazily at

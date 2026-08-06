@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+Fixes driven by the 2026-08-05 field-issues report (two weeks of MCP
+usage from a real project). MCP output schema bumps to v10.
+
+**Quorum-aware terse-retry skip (field issue #1)**
+* When a CLI peer times out after the round already holds `min_quorum`
+  labeled votes from the other peers, the 30-120s terse-retry is
+  skipped: the timeout error gains an explanatory suffix (its
+  `Timeout:` prefix — and therefore `error_kind` / quorum math — is
+  unchanged) and a `terse_retry_skipped` progress event fires. In the
+  field runs that motivated this, the retry re-timed-out every time,
+  doubling the wasted wall time on runs that were already viable.
+  Default ON; `defaults.skip_terse_retry_when_quorum_met: false`
+  restores the old always-retry behavior.
+
+**Dropped context files are loud (field issue #2)**
+* Files dropped by context chunking were only visible as a progress
+  event — which some MCP hosts (Claude Code) never render. The MCP
+  `council_run` payload now carries a top-level `context_files_dropped`
+  key (omit-when-empty) naming every dropped path plus a warning that
+  the files never reached any peer; the markdown transcript gains a ⚠️
+  header bullet and the CLI a second stderr warning line.
+
+**Directional verdict on definite+tradeoff ties (field issue #4)**
+* A final-round tie between `no` and `tradeoff` (or `yes` and
+  `tradeoff`) with zero votes for the opposing definite label now
+  reports `leaning-no` / `leaning-yes` instead of `unknown` — the peers
+  agree on posture and differ only in label strength. `unknown` is
+  reserved for label-free runs, true yes/no opposition, and three-way
+  ties. `recommendation_tied` stays true and `agreement_count` stays 0
+  for leaning outcomes (there is still no unique leader).
+
+**Account-default peer models are named (field issue #3)**
+* Runs now stamp `metadata.cli_default_model_peers` with every CLI peer
+  running `model: None` (the operator's account default — not
+  necessarily the host session's model), plus a transcript header note.
+  Motivated by a host session that assumed the claude peer matched its
+  own pinned model for weeks.
+
+**Unreported telemetry renders n/a, not zero (field issue #5)**
+* Transcript headers rendered "Tokens reported: 0 · Cost: $0.000000"
+  when every peer's usage was null (text-mode CLI peers have no
+  metering hook), reading as "this run was free". All-null totals now
+  render `n/a` in both the markdown and HTML transcripts; partial sums
+  still render as before.
+
+**Angle brackets dropped from timeout advice (field issue #6)**
+* The timeout error's `participants.<name>.timeout: <seconds>` advice
+  arrived HTML-escaped (`&lt;seconds&gt;`) through some MCP hosts'
+  rendering. Reworded without angle brackets; llm-council's own JSON
+  was already clean.
+
 **MCP starvation enforced at command-build time (field bug)**
 * `_build_cli_command` now injects `-c mcp_servers={}` into every
   codex-family `exec` invocation unless the operator's args already

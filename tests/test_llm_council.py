@@ -11738,10 +11738,20 @@ def test_council_run_output_schema_advertises_typed_fields():
 
     schema = council_run_output_schema()
     props = schema["properties"]
-    assert props["recommendation"]["enum"] == ["yes", "no", "tradeoff", "unknown"]
+    assert props["recommendation"]["enum"] == [
+        "yes",
+        "no",
+        "tradeoff",
+        "leaning-yes",
+        "leaning-no",
+        "unknown",
+    ]
     assert props["agreement_count"]["type"] == "integer"
     assert props["degraded"]["type"] == "boolean"
     assert "transcript" in props and "results" in props
+    # v10: dropped context files are advertised top-level (omit-when-empty).
+    assert "context_files_dropped" in props
+    assert "files" in props["context_files_dropped"]["properties"]
     item_props = props["results"]["items"]["properties"]
     assert "stance" in item_props
     assert "error_kind" in item_props

@@ -119,6 +119,15 @@ DEFAULT_CONFIG: dict = {
         # Watch `evidence_tag_distribution["untagged"]` in stats for two
         # releases before flipping the default.
         "strict_evidence": False,
+        # Quorum-aware terse-retry skip (field issue #1, 2026-08). When a
+        # CLI peer times out AFTER the round already has min_quorum labeled
+        # votes from the other peers, its 30-120s terse-retry is skipped —
+        # in the observed chronic-timeout runs the retry re-timed-out every
+        # time, doubling the wasted wall time on a run that was already
+        # viable. Set False to always attempt the retry (a recovered vote
+        # can still change the headline recommendation, just not quorum
+        # viability).
+        "skip_terse_retry_when_quorum_met": True,
         "origin_policy": "any",
         "max_concurrency": 4,
         "transparent": False,

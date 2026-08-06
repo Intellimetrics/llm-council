@@ -293,7 +293,7 @@ def council_run_schema() -> dict[str, Any]:
     }
 
 
-COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 9  # v9 = cross-rank subsystem removed (also covers v0.19.0 removal of focus bundles + acceptance-contract, which dropped fields but did not add any); v8 = wall time + client/pin eligibility; v7 = model substitutions
+COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 10  # v10 = context_files_dropped + leaning-yes/leaning-no recommendation values + cli_default_model_peers metadata; v9 = cross-rank subsystem removed (also covers v0.19.0 removal of focus bundles + acceptance-contract, which dropped fields but did not add any); v8 = wall time + client/pin eligibility; v7 = model substitutions
 COUNCIL_RUN_VALID_STANCES = ("for", "against", "neutral")
 COUNCIL_RUN_VALID_ERROR_KINDS = (
     "timeout",
@@ -336,11 +336,21 @@ def council_run_output_schema() -> dict[str, Any]:
             },
             "recommendation": {
                 "type": "string",
-                "enum": ["yes", "no", "tradeoff", "unknown"],
+                "enum": [
+                    "yes",
+                    "no",
+                    "tradeoff",
+                    "leaning-yes",
+                    "leaning-no",
+                    "unknown",
+                ],
                 "description": (
-                    "Unique leading label across the final round. `unknown` "
-                    "when no peer produced a usable label or the top labels "
-                    "are tied."
+                    "Unique leading label across the final round. "
+                    "`leaning-yes` / `leaning-no` when the top labels are "
+                    "tied between a definite label and `tradeoff` (the "
+                    "peers agree on direction, differ on label strength). "
+                    "`unknown` only when no peer produced a usable label, "
+                    "or on true yes/no opposition or a three-way tie."
                 ),
             },
             "agreement_count": {
@@ -742,6 +752,29 @@ def council_run_output_schema() -> dict[str, Any]:
                     },
                     "required": ["peer", "served_by"],
                 },
+            },
+            "context_files_dropped": {
+                "type": "object",
+                "description": (
+                    "v10: present ONLY when context chunking dropped one or "
+                    "more `context_files` entirely — those files never "
+                    "reached any peer. `files` lists every dropped path; "
+                    "`oversize_files` is the subset dropped because a "
+                    "single file exceeded the prompt budget on its own. "
+                    "Surfaced top-level because progress events are not "
+                    "rendered by some MCP hosts and a silent drop reads as "
+                    "full coverage. Omitted when nothing was dropped (the "
+                    "common case)."
+                ),
+                "properties": {
+                    "files": {"type": "array", "items": {"type": "string"}},
+                    "oversize_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "warning": {"type": "string"},
+                },
+                "required": ["files", "warning"],
             },
             "metadata": {"type": "object"},
             "summary_markdown": {
@@ -1573,6 +1606,31 @@ async def _run_council_scoped(
         progress_events = metadata.setdefault("progress_events", [])
         if isinstance(progress_events, list):
             progress_events.extend(chunk_events)
+    # Field issue (2026-08): files dropped by context chunking were only
+    # visible as a `context_files_chunked` progress event — and the primary
+    # MCP host (Claude Code) does not render progress notifications, so
+    # operators discovered the drop after the fact. Aggregate every dropped
+    # path here for a LOUD top-level payload key (set below, omit-when-empty
+    # like `quota_throttled_peers`).
+    dropped_context_files = sorted(
+        {
+            str(path)
+            for event in chunk_events
+            for path in (event.get("dropped_files") or [])
+        }
+    )
+    oversize_context_files = sorted(
+        {
+            str(path)
+            for event in chunk_events
+            for path in (event.get("oversize_files") or [])
+        }
+    )
+    if dropped_context_files:
+        metadata["context_files_dropped"] = {
+            "files": dropped_context_files,
+            "oversize_files": oversize_context_files,
+        }
     # Record the pre-run independent-review suppression (only when it actually
     # occurred). Surfaced as a metadata flag rather than a mid-run progress
     # event because the decision precedes execute_council.
@@ -1745,6 +1803,10 @@ async def _run_council_scoped(
     metadata, model_substituted_peers = _lift(
         metadata, "model_substituted_peers", []
     )
+    # Dropped context files: lifted with the same pattern so the calling
+    # agent cannot miss that some of the context it supplied never reached
+    # any peer (progress events are invisible in some MCP hosts).
+    metadata, context_files_dropped = _lift(metadata, "context_files_dropped", {})
     payload: dict[str, Any] = {
         "schema_version": COUNCIL_RUN_OUTPUT_SCHEMA_VERSION,
         "recommendation": recommendation,
@@ -1781,6 +1843,17 @@ async def _run_council_scoped(
         payload["missing_key_peers"] = missing_key_peers
     if model_substituted_peers:
         payload["model_substituted_peers"] = model_substituted_peers
+    if context_files_dropped:
+        payload["context_files_dropped"] = {
+            **context_files_dropped,
+            "warning": (
+                "One or more context_files were dropped by chunking and "
+                "NEVER reached any peer. CLI peers with read tools can be "
+                "re-run with the paths referenced in the question text "
+                "instead; peers without file access (e.g. antigravity) "
+                "only ever see inlined content."
+            ),
+        }
     # L7 / M6: lift the compact cost-estimate echo and the soft cost-warning
     # to top-level so a calling agent sees the cost signal without parsing
     # metadata. Omit-when-absent (the common no-cap-no-warn path leaves both

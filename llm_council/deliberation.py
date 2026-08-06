@@ -116,9 +116,16 @@ def recommendation_counts(results: list[ParticipantResult]) -> dict[str, int]:
 class RecommendationSummary:
     """Machine-facing summary of a set of peer votes.
 
-    ``recommendation`` is emitted only for a unique trinary leader. A tied
-    top count is intentionally ``unknown`` rather than relying on iteration
-    order (which previously biased unresolved yes/no ties toward ``yes``).
+    ``recommendation`` is emitted for a unique trinary leader. A tie
+    between a definite label and ``tradeoff`` — with ZERO votes for the
+    opposing definite label — reports the direction as ``leaning-yes`` /
+    ``leaning-no``: the peers agree on posture and differ only in label
+    strength, and ``unknown`` undersells that (2026-08 field issue #4).
+    Any tie involving true yes/no opposition (or a three-way tie) stays
+    ``unknown`` rather than relying on iteration order (which previously
+    biased unresolved yes/no ties toward ``yes``). ``tied`` remains True
+    for leaning outcomes — there is still no unique leader, and
+    ``agreement_count`` stays 0 for the same reason.
     """
 
     recommendation: str
@@ -152,8 +159,18 @@ def summarize_recommendations(
     top_count = max(counts[label] for label in labels)
     leaders = [label for label in labels if counts[label] == top_count]
     if len(leaders) != 1:
+        recommendation = "unknown"
+        definite_leaders = [label for label in leaders if label != "tradeoff"]
+        if len(leaders) == 2 and len(definite_leaders) == 1:
+            # {yes, tradeoff} or {no, tradeoff} tie. Directional ONLY when
+            # the opposing definite label drew zero votes — every labeled
+            # peer sits on the same side of the yes/no axis.
+            direction = definite_leaders[0]
+            opposition = "no" if direction == "yes" else "yes"
+            if counts[opposition] == 0:
+                recommendation = f"leaning-{direction}"
         return RecommendationSummary(
-            recommendation="unknown",
+            recommendation=recommendation,
             agreement_count=0,
             total_labeled=total_labeled,
             counts=counts,

@@ -536,8 +536,10 @@ Routing rules:
   prior run; the new transcript will record `parent_run_id`.
 
 Council output shape (when the host supports MCP outputSchema):
-- `recommendation`: yes / no / tradeoff / unknown — the unique leading
-  final-round label, or unknown when leaders tie
+- `recommendation`: yes / no / tradeoff / leaning-yes / leaning-no /
+  unknown — the unique leading final-round label; leaning-* when the top
+  labels tie between a definite label and tradeoff with no opposing
+  votes (peers agree on direction); unknown otherwise
 - `agreement_count`: peers matching that unique leading label
 - `degraded`: true when fewer than `min_quorum` peers labeled
 - `transcript`: filesystem path to the markdown transcript

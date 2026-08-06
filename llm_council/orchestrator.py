@@ -19,6 +19,7 @@ from llm_council.adapters import (
     ERROR_KIND_MODEL_SUBSTITUTED,
     ParticipantResult,
     PREFLIGHT_FAILED_PREFIX,
+    QuorumTracker,
     classify_error,
     is_quota_exhausted_error,
     is_timeout_error,
@@ -691,6 +692,30 @@ async def execute_council(
         and mode_cfg_for_timeout.get("tool_call_voting")
     )
 
+    # Quorum-aware terse-retry skip (field issue #1, 2026-08). One tracker
+    # per round: as peers finish with usable labels, the count rises, and a
+    # straggler that times out AFTER the round is already viable skips its
+    # 30-120s terse retry. Uses the same min-quorum derivation as the
+    # post-run `degraded` computation. `defaults.skip_terse_retry_when_
+    # quorum_met: false` disables (tracker stays None → behavior unchanged).
+    _defaults_cfg = config.get("defaults", {}) if isinstance(config, dict) else {}
+    _skip_terse_on_quorum = (
+        _defaults_cfg.get("skip_terse_retry_when_quorum_met", True)
+        if isinstance(_defaults_cfg, dict)
+        else True
+    )
+    tracker_min_quorum = max(
+        1,
+        int(min_quorum)
+        if min_quorum is not None
+        else default_min_quorum(len(participants)),
+    )
+
+    def _round_quorum_tracker() -> QuorumTracker | None:
+        if not _skip_terse_on_quorum:
+            return None
+        return QuorumTracker(tracker_min_quorum)
+
     if run_targets:
         run_results = await run_participants(
             run_targets,
@@ -705,6 +730,7 @@ async def execute_council(
             mode_multiplier=mode_multiplier,
             mode=mode,
             tool_call_voting=tool_call_voting,
+            quorum_tracker=_round_quorum_tracker(),
         )
         verify_evidence_citations(run_results, cwd)
     else:
@@ -812,6 +838,21 @@ async def execute_council(
         "deliberation_status": "not_requested",
         "progress_events": progress_events,
     }
+    # Field issue #3 (2026-08): CLI peers with `model: None` run whatever
+    # the operator's ACCOUNT defaults to — not necessarily the model the
+    # host session is using. A host on a pinned frontier model assumed the
+    # claude peer matched it for weeks. Name those peers in metadata so
+    # the mismatch potential is visible per run (the host's own model is
+    # not detectable from here, so this is a note, not a comparison).
+    cli_default_model_peers = sorted(
+        name
+        for name in participants
+        if isinstance(participant_cfg.get(name), dict)
+        and participant_cfg[name].get("type", "cli") == "cli"
+        and not participant_cfg[name].get("model")
+    )
+    if cli_default_model_peers:
+        metadata["cli_default_model_peers"] = cli_default_model_peers
     if deliberate:
         if not initial_disagreement:
             metadata["deliberation_status"] = "skipped_no_labeled_disagreement"
@@ -988,6 +1029,7 @@ async def execute_council(
             mode_multiplier=mode_multiplier,
             mode=mode,
             tool_call_voting=tool_call_voting,
+            quorum_tracker=_round_quorum_tracker(),
         )
         verify_evidence_citations(next_results, cwd)
         prior_round_results = list(round_results)

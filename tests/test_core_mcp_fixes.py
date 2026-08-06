@@ -191,6 +191,51 @@ def test_recommendation_summary_requires_unique_leader():
     assert majority.tied is False
 
 
+def test_recommendation_summary_definite_tradeoff_tie_reports_leaning():
+    """Field issue #4 (2026-08): a {no, tradeoff} tie is directionally
+    informative — both peers sit on the don't-adopt side — and `unknown`
+    undersold it. Only fires when the opposing definite label drew ZERO
+    votes; `tied` stays True and `agreement_count` stays 0 because there
+    is still no unique leader."""
+    leaning_no = summarize_recommendations(
+        [_result("a", "no"), _result("b", "tradeoff")]
+    )
+    assert leaning_no.recommendation == "leaning-no"
+    assert leaning_no.tied is True
+    assert leaning_no.agreement_count == 0
+    assert leaning_no.total_labeled == 2
+
+    leaning_yes = summarize_recommendations(
+        [_result("a", "yes"), _result("b", "tradeoff")]
+    )
+    assert leaning_yes.recommendation == "leaning-yes"
+    assert leaning_yes.tied is True
+
+
+def test_recommendation_summary_leaning_requires_zero_opposition():
+    """A dissenting vote for the opposing definite label keeps the tie
+    at `unknown` — the peers are NOT all on one side of the yes/no axis."""
+    contested = summarize_recommendations(
+        [
+            _result("a", "no"),
+            _result("b", "no"),
+            _result("c", "tradeoff"),
+            _result("d", "tradeoff"),
+            _result("e", "yes"),
+        ]
+    )
+    assert contested.recommendation == "unknown"
+    assert contested.tied is True
+
+
+def test_recommendation_summary_three_way_tie_stays_unknown():
+    three_way = summarize_recommendations(
+        [_result("a", "yes"), _result("b", "no"), _result("c", "tradeoff")]
+    )
+    assert three_way.recommendation == "unknown"
+    assert three_way.tied is True
+
+
 def test_deliberation_builder_honors_its_advertised_character_cap():
     from llm_council.deliberation import (
         MAX_DELIBERATION_PROMPT_CHARS,

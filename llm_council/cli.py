@@ -2479,6 +2479,14 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                 file=sys.stderr,
                 flush=True,
             )
+            if dropped_files:
+                print(
+                    "warning: the dropped files above were NOT seen by any "
+                    "peer. Reference their paths in the question text so "
+                    "CLI peers can read them from disk, or split the run.",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         participant_cfg = config.get("participants", {})
         if not isinstance(participant_cfg, dict):

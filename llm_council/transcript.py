@@ -1300,8 +1300,15 @@ def write_transcript(
     final_results = final_round_results(results)
     final_ok_count = sum(1 for result in final_results if result.ok)
     elapsed_total = sum(result.elapsed_seconds for result in results)
-    token_total = sum(result.total_tokens or 0 for result in results)
-    cost_total = sum(result.cost_usd or 0 for result in results)
+    # None (rendered "n/a") when NO participant reported the figure —
+    # text-mode CLI peers have no metering hook, and summing their Nones
+    # to 0 reads as "this run was free" rather than "telemetry
+    # unavailable". A partial sum (some peers reported) is still shown:
+    # the header says "reported", not "total".
+    reported_tokens = [r.total_tokens for r in results if r.total_tokens is not None]
+    reported_costs = [r.cost_usd for r in results if r.cost_usd is not None]
+    token_total = sum(reported_tokens) if reported_tokens else None
+    cost_total = sum(reported_costs) if reported_costs else None
     recommendations = recommendation_counts(final_results)
     quorum = quorum_summary(final_results, metadata)
     quorum_bullet = (
@@ -1316,6 +1323,39 @@ def write_transcript(
         if overflow_names
         else []
     )
+    # Context files dropped by chunking never reached any peer — a silent
+    # drop reads as full coverage, so the transcript states it loudly.
+    # MCP runs store every event in `chunk_events`; CLI runs store only the
+    # latest under `diff_chunking`.
+    chunk_records = metadata.get("chunk_events") or [
+        metadata.get("diff_chunking") or {}
+    ]
+    dropped_context = sorted(
+        {
+            str(path)
+            for record in chunk_records
+            if isinstance(record, dict)
+            for path in (record.get("dropped_files") or [])
+        }
+    )
+    dropped_bullet = (
+        [
+            "- ⚠️ Context files DROPPED by chunking (no peer saw their "
+            "contents): " + ", ".join(f"`{p}`" for p in dropped_context)
+        ]
+        if dropped_context
+        else []
+    )
+    default_model_peers = metadata.get("cli_default_model_peers") or []
+    default_model_bullet = (
+        [
+            "- Peers on account-default models (may differ from the host "
+            "session's model): "
+            + ", ".join(f"`{p}`" for p in default_model_peers)
+        ]
+        if default_model_peers
+        else []
+    )
     lines = [
         "# LLM Council Transcript",
         "",
@@ -1325,8 +1365,9 @@ def write_transcript(
         f"- Successful responses: {ok_count}/{len(results)} total",
         f"- Final-round successful responses: {final_ok_count}/{len(final_results)}",
         f"- Participant elapsed total: `{elapsed_total:.1f}s`",
-        f"- Tokens reported: `{token_total}`",
-        f"- Cost reported: `${cost_total:.6f}`",
+        f"- Tokens reported: `{'n/a' if token_total is None else token_total}`",
+        "- Cost reported: "
+        f"`{'n/a' if cost_total is None else f'${cost_total:.6f}'}`",
         f"- Rounds: `{metadata.get('rounds', 1)}`",
         f"- Deliberation: {deliberation_summary(metadata)}",
         *convergence_summary_lines(metadata),
@@ -1340,6 +1381,8 @@ def write_transcript(
         f"{recommendations['tradeoff']} tradeoff / {recommendations['unknown']} unknown`",
         quorum_bullet,
         *overflow_bullet,
+        *dropped_bullet,
+        *default_model_bullet,
         "",
         "## Question",
         "",
@@ -1640,14 +1683,19 @@ def _generate_html_dashboard(
     metadata: dict[str, Any],
     parent_run_id: str | None,
     elapsed_total: float,
-    token_total: int,
-    cost_total: float,
+    token_total: int | None,
+    cost_total: float | None,
     recommendations: dict[str, int],
     quorum: dict[str, Any],
 ) -> str:
     import html
     def esc(text: str) -> str:
         return html.escape(text)
+
+    # None means no participant reported the figure (text-mode CLI peers
+    # have no metering hook) — render "n/a", never a misleading zero.
+    token_display = "n/a" if token_total is None else str(token_total)
+    cost_display = "n/a" if cost_total is None else f"${cost_total:.5f}"
 
     synthesis = metadata.get("synthesis") or {}
     decision = final_decision_label(results)
@@ -1892,12 +1940,12 @@ def _generate_html_dashboard(
                 <div class="stat-val">{elapsed_total:.1f}s</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Tokens Used</div>
-                <div class="stat-val">{token_total}</div>
+                <div class="stat-label">Tokens Reported</div>
+                <div class="stat-val">{token_display}</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Cost (USD)</div>
-                <div class="stat-val">${cost_total:.5f}</div>
+                <div class="stat-val">{cost_display}</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Quorum</div>

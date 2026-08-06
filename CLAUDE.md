@@ -227,7 +227,12 @@ Key modules:
   helpers (filename mentions, extension affinity, smaller-first
   tiebreak). A single file larger than `max_prompt_chars - framing` is
   dropped entirely with a `context_files_chunked` progress event listing
-  `oversize_files` — operator-visible rather than silently truncated.
+  `oversize_files` — and, because some MCP hosts (Claude Code) never
+  render progress events, any dropped file is ALSO surfaced loudly
+  (2026-08 field issue #2): top-level `context_files_dropped` key in the
+  MCP `council_run` payload (omit-when-empty, schema v10, with a warning
+  string stating the files never reached any peer), a ⚠️ bullet in the
+  markdown transcript header, and a second CLI stderr warning line.
   The round-2 deliberation body budget is DERIVED, not fixed:
   `deliberation.deliberation_body_budget(effective_cap, largest_suffix)`
   returns `min(MAX_DELIBERATION_PROMPT_CHARS, cap) - largest per-peer
@@ -260,6 +265,20 @@ Key modules:
   failure — no chained label-retry, no chained section-repair (three
   attempts past the cost ceiling). Mode-multiplier does NOT apply to the
   retry. Disable per-participant with `terse_retry_on_timeout: false`.
+  **Quorum-aware skip (2026-08 field issue #1):** `run_participants`
+  threads a per-round `adapters.QuorumTracker` (min-quorum derivation
+  matches the post-run `degraded` computation); when a peer times out
+  AFTER the round already has `min_quorum` labeled votes from the other
+  peers, the terse-retry is skipped — the timeout error gains
+  `TERSE_RETRY_SKIPPED_QUORUM_SUFFIX` (its `Timeout:` prefix survives, so
+  `classify_error` / quorum math are unchanged) and a
+  `terse_retry_skipped` progress event fires. Rationale: in the observed
+  chronic-timeout field runs the retry re-timed-out every time, doubling
+  wasted wall time on an already-viable run. Default ON via
+  `defaults.skip_terse_retry_when_quorum_met` (validated boolean); set
+  `false` to always retry (a recovered vote can still change the
+  headline label, just not run viability). One tracker per round —
+  labeled counts never carry across rounds.
 - **Section-coverage validator (default on).** When the user prompt
   contains one or more `PART N — TITLE (REQUIRED)` or
   `PART N — TITLE (REQUIRED BY ...)` headers
