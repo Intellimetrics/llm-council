@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.21.1 - 2026-08-06
 
 Fixes driven by the 2026-08-05 field-issues report (two weeks of MCP
-usage from a real project). MCP output schema bumps to v10.
+usage from a real project). MCP output schema bumps to v10, dogfooded
+live through a restarted MCP server before release.
 
 **Quorum-aware terse-retry skip (field issue #1)**
 * When a CLI peer times out after the round already holds `min_quorum`
