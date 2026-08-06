@@ -1,6 +1,18 @@
 # Changelog
 
-## 0.21.0 - 2026-07-20
+## Unreleased
+
+**MCP starvation enforced at command-build time (field bug)**
+* `_build_cli_command` now injects `-c mcp_servers={}` into every
+  codex-family `exec` invocation unless the operator's args already
+  carry an `mcp_servers` override. The v0.21.0 protection relied on the
+  baseline args plus an exact-match config migration, and a field config
+  with one extra flag (`--skip-git-repo-check`) defeated the match —
+  every council codex run from that project silently booted the
+  operator's three global MCP servers (two headless browsers and a
+  nested llm-council server). The injection closes the gap for any
+  arg-list shape; an explicit `mcp_servers` token in args suppresses it,
+  and non-`exec` invocations are left untouched.
 
 Council-integrity hardening driven by a full 3-CLI self-review dogfood:
 the council reviewed its own codebase, and everything it (or the runs

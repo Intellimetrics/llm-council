@@ -593,16 +593,27 @@ Key modules:
   modes; it inherits down the whole process tree), and
   `orchestrator.execute_council` refuses to run (`NestedCouncilRefused:`
   ValueError) when the marker is present in its own environment. (2)
-  Starvation: the codex baseline args include `-c mcp_servers={}` so a
-  council-spawned codex boots NO MCP servers — the observed real-world
-  recursion path is an operator's global `~/.codex/config.toml` registering
-  llm-council itself as an MCP server, which made every codex council peer
-  start a nested llm-council server (plus headless-browser servers) per
-  run. Claude peers already isolate via `--strict-mcp-config` with no
-  `--mcp-config`. The outgoing codex baseline is preserved as
-  `config.OLD_CODEX_EPHEMERAL_ARGS` so previously generated configs
-  silently upgrade at load. Without both layers a prompt-injected peer
-  calling `council_run` recurses exponentially (each level spawns N peers).
+  Starvation: `adapters._build_cli_command` injects `-c mcp_servers={}`
+  into EVERY codex-family invocation that has an `exec` token and no
+  operator `mcp_servers` override in args, so a council-spawned codex
+  boots NO MCP servers — the observed real-world recursion path is an
+  operator's global `~/.codex/config.toml` registering llm-council itself
+  as an MCP server, which made every codex council peer start a nested
+  llm-council server (plus headless-browser servers) per run. The
+  injection lands at the tail of the option region (before the stdin `-`
+  positional) and is skipped when any arg token starts with
+  `mcp_servers` (explicit operator opt-in wins). Do NOT rely on the
+  baseline args or the load-time migration alone for this: the
+  exact-match rewrite in `config.migrate_known_cli_defaults` (old
+  baselines preserved as `config.OLD_CODEX_EPHEMERAL_ARGS` /
+  `OLD_CODEX_APPROVAL_ARGS`) misses any operator-customized arg list —
+  the 2026-08 field case was a single extra `--skip-git-repo-check`
+  defeating the match, silently booting three global MCP servers per
+  council run. Claude peers already isolate via `--strict-mcp-config`
+  with no `--mcp-config`. Without both layers a prompt-injected peer
+  calling `council_run` recurses exponentially (each level spawns N
+  peers). Guarded by the `_build_cli_command` injection tests in
+  `tests/test_nested_guard.py`.
 - **`.mcp.json` stays local.** Setup adds it to `.gitignore`. It contains
   absolute paths and must not be committed.
 - **Version bumps.** `__version__` in `llm_council/__init__.py` and the

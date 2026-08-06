@@ -752,6 +752,32 @@ def _build_cli_command(
             elif args and args[0] == "exec":
                 args = [args[0], "--json", *args[1:]]
 
+    # Codex boots every MCP server in the operator's global config on each
+    # `exec` run. A council peer must never do that: the observed recursion
+    # path is a global ~/.codex/config.toml registering llm-council itself,
+    # and even benign servers (headless browsers) are per-run startup waste
+    # inside a read-only advisory turn. The baseline args carry
+    # `-c mcp_servers={}`, but operator-customized arg lists — anything the
+    # exact-match rewrite in `config.migrate_known_cli_defaults` doesn't
+    # recognize (field case: one extra `--skip-git-repo-check`) — used to
+    # slip through unstarved. Enforce it here for every codex-family
+    # invocation instead. Skipped when the operator pins any `mcp_servers`
+    # override in args (an explicit opt-in wins), or when there is no
+    # `exec` token to attach it to.
+    if (
+        family == "codex"
+        and ("exec" in command or "exec" in args)
+        and not any(tok.startswith("mcp_servers") for tok in command + args)
+    ):
+        # Land at the tail of the option region — right before the stdin
+        # positional `-` when present — so the canonical `exec -m <model>` /
+        # `exec --json` head assertions stay intact.
+        if "-" in args:
+            insert_at = args.index("-")
+            args = [*args[:insert_at], "-c", "mcp_servers={}", *args[insert_at:]]
+        else:
+            args = [*args, "-c", "mcp_servers={}"]
+
     # agy's print mode has its OWN internal wall clock (--print-timeout,
     # default 5m). A council timeout above 300s would otherwise be silently
     # truncated by the CLI before our subprocess timeout fires. Match agy's

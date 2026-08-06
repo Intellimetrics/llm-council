@@ -8,7 +8,13 @@ llm-council itself). Two independent layers are covered here:
 1. Every CLI child env carries ``LLM_COUNCIL_NESTED=1`` and
    ``execute_council`` refuses to run when it sees the marker.
 2. The codex baseline args clear the peer's MCP server table entirely
-   (``-c mcp_servers={}``), so the nested server never even boots.
+   (``-c mcp_servers={}``), so the nested server never even boots — and
+   ``_build_cli_command`` re-enforces the starvation for ANY codex-family
+   arg list. The exact-match migration only recognizes pristine old
+   baselines; a field config with one extra flag
+   (``--skip-git-repo-check``) slipped through it and booted the
+   operator's global MCP servers (headless browsers + a nested
+   llm-council) on every council run.
 """
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_council.adapters import clean_subprocess_env
+from llm_council.adapters import _build_cli_command, clean_subprocess_env
 from llm_council.config import (
     OLD_CODEX_EPHEMERAL_ARGS,
     migrate_known_cli_defaults,
@@ -114,3 +120,74 @@ def test_migration_upgrades_pre_v21_codex_args() -> None:
         config["participants"]["codex"]["args"]
         == DEFAULT_CONFIG["participants"]["codex"]["args"]
     )
+
+
+def test_codex_customized_args_get_mcp_starvation_injected() -> None:
+    """Field case: one extra flag defeats the exact-match migration, so the
+    command builder itself must starve the MCP table."""
+    cfg = {
+        "family": "codex",
+        "command": "codex",
+        "args": [
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--ephemeral",
+            "--cd",
+            "{cwd}",
+            "-",
+        ],
+    }
+    cmd = _build_cli_command("codex", cfg, "q", Path("/tmp"))
+    idx = cmd.index("-c")
+    assert cmd[idx + 1] == "mcp_servers={}"
+    # Attached to the exec subcommand, before the stdin marker.
+    assert cmd.index("exec") < idx < cmd.index("-")
+    # Read-only sandbox flag untouched.
+    assert "read-only" in cmd
+
+
+def test_codex_baseline_args_not_double_injected() -> None:
+    cfg = dict(DEFAULT_CONFIG["participants"]["codex"])
+    cmd = _build_cli_command("codex", cfg, "q", Path("/tmp"))
+    assert cmd.count("mcp_servers={}") == 1
+
+
+def test_codex_operator_mcp_override_suppresses_injection() -> None:
+    """An explicit per-server mcp_servers override is an operator opt-in;
+    the blanket starvation must not clobber it."""
+    cfg = {
+        "family": "codex",
+        "command": "codex",
+        "args": ["exec", "-c", "mcp_servers.tools.command=x", "-"],
+    }
+    cmd = _build_cli_command("codex", cfg, "q", Path("/tmp"))
+    assert "mcp_servers={}" not in cmd
+
+
+def test_codex_model_pinned_injection_lands_after_exec() -> None:
+    """With a pinned model, `exec` migrates into the command head; the
+    starvation must follow it there, once."""
+    cfg = {
+        "family": "codex",
+        "command": "codex",
+        "model": "gpt-5.4",
+        "args": ["exec", "--sandbox", "read-only", "-"],
+    }
+    cmd = _build_cli_command("codex", cfg, "q", Path("/tmp"))
+    assert cmd.count("mcp_servers={}") == 1
+    assert cmd.index("exec") < cmd.index("mcp_servers={}")
+
+
+def test_non_exec_codex_args_left_alone() -> None:
+    """No `exec` token → unknown invocation shape → no injection."""
+    cfg = {"family": "codex", "command": "codex", "args": ["--version"]}
+    cmd = _build_cli_command("codex", cfg, "q", Path("/tmp"))
+    assert "mcp_servers={}" not in cmd
+
+
+def test_non_codex_families_never_injected() -> None:
+    cfg = {"family": "claude", "command": "claude", "args": ["-p", "exec"]}
+    cmd = _build_cli_command("claude", cfg, "q", Path("/tmp"))
+    assert "mcp_servers={}" not in cmd
