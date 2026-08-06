@@ -13,30 +13,33 @@ Runs as an MCP server inside your coding agent, or as a standalone CLI.
 
 ## What a run looks like
 
-We asked the council whether this README needed a rewrite. It said yes — unanimously. The page you are reading is the result, and this is the actual output that run returned to the host agent:
+A real run from this repo's own development. Upstream `mcp` 2.0.0 had just broken fresh installs, we'd shipped a `<2` pin instead of migrating immediately, and we asked the council whether that was the right call. This is the actual output the host agent received:
 
-> **LLM Council** · mode=quick · 2/2 succeeded · run wall=127.4s · recommendation=**yes**
+> **LLM Council** · mode=quick · 3/3 succeeded · run wall=105.2s · recommendation=**yes**
 >
 > | peer | label | wall time |
 > |---|---|---|
-> | claude | yes | 127.4s |
-> | antigravity | yes | 18.4s |
+> | claude | yes | 105.2s |
+> | codex | yes | 89.8s |
+> | antigravity | yes | 74.3s |
 >
-> Transcript: `.llm-council/runs/20260806_103834_….md`
+> Transcript: `.llm-council/runs/20260806_123707_….md`
 
 Each peer's response opens with its verdict, backed by evidence the orchestrator mechanically checks against your repo:
 
 ```text
-RECOMMENDATION: yes - the README has strong raw material but its structure is
-inverted for a first-time visitor: installation is the seventh section, there
-is not a single line of real product output anywhere on the page...
+RECOMMENDATION: yes - pinning `mcp>=1.0.0,<2` was the right immediate call.
+Fresh installs crashing at startup is a severity-critical regression, the pin
+is the standard minimal remediation, and the coupling surface in mcp_server.py
+is small and well-localized... The pin should carry a deliberate follow-up
+ticket, not sit indefinitely.
 
 EVIDENCE:
-- [VERIFIED:llm_council/display.py:195-235] `render_summary_markdown` produces
-  the header + per-peer table + blockquoted path format...
+- [VERIFIED:llm_council/mcp_server.py:991-1035] Progress bridge depends on
+  `session.send_progress_notification`, the deepest 1.x internal coupling...
 ```
 
-Every run also writes paired Markdown, JSON, and HTML transcripts under `.llm-council/runs/`.
+Every run also writes paired Markdown, JSON, and HTML transcripts under `.llm-council/runs/`. (This README was itself council-reviewed — unanimous *yes* on "does this need a rewrite" — and rebuilt to the council's blueprint.)
 
 ## Quickstart
 
