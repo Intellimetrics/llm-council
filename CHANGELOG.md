@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.21.2 - 2026-08-06
+
+**Pin `mcp<2` (install-time breakage)**
+* mcp 2.0.0 (released upstream) removed the 1.x low-level
+  `Server.list_tools` decorator API this server is built on. The
+  previous unbounded `mcp>=1.0.0` range let fresh installs resolve
+  2.0.0 and crash the MCP server at startup — v0.21.1's CI caught it.
+  Existing environments with mcp 1.x are unaffected. The bound is
+  raised only together with a migration to the 2.x server API.
+
 ## 0.21.1 - 2026-08-06
 
 Fixes driven by the 2026-08-05 field-issues report (two weeks of MCP

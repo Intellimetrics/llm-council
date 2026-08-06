@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-council"
-version = "0.21.1"
+version = "0.21.2"
 description = "Lightweight source-read-only multi-agent council for coding projects."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,7 +21,11 @@ classifiers = [
 ]
 dependencies = [
   "httpx>=0.27.0",
-  "mcp>=1.0.0",
+  # mcp 2.0.0 removed the 1.x low-level `Server.list_tools` decorator API
+  # this server is built on; an unbounded range let fresh installs resolve
+  # 2.0.0 and crash at startup (caught by CI on 2026-08-06). Raise the
+  # bound only together with a migration to the 2.x server API.
+  "mcp>=1.0.0,<2",
   "python-dotenv>=1.0.0",
   "pyyaml>=6.0.1",
 ]
