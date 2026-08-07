@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.22.0 - 2026-08-07
 
 **Migrate the MCP server to the mcp 2.x SDK (lifts the `<2` pin)**
 * `llm_council.mcp_server._serve` now targets mcp 2.x's

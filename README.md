@@ -5,7 +5,7 @@
 [![MCP](https://img.shields.io/badge/MCP-ready-2f855a)](docs/llm-council.md)
 [![Source read-only peers](https://img.shields.io/badge/peers-source--read--only-6b7280)](#read-only-safety)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.21.2-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.22.0-111827)](CHANGELOG.md)
 
 Your coding agent grades its own homework. **llm-council** gives it a second opinion that isn't its own: one question or diff, fanned out in parallel to independent, read-only AI peers — the Claude, Codex, and Antigravity CLIs you already have, on your own accounts — and every peer must commit to a verdict: `yes`, `no`, or `tradeoff`. Read-only is enforced by CLI flags, not vibes. Essays without a verdict are rejected.
 

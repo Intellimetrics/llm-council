@@ -1,3 +1,3 @@
 """Lightweight multi-agent council orchestration."""
 
-__version__ = "0.21.2"
+__version__ = "0.22.0"
