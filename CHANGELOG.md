@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+**Migrate the MCP server to the mcp 2.x SDK (lifts the `<2` pin)**
+* `llm_council.mcp_server._serve` now targets mcp 2.x's
+  constructor-callback `Server` API (`on_list_tools=` / `on_call_tool=`
+  replacing the removed 1.x decorators and the ambient
+  `request_context`). Dependency bound raised from `mcp>=1.0.0,<2` to
+  `mcp>=2.0.0,<3` — mcp 1.x is upstream maintenance-only. A 1.x
+  install now gets an actionable SystemExit at server start instead of
+  an opaque TypeError, and `llm-council doctor` reports the installed
+  mcp version, flagging `<2`.
+* Wire behavior preserved: identical tool list and JSON schemas
+  (`council_run` output schema stays v10), `structuredContent` on
+  `council_run`, and handler errors still surface as `isError` tool
+  results carrying the real message text — mcp 2.x's default would
+  sanitize them into opaque JSON-RPC "Internal server error" frames
+  the calling agent can't read. Also absorbed: 2.x delivers absent
+  tool `arguments` as `None` and no longer validates them against the
+  advertised inputSchema (handlers already do their own checks).
+* Progress bridge intact: the per-call token now comes from the
+  handler context (`ctx.meta["progress_token"]`);
+  `send_progress_notification` is unchanged and undeprecated. A new
+  stdio integration test pins the path end-to-end — a real run with a
+  client `progressToken` must produce `notifications/progress` frames
+  on the wire (dry-run returns before any progress fires, so the test
+  runs a real council whose only peer fails preflight instantly
+  against a dead local port).
+* The server now reports its real version in `serverInfo` (mcp 2.x
+  reports `""` for unversioned servers; `__version__` is passed
+  explicitly).
+
 ## 0.21.2 - 2026-08-06
 
 **Pin `mcp<2` (install-time breakage)**

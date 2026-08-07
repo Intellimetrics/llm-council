@@ -298,7 +298,28 @@ def check_environment(
     try:
         import mcp  # noqa: F401
 
-        checks.append(Check(name="python:mcp", ok=True, detail="installed"))
+        try:
+            from importlib.metadata import version as _dist_version
+
+            mcp_version = _dist_version("mcp")
+            mcp_major = int(mcp_version.split(".", 1)[0])
+        except Exception:
+            mcp_version, mcp_major = "unknown", None
+        if mcp_major is not None and mcp_major < 2:
+            checks.append(
+                Check(
+                    name="python:mcp",
+                    ok=False,
+                    detail=(
+                        f"installed ({mcp_version}) but the MCP server needs "
+                        "mcp>=2 — pip install -U 'mcp>=2,<3'"
+                    ),
+                )
+            )
+        else:
+            checks.append(
+                Check(name="python:mcp", ok=True, detail=f"installed ({mcp_version})")
+            )
     except Exception as exc:
         checks.append(
             Check(name="python:mcp", ok=False, detail=f"{type(exc).__name__}: {exc}")

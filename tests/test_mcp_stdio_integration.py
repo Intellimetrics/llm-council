@@ -46,10 +46,19 @@ modes:
 """.lstrip()
 
 
-def _call_council_run_over_stdio(root: Path) -> tuple[set[str], dict]:
-    """Spawn the server over stdio, list tools, and dry-run council_run.
+def _call_council_run_over_stdio(
+    root: Path,
+    *,
+    arguments: dict | None = None,
+    meta: dict | None = None,
+) -> tuple[set[str], dict, list[dict]]:
+    """Spawn the server over stdio, list tools, and call council_run.
 
-    Returns (tool_names, council_run_payload).
+    `arguments` defaults to a dry-run probe; pass explicit arguments (and
+    optionally a request `_meta`, e.g. a progressToken) to exercise other
+    paths. Returns (tool_names, council_run_payload, other_messages) where
+    other_messages holds every frame that wasn't a direct response —
+    notifications included — in arrival order.
     """
     env = os.environ.copy()
     # Make the subprocess import the same tree the test runs against, and pin
@@ -150,18 +159,18 @@ def _call_council_run_over_stdio(root: Path) -> tuple[set[str], dict]:
 
         listed = _request(2, "tools/list", {})
         tool_names = {tool["name"] for tool in listed["tools"]}
-        called = _request(
-            3,
-            "tools/call",
-            {
-                "name": "council_run",
-                "arguments": {
-                    "question": "stdio integration probe",
-                    "working_directory": str(root),
-                    "dry_run": True,
-                },
+        call_params: dict = {
+            "name": "council_run",
+            "arguments": arguments
+            or {
+                "question": "stdio integration probe",
+                "working_directory": str(root),
+                "dry_run": True,
             },
-        )
+        }
+        if meta is not None:
+            call_params["_meta"] = meta
+        called = _request(3, "tools/call", call_params)
         payload = _extract_payload(called)
     except TimeoutError as exc:
         unexpected_summary = json.dumps(
@@ -200,7 +209,7 @@ def _call_council_run_over_stdio(root: Path) -> tuple[set[str], dict]:
 
     assert not shutdown_timed_out, "MCP server did not exit after stdio closed"
     assert proc.returncode == 0
-    return tool_names, payload
+    return tool_names, payload, unexpected_messages
 
 
 def _extract_payload(result) -> dict:
@@ -239,7 +248,7 @@ def _extract_payload(result) -> dict:
 def test_mcp_server_stdio_round_trip_council_run(tmp_path: Path):
     (tmp_path / ".llm-council.yaml").write_text(_LOCAL_CONFIG, encoding="utf-8")
 
-    tool_names, payload = _call_council_run_over_stdio(tmp_path)
+    tool_names, payload, _notifications = _call_council_run_over_stdio(tmp_path)
 
     # The tool surface is registered and reachable over the real transport.
     assert "council_run" in tool_names
@@ -251,6 +260,58 @@ def test_mcp_server_stdio_round_trip_council_run(tmp_path: Path):
     for required in ("recommendation", "agreement_count", "degraded", "rounds", "results"):
         assert required in payload, f"missing {required!r} in stdio council_run payload"
     assert payload["metadata"]["dry_run"] is True
+
+
+def test_mcp_server_stdio_progress_notifications(tmp_path: Path):
+    """A real (non-dry) council_run with a client progressToken must emit
+    notifications/progress frames on the wire.
+
+    This pins the mcp 2.x progress path end-to-end: token extraction from
+    the handler context (``ctx.meta["progress_token"]``) through
+    ``ServerSession.send_progress_notification``. Dry-run returns before
+    ``execute_council`` and never emits progress, so the run is real — but
+    its only peer points at a reserved-then-released local port, so
+    preflight fails instantly and no backend is needed. ``council_start``
+    always formats a progress message, guaranteeing at least one frame.
+    """
+    import socket
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    config = _LOCAL_CONFIG.replace(
+        "http://localhost:11434", f"http://127.0.0.1:{port}"
+    )
+    (tmp_path / ".llm-council.yaml").write_text(config, encoding="utf-8")
+
+    token = "probe-progress-1"
+    _tools, payload, notifications = _call_council_run_over_stdio(
+        tmp_path,
+        arguments={
+            "question": "stdio progress probe",
+            "working_directory": str(tmp_path),
+        },
+        meta={"progressToken": token},
+    )
+
+    progress_frames = [
+        frame
+        for frame in notifications
+        if frame.get("method") == "notifications/progress"
+        and (frame.get("params") or {}).get("progressToken") == token
+    ]
+    assert progress_frames, (
+        "no notifications/progress carried the client's progressToken; "
+        f"other frames: {notifications[:5]!r}"
+    )
+    for frame in progress_frames:
+        assert isinstance(frame["params"].get("progress"), (int, float))
+
+    # The run itself completed degraded (its only peer is unreachable) but
+    # still shipped a schema-valid envelope.
+    assert payload["schema_version"] == COUNCIL_RUN_OUTPUT_SCHEMA_VERSION
+    assert payload["degraded"] is True
 
 
 @pytest.mark.asyncio

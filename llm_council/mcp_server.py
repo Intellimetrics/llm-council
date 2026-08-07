@@ -2249,168 +2249,188 @@ def run_config(arguments: dict[str, Any]) -> dict[str, Any]:
 
 async def _serve() -> None:
     try:
+        from mcp import types
         from mcp.server import Server
         from mcp.server.stdio import stdio_server
-        from mcp.types import TextContent, Tool
     except Exception as exc:  # pragma: no cover - depends on environment install
         raise SystemExit(
-            "The 'mcp' Python package is required for MCP server mode. "
+            "The 'mcp' Python package (>=2) is required for MCP server mode. "
             "Install project requirements first."
         ) from exc
 
-    app = Server("llm-council")
+    # The constructor-callback Server API below is mcp 2.x-only; a 1.x
+    # install imports fine but rejects the on_* kwargs with an opaque
+    # TypeError, so fail with an actionable message instead.
+    try:
+        from importlib.metadata import version as _dist_version
 
-    def _tool(**kwargs: Any) -> Tool:
-        """Build a Tool, dropping outputSchema if the installed mcp SDK is too old.
+        mcp_major = int(_dist_version("mcp").split(".", 1)[0])
+    except Exception:  # pragma: no cover - metadata missing/unparseable
+        mcp_major = None
+    if mcp_major is not None and mcp_major < 2:
+        raise SystemExit(
+            "llm-council's MCP server requires the mcp 2.x SDK; found "
+            "an older major version. Upgrade with: pip install -U 'mcp>=2,<3'"
+        )
 
-        outputSchema landed in MCP spec 2025-06; older `mcp` packages reject
-        the kwarg. We try first with outputSchema, then fall back so old envs
-        still get the tool, just without the typed advertisement.
-        """
+    async def _on_list_tools(ctx: Any, params: Any) -> Any:
+        return types.ListToolsResult(
+            tools=[
+                types.Tool(
+                    name="council_run",
+                    description="Run a read-only multi-agent council.",
+                    input_schema=council_run_schema(),
+                    output_schema=council_run_output_schema(),
+                ),
+                types.Tool(
+                    name="council_recommend",
+                    description="Recommend whether a task should go to council and which mode to use.",
+                    input_schema=recommend_schema(),
+                ),
+                types.Tool(
+                    name="council_estimate",
+                    description="Estimate prompt size and OpenRouter costs before running council.",
+                    input_schema=estimate_schema(),
+                ),
+                types.Tool(
+                    name="council_list_modes",
+                    description="List configured council modes and participants.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"working_directory": _working_directory_schema()},
+                        "additionalProperties": False,
+                    },
+                ),
+                types.Tool(
+                    name="council_last_transcript",
+                    description="Read the latest council transcript from the project.",
+                    input_schema=last_transcript_schema(),
+                ),
+                types.Tool(
+                    name="council_doctor",
+                    description="Diagnose local CLI, OpenRouter, Ollama, and MCP readiness.",
+                    input_schema=doctor_schema(),
+                ),
+                types.Tool(
+                    name="council_models",
+                    description="List cached OpenRouter models with optional filter/origin.",
+                    input_schema=models_schema(),
+                ),
+                types.Tool(
+                    name="council_stats",
+                    description=(
+                        "Aggregate per-participant metrics across recorded "
+                        "transcripts: run count, success rate, recommendation "
+                        "label distribution, tokens, cost, and last-used time."
+                    ),
+                    input_schema=stats_schema(),
+                ),
+                types.Tool(
+                    name="council_query_transcripts",
+                    description=(
+                        "Semantic search across recorded council transcripts. "
+                        "Returns the top-k prior runs whose questions overlap "
+                        "with the query (Jaccard token similarity). Lets an "
+                        "agent check whether council already weighed in on a "
+                        "topic before launching a fresh consultation."
+                    ),
+                    input_schema=query_transcripts_schema(),
+                ),
+                types.Tool(
+                    name="council_config",
+                    description="Get or set configuration keys in the project's .llm-council.yaml config file.",
+                    input_schema=config_schema(),
+                ),
+            ]
+        )
+
+    async def _on_call_tool(ctx: Any, params: Any) -> Any:
+        name = params.name
+        # mcp 2.x delivers `arguments` as None when the client sent none
+        # (1.x defaulted to {}), and no longer validates them against the
+        # advertised inputSchema — the handlers do their own checks.
+        arguments = dict(params.arguments or {})
         try:
-            return Tool(**kwargs)
-        except TypeError:
-            kwargs.pop("outputSchema", None)
-            return Tool(**kwargs)
-
-    @app.list_tools()
-    async def list_tools() -> list[Tool]:
-        return [
-            _tool(
-                name="council_run",
-                description="Run a read-only multi-agent council.",
-                inputSchema=council_run_schema(),
-                outputSchema=council_run_output_schema(),
-            ),
-            Tool(
-                name="council_recommend",
-                description="Recommend whether a task should go to council and which mode to use.",
-                inputSchema=recommend_schema(),
-            ),
-            Tool(
-                name="council_estimate",
-                description="Estimate prompt size and OpenRouter costs before running council.",
-                inputSchema=estimate_schema(),
-            ),
-            Tool(
-                name="council_list_modes",
-                description="List configured council modes and participants.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {"working_directory": _working_directory_schema()},
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="council_last_transcript",
-                description="Read the latest council transcript from the project.",
-                inputSchema=last_transcript_schema(),
-            ),
-            Tool(
-                name="council_doctor",
-                description="Diagnose local CLI, OpenRouter, Ollama, and MCP readiness.",
-                inputSchema=doctor_schema(),
-            ),
-            Tool(
-                name="council_models",
-                description="List cached OpenRouter models with optional filter/origin.",
-                inputSchema=models_schema(),
-            ),
-            Tool(
-                name="council_stats",
-                description=(
-                    "Aggregate per-participant metrics across recorded "
-                    "transcripts: run count, success rate, recommendation "
-                    "label distribution, tokens, cost, and last-used time."
-                ),
-                inputSchema=stats_schema(),
-            ),
-            Tool(
-                name="council_query_transcripts",
-                description=(
-                    "Semantic search across recorded council transcripts. "
-                    "Returns the top-k prior runs whose questions overlap "
-                    "with the query (Jaccard token similarity). Lets an "
-                    "agent check whether council already weighed in on a "
-                    "topic before launching a fresh consultation."
-                ),
-                inputSchema=query_transcripts_schema(),
-            ),
-            Tool(
-                name="council_config",
-                description="Get or set configuration keys in the project's .llm-council.yaml config file.",
-                inputSchema=config_schema(),
-            ),
-        ]
-
-    @app.call_tool()
-    async def call_tool(name: str, arguments: dict):
-        if name == "council_run":
-            # Grab the per-call MCP context to enable mid-run progress
-            # notifications. Both fields are None-safe: a client that
-            # didn't set `_meta.progressToken` (the on-the-wire shape)
-            # gets the silent no-op fallback documented in
-            # `_build_mcp_progress_callback`.
-            session: Any = None
-            progress_token: Any = None
-            try:
-                rc = app.request_context
-                session = getattr(rc, "session", None)
-                meta = getattr(rc, "meta", None)
+            if name == "council_run":
+                # Grab the per-call MCP context to enable mid-run progress
+                # notifications. Both fields are None-safe: a client that
+                # didn't set `_meta.progressToken` (the on-the-wire shape)
+                # gets the silent no-op fallback documented in
+                # `_build_mcp_progress_callback`.
+                session = getattr(ctx, "session", None)
+                meta = getattr(ctx, "meta", None) or {}
                 progress_token = (
-                    getattr(meta, "progressToken", None) if meta is not None else None
+                    meta.get("progress_token")
+                    if isinstance(meta, dict)
+                    else getattr(meta, "progressToken", None)
                 )
-            except (LookupError, AttributeError):
-                pass
-            result = await run_council(
-                arguments,
-                mcp_session=session,
-                progress_token=progress_token,
+                result = await run_council(
+                    arguments,
+                    mcp_session=session,
+                    progress_token=progress_token,
+                )
+            elif name == "council_recommend":
+                cwd = _resolve_working_directory(arguments)
+                with project_env_context(cwd, stop_at=_mcp_root()):
+                    result = await _run_recommend(arguments)
+            elif name == "council_estimate":
+                cwd = _resolve_working_directory(arguments)
+                with project_env_context(cwd, stop_at=_mcp_root()):
+                    result = estimate_run(arguments)
+            elif name == "council_list_modes":
+                cwd = _resolve_working_directory(arguments)
+                with project_env_context(cwd, stop_at=_mcp_root()):
+                    result = list_modes(arguments)
+            elif name == "council_last_transcript":
+                cwd = _resolve_working_directory(arguments)
+                with project_env_context(cwd, stop_at=_mcp_root()):
+                    result = last_transcript(arguments)
+            elif name == "council_doctor":
+                cwd = _resolve_working_directory(arguments)
+                with project_env_context(cwd, stop_at=_mcp_root()):
+                    result = run_doctor(arguments)
+            elif name == "council_models":
+                result = list_models(arguments)
+            elif name == "council_stats":
+                cwd = _resolve_working_directory(arguments)
+                with project_env_context(cwd, stop_at=_mcp_root()):
+                    result = run_stats(arguments)
+            elif name == "council_query_transcripts":
+                cwd = _resolve_working_directory(arguments)
+                with project_env_context(cwd, stop_at=_mcp_root()):
+                    result = query_transcripts(arguments)
+            elif name == "council_config":
+                cwd = _resolve_working_directory(arguments)
+                with project_env_context(cwd, stop_at=_mcp_root()):
+                    result = run_config(arguments)
+            else:
+                raise ValueError(f"Unknown tool: {name}")
+        except Exception as exc:
+            # mcp 2.x propagates handler exceptions as sanitized JSON-RPC
+            # protocol errors, which strips the message the calling agent
+            # needs. Convert to the 1.x-era isError tool result so clients
+            # keep seeing the real error text.
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(exc))],
+                is_error=True,
             )
-        elif name == "council_recommend":
-            cwd = _resolve_working_directory(arguments)
-            with project_env_context(cwd, stop_at=_mcp_root()):
-                result = await _run_recommend(arguments)
-        elif name == "council_estimate":
-            cwd = _resolve_working_directory(arguments)
-            with project_env_context(cwd, stop_at=_mcp_root()):
-                result = estimate_run(arguments)
-        elif name == "council_list_modes":
-            cwd = _resolve_working_directory(arguments)
-            with project_env_context(cwd, stop_at=_mcp_root()):
-                result = list_modes(arguments)
-        elif name == "council_last_transcript":
-            cwd = _resolve_working_directory(arguments)
-            with project_env_context(cwd, stop_at=_mcp_root()):
-                result = last_transcript(arguments)
-        elif name == "council_doctor":
-            cwd = _resolve_working_directory(arguments)
-            with project_env_context(cwd, stop_at=_mcp_root()):
-                result = run_doctor(arguments)
-        elif name == "council_models":
-            result = list_models(arguments)
-        elif name == "council_stats":
-            cwd = _resolve_working_directory(arguments)
-            with project_env_context(cwd, stop_at=_mcp_root()):
-                result = run_stats(arguments)
-        elif name == "council_query_transcripts":
-            cwd = _resolve_working_directory(arguments)
-            with project_env_context(cwd, stop_at=_mcp_root()):
-                result = query_transcripts(arguments)
-        elif name == "council_config":
-            cwd = _resolve_working_directory(arguments)
-            with project_env_context(cwd, stop_at=_mcp_root()):
-                result = run_config(arguments)
-        else:
-            raise ValueError(f"Unknown tool: {name}")
-        text_blocks = [TextContent(type="text", text=json.dumps(result, indent=2))]
+        text_blocks = [types.TextContent(type="text", text=json.dumps(result, indent=2))]
         # Tools that advertise an outputSchema MUST return structuredContent
         # alongside the text payload — strict MCP clients refuse the call
         # otherwise. Right now only `council_run` is typed; if more tools
         # gain outputSchema, extend this set.
         if name == "council_run":
-            return text_blocks, result
-        return text_blocks
+            return types.CallToolResult(
+                content=text_blocks, structured_content=result
+            )
+        return types.CallToolResult(content=text_blocks)
+
+    app = Server(
+        "llm-council",
+        version=__version__,
+        on_list_tools=_on_list_tools,
+        on_call_tool=_on_call_tool,
+    )
 
     async with stdio_server() as (read_stream, write_stream):
         await app.run(
