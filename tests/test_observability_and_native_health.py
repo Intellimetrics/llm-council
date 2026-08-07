@@ -130,7 +130,9 @@ def test_cli_wall_elapsed_includes_failed_terse_retry_but_legacy_elapsed_does_no
     async def fake_once(name, cfg, prompt, cwd, **_kwargs):
         nonlocal calls
         calls += 1
-        await asyncio.sleep(0.01)
+        # Long enough that Windows' ~15.6ms monotonic-clock granularity
+        # cannot quantize two sleeps below the single-sleep threshold.
+        await asyncio.sleep(0.05)
         elapsed = 3.0 if calls == 1 else 1.0
         return (
             ParticipantResult(
@@ -158,7 +160,9 @@ def test_cli_wall_elapsed_includes_failed_terse_retry_but_legacy_elapsed_does_no
     assert result.elapsed_seconds == 3.0
     assert result.terse_retry_attempted
     assert result.wall_elapsed_seconds is not None
-    assert result.wall_elapsed_seconds >= 0.018
+    # Above one sleep (0.05) proves the wall clock spanned BOTH attempts;
+    # 0.08 leaves margin for coarse-clock undermeasurement of the second.
+    assert result.wall_elapsed_seconds >= 0.08
 
 
 def test_participant_finish_exposes_attempt_and_wall_durations(monkeypatch, tmp_path: Path) -> None:
