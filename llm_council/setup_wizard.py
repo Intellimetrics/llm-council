@@ -102,6 +102,15 @@ Use council for:
 Do not use council for trivial formatting, obvious syntax fixes, or exact
 mechanical edits the user already specified.
 
+Phrasing security-review questions:
+- Ask peers to VERIFY a control ("confirm this input is validated before
+  use", "check whether this path can be reached unauthenticated"), not to
+  ATTACK it ("find a bypass", "write an exploit"). Some peers run
+  provider-side safety filters that refuse attack-phrased prompts outright
+  (observed: OpenAI's cyber policy on codex); a refused peer drops from
+  quorum and the run reports `content_refused_peers`. Verification phrasing
+  gets the same findings without the refusal.
+
 Before acting on council feedback:
 - Summarize the main agreements, disagreements, and concrete risks.
 - Identify which recommendations you will follow.
@@ -347,7 +356,7 @@ def write_setup_files(
 
     runtime_gitignore = root / ".llm-council" / ".gitignore"
     runtime_gitignore.parent.mkdir(parents=True, exist_ok=True)
-    desired_gitignore = "runs/\ninputs/\n*.log\n"
+    desired_gitignore = "runs/\ninputs/\ncache/\n*.log\n"
     if (
         force
         or not runtime_gitignore.exists()
@@ -405,6 +414,7 @@ def _ensure_project_gitignore(path: Path) -> bool:
         ".mcp.json",
         ".llm-council/runs/",
         ".llm-council/inputs/",
+        ".llm-council/cache/",
         ".llm-council/*.log",
         ".llm-council.env",
     ]

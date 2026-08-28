@@ -265,6 +265,13 @@ DEFAULT_CONFIG: dict = {
                 "--sandbox",
                 "read-only",
                 "--ephemeral",
+                # Councils run wherever the host points `working_directory`
+                # — scratch copies and worktrees without `.git`, or dirs the
+                # operator never marked trusted in ~/.codex/config.toml.
+                # Without this codex refuses outright ("Not inside a trusted
+                # directory and --skip-git-repo-check was not specified";
+                # 2026-08 field report). Safe under `--sandbox read-only`.
+                "--skip-git-repo-check",
                 # Never boot MCP servers inside a council peer: an operator's
                 # global codex config may register llm-council itself as an
                 # MCP server, so without this a council-spawned codex starts
@@ -293,6 +300,18 @@ DEFAULT_CONFIG: dict = {
             # an unknown model id just makes that step fail and the walk
             # continues (or the peer drops if chain is exhausted).
             "fallback_chain": ["gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"],
+            # Reasoning effort pinned for the council turn via
+            # `-c model_reasoning_effort=<value>` (injected by
+            # `adapters._build_cli_command`). Codex otherwise inherits the
+            # operator's interactive ~/.codex/config.toml setting, and at
+            # `ultra` a 5 KB review prompt routinely blew a 600s timeout
+            # (2026-08 field report: 18 of 48 runs) while the same prompt
+            # answered in ~70s at a bounded effort. `inherit` (or null)
+            # restores the CLI's own config; `low` is the documented
+            # ~3x-faster lever for chronically slow hosts. Must equal
+            # `adapters.CODEX_DEFAULT_REASONING_EFFORT` (the fallback for
+            # `replace_defaults` configs that predate this key).
+            "reasoning_effort": "medium",
         },
         "deepseek_v4_pro": {
             "type": "openrouter",

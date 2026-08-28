@@ -967,6 +967,16 @@ def result_to_dict(result: ParticipantResult) -> dict[str, Any]:
         payload["recovered_after_quota"] = True
     if result.section_repair_attempted:
         payload["section_repair_attempted"] = True
+    if getattr(result, "empty_retry_attempted", False):
+        payload["empty_retry_attempted"] = True
+    if getattr(result, "recovered_after_empty_retry", False):
+        payload["recovered_after_empty_retry"] = True
+    # Failure diagnostics (exit status + stderr tail) — omitted on success
+    # and for hosted peers so the common transcript shape is unchanged.
+    if getattr(result, "exit_code", None) is not None and not result.ok:
+        payload["exit_code"] = result.exit_code
+    if getattr(result, "stderr_tail", None):
+        payload["stderr_tail"] = result.stderr_tail
     if getattr(result, "tool_call_status", None) is not None:
         payload["tool_call_status"] = result.tool_call_status
     if result.prompt_chars is not None:
@@ -1356,6 +1366,20 @@ def write_transcript(
         if default_model_peers
         else []
     )
+    refused_peers = metadata.get("content_refused_peers") or []
+    refused_bullet = (
+        [
+            "- ⚠️ Content-policy refusals (peer dropped from quorum; "
+            "rephrase the request as verification rather than attack): "
+            + ", ".join(
+                f"`{entry.get('peer')}` — {entry.get('message') or 'refused'}"
+                for entry in refused_peers
+                if isinstance(entry, dict)
+            )
+        ]
+        if refused_peers
+        else []
+    )
     lines = [
         "# LLM Council Transcript",
         "",
@@ -1383,6 +1407,7 @@ def write_transcript(
         *overflow_bullet,
         *dropped_bullet,
         *default_model_bullet,
+        *refused_bullet,
         "",
         "## Question",
         "",
@@ -1440,6 +1465,28 @@ def write_transcript(
             lines.extend([result.output.strip() or "[empty response]", ""])
         else:
             lines.extend(["```", result.error.strip() or "[unknown error]", "```", ""])
+            if getattr(result, "exit_code", None) is not None:
+                lines.append(f"- Exit status: `{result.exit_code}`")
+            if getattr(result, "empty_retry_attempted", False):
+                lines.append("- Empty-response re-run: attempted, also failed")
+            if getattr(result, "exit_code", None) is not None or getattr(
+                result, "empty_retry_attempted", False
+            ):
+                lines.append("")
+            stderr_tail = getattr(result, "stderr_tail", None)
+            if stderr_tail:
+                lines.extend(
+                    [
+                        "Stderr tail (last "
+                        f"{len(stderr_tail)} chars the CLI wrote before it "
+                        "exited or was killed):",
+                        "",
+                        "```",
+                        stderr_tail.strip(),
+                        "```",
+                        "",
+                    ]
+                )
             if result.output.strip():
                 lines.extend(["Captured output:", "", result.output.strip(), ""])
 

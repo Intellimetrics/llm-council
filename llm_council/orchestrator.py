@@ -21,6 +21,8 @@ from llm_council.adapters import (
     PREFLIGHT_FAILED_PREFIX,
     QuorumTracker,
     classify_error,
+    content_refusal_excerpt,
+    is_content_refusal_error,
     is_quota_exhausted_error,
     is_timeout_error,
     run_participants,
@@ -361,6 +363,40 @@ def _detect_quota_throttled(
                 # the full string is still on ParticipantResult.error for
                 # consumers who want it.
                 "message": result.error.splitlines()[0][:200],
+            }
+        )
+    return new_entries
+
+
+def _detect_content_refused(
+    results: list[ParticipantResult],
+    participant_cfg: dict[str, Any],
+    *,
+    already_emitted: set[str],
+) -> list[dict[str, Any]]:
+    """Find newly content-policy-refused peers in this round's results.
+
+    Mirrors ``_detect_quota_throttled``: one record per peer whose error
+    matches a provider refusal pattern AND whose base name is not yet in
+    ``already_emitted``. ``message`` is the matched refusal line (not the
+    first stderr line, which for codex is its version banner).
+    """
+    new_entries: list[dict[str, Any]] = []
+    for result in results:
+        if result.ok or not result.error:
+            continue
+        if not is_content_refusal_error(result.error):
+            continue
+        base = _base_name(result.name)
+        if base in already_emitted:
+            continue
+        cfg = participant_cfg.get(base) or {}
+        new_entries.append(
+            {
+                "peer": base,
+                "family": cfg.get("family") or base,
+                "model": result.model or cfg.get("model"),
+                "message": content_refusal_excerpt(result.error),
             }
         )
     return new_entries
@@ -762,6 +798,12 @@ async def execute_council(
     # recovered round-1 and then re-failed round-2 emits BOTH events.
     quota_recoveries: list[dict[str, Any]] = []
     quota_recoveries_seen: set[str] = set()
+    # Provider content-policy refusals (`error_kind=content_refused`),
+    # accumulated across rounds with the same per-peer dedup. Surfaced as
+    # `metadata["content_refused_peers"]` so the caller learns the fix is
+    # to REPHRASE (verification, not attack framing), not to raise a limit.
+    content_refused: list[dict[str, Any]] = []
+    content_refused_seen: set[str] = set()
 
     def _detect_and_emit_quota(round_outputs: list[ParticipantResult]) -> None:
         """Detect quota-throttled / recovered peers in ``round_outputs``,
@@ -786,6 +828,12 @@ async def execute_council(
             quota_recoveries.append(entry)
             quota_recoveries_seen.add(entry["peer"])
             emit({"event": "peer_quota_recovered", "round": round_number, **entry})
+        for entry in _detect_content_refused(
+            round_outputs, participant_cfg, already_emitted=content_refused_seen
+        ):
+            content_refused.append(entry)
+            content_refused_seen.add(entry["peer"])
+            emit({"event": "peer_content_refused", "round": round_number, **entry})
 
     # Pinned-model substitutions (M-fable), mirrored on the quota pattern.
     # A `require_pinned_model` peer served by a different model (e.g. Claude
@@ -1249,6 +1297,8 @@ async def execute_council(
         metadata["quota_throttled_peers"] = list(quota_throttled)
     if quota_recoveries:
         metadata["quota_recoveries"] = list(quota_recoveries)
+    if content_refused:
+        metadata["content_refused_peers"] = list(content_refused)
     if missing_key_records:
         metadata["missing_key_peers"] = list(missing_key_records)
 

@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased
+
+**Field report 2026-08-28 (security-council, 48 runs): codex timeouts,
+antigravity empty responses, refused turns filed as `unknown`**
+* **Codex no longer inherits the operator's interactive reasoning
+  profile.** `adapters._build_cli_command` injects
+  `-c model_reasoning_effort=<participants.codex.reasoning_effort>` (new
+  per-peer key, default `medium`; `inherit` / null restores the CLI's own
+  config; an explicit `model_reasoning_effort` token in `args` wins) into
+  every codex `exec` invocation — builder-level, like the MCP starvation,
+  so hand-edited arg lists get it too. Field evidence: the 5.4 KB prompt
+  that timed out at 606 s under the operator's `ultra` setting answered in
+  151 s at `medium` (68 s at the CLI default). The codex baseline args
+  also gain `--skip-git-repo-check` (councils run in scratch copies and
+  untrusted directories; codex refused outright without it); the v0.21–
+  v0.22 baseline migrates silently (`config.OLD_CODEX_MCP_STARVED_ARGS`).
+* **Empty responses get diagnostics and one same-prompt re-run.** A CLI
+  that exits 0 with no stdout used to be recorded as the bare
+  `InvalidParticipantResponse: empty response` and dropped from quorum
+  (17 of 48 field runs, no exit code, no stderr). The error now carries the
+  exit status, the CLI's own status field when JSON mode surfaced one, and
+  a stderr excerpt; `ParticipantResult` gains `exit_code` / `stderr_tail`
+  — the tail is ALSO captured on timeouts, holding what the peer wrote
+  before the kill (the only record of what a timed-out codex was doing).
+  The CLI pipeline replays the same prompt once (`retry_on_empty_response:
+  false` or `retries: 0` opts out); success stamps
+  `recovered_after_empty_retry`, and a re-run that comes back unlabeled
+  never chains into the label-repair call. New fields flow to transcripts
+  (JSON + markdown "Exit status" / "Stderr tail") and MCP
+  `structured_results` (output schema v11).
+* **`usage_from_json` now supports antigravity.** `agy --print …
+  --output-format json` returns `{status, response, usage}`; the parser
+  records real token usage (no model id — agy reports none, so a
+  `require_pinned_model` agy peer fails closed as
+  `pinned_model_unverified`) and surfaces `status` inside the
+  empty-response error. Default OFF like the other families.
+* **New `error_kind=content_refused`.** Provider content/safety refusals
+  (OpenAI "flagged for possible cybersecurity risk" / Trusted Access for
+  Cyber, `content_policy_violation`, Gemini `PROHIBITED_CONTENT` /
+  `SAFETY`) classify explicitly instead of `unknown`; surfaced as
+  `metadata.content_refused_peers` + a `peer_content_refused` progress
+  event, lifted top-level in the MCP `council_run` payload, and rendered
+  as a ⚠️ line in the markdown transcript header. A nonzero-exit CLI's
+  stderr is bounded (2 KB head + 6 KB tail) before it becomes
+  `result.error` — one refused codex turn had shipped 542 KB of echoed
+  prompt and tool trajectory into the transcript.
+* Setup: the generated host instruction snippets tell agents to phrase
+  security reviews as verification ("confirm this control holds") rather
+  than attack ("find a bypass") — the refusal trigger observed in the
+  field; `.llm-council/.gitignore` and the project `.gitignore` template
+  now cover `.llm-council/cache/`.
+
 ## 0.22.0 - 2026-08-07
 
 **Migrate the MCP server to the mcp 2.x SDK (lifts the `<2` pin)**

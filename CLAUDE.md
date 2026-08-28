@@ -452,7 +452,14 @@ Key modules:
   read-only flags (`--permission-mode manual` / `--sandbox read-only`),
   so peers still cannot write. Flag + parser ship together per family —
   `usage_from_json` is a NO-OP for any family without a JSON parser
-  (`_USAGE_JSON_FAMILIES = {claude, codex}`; other families add no flag).
+  (`_USAGE_JSON_FAMILIES = {claude, codex, antigravity}`; other families
+  add no flag). **antigravity** (`--output-format json`, single JSON
+  object `{status, response, duration_seconds, num_turns, usage{
+  input_tokens, output_tokens, thinking_tokens, cache_read_tokens,
+  total_tokens}}`, agy 1.1.22) reports NO model id, so `model` stays the
+  requested one and a `require_pinned_model` agy peer fails closed as
+  `pinned_model_unverified`; its `status` is the diagnostic that text
+  mode hides when a response comes back empty.
   Parsing is fail-soft: `_parse_cli_usage_json` returns None on malformed
   / changed JSON shapes and the adapter falls back to treating raw stdout
   as text (the `RECOMMENDATION:` label check still runs, token fields stay
@@ -606,6 +613,50 @@ Key modules:
     feature is opt-in/default-OFF: no built-in mode except `fable` selects
     the peer, and a peer without `require_pinned_model` (or without JSON
     usage) never trips the guard.
+- **Codex must not inherit the operator's interactive profile
+  (2026-08-28 field report).** `~/.codex/config.toml` is loaded by every
+  `codex exec` — model, `model_reasoning_effort`, MCP servers, memories.
+  At the operator's `ultra` effort a council peer timed out (600 s) on
+  5 KB prompts in 18 of 48 runs; the same prompt answered in 151 s at
+  `medium`. `_build_cli_command` therefore injects
+  `-c model_reasoning_effort=<cfg.reasoning_effort>` into every codex
+  `exec` invocation (default `CODEX_DEFAULT_REASONING_EFFORT = "medium"`,
+  mirrored by `participants.codex.reasoning_effort` in `defaults.py` —
+  a test pins the two equal). Opt-outs: `reasoning_effort: inherit` (or
+  null) re-enables the CLI's own config; an explicit
+  `model_reasoning_effort` token in `args` wins. Same builder-level
+  enforcement as the MCP starvation (hand-edited arg lists get it too),
+  same placement (tail of the option region, before the stdin `-`).
+  `--ignore-user-config` is NOT shipped by default: it also drops the
+  operator's model pin and any `--profile` provider routing (local vLLM
+  etc.); document it as an operator opt-in for a fully clean profile.
+  The baseline codex args also carry `--skip-git-repo-check` (councils run
+  in scratch copies / untrusted dirs; codex refuses to start without it)
+  — outgoing baseline preserved as `config.OLD_CODEX_MCP_STARVED_ARGS`.
+- **Empty CLI responses: diagnostics + one same-prompt re-run.** A CLI
+  that exits 0 with no stdout is a validation failure
+  (`InvalidParticipantResponse: empty response …` — the prefix is the
+  contract for `classify_error` → `invalid_response` and for
+  `is_empty_response_error`). `_run_cli_once` appends the exit status,
+  the CLI's own `status`/`detail` when JSON usage mode surfaced one
+  (antigravity is now in `_USAGE_JSON_FAMILIES`; its JSON has no model
+  id), and a stderr excerpt, and stamps `exit_code` + `stderr_tail`
+  (last 2 KB) on the result. `stderr_tail` is ALSO captured on timeouts:
+  `_cleanup_timed_out_process` returns the partial `(stdout, stderr)` the
+  communicate task had collected before the kill. Nonzero exits embed
+  stderr in `error` instead, bounded by `_bounded_stderr` (2 KB head +
+  6 KB tail; a refused codex turn had produced 542 KB) — quota / refusal /
+  ineligibility patterns keep matching because vendor error lines sit in
+  the tail. The pipeline then replays the SAME prompt once
+  (`_empty_retry_enabled`: `retry_on_empty_response: false` or
+  `retries: 0` opts out) and RETURNS on every path — a re-run that comes
+  back unlabeled must not chain into the label-repair call (third call
+  past the one-extra-call ceiling). Flags: `empty_retry_attempted`,
+  `recovered_after_empty_retry`. Field motivation: antigravity returned
+  empty in 17 of 48 runs, independent of prompt size, with zero
+  diagnostics; agy 1.1.22 handles tool calls fine in print mode (5/5
+  live probes), so the cause is not reproducible on demand — capture,
+  don't guess.
 - **A council must never start another council.** Two independent layers,
   both required. (1) Guard: `adapters.clean_subprocess_env` unconditionally
   sets `LLM_COUNCIL_NESTED=1` in every CLI child env (sieve AND strict
@@ -662,6 +713,7 @@ failure path; do not let strings drift.
 | `model_substituted`  | A CLI peer with `require_pinned_model: true` was served by a model other than its pinned `model` — e.g. Claude Fable 5 refused and the Claude Code surface silently fell back to Opus 4.8. Prefix: `ModelSubstituted:`. Only observable when `usage_from_json: true` surfaces the served model id (the `modelUsage` key with the most `outputTokens` — the answer's author); the served model must fail the lenient variant-tolerant `adapters._model_pin_satisfied` check. Terminal for the peer (ok=False, drops quorum) so a substituted model's answer is never recorded as the requested model's vote; `result.model` still reports the REAL served model, and substituted outputs are excluded from the finding matrix. Detected live per round (round 1, round-2 deliberation) plus the synthesis-chair turn, and preserved through repair-retry merges (with combined original+retry output). Surfaced as `metadata['model_substituted_peers']: [{peer, requested, served_by, synthesis?}]` (omitted when empty), lifted top-level in the MCP `council_run` payload + schema, with a per-round `peer_model_substituted` progress event. Opt-in — a peer without `require_pinned_model` or without JSON usage never trips it. Known limit: attribution is by max cumulative `outputTokens`, so a mid-turn refusal fallback inside a long agentic turn can evade it. |
 | `pinned_model_unverified` | A peer required pinned-model verification but the CLI output did not report a served model. Prefix: `PinnedModelUnverified:`. The answer is excluded from quorum rather than being attributed without evidence. |
 | `client_ineligible` | A native client is installed but durably ineligible for the configured account/tier — e.g. the retired standalone Gemini CLI's `IneligibleTierError` with `UNSUPPORTED_CLIENT` (Google ended individual-tier service 2026-06-18; the built-in `gemini` peer was removed in v0.20.0). Doctor's opt-in native probe surfaces the compatible fallback. |
+| `content_refused`    | A provider-side content/safety policy refused the turn — observed 2026-08 as codex exiting nonzero with OpenAI's "This content was flagged for possible cybersecurity risk … Trusted Access for Cyber" on attack-phrased security-review prompts ("find a bypass"); the same review phrased as verification passed. Pattern-detected over the error string (`adapters.CONTENT_REFUSAL_PATTERNS`, checked BEFORE the quota scan; also matches OpenAI `content_policy_violation` and Gemini `PROHIBITED_CONTENT` / `SAFETY`), no prefix synthesized — so hosted moderation errors classify too. Surfaced as `metadata.content_refused_peers: [{peer, family, model, message}]` (`message` = the matched refusal line, not codex's banner) + a `peer_content_refused` progress event, lifted top-level in the MCP payload (schema v11), and a ⚠️ transcript-header line. The fix is to REPHRASE, not to raise a limit. |
 | `unknown`            | Non-empty error that did not match any known prefix — file a dogfood note            |
 
 ## Custom CLI participant: minimal template

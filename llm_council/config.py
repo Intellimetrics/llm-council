@@ -80,6 +80,20 @@ OLD_CODEX_EPHEMERAL_ARGS = [
     "{cwd}",
     "-",
 ]
+# The v0.21–v0.22 codex baseline: MCP-starved but without
+# `--skip-git-repo-check`, so a council pointed at a scratch copy / untrusted
+# directory failed before launch. Migrated to the current baseline at load.
+OLD_CODEX_MCP_STARVED_ARGS = [
+    "exec",
+    "--sandbox",
+    "read-only",
+    "--ephemeral",
+    "-c",
+    "mcp_servers={}",
+    "--cd",
+    "{cwd}",
+    "-",
+]
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -302,6 +316,25 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(
                 f"Participant '{name}' retry_on_missing_label must be a boolean"
             )
+        if "retry_on_empty_response" in participant and not isinstance(
+            participant["retry_on_empty_response"], bool
+        ):
+            raise ValueError(
+                f"Participant '{name}' retry_on_empty_response must be a boolean"
+            )
+        # Codex-only today: injected as `-c model_reasoning_effort=<value>`.
+        # A bare non-string (e.g. YAML `reasoning_effort: 2`) would be
+        # shipped verbatim to the CLI and fail the turn; null / "inherit"
+        # are the documented "use the CLI's own config" values.
+        if "reasoning_effort" in participant and participant[
+            "reasoning_effort"
+        ] is not None:
+            effort_value = participant["reasoning_effort"]
+            if not isinstance(effort_value, str) or not effort_value.strip():
+                raise ValueError(
+                    f"Participant '{name}' reasoning_effort must be a non-empty "
+                    "string (e.g. low, medium, high) or null/inherit"
+                )
         # Both flags feed the pinned-model substitution guard; a quoted
         # "false" would silently ENABLE them via truthiness, so fail loud
         # like the sibling boolean keys above.
@@ -815,7 +848,12 @@ def migrate_known_cli_defaults(config: dict[str, Any]) -> None:
     if isinstance(codex, dict) and (
         codex.get("type") == "cli"
         and codex.get("family") == "codex"
-        and codex.get("args") in (OLD_CODEX_APPROVAL_ARGS, OLD_CODEX_EPHEMERAL_ARGS)
+        and codex.get("args")
+        in (
+            OLD_CODEX_APPROVAL_ARGS,
+            OLD_CODEX_EPHEMERAL_ARGS,
+            OLD_CODEX_MCP_STARVED_ARGS,
+        )
     ):
         codex["args"] = list(DEFAULT_CONFIG["participants"]["codex"]["args"])
     participants = config.get("participants", {})

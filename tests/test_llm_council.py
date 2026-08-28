@@ -207,6 +207,7 @@ def test_codex_default_uses_current_read_only_exec_flags():
         "--sandbox",
         "read-only",
         "--ephemeral",
+        "--skip-git-repo-check",
         "-c",
         "mcp_servers={}",
         "--cd",
@@ -262,6 +263,7 @@ def test_load_config_migrates_old_cli_args(tmp_path: Path):
         "--sandbox",
         "read-only",
         "--ephemeral",
+        "--skip-git-repo-check",
         "-c",
         "mcp_servers={}",
         "--cd",
@@ -2067,6 +2069,10 @@ def test_cli_participant_retry_does_not_fire_on_empty_response(
                 "command": "claude",
                 "args": ["-p"],
                 "stdin_prompt": True,
+                # The label-repair retry must not fire on an empty response;
+                # the (separate, v0.23) same-prompt re-run is disabled here so
+                # this test keeps pinning exactly that.
+                "retry_on_empty_response": False,
             },
             "prompt",
             tmp_path,
@@ -2075,7 +2081,10 @@ def test_cli_participant_retry_does_not_fire_on_empty_response(
 
     assert len(calls) == 1
     assert result.ok is False
-    assert result.error == "InvalidParticipantResponse: empty response"
+    # The sentinel prefix is the contract; diagnostics (exit status, stderr)
+    # are appended after it since the 2026-08 field report.
+    assert result.error.startswith("InvalidParticipantResponse: empty response")
+    assert "exit 0" in result.error
 
 
 def test_cli_participant_retry_does_not_fire_on_nonzero_exit(

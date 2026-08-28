@@ -33,7 +33,40 @@ from llm_council.env import env_get, env_items
 # mode for these families — never add a JSON output flag for a family without
 # a matching parser (it would break the RECOMMENDATION: label check on raw
 # JSON stdout). See `_build_cli_command` and `_parse_cli_usage_json`.
-_USAGE_JSON_FAMILIES = frozenset({"claude", "codex"})
+_USAGE_JSON_FAMILIES = frozenset({"claude", "codex", "antigravity"})
+
+# Codex inherits the operator's INTERACTIVE profile from ~/.codex/config.toml
+# — `model_reasoning_effort` included. A council peer is a time-boxed
+# advisory turn, and at `ultra` it routinely blew a 600s timeout on 5KB
+# prompts (2026-08 field report: 18 of 48 runs; the same prompt answered in
+# ~70s at the CLI default). `_build_cli_command` therefore pins a bounded
+# effort on every codex `exec` unless the operator sets one explicitly
+# (`participants.codex.reasoning_effort`, or a `model_reasoning_effort`
+# token in args). `reasoning_effort: inherit` (or null) re-enables the
+# CLI's own config.
+CODEX_DEFAULT_REASONING_EFFORT = "medium"
+_INHERIT_REASONING_EFFORT = frozenset({"inherit"})
+
+# Bounds on how much CLI stderr lands in transcripts. A failed codex turn
+# echoes its banner, the whole prompt, and its tool trajectory to stderr
+# (542 KB observed on one refused run); the salient lines are at the END,
+# so `_bounded_stderr` keeps a head for context and a larger tail for the
+# error itself, and `stderr_tail` (the diagnostic field on results that
+# failed with exit 0 or timed out) keeps only the tail.
+CLI_STDERR_ERROR_HEAD_CHARS = 2000
+CLI_STDERR_ERROR_TAIL_CHARS = 6000
+CLI_STDERR_TAIL_CHARS = 2000
+
+# Sentinel prefix for "the CLI exited 0 with no stdout". `classify_error`
+# maps it to `invalid_response`; the pipeline's one same-prompt re-run keys
+# on it via `is_empty_response_error`.
+EMPTY_RESPONSE_ERROR_PREFIX = "InvalidParticipantResponse: empty response"
+EMPTY_RETRY_FAILED_SUFFIX = (
+    " One same-prompt re-run was attempted because the first attempt "
+    "returned no output; it also failed ({retry_kind}). Set "
+    "`participants.{name}.usage_from_json: true` to capture the CLI's own "
+    "status field on the next occurrence."
+)
 
 # Salt cache keys for pinned-model peers after changing the integrity contract
 # from "flag only observed substitutions" to "require observed telemetry".
@@ -278,6 +311,22 @@ class ParticipantResult:
     # Keep the fields separate: existing stats and cache payloads intentionally
     # treat `elapsed_seconds` as the original/adapter-attempt timing.
     wall_elapsed_seconds: float | None = None
+    # Diagnostics for failed CLI attempts (2026-08 field report: 17
+    # antigravity "empty response" drops carried no exit code and no
+    # stderr, so the operator had nothing to act on). `exit_code` is the
+    # subprocess status of the attempt this result describes. `stderr_tail`
+    # is the last CLI_STDERR_TAIL_CHARS of stderr — for an exit-0 failure
+    # (empty / unlabeled / pin-rejected output) and for a TIMEOUT, where it
+    # holds what the peer wrote before the kill (the only record of what a
+    # timed-out CLI was doing). Nonzero exits carry bounded stderr in
+    # `error` instead. Both stay None on success and for hosted peers.
+    exit_code: int | None = None
+    stderr_tail: str | None = None
+    # One same-prompt re-run fired because the first attempt produced no
+    # output (exit 0, empty stdout). `recovered_after_empty_retry` flips
+    # only when that re-run yielded a valid response.
+    empty_retry_attempted: bool = False
+    recovered_after_empty_retry: bool = False
 
 
 @dataclass
@@ -762,6 +811,15 @@ def _build_cli_command(
                 command.insert(command.index("exec") + 1, "--json")
             elif args and args[0] == "exec":
                 args = [args[0], "--json", *args[1:]]
+        elif family == "antigravity":
+            # `agy --print ... --output-format json` returns ONE JSON object
+            # (agy 1.1.x): {status, response, duration_seconds, num_turns,
+            # usage{input_tokens, output_tokens, thinking_tokens, ...}}. No
+            # model id is reported. `status` is the diagnostic that text
+            # mode hides when the response comes back empty. Position is
+            # free-form for agy; `--print` / `--mode plan` stay in args.
+            if "--output-format" not in args and "--output-format" not in command:
+                command.extend(["--output-format", "json"])
 
     # Codex boots every MCP server in the operator's global config on each
     # `exec` run. A council peer must never do that: the observed recursion
@@ -788,6 +846,30 @@ def _build_cli_command(
             args = [*args[:insert_at], "-c", "mcp_servers={}", *args[insert_at:]]
         else:
             args = [*args, "-c", "mcp_servers={}"]
+
+    # Codex also inherits the operator's `model_reasoning_effort` from
+    # ~/.codex/config.toml. Pin a bounded effort for the council turn (see
+    # CODEX_DEFAULT_REASONING_EFFORT) unless the operator already passes a
+    # `model_reasoning_effort` token in args or sets
+    # `reasoning_effort: inherit` / null. Same placement rules as the MCP
+    # starvation above; same "explicit operator token wins" opt-out.
+    effort_raw = cfg.get("reasoning_effort", CODEX_DEFAULT_REASONING_EFFORT)
+    effort = str(effort_raw).strip() if effort_raw is not None else ""
+    if (
+        family == "codex"
+        and effort
+        and effort.lower() not in _INHERIT_REASONING_EFFORT
+        and ("exec" in command or "exec" in args)
+        and not any(
+            tok.startswith("model_reasoning_effort") for tok in command + args
+        )
+    ):
+        effort_token = f"model_reasoning_effort={effort}"
+        if "-" in args:
+            insert_at = args.index("-")
+            args = [*args[:insert_at], "-c", effort_token, *args[insert_at:]]
+        else:
+            args = [*args, "-c", effort_token]
 
     # agy's print mode has its OWN internal wall clock (--print-timeout,
     # default 5m). A council timeout above 300s would otherwise be silently
@@ -983,6 +1065,47 @@ async def _run_cli_participant_pipeline(
         if retry_meta.get("exited") and not retry_meta.get("nonzero_exit"):
             retry_result.recovered_after_launch_retry = True
         result, meta = retry_result, retry_meta
+    # Empty-response re-run (2026-08 field report: antigravity exited 0 with
+    # no stdout in 17 of 48 runs, independent of prompt size, and every one
+    # silently dropped the peer from quorum). There is nothing to repair —
+    # the peer produced no text — so replay the SAME prompt once. Returns on
+    # every path: a re-run that comes back unlabeled must not chain into the
+    # label-repair call below (a third call past the one-extra-call ceiling).
+    if (
+        not result.ok
+        and is_empty_response_error(result.error)
+        and _empty_retry_enabled(cfg)
+    ):
+        from dataclasses import replace as _replace
+        retry_result, _retry_meta = await _run_cli_once(
+            name, cfg, prompt, cwd, start=start,
+            mode_multiplier=mode_multiplier, mode=mode,
+        )
+        if retry_result.ok:
+            merged = _replace(
+                retry_result,
+                empty_retry_attempted=True,
+                recovered_after_empty_retry=True,
+            )
+            if result.recovered_after_launch_retry:
+                merged.recovered_after_launch_retry = True
+            _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
+            return merged
+        # The re-run's own error is the more informative one (it may be a
+        # timeout or a labeled-but-invalid response rather than a second
+        # empty); annotate a repeat empty so the transcript shows both
+        # attempts came back blank and names the diagnostic lever.
+        annotated = retry_result.error
+        if is_empty_response_error(annotated):
+            annotated += EMPTY_RETRY_FAILED_SUFFIX.format(
+                retry_kind=classify_error(retry_result.error) or "unknown",
+                name=name,
+            )
+        merged = _replace(
+            retry_result, empty_retry_attempted=True, error=annotated
+        )
+        _maybe_persist_cache(name, prompt, cache_key, merged, cache_ctx)
+        return merged
     if (
         not result.ok
         and _retry_enabled(cfg)
@@ -1154,6 +1277,9 @@ async def _run_cli_once(
         else None
     )
 
+    proc: Any = None
+    # stderr collected before a timeout kill — see `_cleanup_timed_out_process`.
+    timed_out_stderr = b""
     try:
         proc = await asyncio.create_subprocess_exec(
             *command,
@@ -1230,7 +1356,9 @@ async def _run_cli_once(
         try:
             stdout, stderr = await asyncio.wait_for(asyncio.shield(communicate), timeout)
         except TimeoutError:
-            await _cleanup_timed_out_process(proc, communicate)
+            partial = await _cleanup_timed_out_process(proc, communicate)
+            if partial is not None:
+                timed_out_stderr = partial[1] or b""
             raise
         elapsed = time.monotonic() - start
         out = stdout.decode(errors="replace").strip()
@@ -1251,6 +1379,14 @@ async def _run_cli_once(
         validation_error = (
             _response_validation_error(out, cfg, prompt=prompt) if ok else ""
         )
+        if validation_error.startswith(EMPTY_RESPONSE_ERROR_PREFIX):
+            # Keep the prefix (`classify_error` and the empty-response re-run
+            # key on it) and append what we DO know: exit status, the CLI's
+            # own status/message when JSON mode surfaced one, and a stderr
+            # excerpt. Previously the bare sentinel was all a transcript got.
+            validation_error = _describe_empty_response(
+                name, proc.returncode, err, usage_fields
+            )
         # Silent CLI failures (nonzero exit but empty stderr) used to land
         # with `error=""`, which made `classify_error` return None — a
         # taxonomy hole. Always synthesize a stable error string when ok is
@@ -1301,7 +1437,7 @@ async def _run_cli_once(
                 error=(
                     model_pin_error
                     or validation_error
-                    or (err if not ok else "")
+                    or (_bounded_stderr(err) if not ok else "")
                 ),
                 elapsed_seconds=elapsed,
                 command=redact_prompt_args(command, prompt),
@@ -1317,6 +1453,16 @@ async def _run_cli_once(
                     usage_fields.get("total_tokens") if usage_fields else None
                 ),
                 cost_usd=usage_fields.get("cost_usd") if usage_fields else None,
+                exit_code=proc.returncode,
+                # Nonzero exits already embed (bounded) stderr in `error`;
+                # attach the tail only when exit 0 hid a failure (empty /
+                # unlabeled / pin-rejected response) so the transcript
+                # carries the CLI's own complaint without duplicating it.
+                stderr_tail=(
+                    _stderr_tail(err)
+                    if ok and err and (validation_error or model_pin_error)
+                    else None
+                ),
             ),
             {"nonzero_exit": not ok, "stderr": err, "exited": True},
         )
@@ -1336,6 +1482,10 @@ async def _run_cli_once(
                 command=redact_prompt_args(command, prompt),
                 model=cfg.get("model"),
                 prompt_chars=len(prompt),
+                exit_code=(proc.returncode if proc is not None else None),
+                stderr_tail=_stderr_tail(
+                    timed_out_stderr.decode(errors="replace").strip()
+                ),
             ),
             {"nonzero_exit": False, "stderr": "", "exited": False},
         )
@@ -1745,7 +1895,7 @@ async def _cleanup_timed_out_process(
     communicate: asyncio.Task[tuple[bytes, bytes]],
     *,
     terminate_grace_seconds: float = 2.0,
-) -> None:
+) -> tuple[bytes, bytes] | None:
     if proc.returncode is None:
         try:
             proc.terminate()
@@ -1761,10 +1911,15 @@ async def _cleanup_timed_out_process(
                     pass
             await proc.wait()
 
+    # Once the process is dead its pipes hit EOF and the communicate task
+    # completes with whatever it had collected — the peer's stderr up to the
+    # kill, the only record of what a timed-out CLI was doing. An idle-
+    # deadline read raises its own TimeoutError here; that (like a pipe
+    # error) just means no partial output is recoverable.
     try:
-        await communicate
-    except (BrokenPipeError, ConnectionResetError):
-        pass
+        return await communicate
+    except (BrokenPipeError, ConnectionResetError, TimeoutError):
+        return None
 
 
 async def _run_hosted_participant(
@@ -2879,6 +3034,68 @@ def _float_or_none(value: Any) -> float | None:
     return float(value)
 
 
+def _parse_antigravity_usage_json(out: str) -> dict[str, Any] | None:
+    """`agy --print ... --output-format json` → one JSON object (agy 1.1.x).
+
+    Observed shape (1.1.22)::
+
+        {"conversation_id": "...", "status": "SUCCESS",
+         "response": "<answer text>", "duration_seconds": 36.9,
+         "num_turns": 1,
+         "usage": {"input_tokens": 18952, "output_tokens": 3423,
+                   "thinking_tokens": 3113, "cache_read_tokens": 28445,
+                   "total_tokens": 22375}}
+
+    No model id is reported, so ``model`` stays None and a
+    ``require_pinned_model`` agy peer fails closed as
+    ``pinned_model_unverified`` (correct: nothing attests the served model).
+    ``status`` / any error-ish string field are returned as ``status`` /
+    ``detail`` so an empty ``response`` can be described with the CLI's own
+    verdict instead of the bare "empty response" sentinel. When the object
+    carries a ``status`` but no ``response`` string, ``text`` is ``""``
+    (a describable empty) rather than a fail-soft ``None`` — the JSON
+    itself is not a usable answer, and the status is the diagnostic.
+    """
+    obj = json.loads(out)
+    if not isinstance(obj, dict):
+        return None
+    status = obj.get("status")
+    status = status.strip() if isinstance(status, str) and status.strip() else None
+    text = obj.get("response")
+    if text is None:
+        text = obj.get("result")
+    if not isinstance(text, str):
+        if status is None:
+            return None
+        text = ""
+    usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+    prompt_tokens = _int_or_none(usage.get("input_tokens"))
+    completion_tokens = _int_or_none(usage.get("output_tokens"))
+    total_tokens = _int_or_none(usage.get("total_tokens"))
+    if (
+        total_tokens is None
+        and prompt_tokens is not None
+        and completion_tokens is not None
+    ):
+        total_tokens = prompt_tokens + completion_tokens
+    detail: str | None = None
+    for key in ("error", "message", "reason", "error_message"):
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            detail = value.strip()
+            break
+    return {
+        "text": text,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "cost_usd": None,
+        "model": None,
+        "status": status,
+        "detail": detail,
+    }
+
+
 def _parse_cli_usage_json(family: str, out: str) -> dict[str, Any] | None:
     """Parse a CLI's JSON output mode into model text + usage/cost (M7).
 
@@ -2901,6 +3118,8 @@ def _parse_cli_usage_json(family: str, out: str) -> dict[str, Any] | None:
             return _parse_claude_usage_json(out)
         if family == "codex":
             return _parse_codex_usage_json(out)
+        if family == "antigravity":
+            return _parse_antigravity_usage_json(out)
     except Exception:
         # Defensive: any shape drift degrades to today's raw-text behavior.
         return None
@@ -3693,6 +3912,85 @@ def _has_recommendation_label(output: str) -> bool:
     return False
 
 
+def _bounded_stderr(err: str) -> str:
+    """Bound a failed CLI's stderr before it becomes ``result.error``.
+
+    Keeps the first CLI_STDERR_ERROR_HEAD_CHARS (banner / invocation
+    context) and the last CLI_STDERR_ERROR_TAIL_CHARS (where CLIs print
+    their actual error lines) with an explicit elision marker between.
+    Short stderr passes through unchanged, so every existing
+    prefix/pattern match (quota, refusal, ineligibility) keeps working.
+    """
+    limit = CLI_STDERR_ERROR_HEAD_CHARS + CLI_STDERR_ERROR_TAIL_CHARS
+    if len(err) <= limit:
+        return err
+    elided = len(err) - limit
+    return (
+        err[:CLI_STDERR_ERROR_HEAD_CHARS].rstrip()
+        + f"\n[... {elided} chars of stderr elided; the tail below carries "
+        "the CLI's final lines ...]\n"
+        + err[-CLI_STDERR_ERROR_TAIL_CHARS:].lstrip()
+    )
+
+
+def _stderr_tail(err: str) -> str | None:
+    """Last CLI_STDERR_TAIL_CHARS of ``err`` for the ``stderr_tail``
+    diagnostic field; None when there is nothing to show."""
+    cleaned = (err or "").strip()
+    if not cleaned:
+        return None
+    return cleaned[-CLI_STDERR_TAIL_CHARS:]
+
+
+def is_empty_response_error(error: str) -> bool:
+    """True for the empty-stdout sentinel (with or without diagnostics)."""
+    return bool(error) and error.startswith(EMPTY_RESPONSE_ERROR_PREFIX)
+
+
+def _describe_empty_response(
+    name: str,
+    returncode: int | None,
+    stderr: str,
+    usage_fields: dict[str, Any] | None,
+) -> str:
+    """Build the empty-response error with every diagnostic we hold.
+
+    Prefix stays EMPTY_RESPONSE_ERROR_PREFIX so ``classify_error`` still
+    yields ``invalid_response`` and the pipeline's empty-response re-run
+    still fires. Appends the exit status, the CLI's own ``status`` /
+    ``detail`` when JSON usage mode surfaced one (antigravity reports
+    ``status``), and a whitespace-collapsed stderr excerpt.
+    """
+    parts = [f"exit {returncode}"]
+    status = (usage_fields or {}).get("status")
+    if status:
+        parts.append(f"CLI status {status}")
+    detail = (usage_fields or {}).get("detail")
+    if detail:
+        parts.append(f"CLI message: {str(detail)[:200]}")
+    excerpt = " ".join((stderr or "").split())
+    if excerpt:
+        if len(excerpt) > 300:
+            excerpt = "..." + excerpt[-297:]
+        parts.append(f"stderr: {excerpt}")
+    else:
+        parts.append("no stderr")
+    return f"{EMPTY_RESPONSE_ERROR_PREFIX} from `{name}` ({'; '.join(parts)})"
+
+
+def _empty_retry_enabled(cfg: dict[str, Any]) -> bool:
+    """Whether the one same-prompt re-run on an empty response may fire.
+
+    Per-participant opt-out `retry_on_empty_response: false`; also honours
+    the `retries: 0` kill-switch like every other extra-call path.
+    """
+    if cfg.get("retry_on_empty_response", True) is False:
+        return False
+    if _retries_zero_kill_switch(cfg):
+        return False
+    return True
+
+
 def _first_output_excerpt(output: str, max_chars: int = 240) -> str:
     cleaned = " ".join(output.split())
     if len(cleaned) <= max_chars:
@@ -3863,6 +4161,12 @@ ERROR_KIND_MODEL_SUBSTITUTED = "model_substituted"
 # model authored the response, so the peer is dropped rather than silently
 # treating the requested configuration value as observed execution data.
 ERROR_KIND_PINNED_MODEL_UNVERIFIED = "pinned_model_unverified"
+# A provider-side content/safety policy refused the request (2026-08 field
+# report: codex exited nonzero with OpenAI's "flagged for possible
+# cybersecurity risk" on attack-phrased security-review prompts; the 542 KB
+# stderr landed verbatim as `error_kind=unknown`). Pattern-detected over
+# the error string like quota, so hosted moderation errors classify too.
+ERROR_KIND_CONTENT_REFUSED = "content_refused"
 ERROR_KIND_UNKNOWN = "unknown"
 
 KNOWN_ERROR_KINDS = frozenset(
@@ -3881,6 +4185,7 @@ KNOWN_ERROR_KINDS = frozenset(
         ERROR_KIND_CLIENT_INELIGIBLE,
         ERROR_KIND_MODEL_SUBSTITUTED,
         ERROR_KIND_PINNED_MODEL_UNVERIFIED,
+        ERROR_KIND_CONTENT_REFUSED,
         ERROR_KIND_UNKNOWN,
     }
 )
@@ -3972,6 +4277,50 @@ def is_quota_exhausted_error(error: str) -> bool:
     return any(pattern.search(error) for pattern in QUOTA_EXHAUSTED_PATTERNS)
 
 
+# Provider content/safety refusals. Anchored on vendor phrasing rather than
+# generic words: a failed codex turn echoes the whole PROMPT to stderr, and a
+# security-review prompt legitimately talks about "policy" and "blocked", so
+# loose patterns would misfile ordinary failures. Add new vendor shapes here
+# with the observed text quoted in the commit.
+CONTENT_REFUSAL_PATTERNS = (
+    # OpenAI / Codex (observed 2026-08-26, codex 0.149–0.150):
+    # "ERROR: This content was flagged for possible cybersecurity risk. If
+    #  this seems wrong, try rephrasing your request. To get authorized for
+    #  security work, join the Trusted Access for Cyber program"
+    re.compile(r"flagged\s+for\s+possible\s+cybersecurity\s+risk", re.IGNORECASE),
+    re.compile(r"Trusted\s+Access\s+for\s+Cyber", re.IGNORECASE),
+    # OpenAI API error code (hosted / openai_compatible peers).
+    re.compile(r"content_policy_violation", re.IGNORECASE),
+    # Google / Gemini-family safety blocks.
+    re.compile(r"PROHIBITED_CONTENT"),
+    re.compile(r"finish_?reason\W{0,5}SAFETY", re.IGNORECASE),
+    re.compile(
+        r"\bblocked\s+(?:by|due\s+to)\s+(?:the\s+)?(?:safety|content|moderation)",
+        re.IGNORECASE,
+    ),
+)
+
+
+def is_content_refusal_error(error: str) -> bool:
+    """True when ``error`` carries a known provider content-policy refusal."""
+    if not error:
+        return False
+    return any(pattern.search(error) for pattern in CONTENT_REFUSAL_PATTERNS)
+
+
+def content_refusal_excerpt(error: str, max_chars: int = 200) -> str:
+    """The line of ``error`` that matched a refusal pattern (trimmed), for
+    one-line surfacing in metadata / progress events. Falls back to the
+    first non-empty line."""
+    for line in (error or "").splitlines():
+        if any(pattern.search(line) for pattern in CONTENT_REFUSAL_PATTERNS):
+            return line.strip()[:max_chars]
+    for line in (error or "").splitlines():
+        if line.strip():
+            return line.strip()[:max_chars]
+    return ""
+
+
 def classify_error(error: str) -> str | None:
     """Return a stable error_kind for non-empty error strings, else None.
 
@@ -4018,6 +4367,11 @@ def classify_error(error: str) -> str | None:
     # prefix-based checks above so a `CliExitNonZero:` synthesized error
     # with the word "quota" in it still classifies as cli_nonzero_exit
     # (the prefix is load-bearing for that path).
+    # Content-policy refusals precede the quota scan: a refused turn can
+    # mention rate limits in its trailing usage summary, and the refusal is
+    # the actionable signal (rephrase the prompt, not raise a limit).
+    if is_content_refusal_error(error):
+        return ERROR_KIND_CONTENT_REFUSED
     if is_quota_exhausted_error(error):
         return ERROR_KIND_QUOTA_EXHAUSTED
     # httpx + downstream-API errors funnel through f"{type(exc).__name__}: ..."

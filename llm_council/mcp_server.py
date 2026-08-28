@@ -293,7 +293,7 @@ def council_run_schema() -> dict[str, Any]:
     }
 
 
-COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 10  # v10 = context_files_dropped + leaning-yes/leaning-no recommendation values + cli_default_model_peers metadata; v9 = cross-rank subsystem removed (also covers v0.19.0 removal of focus bundles + acceptance-contract, which dropped fields but did not add any); v8 = wall time + client/pin eligibility; v7 = model substitutions
+COUNCIL_RUN_OUTPUT_SCHEMA_VERSION = 11  # v11 = content_refused_peers + per-result exit_code / stderr_tail / empty-retry flags; v10 = context_files_dropped + leaning-yes/leaning-no recommendation values + cli_default_model_peers metadata; v9 = cross-rank subsystem removed (also covers v0.19.0 removal of focus bundles + acceptance-contract, which dropped fields but did not add any); v8 = wall time + client/pin eligibility; v7 = model substitutions
 COUNCIL_RUN_VALID_STANCES = ("for", "against", "neutral")
 COUNCIL_RUN_VALID_ERROR_KINDS = (
     "timeout",
@@ -310,6 +310,7 @@ COUNCIL_RUN_VALID_ERROR_KINDS = (
     "model_substituted",
     "pinned_model_unverified",
     "client_ineligible",
+    "content_refused",
     "unknown",
 )
 
@@ -488,6 +489,40 @@ def council_run_output_schema() -> dict[str, Any]:
                             "description": (
                                 "True when a `(REQUIRED)` section was missing and "
                                 "a section-repair retry was attempted."
+                            ),
+                        },
+                        "empty_retry_attempted": {
+                            "type": "boolean",
+                            "description": (
+                                "v11: True when the first attempt exited 0 with "
+                                "no stdout and one same-prompt re-run was made "
+                                "(set on both the recovered and the failed path)."
+                            ),
+                        },
+                        "recovered_after_empty_retry": {
+                            "type": "boolean",
+                            "description": (
+                                "v11: True when the empty-response re-run "
+                                "produced a valid response."
+                            ),
+                        },
+                        "exit_code": {
+                            "type": ["integer", "null"],
+                            "description": (
+                                "v11: subprocess exit status of the attempt this "
+                                "result describes (CLI peers, failures only; "
+                                "negative = killed by signal, e.g. -15 after a "
+                                "timeout). `null` on success and for hosted peers."
+                            ),
+                        },
+                        "stderr_tail": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "v11: last ~2000 chars of the CLI's stderr for an "
+                                "exit-0 failure (empty / unlabeled response) or a "
+                                "timeout (what the peer wrote before the kill). "
+                                "`null` otherwise; nonzero exits carry bounded "
+                                "stderr in `error` instead."
                             ),
                         },
                         "continue_debate": {
@@ -751,6 +786,30 @@ def council_run_output_schema() -> dict[str, Any]:
                         "served_by": {"type": ["string", "null"]},
                     },
                     "required": ["peer", "served_by"],
+                },
+            },
+            "content_refused_peers": {
+                "type": "array",
+                "description": (
+                    "v11: peers whose turn was refused by a provider-side "
+                    "content/safety policy (`error_kind=content_refused`) — "
+                    "e.g. OpenAI's cyber policy on codex refusing an "
+                    "attack-phrased security-review prompt. The peer dropped "
+                    "from quorum. The fix is to REPHRASE the question as "
+                    "verification ('confirm this control holds') rather than "
+                    "attack ('find a bypass'), not to raise a limit. "
+                    "`message` is the provider's refusal line. Omitted "
+                    "entirely when no peer was refused (the common case)."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "peer": {"type": "string"},
+                        "family": {"type": "string"},
+                        "model": {"type": ["string", "null"]},
+                        "message": {"type": "string"},
+                    },
+                    "required": ["peer", "family", "message"],
                 },
             },
             "context_files_dropped": {
@@ -1719,6 +1778,16 @@ async def _run_council_scoped(
                 "section_repair_attempted": bool(
                     getattr(result, "section_repair_attempted", False)
                 ),
+                "empty_retry_attempted": bool(
+                    getattr(result, "empty_retry_attempted", False)
+                ),
+                "recovered_after_empty_retry": bool(
+                    getattr(result, "recovered_after_empty_retry", False)
+                ),
+                "exit_code": (
+                    getattr(result, "exit_code", None) if not result.ok else None
+                ),
+                "stderr_tail": getattr(result, "stderr_tail", None) or None,
                 "continue_debate": getattr(result, "continue_debate", None),
                 "evidence_verification_failures": list(
                     getattr(result, "evidence_verification_failures", None) or []
@@ -1803,6 +1872,10 @@ async def _run_council_scoped(
     metadata, model_substituted_peers = _lift(
         metadata, "model_substituted_peers", []
     )
+    # v11: provider content-policy refusals, lifted like quota_throttled_peers
+    # so the calling agent sees "rephrase this" without parsing per-result
+    # error strings (a refused codex turn's error is its whole stderr).
+    metadata, content_refused_peers = _lift(metadata, "content_refused_peers", [])
     # Dropped context files: lifted with the same pattern so the calling
     # agent cannot miss that some of the context it supplied never reached
     # any peer (progress events are invisible in some MCP hosts).
@@ -1843,6 +1916,8 @@ async def _run_council_scoped(
         payload["missing_key_peers"] = missing_key_peers
     if model_substituted_peers:
         payload["model_substituted_peers"] = model_substituted_peers
+    if content_refused_peers:
+        payload["content_refused_peers"] = content_refused_peers
     if context_files_dropped:
         payload["context_files_dropped"] = {
             **context_files_dropped,
