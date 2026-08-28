@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.23.0 - 2026-08-28
 
 **Field report 2026-08-28 (security-council, 48 runs): codex timeouts,
 antigravity empty responses, refused turns filed as `unknown`**
