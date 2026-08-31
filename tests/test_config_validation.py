@@ -285,3 +285,51 @@ def test_load_config_rejects_negative_timeout_per_kb_chars(tmp_path: Path):
         ValueError, match="timeout_per_kb_chars must be a non-negative number"
     ):
         load_config(path)
+
+
+def test_load_config_rejects_bad_okf_context_values(tmp_path: Path):
+    for payload, message in (
+        ({"defaults": {"okf_context": "yes"}}, "defaults.okf_context must be a boolean"),
+        ({"modes": {"review": {"okf_context": 1}}}, "okf_context must be a boolean"),
+        ({"defaults": {"okf_binary": ""}}, "defaults.okf_binary must be a non-empty string"),
+        ({"defaults": {"okf_binary": 3}}, "defaults.okf_binary must be a non-empty string"),
+        (
+            {"defaults": {"okf_generate_timeout_seconds": "fast"}},
+            "defaults.okf_generate_timeout_seconds must be a positive number",
+        ),
+        (
+            {"defaults": {"okf_max_excerpt_chars": 0}},
+            "defaults.okf_max_excerpt_chars must be a positive integer",
+        ),
+    ):
+        path = tmp_path / ".llm-council.yaml"
+        path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+        with pytest.raises(ValueError, match=message):
+            load_config(path)
+
+
+def test_load_config_accepts_okf_context_settings(tmp_path: Path):
+    path = tmp_path / ".llm-council.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "defaults": {
+                    "okf_context": True,
+                    "okf_binary": "okf-rs",
+                    "okf_generate_timeout_seconds": 30,
+                    "okf_max_excerpt_chars": 8000,
+                },
+                "modes": {"review": {"okf_context": False}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config["defaults"]["okf_context"] is True
+    assert config["modes"]["review"]["okf_context"] is False
+
+    # Resolution honours the mode-explicit false over the defaults true.
+    from llm_council.okf_context import resolve_okf_settings
+
+    assert resolve_okf_settings(config, "review", None).enabled is False
+    assert resolve_okf_settings(config, "quick", None).enabled is True

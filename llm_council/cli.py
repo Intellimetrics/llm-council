@@ -53,6 +53,7 @@ from llm_council.model_catalog import (
     fetch_openrouter_models,
     refresh_openrouter_cache,
 )
+from llm_council.okf_context import resolve_okf_settings
 from llm_council.orchestrator import execute_council
 from llm_council.policy import should_use_council
 from llm_council.setup_wizard import write_setup_files
@@ -313,6 +314,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--okf-context",
+        dest="okf_context",
+        action="store_true",
+        default=False,
+        help=(
+            "With --diff, append a one-hop call-graph blast-radius excerpt "
+            "derived from an OKF knowledge bundle (okf-rs) covering the "
+            "symbols the diff touches. Fail-soft: any OKF problem (missing "
+            "binary, generation failure, no matched concepts) leaves the "
+            "run unchanged plus a diagnostic. Can also be enabled per-mode "
+            "(modes.<name>.okf_context) or globally (defaults.okf_context)."
+        ),
+    )
+    run.add_argument(
         "--open",
         action="store_true",
         default=False,
@@ -482,6 +497,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow --context and --image files outside the working directory",
     )
     estimate.add_argument("--diff", action="store_true", help="Include git diff")
+    estimate.add_argument(
+        "--okf-context",
+        dest="okf_context",
+        action="store_true",
+        default=False,
+        help=(
+            "Build the estimate prompt with the OKF blast-radius excerpt "
+            "(estimate parity with `run --okf-context`)."
+        ),
+    )
     estimate.add_argument(
         "--chunk-strategy",
         choices=["fail", "head", "tail", "hash-aware"],
@@ -1771,6 +1796,7 @@ def cmd_estimate(args: argparse.Namespace) -> int:
             image_paths=args.image or None,
             chunk_strategy=getattr(args, "chunk_strategy", "fail"),
             chunk_progress=chunk_events.append,
+            okf_context=True if getattr(args, "okf_context", False) else None,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -2519,6 +2545,37 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         safe_context = bool(
             (config.get("modes", {}) or {}).get(mode, {}).get("safe_context")
         )
+        # OKF blast-radius enrichment (opt-in). Same None-aware precedence
+        # as independent_review: store_true flag can only force ON; unset
+        # defers to modes.<mode>.okf_context, then defaults.okf_context.
+        okf_settings = resolve_okf_settings(
+            config, mode, True if getattr(args, "okf_context", False) else None
+        )
+        okf_events: list[dict] = []
+
+        def _record_okf_event(event: dict) -> None:
+            okf_events.append(event)
+            status = event.get("status")
+            if status in ("attached", "stale_attached"):
+                stale_note = " — STALE bundle, line locators approximate" if event.get("stale") else ""
+                print(
+                    f"note: okf-context: {status} "
+                    f"({event.get('concepts')} concepts, {event.get('chars')} chars, "
+                    f"rev {event.get('source_revision') or 'unknown'}, "
+                    f"{event.get('source')}){stale_note}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                detail = event.get("detail")
+                detail_note = f" ({detail})" if detail else ""
+                print(
+                    f"warning: okf-context: {status}{detail_note} — run "
+                    "proceeds without blast-radius context",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
         prompt = build_prompt(
             question,
             mode=mode,
@@ -2535,6 +2592,8 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             safe_context=safe_context,
             chunk_strategy=getattr(args, "chunk_strategy", "fail"),
             chunk_progress=_record_chunk_event,
+            okf_settings=okf_settings,
+            okf_status=_record_okf_event,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -2868,6 +2927,11 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     # a mid-run progress event because the decision precedes execute_council.
     if prior_context_suppressed:
         metadata["prior_context_suppressed_for_independence"] = True
+    # OKF enrichment outcome (only when the feature was enabled — the
+    # callback never fires otherwise). Pre-run decision, so a metadata
+    # flag rather than a progress event, like the suppression above.
+    if okf_events:
+        metadata["okf_context"] = okf_events[-1]
     # Surface any non-configuration synthesis failure reported after the
     # early chair validation (for example, a chair call that fails at runtime).
     if metadata.get("synthesis_error"):

@@ -287,6 +287,18 @@ def council_run_schema() -> dict[str, Any]:
                     "also be set per-mode or via defaults.independent_review."
                 ),
             },
+            "okf_context": {
+                "type": "boolean",
+                "description": (
+                    "With include_diff, append a one-hop call-graph "
+                    "blast-radius excerpt derived from an OKF knowledge "
+                    "bundle (okf-rs) covering the symbols the diff touches. "
+                    "Fail-soft: any OKF problem leaves the run unchanged "
+                    "plus a metadata.okf_context diagnostic. Overrides "
+                    "modes.<mode>.okf_context and defaults.okf_context "
+                    "(explicit false disables a config-enabled default)."
+                ),
+            },
         },
         "required": ["question"],
         "additionalProperties": False,
@@ -949,6 +961,14 @@ def estimate_schema() -> dict[str, Any]:
                 "enum": ["fail", "head", "tail", "hash-aware"],
                 "default": "fail",
             },
+            "okf_context": {
+                "type": "boolean",
+                "description": (
+                    "Build the estimate prompt with the OKF blast-radius "
+                    "excerpt (estimate parity with council_run's "
+                    "okf_context)."
+                ),
+            },
             "deliberate": {"type": "boolean", "default": False},
             "max_rounds": {"type": "integer", "minimum": 1, "maximum": 3},
             "completion_tokens": {
@@ -1314,6 +1334,13 @@ async def _run_council_scoped(
     safe_context = bool(
         (config.get("modes", {}) or {}).get(mode, {}).get("safe_context")
     )
+    # OKF blast-radius enrichment (opt-in). Tri-state MCP arg: explicit
+    # false overrides a config-enabled mode/default (same None-aware
+    # precedence as independent_review above).
+    from llm_council.okf_context import resolve_okf_settings
+
+    okf_settings = resolve_okf_settings(config, mode, arguments.get("okf_context"))
+    okf_events: list[dict[str, Any]] = []
     chunk_events: list[dict[str, Any]] = []
     prompt = build_prompt(
         question,
@@ -1331,6 +1358,8 @@ async def _run_council_scoped(
         safe_context=safe_context,
         chunk_strategy=str(arguments.get("chunk_strategy") or "fail"),
         chunk_progress=chunk_events.append,
+        okf_settings=okf_settings,
+        okf_status=okf_events.append,
     )
     from llm_council.safety import apply_secret_scan_policy, redact_secrets
 
@@ -1695,6 +1724,11 @@ async def _run_council_scoped(
     # event because the decision precedes execute_council.
     if prior_context_suppressed:
         metadata["prior_context_suppressed_for_independence"] = True
+    # OKF enrichment outcome (only when the feature was enabled — the
+    # callback never fires otherwise). Metadata-only by design: advisory,
+    # never changes the run outcome, so no top-level lift / schema bump.
+    if okf_events:
+        metadata["okf_context"] = okf_events[-1]
     metadata["config_warnings"] = _pending_config_warnings
     # L7: compact cost-estimate echo so a caller who skipped `council_estimate`
     # still sees the cost signal. M6: non-fatal soft cost-warning (omitted when
@@ -2129,6 +2163,7 @@ def estimate_run(arguments: dict[str, Any]) -> dict[str, Any]:
             image_paths=image_path_inputs or None,
             chunk_strategy=str(arguments.get("chunk_strategy") or "fail"),
             chunk_progress=chunk_events.append,
+            okf_context=arguments.get("okf_context"),
         )
         if chunk_events:
             estimate["chunk_events"] = chunk_events

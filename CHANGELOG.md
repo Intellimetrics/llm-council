@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+* **Opt-in OKF blast-radius context (`--okf-context` / `okf_context`).**
+  With `--diff`, the orchestrator derives the symbols touched by the
+  diff, looks up their one-hop caller/callee neighborhood in an OKF
+  knowledge bundle, and appends a compact signatures+locators excerpt
+  after the Git Diff section so every peer sees the blast radius, not
+  just the diff (live A/B on this repo: 11/11 cross-module consumers
+  enumerated vs 1/11 from raw source). Bundle acquisition is
+  ephemeral-first — `okf-rs generate <root> -o <tmpdir> --no-cache` from
+  the working tree, never writing into the project; a pre-existing
+  bundle (`okf.toml` `output` key / `knowledge/index.md`) is a fallback,
+  marked stale when its `source_revision` is not HEAD. Default OFF
+  everywhere; prompts are byte-identical when disabled. Fail-soft:
+  missing binary, generation failure/timeout, no matched concepts, or
+  no prompt headroom leaves the run exactly as today plus
+  `metadata.okf_context` (statuses: `attached` / `stale_attached` /
+  `no_diff` / `excerpt_over_budget` / `binary_missing` /
+  `generate_failed` / `generate_timeout` / `no_matched_concepts` /
+  `internal_error`), a transcript header bullet, and a CLI stderr note.
+  The excerpt renders into post-assembly prompt headroom only (capped by
+  `defaults.okf_max_excerpt_chars`, default 12 000), so it can never
+  trigger overflow chunking. Config: `defaults.okf_context` /
+  `modes.<name>.okf_context` (None-aware precedence like
+  `independent_review`), `defaults.okf_binary`,
+  `defaults.okf_generate_timeout_seconds`. Estimate parity: `estimate`
+  / `council_estimate` accept the same flag and build the same enriched
+  prompt. MCP surfacing is metadata-only (schema stays v11). Peers gain
+  no tools — this is orchestrator-side prompt text only. Opt-in canary
+  `tests/test_live_okf_bundle.py` (`LLM_COUNCIL_LIVE_OKF_TEST=1`)
+  guards the okf-rs frontmatter/read-only contract against upstream
+  drift (verified live against okf-rs 0.7.0). Hardened after a
+  self-review council run over this very diff (3 CLI peers, with the
+  feature's own excerpt attached) converged on the subprocess edges:
+  tempdir lifecycle moved inside a `TemporaryDirectory` context manager
+  (the split-ownership version leaked on Ctrl-C), generator output
+  capture switched to the disk-backed bounded pattern `_run_git` uses,
+  the generate timeout gained a 120s hard ceiling (async call paths),
+  a hostile `okf.toml` `output` can no longer aim the concept walk
+  outside cwd, status-callback failures became non-fatal, signatures
+  are length-capped, and an unknown fallback-bundle revision now reads
+  as stale rather than fresh.
+
 ## 0.23.0 - 2026-08-28
 
 **Field report 2026-08-28 (security-council, 48 runs): codex timeouts,

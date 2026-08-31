@@ -24,6 +24,7 @@ from llm_council.context import (
 )
 from llm_council.deliberation import deliberation_body_budget
 from llm_council.model_catalog import fetch_openrouter_models
+from llm_council.okf_context import resolve_okf_settings
 from llm_council.synthesis import MAX_SYNTHESIS_PROMPT_CHARS_DEFAULT
 
 # litellm is an OPTIONAL pricing fallback for hosted peers whose model id
@@ -172,6 +173,7 @@ def estimate_council(
     deliberation_prompt_chars: Mapping[str, int] | None = None,
     chunk_strategy: str = "fail",
     chunk_progress: Callable[[dict[str, Any]], None] | None = None,
+    okf_context: bool | None = None,
 ) -> dict[str, Any]:
     """Return a best-effort preflight estimate for a council run.
 
@@ -259,12 +261,15 @@ def estimate_council(
             # Match the runtime prompt so an estimate that passes can't be
             # rejected by the actual run's per-participant prompt-size guard
             # (same parity rule as the image budget above) — the framing adds
-            # ~850 chars.
+            # ~850 chars. okf_context is prompt-affecting for the same
+            # reason: the estimate must build the same blast-radius excerpt
+            # or the size/cost estimate lies.
             safe_context=bool(mode_cfg.get("safe_context")),
             stances=mode_stances,
             participants=participant_cfg or None,
             chunk_strategy=chunk_strategy,
             chunk_progress=chunk_progress,
+            okf_settings=resolve_okf_settings(config, mode, okf_context),
         )
     deliberate = bool(deliberate or mode_cfg.get("deliberate"))
     rounds = int(

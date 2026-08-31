@@ -431,6 +431,11 @@ def validate_config(config: dict[str, Any]) -> None:
         # silently ENABLE the framing without this check.
         if "safe_context" in mode and not isinstance(mode["safe_context"], bool):
             raise ValueError(f"Mode '{name}' safe_context must be a boolean")
+        # OKF blast-radius enrichment opt-in. Boolean when present — the
+        # resolution uses truthiness, so a quoted "false" would silently
+        # enable it (same rationale as safe_context).
+        if "okf_context" in mode and not isinstance(mode["okf_context"], bool):
+            raise ValueError(f"Mode '{name}' okf_context must be a boolean")
         if mode.get("origin_policy") not in (None, "any", "us"):
             raise ValueError(f"Mode '{name}' origin_policy must be 'any' or 'us'")
         _validate_positive_int(mode, "max_rounds", f"mode '{name}'")
@@ -527,6 +532,17 @@ def validate_config(config: dict[str, Any]) -> None:
         defaults["deliberation_early_stop"], bool
     ):
         raise ValueError("defaults.deliberation_early_stop must be a boolean")
+    # OKF blast-radius enrichment (opt-in, default off). Boolean when
+    # present; the companion knobs validate for shape so a typo fails at
+    # config load, not mid-run after prompt build.
+    if "okf_context" in defaults and not isinstance(defaults["okf_context"], bool):
+        raise ValueError("defaults.okf_context must be a boolean")
+    if "okf_binary" in defaults and (
+        not isinstance(defaults["okf_binary"], str) or not defaults["okf_binary"]
+    ):
+        raise ValueError("defaults.okf_binary must be a non-empty string")
+    _validate_positive_number(defaults, "okf_generate_timeout_seconds", "defaults")
+    _validate_positive_int(defaults, "okf_max_excerpt_chars", "defaults")
     _validate_positive_int(defaults, "max_concurrency", "defaults")
     _validate_positive_int(defaults, "max_deliberation_rounds", "defaults")
     _validate_positive_int(defaults, "max_prompt_chars", "defaults")

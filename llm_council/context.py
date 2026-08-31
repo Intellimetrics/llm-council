@@ -9,7 +9,10 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, BinaryIO, Callable
+from typing import TYPE_CHECKING, Any, BinaryIO, Callable
+
+if TYPE_CHECKING:
+    from llm_council.okf_context import OkfSettings
 
 from llm_council.defaults import (
     DEFAULT_STANCE_PROMPTS,
@@ -556,6 +559,8 @@ def build_prompt(
     safe_context: bool = False,
     chunk_strategy: str = "fail",
     chunk_progress: Callable[[dict[str, Any]], None] | None = None,
+    okf_settings: "OkfSettings | None" = None,
+    okf_status: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
     """Build the read-only prompt sent to each participant."""
 
@@ -715,6 +720,58 @@ def build_prompt(
         return "\n".join(sections)
 
     prompt = assemble(context_sections)
+    # OKF blast-radius enrichment (opt-in; see llm_council/okf_context.py).
+    # Runs only after base assembly so the excerpt renders into real
+    # headroom and can never itself trigger the overflow remediation
+    # below; when disabled — or on any OKF failure — the prompt bytes are
+    # untouched. Lazy import keeps module import cost flat for the
+    # overwhelmingly common disabled path.
+    if okf_settings is not None and okf_settings.enabled:
+        from llm_council.okf_context import build_okf_section
+
+        def _okf_notify(event: dict[str, Any]) -> None:
+            # The status callback sits outside build_okf_section's own
+            # fail-soft wrapper; a raising callback (e.g. stderr write
+            # failure in the CLI printer) must not abort the run either.
+            if okf_status is None:
+                return
+            try:
+                okf_status(event)
+            except Exception:
+                pass
+
+        if not include_diff:
+            # The feature is defined over the diff; without one there is
+            # nothing to derive touched symbols from.
+            _okf_notify({"status": "no_diff"})
+        else:
+            if max_prompt_chars is not None:
+                # -1 accounts for the "\n" separator the extra section adds
+                # in `assemble`, so a full-budget excerpt still fits exactly.
+                headroom = max_prompt_chars - len(prompt) - 1
+            else:
+                headroom = okf_settings.max_excerpt_chars
+            okf_section, okf_result = build_okf_section(
+                cwd, diff_raw, okf_settings, headroom=headroom
+            )
+            _okf_notify(okf_result)
+            if okf_section:
+                insert_at = (
+                    diff_section_index + 1
+                    if diff_section_index is not None
+                    else len(context_sections)
+                )
+                context_sections.insert(insert_at, okf_section)
+                # Keep the chunker's section-slot -> path-label map aligned
+                # with the shifted positions (defensive: with the excerpt
+                # budgeted from headroom the remediation below cannot fire
+                # because of this insertion, but the map must stay correct
+                # for the paths that CAN still trigger it).
+                context_file_indices = {
+                    (idx + 1 if idx >= insert_at else idx): label
+                    for idx, label in context_file_indices.items()
+                }
+                prompt = assemble(context_sections)
     if max_prompt_chars is not None and len(prompt) > max_prompt_chars:
         # Context-files chunking is automatic (no `chunk_strategy` opt-in
         # required) because context_files are explicitly-requested attachments

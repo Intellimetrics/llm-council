@@ -1380,6 +1380,30 @@ def write_transcript(
         if refused_peers
         else []
     )
+    # OKF blast-radius enrichment outcome. Key absent = feature off (no
+    # bullet); requested-but-failed states surface loudly so the operator
+    # knows peers reviewed without the call-graph context they asked for.
+    okf_record = metadata.get("okf_context")
+    okf_bullet: list[str] = []
+    if isinstance(okf_record, dict):
+        okf_status = okf_record.get("status")
+        if okf_status in ("attached", "stale_attached"):
+            stale_note = (
+                " — STALE bundle, line locators approximate"
+                if okf_record.get("stale")
+                else ""
+            )
+            okf_bullet = [
+                f"- OKF blast radius: {okf_record.get('concepts')} concept(s), "
+                f"{okf_record.get('chars')} chars (bundle rev "
+                f"`{okf_record.get('source_revision') or 'unknown'}`, "
+                f"{okf_record.get('source')}){stale_note}"
+            ]
+        else:
+            okf_bullet = [
+                "- ⚠️ OKF blast radius requested but not attached: "
+                f"`{okf_status}`"
+            ]
     lines = [
         "# LLM Council Transcript",
         "",
@@ -1408,6 +1432,7 @@ def write_transcript(
         *dropped_bullet,
         *default_model_bullet,
         *refused_bullet,
+        *okf_bullet,
         "",
         "## Question",
         "",

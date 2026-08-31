@@ -126,6 +126,11 @@ Key modules:
   (`council_query_transcripts`); no CLI subcommand. No new
   dependencies — sentence-transformers deferred until Jaccard proves
   insufficient.
+- `okf_context.py` — opt-in OKF blast-radius enrichment: bundle
+  discovery/ephemeral generation (external `okf-rs` binary),
+  diff→touched-symbol matching over concept-file frontmatter, and the
+  budgeted excerpt `context.build_prompt` inserts after the Git Diff
+  section. Resolution/config surface mirrors `independent_review`.
 
 ## Invariants worth preserving
 
@@ -684,6 +689,48 @@ Key modules:
   calling `council_run` recurses exponentially (each level spawns N
   peers). Guarded by the `_build_cli_command` injection tests in
   `tests/test_nested_guard.py`.
+- **OKF enrichment is opt-in, fail-soft, and never writes into the
+  project.** No built-in mode or default sets `okf_context`; when disabled
+  the prompt is byte-identical (guarded by
+  `tests/test_okf_prompt_integration.py::test_prompt_byte_identical_when_disabled`).
+  Every OKF failure (binary missing, generation failed/timeout,
+  stale-only bundle, zero matched concepts, no prompt headroom) must
+  degrade to "run proceeds exactly as today plus a `metadata.okf_context`
+  diagnostic" — `okf_context.build_okf_section` deliberately catches
+  broad `Exception` for this reason (BaseException propagates by design;
+  see below), and `context.build_prompt` wraps the `okf_status` callback
+  in its own try/except so a raising CLI printer can't abort the run
+  either; do not "fix" either of those. Ephemeral bundles go to a
+  tempdir via `okf-rs generate <root> -o <tmpdir> --no-cache` (the
+  `--no-cache` flag is load-bearing: without it okf-rs drops
+  `.okf-cache.json` in the project root). The tempdir is owned by a
+  `tempfile.TemporaryDirectory` context manager INSIDE
+  `build_okf_section` — never split creation and cleanup across the
+  `generate_ephemeral_bundle` return boundary again (the 2026-08-31
+  self-review council caught that split leaking the dir on Ctrl-C).
+  Generator output capture is disk-backed with a bounded stderr-tail
+  decode, following `context._run_git`'s documented pattern (in-memory
+  `capture_output` is unbounded, and pipes held by surviving
+  grandchildren can block past our own timeout). The generate timeout is
+  clamped to `OKF_GENERATE_TIMEOUT_CEILING_SECONDS` (120s) regardless of
+  config because `build_prompt` runs on async call paths. `find_bundle`
+  refuses an `okf.toml` `output` that resolves outside cwd — the file
+  lives in the reviewed (possibly hostile) repo.
+  Bundle acquisition is ephemeral-FIRST: the feature only runs when a
+  diff exists, which means the working tree differs from HEAD for
+  exactly the files under review, so a committed bundle is only a
+  fallback (marked `stale_attached` when its `source_revision` ≠ HEAD).
+  The excerpt renders into post-assembly prompt headroom only, so it can
+  never trigger the overflow-chunking paths, and the machine interface
+  is concept-file frontmatter (`resource: path#Lstart-Lend`,
+  `relationships`) — okf-rs query subcommands have no JSON output. Line
+  locators are kept verbatim (the format the 2026-08-31 A/B validated);
+  staleness is tolerated because `citations.py` verifies `[VERIFIED:...]`
+  tags against the working tree, so a stale locator degrades to an
+  unverified tag rather than silently wrong evidence. MCP surfacing is
+  metadata-only (no top-level key, no schema bump). The opt-in canary
+  `tests/test_live_okf_bundle.py` (`LLM_COUNCIL_LIVE_OKF_TEST=1`) guards
+  the okf-rs frontmatter/read-only contract across upstream releases.
 - **`.mcp.json` stays local.** Setup adds it to `.gitignore`. It contains
   absolute paths and must not be committed.
 - **Version bumps.** `__version__` in `llm_council/__init__.py` and the
