@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.24.0 - 2026-08-31
 
 * **Opt-in OKF blast-radius context (`--okf-context` / `okf_context`).**
   With `--diff`, the orchestrator derives the symbols touched by the
