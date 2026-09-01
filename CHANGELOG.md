@@ -1,5 +1,63 @@
 # Changelog
 
+## Unreleased
+
+**Operator guidance: the tuning knowledge moves out of source comments
+and into the product** (from a survey of every guidance surface — setup,
+doctor, list, stats, recommend — that found day-0 wiring and
+failure-moment coaching strong, but configuration advice invisible).
+
+* **`llm-council stats` now prints a `recommendations:` block.** The
+  interpretation rules that previously existed only as source comments
+  on the metric definitions are applied to the aggregated numbers and
+  rendered as concrete advice: timeout walls with zero terse-retry
+  recoveries → raise `participants.<peer>.timeout` / the mode's
+  `timeout_multiplier`; retries that fire and never recover → raise the
+  base timeout or disable `terse_retry_on_timeout`; repeated quota walls
+  with no recovery → configure `fallback_chain`; high invalid-label
+  rates → check phrasing or `require_recommendation: false`;
+  content-policy refusals → rephrase as verification. Conservative
+  minimum sample sizes; advisory only; also in `--json` and MCP
+  `council_stats` output (`recommendations` +
+  `okf_context_status_counts` keys). Run-level `okf_context` outcomes
+  are now aggregated too (attach rate vs `binary_missing` /
+  `no_matched_concepts` — the evidence base for ever defaulting the
+  feature on).
+* **Every failing doctor check now says what to do next.** Missing
+  native CLIs carry per-family install commands, missing API-key env
+  vars point at `.llm-council.env`, missing ollama links the installer.
+  New `okf:binary` row: informational when the OKF feature is unused
+  (present → how to enable it; absent → how to install okf-rs), a
+  FAILING check only when config enables `okf_context` somewhere and
+  the binary is missing (runs would silently degrade).
+* **`llm-council setup --write-instructions` (opt-in).** Upserts the
+  instruction snippet into `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`
+  inside idempotent `<!-- llm-council:instructions:begin/end -->`
+  markers — re-runs replace the block, bytes outside the markers are
+  never touched, missing files are created. Default behavior is
+  unchanged: without the flag setup still never edits those files, and
+  the manual-append next-step now mentions the flag. Hardened by a
+  self-review council over the diff (2 of 3 peers flagged the updater):
+  markers match only as whole lines and a file must hold exactly one
+  begin/end pair in order (duplicates, reversed order, prose mentions
+  refused or ignored — never silently clobbered); all three targets are
+  validated before any is written; writes are atomic (same-dir temp +
+  `os.replace`, mode preserved) so an interruption can't truncate a
+  user's file; CRLF endings outside the block survive; entry points that
+  resolve to the same real file (an `AGENTS.md → CLAUDE.md` symlink) are
+  written once through the resolved target. The printed next-step notes
+  the block embeds this machine's absolute project path — teammates
+  re-run the flag locally after cloning.
+* **`llm-council list --verbose`.** Surfaces the per-peer and per-mode
+  tuning keys that were previously invisible outside source/README:
+  `reasoning_effort`, `usage_from_json`, `env_strict`,
+  `require_pinned_model`, `fallback_chain`, `retry_on_missing_label`,
+  `require_recommendation`, `timeout_per_kb_chars: 0`, `idle_timeout`;
+  mode `timeout_multiplier`, `okf_context`, `safe_context`,
+  `independent_review`, `stances`, `model_overrides`; plus configured
+  `defaults.tiers` with the `--tier` usage hint. Non-verbose output
+  gains a one-line pointer to `--verbose`.
+
 ## 0.24.0 - 2026-08-31
 
 * **Opt-in OKF blast-radius context (`--okf-context` / `okf_context`).**

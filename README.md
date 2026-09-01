@@ -55,7 +55,7 @@ llm-council doctor --probe-native        # verify the peers actually respond
 ```
 
 > [!IMPORTANT]
-> Setup writes host-specific snippets under `.llm-council/instructions/` — it never edits your instruction files for you. Append the active host's snippet to `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` (setup prints the exact paths), then restart that agent session so MCP reloads.
+> Setup writes host-specific snippets under `.llm-council/instructions/` — by default it never edits your instruction files for you. Either append the active host's snippet to `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` (setup prints the exact paths), or pass `--write-instructions` to have setup maintain an idempotent marker-delimited block in those files itself (re-runs replace the block; everything outside the markers is untouched). Then restart that agent session so MCP reloads.
 
 Then just talk to your coding agent:
 
@@ -214,6 +214,7 @@ These optional keys sharpen the council's signal without changing the read-only 
 | `usage_from_json` | per-peer | Invoke `claude` / `codex` / `agy` in their JSON output modes to record real token usage and cost (and, for `agy`, its `status` when a response comes back empty); fails soft to raw text and keeps the read-only flags. |
 | `skip_terse_retry_when_quorum_met` | `defaults` | Default **on**: when a peer times out after the round already has labeled quorum, skip its timeout retry instead of burning more wall time. Set `false` to always retry. |
 | `reasoning_effort` | per-peer (`codex`) | Reasoning effort pinned for the council turn as `-c model_reasoning_effort=…` (default `medium`; `inherit` uses the CLI's own config). Codex otherwise inherits the operator's interactive `~/.codex/config.toml` setting — at `ultra`, 5 KB review prompts blew 600 s timeouts. |
+| `okf_context` | `defaults` / per-mode (or `--okf-context`) | With a diff attached, append a one-hop call-graph blast-radius excerpt derived from an OKF knowledge bundle (requires the external [`okf-rs`](https://github.com/jyjeanne/okf-rs) binary; ephemeral tempdir generation, never written into the project). Fail-soft: any OKF problem leaves the run unchanged plus a `metadata.okf_context` diagnostic. |
 | `retry_on_empty_response` | per-peer | Default **on**: one same-prompt re-run when a CLI exits 0 with no output. Either way the error records the exit status and a stderr tail, and provider content-policy refusals surface as `content_refused_peers` (rephrase as verification, not attack). |
 
 `litellm` pricing fallback is automatic when the optional `litellm` package is installed — never a hard dependency. Older `local-private` / `local-only` command aliases remain accepted as deprecated; new output uses `private-local`. See `CLAUDE.md` for the full invariant notes behind each knob.

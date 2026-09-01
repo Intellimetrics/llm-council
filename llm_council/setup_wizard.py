@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,24 @@ OPENROUTER_PARTICIPANTS = (
     "glm_5_1",
     "glm_4_7_flash",
     "kimi_k2_6",
+)
+
+# Host-agent entry-point files for `setup --write-instructions`. Setup's
+# default posture stays "never edits your instruction files" — the opt-in
+# flag upserts an idempotent marker-delimited block into these instead of
+# asking the operator to append snippets by hand (the manual step most
+# setups die on). Pattern borrowed from okf-rs's own `init`.
+INSTRUCTION_ENTRY_POINTS = {
+    "claude": "CLAUDE.md",
+    "codex": "AGENTS.md",
+    "antigravity": "GEMINI.md",
+}
+INSTRUCTION_BLOCK_BEGIN = "<!-- llm-council:instructions:begin -->"
+INSTRUCTION_BLOCK_END = "<!-- llm-council:instructions:end -->"
+_INSTRUCTION_BLOCK_NOTE = (
+    "<!-- Managed by `llm-council setup --write-instructions`. Re-running "
+    "setup replaces everything between the llm-council markers; content "
+    "outside them is never touched. -->"
 )
 
 
@@ -272,6 +292,126 @@ def mcp_config(project_root: Path) -> dict[str, Any]:
             }
         }
     }
+
+
+def upsert_instruction_blocks(
+    root: Path,
+    *,
+    default_mode: str = "quick",
+    hosts: tuple[str, ...] = ("claude", "codex", "antigravity"),
+) -> list[Path]:
+    """Idempotently install instruction blocks into host entry-point files.
+
+    For each host, write the formatted INSTRUCTION_TEXT into the project's
+    CLAUDE.md / AGENTS.md / GEMINI.md between llm-council marker comments:
+    an existing marked block is replaced in place, a file without markers
+    gets the block appended, a missing file is created. Bytes outside the
+    markers are never modified (files are read/written with newline=""
+    so CRLF endings survive, and the append path adds to the end without
+    rewriting what precedes it).
+
+    Safety posture (2026-09-01 self-review council findings):
+    - Markers match only as whole lines, and a file must contain exactly
+      one begin and one end marker in order — anything else (duplicates,
+      reversed order, one without the other) is refused with ValueError.
+      A prose mention of a marker mid-line is ignored, not matched.
+    - Two-phase: every target is read and validated before ANY file is
+      written, so a corrupt GEMINI.md cannot leave CLAUDE.md half-updated.
+    - Writes are atomic (same-directory temp file + os.replace) so an
+      interruption can never truncate a user's file.
+    - Entry-point files that resolve to the same real file (e.g. an
+      AGENTS.md -> CLAUDE.md symlink) are written once; later hosts skip.
+
+    Returns the list of files actually changed.
+    """
+
+    # Phase 1: read + validate + compute every update. No writes yet.
+    planned: list[tuple[Path, Path, str, bool]] = []
+    seen_real: set[Path] = set()
+    for host in hosts:
+        target = root / INSTRUCTION_ENTRY_POINTS[host]
+        real = target.resolve()
+        if real in seen_real:
+            continue
+        seen_real.add(real)
+        block = "\n".join(
+            [
+                INSTRUCTION_BLOCK_BEGIN,
+                _INSTRUCTION_BLOCK_NOTE,
+                INSTRUCTION_TEXT.format(
+                    current=host,
+                    project_root=str(root.resolve()),
+                    default_mode=default_mode,
+                ).strip(),
+                INSTRUCTION_BLOCK_END,
+            ]
+        )
+        if target.exists():
+            with target.open("r", encoding="utf-8", newline="") as handle:
+                existing = handle.read()
+            lines = existing.splitlines(keepends=True)
+            begin_lines = [
+                i for i, line in enumerate(lines)
+                if line.strip() == INSTRUCTION_BLOCK_BEGIN
+            ]
+            end_lines = [
+                i for i, line in enumerate(lines)
+                if line.strip() == INSTRUCTION_BLOCK_END
+            ]
+            if not begin_lines and not end_lines:
+                separator = "" if existing.endswith(("\n", "\r\n")) else "\n"
+                updated = existing + separator + "\n" + block + "\n"
+            elif (
+                len(begin_lines) == 1
+                and len(end_lines) == 1
+                and begin_lines[0] < end_lines[0]
+            ):
+                prefix = "".join(lines[: begin_lines[0]])
+                suffix = "".join(lines[end_lines[0] + 1:])
+                updated = prefix + block + "\n" + suffix
+            else:
+                raise ValueError(
+                    f"{target} has an unusable llm-council marker layout "
+                    f"(found {len(begin_lines)} begin / {len(end_lines)} end "
+                    "markers on their own lines; expected exactly one of "
+                    "each, begin before end). Fix or remove the markers "
+                    "before re-running --write-instructions. No instruction "
+                    "files were modified (setup's own files may already be "
+                    "written)."
+                )
+            if updated != existing:
+                planned.append((target, real, updated, True))
+        else:
+            planned.append((target, real, block + "\n", False))
+
+    # Phase 2: atomic writes, only after every target validated.
+    written: list[Path] = []
+    for target, real, updated, existed in planned:
+        _atomic_write_text(real, updated, preserve_mode_from=real if existed else None)
+        written.append(target)
+    return written
+
+
+def _atomic_write_text(
+    real: Path, text: str, *, preserve_mode_from: Path | None
+) -> None:
+    """Same-directory temp file + os.replace; never truncates in place."""
+
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(real.parent), prefix=f".{real.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        if preserve_mode_from is not None:
+            shutil.copymode(preserve_mode_from, tmp_name)
+        os.replace(tmp_name, real)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def write_setup_files(

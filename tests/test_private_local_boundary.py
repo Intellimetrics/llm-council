@@ -262,12 +262,15 @@ def test_doctor_reports_explicit_openai_compatible_key_env(
 
     by_name = {check.name: check for check in check_environment(config)}
 
-    assert by_name["env:LOCAL_OPENAI_API_KEY"] == Check(
-        "env:LOCAL_OPENAI_API_KEY", False, "not set"
-    )
-    assert by_name["env:OPENROUTER_API_KEY"] == Check(
-        "env:OPENROUTER_API_KEY", False, "not set"
-    )
+    # Detail carries a remediation hint (export / .llm-council.env) since
+    # v0.25; assert the load-bearing parts rather than the full string.
+    local_key = by_name["env:LOCAL_OPENAI_API_KEY"]
+    assert local_key.ok is False
+    assert local_key.detail.startswith("not set")
+    assert "LOCAL_OPENAI_API_KEY" in local_key.detail
+    openrouter_key = by_name["env:OPENROUTER_API_KEY"]
+    assert openrouter_key.ok is False
+    assert openrouter_key.detail.startswith("not set")
 
 
 def test_doctor_requires_explicit_endpoint_key_only_on_default_route(

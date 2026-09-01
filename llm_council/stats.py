@@ -194,6 +194,11 @@ def aggregate(
 
     peers: dict[str, dict[str, Any]] = {}
     mode_counts: dict[str, int] = {}
+    # Run-level OKF enrichment outcomes (v0.24.0 `okf_context` metadata).
+    # Only present on transcripts where the feature was enabled; the
+    # attach rate vs. binary_missing / no_matched_concepts split is the
+    # signal for whether the blast-radius excerpt is earning its keep.
+    okf_status_counts: dict[str, int] = {}
     transcripts_considered = 0
     total_runs = 0
     total_successes = 0
@@ -209,6 +214,10 @@ def aggregate(
         mode = data.get("mode") or ""
         if mode:
             mode_counts[mode] = mode_counts.get(mode, 0) + 1
+        okf_record = (data.get("metadata") or {}).get("okf_context")
+        if isinstance(okf_record, dict) and okf_record.get("status"):
+            okf_status = str(okf_record["status"])
+            okf_status_counts[okf_status] = okf_status_counts.get(okf_status, 0) + 1
 
         for result in results:
             raw_name = result.get("name") or ""
@@ -381,17 +390,137 @@ def aggregate(
             }
         )
 
-    return {
+    stats = {
         "transcripts_considered": transcripts_considered,
         "total_runs": total_runs,
         "total_successes": total_successes,
         "mode_counts": dict(sorted(mode_counts.items())),
+        "okf_context_status_counts": dict(sorted(okf_status_counts.items())),
         "participants": participant_rows,
         "filters": {
             "participant": participant,
             "since_seconds": since_seconds,
         },
     }
+    stats["recommendations"] = derive_recommendations(stats)
+    return stats
+
+
+# Minimum sample sizes before a recommendation fires. Deliberately
+# conservative: a recommendation printed on two runs of noise erodes trust
+# in the whole block. Tune upward, not downward.
+_RECO_MIN_TIMEOUTS = 3
+_RECO_MIN_QUOTA_INCIDENTS = 2
+_RECO_MIN_LABEL_RUNS = 5
+_RECO_INVALID_LABEL_RATE = 0.2
+
+
+def derive_recommendations(stats: dict[str, Any]) -> list[str]:
+    """Turn aggregated telemetry into actionable configuration advice.
+
+    These rules previously lived only as source comments on the metric
+    definitions (`timeout_by_prompt_size`, `terse_retry_attempts`,
+    `quota_incidents`, ...); an operator reading `llm-council stats`
+    output never saw them. Each rule states the observation AND the
+    concrete knob to turn. Advisory only — nothing here changes behavior.
+    """
+
+    recommendations: list[str] = []
+    for row in stats.get("participants") or []:
+        name = row.get("name") or "?"
+        timeouts_by_size = row.get("timeout_by_prompt_size") or {}
+        recoveries_by_size = row.get("timeout_recoveries_by_prompt_size") or {}
+        timeout_rule_fired = False
+        for size_bucket, timeouts in timeouts_by_size.items():
+            recoveries = recoveries_by_size.get(size_bucket, 0)
+            if timeouts >= _RECO_MIN_TIMEOUTS and recoveries == 0:
+                timeout_rule_fired = True
+                recommendations.append(
+                    f"{name}: {timeouts} timeouts on {size_bucket} prompts "
+                    "with 0 terse-retry recoveries — raise "
+                    f"`participants.{name}.timeout` (or the mode's "
+                    "`timeout_multiplier`)."
+                )
+        terse_attempts = row.get("terse_retry_attempts") or 0
+        timeout_recoveries = row.get("timeout_recoveries") or 0
+        # Skipped when a bucket rule above already fired for this peer:
+        # both rules read the same underlying failures and printing
+        # near-duplicate advice for one peer reads as noise.
+        if (
+            not timeout_rule_fired
+            and terse_attempts >= _RECO_MIN_TIMEOUTS
+            and timeout_recoveries == 0
+        ):
+            recommendations.append(
+                f"{name}: terse-retry fired {terse_attempts}x and never "
+                "recovered — the retry window is structurally too small "
+                "for this peer; raise the base `timeout` or set "
+                f"`participants.{name}.terse_retry_on_timeout: false` to "
+                "stop paying for doomed retries."
+            )
+        quota_incidents = row.get("quota_incidents") or 0
+        quota_recoveries = row.get("quota_recoveries") or 0
+        if quota_incidents >= _RECO_MIN_QUOTA_INCIDENTS and quota_recoveries == 0:
+            recommendations.append(
+                f"{name}: hit {quota_incidents} quota walls with no "
+                "fallback recovery — configure "
+                f"`participants.{name}.fallback_chain` (ordered step-down "
+                "model ids) or move the peer to a lighter model/tier."
+            )
+        # Gate on SUCCESSES, not runs: invalid_label_rate's denominator is
+        # successful responses, so gating on runs let a peer with 5 runs
+        # and 1 unlabeled success print "100%" from a sample of one
+        # (2026-09-01 council finding).
+        successes = row.get("successes") or 0
+        invalid_rate = row.get("invalid_label_rate") or 0.0
+        if (
+            successes >= _RECO_MIN_LABEL_RUNS
+            and invalid_rate >= _RECO_INVALID_LABEL_RATE
+        ):
+            recommendations.append(
+                f"{name}: {invalid_rate * 100:.0f}% of successful responses "
+                "lacked a usable RECOMMENDATION label — check custom prompt "
+                "phrasing; for genuinely non-vote uses set "
+                f"`participants.{name}.require_recommendation: false` "
+                "instead of eating the repair-retry cost (already set? "
+                "then this is expected — ignore)."
+            )
+        # Deliberate n=1 exception to the minimum-sample discipline: each
+        # refusal is individually actionable (the fix is rephrasing that
+        # specific prompt), unlike the rate-based rules above.
+        content_refusals = (row.get("error_kind_counts") or {}).get(
+            "content_refused", 0
+        )
+        if content_refusals:
+            recommendations.append(
+                f"{name}: {content_refusals} content-policy refusal(s) — "
+                "rephrase security prompts as verification (\"verify this "
+                "is safe\") rather than attack (\"find a bypass\"); see the "
+                "⚠️ notes in the affected transcripts."
+            )
+    okf_counts = stats.get("okf_context_status_counts") or {}
+    okf_missing = okf_counts.get("binary_missing", 0)
+    if okf_missing:
+        recommendations.append(
+            f"{okf_missing} run(s) requested OKF blast-radius context but "
+            "the configured OKF binary (default `okf-rs`) was not on PATH "
+            "— install okf-rs (GitHub release binary or `cargo install "
+            "--git https://github.com/jyjeanne/okf-rs okf-cli`) to give "
+            "peers call-graph context on diff reviews."
+        )
+    okf_attached = okf_counts.get("attached", 0) + okf_counts.get(
+        "stale_attached", 0
+    )
+    okf_unmatched = okf_counts.get("no_matched_concepts", 0)
+    if okf_unmatched >= _RECO_MIN_TIMEOUTS and okf_unmatched > okf_attached:
+        recommendations.append(
+            f"OKF enrichment matched no concepts in {okf_unmatched} "
+            "attempt(s) (vs "
+            f"{okf_attached} attached) — the diffs may touch non-code "
+            "files, or the languages involved are outside okf-rs's "
+            "extraction coverage."
+        )
+    return recommendations
 
 
 def compute_stats(
@@ -468,8 +597,11 @@ def format_stats_text(stats: dict[str, Any]) -> str:
 
     rows = stats.get("participants") or []
     if not rows:
+        # Still fall through: the okf-context and recommendations blocks
+        # below can carry run-level signal (e.g. binary_missing advice)
+        # even when no participant rows matched the filter.
         lines.append("(no participants in selection)")
-        return "\n".join(lines)
+        return _append_advice_blocks(lines, stats)
 
     lines.append("")
     lines.append(
@@ -510,4 +642,28 @@ def format_stats_text(stats: dict[str, Any]) -> str:
             lines.append(
                 f"  {row['name'][:14]:14} {recoveries}/{incidents}{pct}"
             )
+
+    return _append_advice_blocks(lines, stats)
+
+
+def _append_advice_blocks(lines: list[str], stats: dict[str, Any]) -> str:
+    """Shared tail: okf-context counts + the advisory recommendations.
+
+    The interpretation rules previously lived only as source comments on
+    the metric definitions, invisible to the operator running `stats`.
+    """
+
+    okf_counts = stats.get("okf_context_status_counts") or {}
+    if okf_counts:
+        lines.append("")
+        lines.append(
+            "okf-context: "
+            + ", ".join(f"{name}={count}" for name, count in okf_counts.items())
+        )
+    recommendations = stats.get("recommendations") or []
+    if recommendations:
+        lines.append("")
+        lines.append("recommendations:")
+        for recommendation in recommendations:
+            lines.append(f"  - {recommendation}")
     return "\n".join(lines)

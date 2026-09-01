@@ -101,7 +101,12 @@ Key modules:
 - `setup_wizard.py` — writes `.llm-council.yaml`, `.mcp.json`, and the
   per-CLI instruction snippets in `.llm-council/instructions/`. Setup is
   guarded by `_preset_status` in `cli.py`; presets whose required CLIs/keys
-  are missing are blocked unless `--allow-incomplete` is passed.
+  are missing are blocked unless `--allow-incomplete` is passed. Opt-in
+  `--write-instructions` upserts the snippet into `CLAUDE.md` /
+  `AGENTS.md` / `GEMINI.md` between idempotent
+  `<!-- llm-council:instructions:begin/end -->` markers
+  (`upsert_instruction_blocks`); without the flag setup never edits
+  those files — keep that default.
 - `budget.py` / `estimate.py` / `model_catalog.py` — token/cost estimation
   and OpenRouter model catalog fetch (cached on disk).
 - `transcript.py` — paired markdown + JSON transcripts under
@@ -393,6 +398,14 @@ Key modules:
   signal for raising `defaults.timeout` or a mode's `timeout_multiplier`
   rather than chunking. Bucket cutoffs are tuned to
   `MAX_PROMPT_CHARS=200_000`; revisit if the global cap changes.
+  These interpretation rules are now PRINTED, not just commented:
+  `stats.derive_recommendations` renders them (plus quota / invalid-label
+  / content-refused / okf-attach-rate rules) as an advisory
+  `recommendations:` block in `llm-council stats` and the
+  `recommendations` key in JSON/MCP output. Keep new telemetry metrics
+  paired with a recommendation rule there, and keep the thresholds
+  conservative — a recommendation printed on noise erodes trust in the
+  whole block.
 - **Quota-fallback chain semantics (multi-step walking).** Each CLI
   participant carries an optional `fallback_chain: list[str]` — ordered
   list of model IDs to step down to on a `quota_exhausted` failure.

@@ -334,7 +334,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Automatically open the HTML transcript in the default browser at the end of the run.",
     )
 
-    sub.add_parser("list", help="List participants and modes")
+    list_parser = sub.add_parser("list", help="List participants and modes")
+    list_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help=(
+            "Also show per-participant and per-mode tuning keys that are "
+            "otherwise invisible (reasoning_effort, usage_from_json, "
+            "env_strict, fallback_chain, timeout_multiplier, okf_context, "
+            "stances, model_overrides) plus configured tiers."
+        ),
+    )
     init = sub.add_parser("init", help="Write an example project config")
     init.add_argument("--path", default=".llm-council.yaml")
 
@@ -372,6 +383,17 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--no-mcp", action="store_true", help="Do not write .mcp.json")
     setup.add_argument(
         "--no-instructions", action="store_true", help="Do not write instruction snippets"
+    )
+    setup.add_argument(
+        "--write-instructions",
+        action="store_true",
+        help=(
+            "Also upsert the instruction snippet into CLAUDE.md, AGENTS.md, "
+            "and GEMINI.md at the project root, inside idempotent "
+            "llm-council marker comments — re-runs replace the block, "
+            "content outside the markers is never touched, missing files "
+            "are created. Without this flag setup never edits those files."
+        ),
     )
     setup.add_argument(
         "--probe-local",
@@ -827,10 +849,14 @@ def cmd_list(args: argparse.Namespace) -> int:
     load_project_env(Path.cwd())
     config = load_config(getattr(args, "config", None))
     _emit_config_warnings(config)
+    verbose = bool(getattr(args, "verbose", False))
     print("Participants:")
     for name, cfg in config.get("participants", {}).items():
         model = cfg.get("model") or "cli default (unreported)"
         print(f"  {name:20} {cfg.get('type'):10} {model}")
+        if verbose:
+            for note in _participant_verbose_notes(cfg):
+                print(f"  {'':20} {note}")
     print("\nModes:")
     modes = config.get("modes", {})
     for name, cfg in modes.items():
@@ -841,7 +867,86 @@ def cmd_list(args: argparse.Namespace) -> int:
         if flag and description.upper().startswith("EXPERIMENTAL"):
             description = description.partition("—")[2].strip() or description
         print(f"  {name:20}{flag} {description}")
+        if verbose:
+            for note in _mode_verbose_notes(cfg):
+                print(f"  {'':20} {note}")
+    tiers = (config.get("defaults", {}) or {}).get("tiers") or {}
+    if verbose and isinstance(tiers, dict) and tiers:
+        print("\nTiers (apply with --tier <name>):")
+        for tier_name, swaps in tiers.items():
+            if isinstance(swaps, dict):
+                rendered = ", ".join(f"{p}→{m}" for p, m in swaps.items())
+                print(f"  {tier_name:20} {rendered}")
+    if not verbose:
+        print(
+            "\n(run `llm-council list --verbose` for per-peer/per-mode "
+            "tuning keys: tiers, timeout multipliers, okf_context, "
+            "env_strict, fallback chains, ...)"
+        )
     return 0
+
+
+def _participant_verbose_notes(cfg: dict) -> list[str]:
+    """Non-default tuning keys worth surfacing per participant.
+
+    Discovery surface for config keys that otherwise exist only in
+    source/README (`env_strict`, `usage_from_json`, `fallback_chain`, ...).
+    Only values that deviate from the silent default are shown.
+    """
+
+    notes: list[str] = []
+    if cfg.get("reasoning_effort") is not None:
+        notes.append(f"reasoning_effort={cfg['reasoning_effort']}")
+    if cfg.get("usage_from_json"):
+        notes.append("usage_from_json=true (real token/cost telemetry)")
+    if cfg.get("env_strict"):
+        notes.append("env_strict=true (child env restricted to safe names)")
+    if cfg.get("require_pinned_model"):
+        notes.append("require_pinned_model=true (substituted answers dropped)")
+    chain = cfg.get("fallback_chain")
+    if chain:
+        notes.append("fallback_chain: " + " → ".join(str(m) for m in chain))
+    if cfg.get("retry_on_missing_label") is False:
+        notes.append("retry_on_missing_label=false")
+    if cfg.get("require_recommendation") is False:
+        notes.append("require_recommendation=false (non-vote peer)")
+    if cfg.get("timeout_per_kb_chars") == 0:
+        notes.append("timeout_per_kb_chars=0 (size-scaled timeout disabled)")
+    if cfg.get("idle_timeout") is not None:
+        notes.append(f"idle_timeout={cfg['idle_timeout']}s")
+    return notes
+
+
+def _mode_verbose_notes(cfg: dict) -> list[str]:
+    """Non-default tuning keys worth surfacing per mode."""
+
+    notes: list[str] = []
+    multiplier = cfg.get("timeout_multiplier")
+    if multiplier is not None and multiplier != 1.0:
+        notes.append(f"timeout_multiplier={multiplier}")
+    for key in (
+        "okf_context",
+        "safe_context",
+        "independent_review",
+        "deliberate",
+        "tool_call_voting",
+    ):
+        if cfg.get(key) is not None:
+            notes.append(f"{key}={str(cfg[key]).lower()}")
+    if cfg.get("require_distinct_vendors") is not None:
+        notes.append(f"require_distinct_vendors={cfg['require_distinct_vendors']}")
+    stances = cfg.get("stances")
+    if isinstance(stances, dict) and stances:
+        notes.append(
+            "stances: " + ", ".join(f"{p}={s}" for p, s in stances.items())
+        )
+    overrides = cfg.get("model_overrides")
+    if isinstance(overrides, dict) and overrides:
+        notes.append(
+            "model_overrides: "
+            + ", ".join(f"{p}→{m}" for p, m in overrides.items())
+        )
+    return notes
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -1253,6 +1358,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
     if getattr(args, "plan", False):
         _print_setup_plan(root)
         return 0
+    if getattr(args, "write_instructions", False) and args.no_instructions:
+        raise SystemExit(
+            "--write-instructions and --no-instructions conflict: the "
+            "entry-point blocks are the instruction snippet."
+        )
     preset = args.preset
     if preset == "auto" and not args.yes:
         preset = _prompt_setup_preset(root)
@@ -1316,6 +1426,21 @@ def cmd_setup(args: argparse.Namespace) -> int:
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    entry_points_written = False
+    if getattr(args, "write_instructions", False) and write_instructions:
+        from llm_council.setup_wizard import upsert_instruction_blocks
+
+        try:
+            config_data = _read_setup_config_defaults(root)
+            written.extend(
+                upsert_instruction_blocks(
+                    root,
+                    default_mode=config_data.get("mode", "quick"),
+                )
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        entry_points_written = True
     if written:
         print("Wrote:")
         for path in written:
@@ -1329,8 +1454,24 @@ def cmd_setup(args: argparse.Namespace) -> int:
         write_instructions=write_instructions,
         include_openrouter=include_openrouter,
         include_local=include_local,
+        entry_points_written=entry_points_written,
     )
     return 0
+
+
+def _read_setup_config_defaults(root: Path) -> dict:
+    """Best-effort read of the just-written project config's defaults."""
+
+    try:
+        import yaml as _yaml
+
+        data = _yaml.safe_load(
+            (root / ".llm-council.yaml").read_text(encoding="utf-8")
+        )
+        defaults = (data or {}).get("defaults", {})
+        return defaults if isinstance(defaults, dict) else {}
+    except Exception:  # best-effort by contract; yaml errors included
+        return {}
 
 
 def _make_which_cache():
@@ -1531,10 +1672,24 @@ def _print_setup_next_steps(
     write_instructions: bool,
     include_openrouter: bool,
     include_local: bool,
+    entry_points_written: bool = False,
 ) -> None:
     print()
     print("Next steps:")
-    if write_instructions:
+    if entry_points_written:
+        print(
+            "  1. Instruction blocks are installed in CLAUDE.md, AGENTS.md, "
+            "and GEMINI.md (between llm-council markers). Re-run "
+            "`llm-council setup --write-instructions` after config changes "
+            "to refresh them."
+        )
+        print(
+            "     Note: the blocks embed this machine's absolute project "
+            "path; teammates on other checkouts should re-run "
+            "`llm-council setup --write-instructions` locally after "
+            "cloning."
+        )
+    elif write_instructions:
         print(
             "  1. For each CLI you use, append the full contents of "
             f"{root / '.llm-council/instructions/claude.md'} to CLAUDE.md."
@@ -1546,6 +1701,10 @@ def _print_setup_next_steps(
         print(
             "     Append the full contents of "
             f"{root / '.llm-council/instructions/antigravity.md'} to GEMINI.md."
+        )
+        print(
+            "     (Or re-run with `--write-instructions` to have setup "
+            "manage marker-delimited blocks in those files for you.)"
         )
     else:
         print("  1. Add council instructions to CLAUDE.md, AGENTS.md, and GEMINI.md.")
@@ -1680,6 +1839,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if check_update:
             _print_update_status(check_for_update(__version__))
     required_names = {"python:mcp", "route:default-mode"}
+    # The OKF row only gates the exit code when the config enables the
+    # feature — a missing optional binary is information, not an error.
+    from llm_council.doctor import okf_context_enabled_anywhere
+
+    if okf_context_enabled_anywhere(config):
+        required_names.add("okf:binary")
     for name in default_participants:
         participant = config.get("participants", {}).get(name, {})
         if participant.get("type") == "cli":

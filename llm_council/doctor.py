@@ -28,6 +28,21 @@ from llm_council.model_catalog import (
 
 
 CATALOG_STALE_SECONDS_DEFAULT = 14 * 24 * 60 * 60
+
+# Remediation hints for missing native CLIs, keyed by participant family.
+# Failing checks should always say what to DO next, not just what is
+# missing — a bare "not found on PATH" was the norm before v0.25.
+_CLI_INSTALL_HINTS = {
+    "claude": "install with `npm install -g @anthropic-ai/claude-code`",
+    "codex": "install with `npm install -g @openai/codex`",
+    "antigravity": (
+        "install the Antigravity CLI (`agy`), or point "
+        "participants.<name>.command at the binary"
+    ),
+}
+_CLI_INSTALL_HINT_DEFAULT = (
+    "install it, or point participants.<name>.command at the binary"
+)
 # Tighter than `refresh_openrouter_cache`'s 30s default so a slow connection
 # can't stall the doctor for half a minute. On failure we fall through to a
 # stale-warning Check, so the user still gets a usable report.
@@ -207,6 +222,9 @@ def check_environment(
             continue
         command = cfg.get("command", name)
         resolved = shutil.which(command)
+        install_hint = _CLI_INSTALL_HINTS.get(
+            str(cfg.get("family") or name), _CLI_INSTALL_HINT_DEFAULT
+        ).replace("<name>", name)
         checks.append(
             Check(
                 name=f"cli:{name}",
@@ -214,7 +232,7 @@ def check_environment(
                 detail=(
                     f"{resolved} (executable found; authentication not probed)"
                     if resolved
-                    else f"{command} not found on PATH"
+                    else f"{command} not found on PATH — {install_hint}"
                 ),
             )
         )
@@ -252,7 +270,15 @@ def check_environment(
             Check(
                 name=f"env:{key_env}",
                 ok=bool(api_key),
-                detail="set" if api_key else "not set",
+                detail=(
+                    "set"
+                    if api_key
+                    else (
+                        f"not set — export {key_env}, or put it in "
+                        ".llm-council.env at the project root (loaded "
+                        "automatically; setup gitignores it)"
+                    )
+                ),
             )
         )
     openrouter_envs = sorted(
@@ -275,7 +301,11 @@ def check_environment(
             Check(
                 name="cli:ollama",
                 ok=bool(resolved),
-                detail=resolved or "ollama not found on PATH",
+                detail=resolved
+                or (
+                    "ollama not found on PATH — install from "
+                    "https://ollama.com/download"
+                ),
             )
         )
         if probe_ollama:
@@ -294,6 +324,8 @@ def check_environment(
                 == base_url.rstrip("/")
             ]
             checks.append(_probe_ollama(base_url, expected_models=expected_models))
+
+    checks.append(_check_okf_binary(config))
 
     try:
         import mcp  # noqa: F401
@@ -326,6 +358,67 @@ def check_environment(
         )
 
     return checks
+
+
+def okf_context_enabled_anywhere(config: dict[str, Any]) -> bool:
+    """True when okf_context is switched on in defaults or any mode."""
+
+    if (config.get("defaults", {}) or {}).get("okf_context"):
+        return True
+    return any(
+        isinstance(mode, dict) and mode.get("okf_context")
+        for mode in (config.get("modes", {}) or {}).values()
+    )
+
+
+def _check_okf_binary(config: dict[str, Any]) -> Check:
+    """Discoverability + readiness row for the OKF blast-radius feature.
+
+    Optional dependency, so a missing binary is only a FAILING check when
+    the config actually enables `okf_context` somewhere (runs would then
+    silently degrade to no blast-radius context on every diff review).
+    Otherwise the row is informational: present → how to use it; absent →
+    how to get it.
+    """
+
+    from llm_council.okf_context import DEFAULT_OKF_BINARY
+
+    binary = str(
+        (config.get("defaults", {}) or {}).get("okf_binary") or DEFAULT_OKF_BINARY
+    )
+    resolved = shutil.which(binary)
+    enabled = okf_context_enabled_anywhere(config)
+    install_hint = (
+        "install okf-rs (GitHub release binary, or `cargo install --git "
+        "https://github.com/jyjeanne/okf-rs okf-cli`)"
+    )
+    if resolved:
+        detail = f"{resolved} (blast-radius context "
+        detail += (
+            "active where okf_context is enabled)"
+            if enabled
+            else "available — pass --okf-context on diff reviews, or set "
+            "defaults.okf_context / modes.<name>.okf_context)"
+        )
+        return Check(name="okf:binary", ok=True, detail=detail)
+    if enabled:
+        return Check(
+            name="okf:binary",
+            ok=False,
+            detail=(
+                f"okf_context is enabled but {binary} was not found on PATH "
+                f"— {install_hint}; until then runs proceed without "
+                "blast-radius context"
+            ),
+        )
+    return Check(
+        name="okf:binary",
+        ok=True,
+        detail=(
+            f"{binary} not found (optional) — {install_hint} to give peers "
+            "call-graph blast-radius context on --diff reviews"
+        ),
+    )
 
 
 def _check_openrouter_catalog_age(config: dict[str, Any]) -> Check:
