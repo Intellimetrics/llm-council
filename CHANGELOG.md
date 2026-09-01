@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.25.0 - 2026-09-01
 
 **Operator guidance: the tuning knowledge moves out of source comments
 and into the product** (from a survey of every guidance surface — setup,
