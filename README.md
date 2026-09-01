@@ -11,6 +11,8 @@ Your coding agent grades its own homework. **llm-council** gives it a second opi
 
 Runs as an MCP server inside your coding agent, or as a standalone CLI.
 
+**Jump to:** [Quickstart](#quickstart) · [How it works](#how-it-works) · [Modes](#built-in-modes) · [Blast-radius context](#blast-radius-context-okf) · [Built-in coaching](#the-council-coaches-its-operator) · [Safety](#read-only-safety) · [MCP tools](#mcp-tools) · [Configuration](#configuration--presets)
+
 ## What a run looks like
 
 A real run from this repo's own development. Upstream `mcp` 2.0.0 had just broken fresh installs, we'd shipped a `<2` pin instead of migrating immediately, and we asked the council whether that was the right call. This is the actual output the host agent received:
@@ -70,7 +72,9 @@ llm-council run --mode review --diff "Is this migration safe to run?"
 ```
 
 <details>
-<summary>pipx install · updating · why not uvx</summary>
+<summary>Requirements · pipx install · updating · why not uvx</summary>
+
+**Requirements.** Python 3.11+. At least one peer route: native CLIs (`claude`, `codex`, and/or `agy`) on PATH under your own accounts, an `OPENROUTER_API_KEY` for hosted models, or a local Ollama daemon. Optional: the [`okf-rs`](https://github.com/jyjeanne/okf-rs) binary for [blast-radius context](#blast-radius-context-okf). `llm-council doctor` tells you exactly which of these it can see — and what to install for the ones it can't.
 
 ```bash
 # pipx alternative
@@ -127,6 +131,7 @@ graph TD
 - **Host-aware routing**: detects which agent is asking; `quick` includes a fresh instance of the host's own family for a clean-context pass, `peer-only` excludes it.
 - **HTML transcript**: every run renders a formatted HTML dashboard; opening it in the browser is opt-in (`--open` or `defaults.auto_open_browser: true`).
 - **Loud context accounting**: context files too large to inline are never silently dropped — the result carries a top-level `context_files_dropped` warning, and the transcript header flags it.
+- **A stable failure taxonomy**: every peer failure maps to a machine-readable `error_kind` (`timeout`, `quota_exhausted`, `content_refused`, `abdicated`, `model_substituted`, …) surfaced in transcripts, `--json` output, and stats — so patterns across runs are countable, not anecdotal. The full table lives in [`CLAUDE.md`](CLAUDE.md#failure-taxonomy).
 
 </details>
 
@@ -146,6 +151,52 @@ All built-in rosters are local-CLI only; hosted peers join only by explicit opt-
 | `fable` | Read-only second opinion from Claude Fable 5, with defensive-review framing and a silent-model-substitution guard. |
 | `private-local` | Routes only to same-machine loopback Ollama participants. |
 
+Any mode composes with `--origin-policy us` to restrict the roster to US-origin participants, and with your own modes defined in `.llm-council.yaml`.
+
+## Blast-radius context (OKF)
+
+A diff shows *what changed*; it doesn't show *who depends on it*. With `--okf-context` (CLI), `okf_context: true` (MCP / per-mode / defaults), a diff review also carries the one-hop call graph of every touched symbol:
+
+```bash
+llm-council run --mode review --diff --okf-context "Is this refactor safe?"
+```
+
+Under the hood, llm-council generates an ephemeral [Open Knowledge Format](https://github.com/jyjeanne/okf-rs) bundle from your working tree (`okf-rs generate -o <tmpdir> --no-cache` — nothing is ever written into your project), maps the diff's line ranges to concepts, and inserts a compact excerpt after the Git Diff section: signatures, `file#Lstart-Lend` locators, callers, and callees.
+
+```text
+## OKF Blast Radius (call-graph context)
+
+### functions/llm_council/deliberation/recommendation_label
+- signature: `def recommendation_label(text: str) -> str`
+- resource: llm_council/deliberation.py#L92-L103
+- called_by:
+  - `def _is_labeled_vote(r) -> bool` — llm_council/orchestrator.py#L275-L276
+  - `def aggregate(records, ...)` — llm_council/stats.py#L177-L394
+  ...
+```
+
+Why bother: in a live A/B on this repo, peers given the call-graph excerpt enumerated **11/11** cross-module consumers of a changed function; peers given only the raw source found **1/11**. The diff supplies semantics, the graph supplies blast radius — reviewers need both.
+
+Everything about it is opt-in and fail-soft: no built-in mode enables it, prompts are byte-identical when it's off, and a missing binary, failed generation, or unmatched diff leaves the run exactly as it would have been — plus a `metadata.okf_context` diagnostic, a transcript-header note, and a stderr warning. Requires the external `okf-rs` binary on PATH (prebuilt binaries on its releases page, or `cargo install --git https://github.com/jyjeanne/okf-rs okf-cli`).
+
+## The council coaches its operator
+
+The tuning knowledge isn't buried in docs — the tool applies it to your own telemetry and tells you what to change:
+
+- **`llm-council stats` ends with a `recommendations:` block.** The aggregated numbers are run through the same interpretation rules the maintainers use: timeout walls that retries never rescue → the exact `timeout` / `timeout_multiplier` key to raise; repeated quota walls with no recovery → configure a `fallback_chain`; high missing-label rates → the phrasing or `require_recommendation` fix; content-policy refusals → rephrase as verification. Conservative minimum sample sizes, advisory only, also present in `--json` and MCP `council_stats` output.
+
+  ```text
+  recommendations:
+    - claude: 6 timeouts on small prompts with 0 terse-retry recoveries —
+      raise `participants.claude.timeout` (or the mode's `timeout_multiplier`).
+    - deepseek_v4_flash: 20% of successful responses lacked a usable
+      RECOMMENDATION label — check custom prompt phrasing; ...
+  ```
+
+- **Every failing `doctor` check says what to do next** — missing CLIs carry the install command, missing keys point at `.llm-council.env`, and an `okf:binary` row tracks the optional okf-rs dependency (informational when unused; a real failure only when your config enables `okf_context` and the binary is gone).
+- **`llm-council list --verbose`** surfaces the per-peer and per-mode tuning keys that are otherwise invisible — `reasoning_effort`, `usage_from_json`, `env_strict`, `fallback_chain`, mode `timeout_multiplier`s, `stances`, `model_overrides` — plus your configured `tiers`.
+- **`llm-council setup --write-instructions`** closes the last manual step: instead of hand-appending snippets, setup maintains an idempotent marker-delimited block in `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` itself. Re-runs replace the block; bytes outside the markers are never touched; writes are atomic; a file with a damaged marker pair is refused, never guessed at.
+
 ## Read-Only Safety
 
 Peers are advisors, not co-authors. How strongly that's enforced differs by peer type — know the difference before reviewing untrusted code:
@@ -160,7 +211,7 @@ The server exposes ten tools to your agent. The ones you'll actually see in traf
 
 | Tool | What it does |
 | :--- | :--- |
-| `council_run` | Run a council query with modes, context files, and optional diffs. Returns the verdict, per-peer results, and advisory signals (`cost_warning`, `independence_warning`, `context_files_dropped`). |
+| `council_run` | Run a council query with modes, context files, optional diffs, and optional `okf_context` blast-radius enrichment. Returns the verdict, per-peer results, and advisory signals (`cost_warning`, `independence_warning`, `context_files_dropped`, `metadata.okf_context`). |
 | `council_recommend` | Should this task even go to council? Returns a difficulty class, matched trigger keywords, and (optionally) an LLM-graded verdict. |
 | `council_estimate` | Token sizes and estimated cost before launching. |
 | `council_doctor` | Diagnoses connectivity, API keys, and CLI path resolution. |
@@ -177,7 +228,7 @@ The server exposes ten tools to your agent. The ones you'll actually see in traf
 | `council_models` | Lists the cached OpenRouter model catalog. |
 | `council_list_modes` | Lists configured runtime modes and participants. |
 | `council_last_transcript` | Returns the path and content of the last recorded run. |
-| `council_stats` | Aggregates participant metrics (runs, success, tokens, cost, quota incidents) across transcripts. |
+| `council_stats` | Aggregates participant metrics (runs, success, tokens, cost, quota incidents, OKF attach rates) across transcripts — including the advisory `recommendations` list. |
 | `council_query_transcripts` | Searches past transcript history for similar reviews. |
 | `council_config` | Get or set `.llm-council.yaml` keys over the MCP connection. |
 
@@ -216,6 +267,11 @@ These optional keys sharpen the council's signal without changing the read-only 
 | `reasoning_effort` | per-peer (`codex`) | Reasoning effort pinned for the council turn as `-c model_reasoning_effort=…` (default `medium`; `inherit` uses the CLI's own config). Codex otherwise inherits the operator's interactive `~/.codex/config.toml` setting — at `ultra`, 5 KB review prompts blew 600 s timeouts. |
 | `okf_context` | `defaults` / per-mode (or `--okf-context`) | With a diff attached, append a one-hop call-graph blast-radius excerpt derived from an OKF knowledge bundle (requires the external [`okf-rs`](https://github.com/jyjeanne/okf-rs) binary; ephemeral tempdir generation, never written into the project). Fail-soft: any OKF problem leaves the run unchanged plus a `metadata.okf_context` diagnostic. |
 | `retry_on_empty_response` | per-peer | Default **on**: one same-prompt re-run when a CLI exits 0 with no output. Either way the error records the exit status and a stderr tail, and provider content-policy refusals surface as `content_refused_peers` (rephrase as verification, not attack). |
+| `tiers` | `defaults` (applied with `--tier <name>`) | Named per-peer model-swap maps — e.g. a `deep` tier pinning top thinking models, a `fast` tier pinning budget ones. Peers missing from a tier map keep their default model, so a tier can swap a subset. |
+| `timeout_multiplier` | per-mode | Layered on the per-peer base timeout for slow modes (built-ins: `consensus` 2.0×, `deliberate` 1.5×). A prompt-size bonus also scales timeouts automatically (~5 s/KB above 4 KB). |
+| `fallback_chain` | per-peer | Ordered step-down model ids tried when a peer hits a quota wall (up to 3 steps); recoveries surface as `quota_recoveries`. Claude-family peers delegate to the CLI's own `--fallback-model` instead. |
+| `env_strict` | per-peer | Restrict the peer subprocess to a safe env-var allowlist plus its `env_passthrough` — stops ambient `*_MODEL` / `*_BASE_URL` exports from silently steering a CLI peer's model or endpoint. |
+| `okf_max_excerpt_chars` / `okf_generate_timeout_seconds` / `okf_binary` | `defaults` | Tuning for [blast-radius context](#blast-radius-context-okf): excerpt budget (default 12 000 chars), generation timeout (default 20 s, hard-capped at 120 s), and the binary name/path. |
 
 `litellm` pricing fallback is automatic when the optional `litellm` package is installed — never a hard dependency. Older `local-private` / `local-only` command aliases remain accepted as deprecated; new output uses `private-local`. See `CLAUDE.md` for the full invariant notes behind each knob.
 
@@ -231,9 +287,15 @@ These optional keys sharpen the council's signal without changing the read-only 
 | **`llm-council run --continue`** | Continue a prior run. A private-local parent stays private-local when mode is omitted; moving its context to hosted/native peers is refused unless `--allow-privacy-downgrade` is explicit. |
 | **`llm-council run --independent-review`** | On a `--continue` run, suppress the prior council's verdicts so the round forms its opinion independently. |
 | **`llm-council run --cost-warn-usd`** | Non-fatal warning when the pre-flight estimate exceeds a threshold. <br>`llm-council run --mode consensus --cost-warn-usd 0.50 --diff "Worth a full debate?"` |
+| **`llm-council run --okf-context`** | Attach the [OKF blast-radius excerpt](#blast-radius-context-okf) to a `--diff` review. Also on `estimate` for size parity. |
+| **`llm-council run --tier`** | Apply a named model-swap tier from `defaults.tiers` for this run. |
 | **`llm-council estimate`** | Prompt size and cost before running; reports a `cost_class` plus paid/free peer counts. |
+| **`llm-council recommend`** | Zero-cost heuristic: should this task go to council at all, and in which mode? <br>`llm-council recommend "swap the auth middleware" --files-touched 7` |
 | **`llm-council last`** | Inspect the last run's raw transcripts. |
-| **`llm-council stats`** | Aggregate per-peer metrics (incl. quota incidents/recoveries) across recorded transcripts. |
+| **`llm-council list --verbose`** | Participants and modes, plus the otherwise-invisible tuning keys and configured tiers. |
+| **`llm-council stats`** | Aggregate per-peer metrics (incl. quota incidents/recoveries and OKF attach rates) across recorded transcripts, ending with the advisory `recommendations:` block. |
+| **`llm-council setup --write-instructions`** | Have setup maintain the instruction block in `CLAUDE.md`/`AGENTS.md`/`GEMINI.md` itself (idempotent markers, atomic writes). |
+| **`llm-council models refresh`** | Refresh the cached OpenRouter model/pricing catalog. |
 | **`llm-council config get/set`** | Read or write configuration values. <br>`llm-council config set defaults.auto_open_browser true` |
 | **`llm-council install-hook`** | Install a `pre-commit` or `pre-push` council gate; refuses to replace an existing hook unless `--force`. |
 | **`llm-council transcripts prune`** | Preview transcript deletion under a retention policy; add `--delete` to remove. |
