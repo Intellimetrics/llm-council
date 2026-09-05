@@ -38,12 +38,13 @@ from typing import Any
 
 import yaml
 
+from llm_council.blocking import check_cancelled, run_process
+
 DEFAULT_OKF_BINARY = "okf-rs"
 DEFAULT_OKF_GENERATE_TIMEOUT_SECONDS = 20.0
-# Hard ceiling on the generate timeout regardless of config. build_prompt
-# is called from async contexts (CLI run loop, MCP server) and this is a
-# synchronous subprocess wait, so an operator-config value must not be
-# able to stall the event loop arbitrarily (2026-08-31 council finding).
+# Bound generator lifetime even when config requests an excessive timeout.
+# Async callers run preparation in a cancellable worker; synchronous callers
+# retain the same ceiling.
 OKF_GENERATE_TIMEOUT_CEILING_SECONDS = 120.0
 DEFAULT_OKF_MAX_EXCERPT_CHARS = 12_000
 # Below this much prompt headroom the excerpt cannot say anything useful;
@@ -52,6 +53,7 @@ OKF_EXCERPT_FLOOR_CHARS = 500
 # Safety caps for the bundle walk (a generated bundle for a large monorepo
 # can hold tens of thousands of concept files).
 MAX_CONCEPT_FILES_SCANNED = 5_000
+MAX_BUNDLE_ENTRIES_SCANNED = 20_000
 MAX_FRONTMATTER_BYTES = 16_384
 MAX_GENERATE_CAPTURE_BYTES = 8_192
 # Only fine-grained concepts participate in range matching. Module/package
@@ -238,6 +240,44 @@ def _relationship_targets(entries: Any) -> list[str]:
     return targets
 
 
+def _read_bundle_text(path: Path, boundary: Path) -> str:
+    """Read a bounded prefix of a regular file within the bundle boundary."""
+    check_cancelled()
+    resolved = path.resolve(strict=True)
+    if not resolved.is_relative_to(boundary.resolve()) or not resolved.is_file():
+        raise ValueError(f"Bundle file is outside its boundary or not regular: {path}")
+    with resolved.open("rb") as handle:
+        return handle.read(MAX_FRONTMATTER_BYTES).decode("utf-8", errors="replace")
+
+
+def _concept_paths(bundle_dir: Path) -> list[Path]:
+    """Bound enumeration before sorting; never follow directory/file symlinks."""
+    paths: list[Path] = []
+    pending = [bundle_dir / kind for kind in ("functions", "classes")]
+    scanned = 0
+    while pending:
+        check_cancelled()
+        directory = pending.pop()
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                check_cancelled()
+                scanned += 1
+                if scanned > MAX_BUNDLE_ENTRIES_SCANNED:
+                    raise ValueError("OKF bundle exceeds directory-entry scan limit")
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif (
+                    entry.is_file(follow_symlinks=False)
+                    and entry.name.endswith(".md") and entry.name != "index.md"
+                ):
+                    paths.append(Path(entry.path))
+                    if len(paths) > MAX_CONCEPT_FILES_SCANNED:
+                        raise ValueError("OKF bundle exceeds concept-file scan limit")
+    return sorted(paths)
+
+
 def load_concepts(bundle_dir: Path) -> dict[str, Concept]:
     """Index a bundle's function/class concept files by concept id.
 
@@ -248,43 +288,31 @@ def load_concepts(bundle_dir: Path) -> dict[str, Concept]:
     """
 
     concepts: dict[str, Concept] = {}
-    scanned = 0
-    for kind in ("functions", "classes"):
-        root = bundle_dir / kind
-        if not root.is_dir():
+    for md_path in _concept_paths(bundle_dir):
+        try:
+            text = _read_bundle_text(md_path, bundle_dir)
+        except (OSError, ValueError):
             continue
-        for md_path in sorted(root.rglob("*.md")):
-            if md_path.name == "index.md":
-                continue
-            scanned += 1
-            if scanned > MAX_CONCEPT_FILES_SCANNED:
-                return concepts
-            try:
-                text = md_path.read_text(encoding="utf-8", errors="replace")[
-                    :MAX_FRONTMATTER_BYTES
-                ]
-            except OSError:
-                continue
-            frontmatter = _parse_frontmatter(text)
-            if frontmatter is None:
-                continue
-            resource = frontmatter.get("resource")
-            match = _RESOURCE_RE.match(resource) if isinstance(resource, str) else None
-            if match is None:
-                continue
-            relationships = frontmatter.get("relationships") or {}
-            if not isinstance(relationships, dict):
-                relationships = {}
-            concept_id = md_path.relative_to(bundle_dir).with_suffix("").as_posix()
-            concepts[concept_id] = Concept(
-                concept_id=concept_id,
-                path=match.group("path").replace("\\", "/"),
-                start=int(match.group("start")),
-                end=int(match.group("end")),
-                signature=_extract_signature(text),
-                calls=_relationship_targets(relationships.get("calls")),
-                called_by=_relationship_targets(relationships.get("called_by")),
-            )
+        frontmatter = _parse_frontmatter(text)
+        if frontmatter is None:
+            continue
+        resource = frontmatter.get("resource")
+        match = _RESOURCE_RE.match(resource) if isinstance(resource, str) else None
+        if match is None:
+            continue
+        relationships = frontmatter.get("relationships") or {}
+        if not isinstance(relationships, dict):
+            relationships = {}
+        concept_id = md_path.relative_to(bundle_dir).with_suffix("").as_posix()
+        concepts[concept_id] = Concept(
+            concept_id=concept_id,
+            path=match.group("path").replace("\\", "/"),
+            start=int(match.group("start")),
+            end=int(match.group("end")),
+            signature=_extract_signature(text),
+            calls=_relationship_targets(relationships.get("calls")),
+            called_by=_relationship_targets(relationships.get("called_by")),
+        )
     return concepts
 
 
@@ -409,7 +437,7 @@ def find_bundle(cwd: Path) -> tuple[Path, str | None] | None:
         try:
             import tomllib
 
-            output = tomllib.loads(okf_toml.read_text(encoding="utf-8")).get("output")
+            output = tomllib.loads(_read_bundle_text(okf_toml, cwd)).get("output")
             if isinstance(output, str) and output:
                 resolved = (cwd / output).resolve()
                 # okf.toml lives in the reviewed repo and may be hostile: an
@@ -426,18 +454,17 @@ def find_bundle(cwd: Path) -> tuple[Path, str | None] | None:
             pass
     candidates.append(cwd / "knowledge")
     for candidate in candidates:
+        candidate = candidate.resolve()
+        if not candidate.is_relative_to(cwd.resolve()):
+            continue
         index = candidate / "index.md"
         if not index.is_file():
             continue
         revision: str | None = None
         try:
-            frontmatter = _parse_frontmatter(
-                index.read_text(encoding="utf-8", errors="replace")[
-                    :MAX_FRONTMATTER_BYTES
-                ]
-            )
-        except OSError:
-            frontmatter = None
+            frontmatter = _parse_frontmatter(_read_bundle_text(index, candidate))
+        except (OSError, ValueError):
+            continue
         if frontmatter is not None:
             raw_revision = frontmatter.get("source_revision")
             if isinstance(raw_revision, str) and raw_revision:
@@ -483,14 +510,13 @@ def generate_ephemeral_bundle(
             tempfile.TemporaryFile(mode="w+b") as stdout_file,
             tempfile.TemporaryFile(mode="w+b") as stderr_file,
         ):
-            completed = subprocess.run(
+            completed = run_process(
                 [binary, "generate", str(cwd), "-o", str(out_dir), "--no-cache"],
                 cwd=str(cwd),
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=stderr_file,
-                check=False,
                 timeout=timeout,
             )
             # Decode only the stderr TAIL — vendor error lines sit at the
@@ -509,9 +535,16 @@ def generate_ephemeral_bundle(
         return None, "generate_failed", stderr_tail or f"exit {completed.returncode}"
     # okf-rs writes the bundle directly into -o; tolerate a nested
     # `knowledge/` layout in case a future version changes that.
+    boundary = out_dir.resolve()
     for candidate in (out_dir, out_dir / "knowledge"):
-        if (candidate / "index.md").is_file():
-            return candidate, None, None
+        try:
+            resolved = candidate.resolve(strict=True)
+            if not resolved.is_relative_to(boundary):
+                continue
+            _read_bundle_text(resolved / "index.md", boundary)
+        except (OSError, ValueError, RuntimeError):
+            continue
+        return resolved, None, None
     return None, "generate_failed", "no index.md in generated output"
 
 
@@ -565,13 +598,10 @@ def build_okf_section(
                     }
                 bundle_dir, source_revision = fallback
                 source_kind = "pre-existing bundle"
-                # An unreported bundle revision counts as stale: locators
-                # of unknown vintage must not read as fresh.
-                stale = (
-                    source_revision is None
-                    or source_revision != _head_revision(cwd)
-                )
-                status = "stale_attached" if stale else "attached"
+                # HEAD equality does not prove freshness for the dirty
+                # source under review. Only this run's generation does.
+                stale = True
+                status = "stale_attached"
 
             concepts = load_concepts(bundle_dir)
             matched = match_concepts(concepts, touched)

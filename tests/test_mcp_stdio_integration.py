@@ -32,6 +32,29 @@ import pytest
 
 from llm_council.mcp_server import COUNCIL_RUN_OUTPUT_SCHEMA_VERSION
 
+def test_stdio_deadline_returns_partial_transcript(tmp_path: Path):
+    import yaml
+    cfg = {"participants": {
+        "fast": {"type": "cli", "family": "custom", "command": sys.executable,
+                 "args": ["-c", "print('RECOMMENDATION: yes')"], "timeout": 60},
+        "slow": {"type": "cli", "family": "custom", "command": sys.executable,
+                 "args": ["-c", "import time; time.sleep(30)"], "timeout": 60},
+    }}
+    (tmp_path / ".llm-council.yaml").write_text(yaml.safe_dump(cfg))
+    started = time.monotonic()
+    _, payload, _ = _call_council_run_over_stdio(tmp_path, arguments={
+        "working_directory": str(tmp_path), "current": "codex", "mode": "quick",
+        "participants": ["fast", "slow"], "min_quorum": 1, "question": "fixture",
+        "request_timeout_seconds": 2, "deliberate": False,
+    })
+    assert time.monotonic() - started < 6
+    assert payload["metadata"]["partial"]
+    assert payload["results"][0]["ok"]
+    assert payload["results"][1]["error_kind"] == "timeout"
+    assert "Partial result" in payload["summary_markdown"]
+    assert "Partial result" in Path(payload["transcript"]).read_text()
+
+
 _LOCAL_CONFIG = """
 defaults:
   mode: review-local

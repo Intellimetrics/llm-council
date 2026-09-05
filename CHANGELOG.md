@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.26.0 - 2026-09-05
+
+* Refresh README, operator/maintainer guidance, repository agent instructions,
+  and shared setup instruction templates with verified native file access,
+  explicit context sharing, OKF coverage limits, partial-result handling, and
+  installed-versus-running MCP verification. Document remaining OKF issues
+  separately from completed fixes; remove unsupported review-quality claims.
+
+* Address live dogfood failures: default MCP requests to 240 seconds, stop peer
+  work before the request deadline, preserve completed votes in partial
+  transcripts, and identify partial results in the response. Native CLI process
+  groups are stopped on completion, timeout, and cancellation on POSIX.
+* Reject generated OKF bundles/indexes outside the temporary output root and
+  stop generator descendants after successful parent exit as well as failures.
+* Count `verified` evidence separately from untagged evidence. Display resolved
+  vendors in transcript independence warnings.
+* Move citation checks off the event loop and cap source scanning per file/run;
+  ranges beyond the checked prefix remain unverified. Bound transcript search
+  to the newest 10,000 eligible records, individual JSON size, total cold-read
+  work, and question prefixes; expose search-scope limits to MCP callers.
+* Reject OKF bundle/index/concept paths that escape the project, skip linked
+  concept trees, and bound file reads and directory enumeration before allocation.
+  Pre-existing fallback bundles are stale even when their revision equals HEAD.
+* Move MCP prompt preparation, estimates, diagnostics, and transcript queries
+  off the event loop. Cancelled OKF generation kills/reaps the generator process
+  group on POSIX and cleans temporary output before returning.
+* Disable response caching by default for CLI peers that can inspect the
+  filesystem. Custom prompt-only CLIs can explicitly set `cache_response: true`.
+  Hosted/local API response caching remains enabled.
+* Refresh Codex fallbacks to GPT-5.6 Terra/Luna and Claude fallbacks to Opus 5/
+  Sonnet 5. Migrate exact previously shipped chains; preserve custom chains and
+  explicit model pins. New Fable defaults pin Fable 5.1. Reject different minor
+  models when checking a pin; accept exact IDs and dated snapshots only.
+* Transcript search uses the same final-round decision as the dashboard,
+  including directional ties. Within its bounded window, the in-memory index
+  reuses unchanged transcripts, observes pruning, and retains no full prompts
+  or responses.
+* Verify FINDINGS citations even when omitted from EVIDENCE; nonexistent
+  references can no longer form a verified agreement cluster. Reuse file line
+  counts within each run, invalidating them when the file changes.
+* Exclude cached historical cost/token/retry receipts from newly incurred usage
+  statistics and expose cache-hit counts. Infer vendor independence from model
+  IDs where available, so native clients and routers serving the same vendor
+  cannot count as independent vendors merely because their names differ.
+* Give Antigravity the review-with-tools verification directive. Clarify that
+  optional `record_recommendation` text is output syntax, not a registered tool.
+* Remove the unused deliberation `first_nonempty_line` helper.
+
 ## 0.25.0 - 2026-09-01
 
 **Operator guidance: the tuning knowledge moves out of source comments

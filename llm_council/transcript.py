@@ -1547,6 +1547,11 @@ def write_transcript(
             )
         lines.append("")
 
+    if metadata.get("partial"):
+        lines.extend([
+            "**Partial result:** the request deadline stopped remaining work. "
+            "Completed votes are preserved; unfinished peers do not vote.", "",
+        ])
     degraded = degraded_consensus_payload(final_results, metadata)
     if degraded is not None:
         lines.extend(["## Degraded consensus", ""])
@@ -1585,7 +1590,7 @@ def write_transcript(
     if isinstance(independence_warning, dict):
         distinct = independence_warning.get("distinct_vendors")
         required = independence_warning.get("required")
-        families = independence_warning.get("families") or []
+        families = independence_warning.get("vendors") or independence_warning.get("families") or []
         labeled = independence_warning.get("labeled_quorum")
         lines.append(
             f"- ⚠️ Independence warning: all {labeled} labeled vote(s) came "

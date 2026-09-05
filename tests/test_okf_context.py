@@ -624,7 +624,7 @@ def test_build_okf_section_no_tempdir_leak_on_keyboard_interrupt(
     def _interrupt(*args, **kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(okf.subprocess, "run", _interrupt)
+    monkeypatch.setattr(okf, "run_process", _interrupt)
     monkeypatch.setattr(okf.shutil, "which", lambda binary: "/usr/bin/true")
 
     def _leftovers() -> set[str]:

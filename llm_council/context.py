@@ -918,7 +918,7 @@ def build_prompt(
 # (openrouter / openai_compatible) and local Ollama peers never see tool
 # access at the council layer, even if they're forcibly routed into a
 # tool-mode run via `--include`.
-_TOOL_CAPABLE_CLI_FAMILIES = frozenset({"claude", "codex", "gemini"})
+_TOOL_CAPABLE_CLI_FAMILIES = frozenset({"claude", "codex", "gemini", "antigravity"})
 
 # Steers agy toward its native file-read tool: in headless --sandbox print
 # mode a shell `cat` is auto-denied, silently costing the peer its file
@@ -944,16 +944,15 @@ REVIEW_WITH_TOOLS_DIRECTIVE = (
 # v0.9.0 Feature 3 — additional directive appended on top of
 # REVIEW_WITH_TOOLS_DIRECTIVE when `modes.review-with-tools.tool_call_voting`
 # is true AND the peer is a tool-capable CLI family. `record_recommendation`
-# is NOT a real MCP tool the orchestrator hosts; we rely on the CLI peer's
-# own tool-calling machinery to emit a structured artifact in stdout
-# (claude `tool_use` content blocks, codex JSON function-calls, gemini
-# Vertex-AI flavored). `adapters._extract_tool_call_recommendation`
-# detects + parses after the fact, falling back to regex
-# `RECOMMENDATION:` parsing when the tool call is absent or malformed.
+# is NOT a real MCP tool the orchestrator hosts. Peers can emit structured
+# text in stdout; the parser also accepts legacy native tool-call wrappers.
+# `adapters._extract_tool_call_recommendation` parses after the fact, falling
+# back to `RECOMMENDATION:` when structured output is absent or malformed.
 TOOL_CALL_VOTING_DIRECTIVE = (
-    "You may additionally invoke a `record_recommendation` tool to "
-    "submit your verdict as a structured payload instead of (or in "
-    "addition to) the `RECOMMENDATION:` label. Schema:\n\n"
+    "You may additionally emit `record_recommendation({...})` as structured "
+    "text in your response. This is an output format, not an available "
+    "tool; do not try to call an unregistered tool. Always include your "
+    "`RECOMMENDATION:` label as well. Schema:\n\n"
     "  record_recommendation({\n"
     '    "verdict": "yes" | "no" | "tradeoff",\n'
     '    "blockers": ["concrete missing artifact or hard requirement", ...],\n'
@@ -961,7 +960,7 @@ TOOL_CALL_VOTING_DIRECTIVE = (
     '"verified|published|observable|inferred|speculative", '
     '"path": "...", "start_line": 0, "end_line": 0}, ...]\n'
     "  })\n\n"
-    "If you emit this tool call, the orchestrator parses your "
+    "If you emit this structured text, the orchestrator parses your "
     "recommendation from the structured payload rather than from the "
     "`RECOMMENDATION:` label. The label is still accepted as a "
     "fallback when no tool call is emitted or the payload is malformed."

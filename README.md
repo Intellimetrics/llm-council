@@ -5,7 +5,7 @@
 [![MCP](https://img.shields.io/badge/MCP-ready-2f855a)](docs/llm-council.md)
 [![Source read-only peers](https://img.shields.io/badge/peers-source--read--only-6b7280)](#read-only-safety)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.25.0-111827)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.26.0-111827)](CHANGELOG.md)
 
 Your coding agent grades its own homework. **llm-council** gives it a second opinion that isn't its own: one question or diff, fanned out in parallel to independent, read-only AI peers — the Claude, Codex, and Antigravity CLIs you already have, on your own accounts — and every peer must commit to a verdict: `yes`, `no`, or `tradeoff`. Read-only is enforced by CLI flags, not vibes. Essays without a verdict are rejected.
 
@@ -84,11 +84,19 @@ pipx install --force git+https://github.com/Intellimetrics/llm-council.git
 llm-council check-update
 ```
 
+After updating, restart the MCP connection and verify it through the connected
+`council_doctor` tool. Checkout edits and `uv run` tests do not update a separate
+`uv tool` installation. For local builds and refreshing agent instructions, see
+[updating an active installation](docs/llm-council.md#updating-an-active-installation).
+
 Avoid `uvx` for your primary installation: it's fine for one-off trials but doesn't keep the tool persistently on PATH or give MCP a stable environment. All releases are logged in [CHANGELOG.md](CHANGELOG.md).
 
 </details>
 
 ## How it works
+
+See the [September review and improvement priorities](docs/review-improvements.md)
+for recent reliability fixes and the next review-quality improvements.
 
 llm-council sits between your primary agent and a pool of independent peers. Peers answer in parallel from fresh, isolated contexts; votes are parsed, checked, and reduced to one headline verdict.
 
@@ -99,7 +107,7 @@ graph TD
     Server -- "2. Parse prompt / git diff" --> Orchestrator[Orchestrator]
     Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerA[Peer A: Claude]
     Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerB[Peer B: Codex]
-    Orchestrator -- "3. Parallel invocation (isolated stdin)" --> PeerC[Peer C: Antigravity]
+    Orchestrator -- "3. Parallel invocation (prompt argument)" --> PeerC[Peer C: Antigravity]
     PeerA -- "4. YES/NO/TRADEOFF" --> Consensus[Consensus Evaluator]
     PeerB -- "4. YES/NO/TRADEOFF" --> Consensus
     PeerC -- "4. YES/NO/TRADEOFF" --> Consensus
@@ -148,14 +156,14 @@ All built-in rosters are local-CLI only; hosted peers join only by explicit opt-
 | `review-with-tools` | *Experimental.* CLI peers use their own read-only file/grep tools to verify claims against the repo before voting, instead of relying solely on pasted context. |
 | `deliberate` | Adds a second round when first-round votes disagree. |
 | `consensus` | Assigned-stance debate (for / against / neutral) to attack groupthink; 2x timeouts. |
-| `fable` | Read-only second opinion from Claude Fable 5, with defensive-review framing and a silent-model-substitution guard. |
+| `fable` | Read-only second opinion from Claude Fable 5.1, with defensive-review framing and a model-substitution guard. |
 | `private-local` | Routes only to same-machine loopback Ollama participants. |
 
 Any mode composes with `--origin-policy us` to restrict the roster to US-origin participants, and with your own modes defined in `.llm-council.yaml`.
 
 ## Blast-radius context (OKF)
 
-A diff shows *what changed*; it doesn't show *who depends on it*. With `--okf-context` (CLI), `okf_context: true` (MCP / per-mode / defaults), a diff review also carries the one-hop call graph of every touched symbol:
+A diff shows *what changed*; it doesn't show *who depends on it*. With `--okf-context` (CLI), `okf_context: true` (MCP / per-mode / defaults), a diff review also carries a budgeted one-hop call graph of matched touched symbols:
 
 ```bash
 llm-council run --mode review --diff --okf-context "Is this refactor safe?"
@@ -175,9 +183,47 @@ Under the hood, llm-council generates an ephemeral [Open Knowledge Format](https
   ...
 ```
 
-Why bother: in a live A/B on this repo, peers given the call-graph excerpt enumerated **11/11** cross-module consumers of a changed function; peers given only the raw source found **1/11**. The diff supplies semantics, the graph supplies blast radius — reviewers need both.
+The graph provides starting points for finding affected callers and tests. In
+the September 5 live comparison, all three native peers found the same injected
+compatibility bug with OKF off and on (30.1s versus 33.9s). That verifies the
+integration, but does not establish an accuracy or speed improvement. Graph
+edges can be noisy; verify relationships against source before relying on them.
+
+The default excerpt budget is 12,000 characters. Check `metadata.okf_context`
+for status and `concepts` / `matched` coverage: a large diff may include only a
+subset. Currently OKF calculates headroom before diff trimming, so it can be
+omitted as `excerpt_over_budget` even when trimming later frees space. A saved
+fallback bundle is marked `stale_attached`. See [context access and measured
+limits](docs/review-context.md).
 
 Everything about it is opt-in and fail-soft: no built-in mode enables it, prompts are byte-identical when it's off, and a missing binary, failed generation, or unmatched diff leaves the run exactly as it would have been — plus a `metadata.okf_context` diagnostic, a transcript-header note, and a stderr warning. Requires the external `okf-rs` binary on PATH (prebuilt binaries on its releases page, or `cargo install --git https://github.com/jyjeanne/okf-rs okf-cli`).
+
+## What peers can access
+
+Native CLI peers can read files beyond the attached diff with their configured
+read-only tools. Ask them to inspect affected callers, tests, and requirements;
+`review-with-tools` adds this direction automatically. Hosted API and Ollama
+peers receive the assembled context without a filesystem tool loop.
+
+Peers do not automatically receive the host conversation, connected apps, or
+research results, and live web access should not be assumed. Supply the decision
+criteria in the question and relevant documents through `context_files`.
+
+For a tool-assisted diff review with OKF, use MCP `mode: "review-with-tools"`,
+`include_diff: true`, and `okf_context: true`, or:
+
+```bash
+llm-council run --mode review-with-tools --diff --okf-context \
+  "Check compatibility; inspect callers and tests and cite the affected code."
+```
+
+Project modes can override the roster and OKF setting. This repository enables
+OKF in `review`; its `review-with-tools` mode selects Claude and Codex and needs
+the explicit OKF toggle. One mode does not inherit settings from another.
+
+Before acting, check failed peers, `context_files_dropped`, `degraded`, and
+`metadata.partial`. Quorum and verified line ranges do not establish complete
+coverage or prove that a finding is correct.
 
 ## The council coaches its operator
 
@@ -206,6 +252,12 @@ Peers are advisors, not co-authors. How strongly that's enforced differs by peer
 - **Stdin isolation**: peers receive the codebase or diff via standard input (except `agy`, which stopped reading stdin in 1.1.1 and receives the prompt as a command-line argument instead).
 
 ## MCP tools
+
+MCP requests default to a 240-second deadline, below the observed 300-second
+host timeout. Peer work stops early enough to clean up and save a **partial
+result** with completed votes. Unfinished peers do not vote. Longer overrides
+require a longer host tool-call timeout too. See
+[request deadlines and input limits](docs/request-limits.md).
 
 The server exposes ten tools to your agent. The ones you'll actually see in traffic:
 
@@ -248,6 +300,17 @@ The server exposes ten tools to your agent. The ones you'll actually see in traf
 | `all` | Every discovered participant route on the host machine. |
 
 Custom participants, modes, and defaults live in `.llm-council.yaml`.
+
+See [native model configuration](docs/native-models.md) for current Codex,
+Claude, and Gemini model options, fallback migration, and account-specific
+availability. Native primary peers inherit the operator's CLI model selection;
+the `fable` peer explicitly pins `claude-fable-5-1`.
+
+Response caching is enabled for hosted/local API peers. CLI peers run afresh
+because they can inspect files outside the pasted prompt. Set per-participant
+`cache_response: true` only for a custom CLI whose response depends solely on
+the supplied prompt/configuration, or `false` to disable an API peer's cache.
+`--cache off` and consensus-mode cache disabling still take precedence.
 
 `private-local` connects only to an HTTP(S) loopback Ollama endpoint and ignores proxy environment variables for that connection. It does not sandbox the Ollama daemon itself; for a hard offline guarantee, run Ollama with OS/network egress disabled.
 

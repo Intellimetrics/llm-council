@@ -247,6 +247,41 @@ uv tool install --force git+https://github.com/Intellimetrics/llm-council.git
 MCP clients can pass `check_update: true` to `council_doctor` to get the same
 version and update status in the returned JSON.
 
+### Updating an active installation
+
+There are three separate states: the checkout, the installed executable used
+by the host's MCP configuration, and the already-running server process.
+Passing tests with `uv run` only establishes the checkout state. Restarting an
+old installation does not load uninstalled checkout changes, and reinstalling
+a package does not reload imports in a running server.
+
+For a local development build, from the checkout:
+
+```bash
+uv run pytest -q
+uv build --wheel
+# Use the exact wheel produced above; keep it available for reinstalling.
+uv tool install --force ./dist/llm_council-0.26.0-py3-none-any.whl
+command -v llm-council
+llm-council --version
+```
+
+Compare that executable with the command in the active host's MCP config.
+Development wheels may share a release version, so also retain the wheel
+checksum and install location. Restart the connection when server code changes,
+then call `council_doctor` through that connection and run a small read-only
+review. Check a behavior specific to the fix, such as partial-vote preservation;
+a healthy doctor response alone is not an end-to-end verification.
+
+Setup's instruction source is `llm_council/setup_wizard.py`. Updating the
+package does not automatically replace snippets already copied into agent
+instruction files. `setup --write-instructions` refreshes managed project
+blocks, but also performs normal setup/config merging; review `setup --plan`
+and keep the intended preset. Do not use `--force` just to refresh prose.
+For manually installed/global instructions, replace only the council section
+and preserve unrelated guidance. Reload the agent session when its instruction
+loader requires it. See [AGENTS.md](../AGENTS.md) for this repository's workflow.
+
 For hosted OpenRouter modes, estimate before running:
 
 ```bash
@@ -269,7 +304,7 @@ Core keys:
 - `defaults.max_deliberation_rounds`: default cap for opt-in deliberation
 - `defaults.max_prompt_chars`: global prompt construction cap, default 200000
 - `defaults.mcp_max_prompt_chars`: universal MCP prompt-construction guard, default 80000
-- `defaults.mcp_request_timeout_seconds`: wall-clock deadline for a complete MCP request, default 1200
+- `defaults.mcp_request_timeout_seconds`: wall-clock deadline for a complete MCP request, default 240
 - `defaults.mcp_max_estimated_cost_usd`: MCP estimated cost guard
 - `defaults.auto_open_browser`: automatically open HTML transcripts in the default web browser (boolean, default `false`)
 - `participants`: named CLI, OpenRouter, or Ollama participants
@@ -285,6 +320,13 @@ tightest applicable cap. Use `chunk_strategy` (`fail`, `head`, `tail`, or
 dropped content is reported in chunk metadata.
 
 ## Participants
+
+For repository access, OKF configuration, and context limitations, see
+[context access and OKF review guidance](review-context.md). API peers receive
+supplied context; native CLI peers can inspect additional files. Native response
+caching is disabled by default. `cache_response: true` is reserved for a custom
+CLI restricted to prompt/config inputs; API peers can use `cache_response: false`
+to disable their response cache. Run-level `--cache off` takes precedence.
 
 CLI participants:
 
@@ -345,11 +387,12 @@ Use cheap OpenRouter modes first for breadth. Escalate to frontier hosted
 models when the extra quality can justify the bill: release gates, architecture
 tradeoffs, security-sensitive decisions, or unresolved bugs.
 
-Built-in cheap modes use low-cost paid routes rather than `:free` OpenRouter
-routes. Free routes are account-dependent and can reject otherwise valid calls
-with `402 Payment Required`. The legacy `qwen_coder_free` participant remains
-available for explicit experiments; use `qwen_coder_flash` for reliable cheap
-defaults.
+Built-in modes use native CLIs (or loopback Ollama in `private-local`). Hosted
+rosters such as `review-cheap` are project/setup choices, not universal built-in
+modes. Check `council_list_modes` before selecting one. Hosted free routes are
+account-dependent; inspect the live catalog and account availability before
+choosing a route. See [native model configuration](native-models.md) for the
+dated native model snapshot and fallback migration rules.
 
 The cost shape is roughly:
 
@@ -417,9 +460,9 @@ A mode either lists exact participants or uses one of two strategies:
 `other_cli_peers` (available Claude/Codex participants plus one Gemini-family
 participant,
 optionally with extras via `add`) or `local_only_peers` (every configured
-loopback Ollama participant). Antigravity is preferred for current-client
-compatibility, while Gemini remains available for explicit selection when its
-hard plan-mode boundary is supported. Built-in native modes set
+loopback Ollama participant). Antigravity is the built-in Gemini-family route.
+The standalone Gemini CLI is not a built-in participant; custom routes require
+appropriate account access and equivalent read-only flags. Built-in native modes set
 `include_current: true`, so `quick` includes
 every available native participant, including the active host when its CLI
 executable is discoverable on `PATH`. Use `peer-only`, or set
@@ -498,6 +541,14 @@ Allowed mime types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`.
 
 ## Timeouts and slow warnings
 
+The complete MCP request defaults to **240 seconds**, with up to 10 seconds
+reserved for cleanup and finalization. The earlier peer deadline covers queued
+work, retries, deliberation, and synthesis. Completed votes are preserved in a
+partial result; unfinished peers do not vote. Check `metadata.partial` even
+when `degraded` is false. Raising a participant timeout does not extend the
+request or the host's tool-call timeout. See [request deadlines and input
+limits](request-limits.md) for overrides and cancellation behavior.
+
 Each CLI participant has a per-config `timeout` (default 240s). When the
 deadline is hit, the participant returns an actionable error naming the
 participant, the timeout, the prompt size, and the config knob to raise:
@@ -548,7 +599,7 @@ MCP tools:
 - `council_doctor`: diagnose local readiness
 - `council_models`: list cached OpenRouter models
 - `council_stats`: show aggregate participant metrics across transcripts
-- `council_query_transcripts`: search prior transcript history semantically
+- `council_query_transcripts`: search prior questions by token overlap, with bounded coverage reported in `search_scope`
 - `council_config`: get or set configuration keys in `.llm-council.yaml`
 
 
@@ -602,14 +653,19 @@ Transcript pruning is a dry run unless `--delete` is present. The deprecated
 
 ## Safety notes
 
-All four built-in native CLI participants use CLI-enforced read-only or plan
+The three primary native CLI participants use CLI-enforced read-only or plan
 modes (`--permission-mode manual` Claude, `--sandbox read-only` Codex,
-`--approval-mode plan` Gemini, `--mode plan` Antigravity), and prompts are
+`--mode plan` Antigravity), and prompts are
 sent over stdin where the CLI supports it (Antigravity stopped reading stdin
 in agy 1.1.1, so its prompt is passed as the `--print` argument instead; its
 `--sandbox` additionally restricts shell commands). The council prompt's
 read-only directive rides on top as defense in depth. Subprocess environments
-are sanitized; only configured `env_passthrough` variables are forwarded.
+are sanitized: secret-named variables are filtered unless allowed through
+`env_passthrough`, while non-secret variables normally inherit. Set per-peer
+`env_strict: true` to restrict inheritance to the safe allowlist plus explicit
+passthrough variables. Native read tools are not a guarantee that reads stay
+inside the project; the MCP server's own context-path checks have a narrower
+scope. See [review context](review-context.md).
 
 > [!WARNING]
 > Do not include secrets in diffs or context files. OpenRouter participants

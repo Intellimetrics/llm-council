@@ -94,6 +94,7 @@ def _empty_label_counts() -> dict[str, int]:
 def _new_peer_bucket() -> dict[str, Any]:
     return {
         "runs": 0,
+        "cache_hits": 0,
         "successes": 0,
         "elapsed_total": 0.0,
         "elapsed_runs": 0,
@@ -164,6 +165,7 @@ def _new_peer_bucket() -> dict[str, Any]:
         # `defaults.strict_evidence`: when untagged stays small across
         # representative runs, flip the default.
         "evidence_tag_distribution": {
+            "verified": 0,
             "published": 0,
             "observable": 0,
             "inferred": 0,
@@ -227,6 +229,13 @@ def aggregate(
             # `<peer>:rank` participant.
             name = _base_peer_name(raw_name)
             bucket = peers.setdefault(name, _new_peer_bucket())
+            if bucket["last_used"] is None or mtime > bucket["last_used"]:
+                bucket["last_used"] = mtime
+            # Cached results retain the original request's usage receipts.
+            # Reading them again did not incur another request or charge.
+            if result.get("from_cache"):
+                bucket["cache_hits"] += 1
+                continue
             elapsed = result.get("elapsed_seconds")
             if elapsed is not None:
                 try:
@@ -248,8 +257,6 @@ def aggregate(
                     bucket["cost_runs"] += 1
                 except (TypeError, ValueError):
                     pass
-            if bucket["last_used"] is None or mtime > bucket["last_used"]:
-                bucket["last_used"] = mtime
 
         seen_in_transcript: set[str] = set()
         for result in final_results:
@@ -270,7 +277,7 @@ def aggregate(
             # carry it too (failure path). Mutually exclusive at the same
             # final-round entry: a single result is either a recovery or
             # an annotated failure, never both.
-            if result.get("terse_retry_attempted"):
+            if result.get("terse_retry_attempted") and not result.get("from_cache"):
                 bucket["terse_retry_attempts"] += 1
             if ok:
                 bucket["successes"] += 1
@@ -287,7 +294,7 @@ def aggregate(
                             bucket["envelope_field_present"][field_name] += 1
                     elif value is not None:
                         bucket["envelope_field_present"][field_name] += 1
-                if result.get("recovered_after_timeout"):
+                if result.get("recovered_after_timeout") and not result.get("from_cache"):
                     bucket["timeout_recoveries"] += 1
                     recovery_prompt_chars = result.get("prompt_chars")
                     try:
@@ -301,7 +308,7 @@ def aggregate(
                     bucket["timeout_recoveries_by_prompt_size"][
                         recovery_bucket
                     ] += 1
-                if result.get("recovered_after_quota"):
+                if result.get("recovered_after_quota") and not result.get("from_cache"):
                     # The call DID hit quota; the fallback rescued it — so
                     # it counts as both an incident AND a recovery.
                     bucket["quota_incidents"] += 1
@@ -314,7 +321,7 @@ def aggregate(
                     if isinstance(entry, dict):
                         tag = entry.get("tag")
                         bucket_key = tag if tag in (
-                            "published", "observable", "inferred", "speculative",
+                            "verified", "published", "observable", "inferred", "speculative",
                         ) else "untagged"
                     else:
                         bucket_key = "untagged"
@@ -352,6 +359,7 @@ def aggregate(
             {
                 "name": name,
                 "runs": runs,
+                "cache_hits": bucket["cache_hits"],
                 "successes": successes,
                 "success_rate": (successes / runs) if runs else 0.0,
                 "avg_elapsed_seconds": (

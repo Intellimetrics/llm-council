@@ -20,6 +20,7 @@ from llm_council.adapters import (
     ParticipantResult,
     PREFLIGHT_FAILED_PREFIX,
     QuorumTracker,
+    REQUEST_DEADLINE_ERROR,
     classify_error,
     content_refusal_excerpt,
     is_content_refusal_error,
@@ -31,7 +32,8 @@ from llm_council.cache import (
     is_caching_disabled_for_mode,
     resolve_ttl_seconds,
 )
-from llm_council.citations import verify_evidence_citations
+from llm_council.citations import CitationVerifier, verify_evidence_citations
+from llm_council.blocking import deadline_reached, run_blocking
 from llm_council.config import (
     is_local_base_url,
     is_loopback_base_url,
@@ -276,6 +278,30 @@ def _is_labeled_vote(r: ParticipantResult) -> bool:
     return r.ok and recommendation_label(r.output) in {"yes", "no", "tradeoff"}
 
 
+def _participant_vendor(result: ParticipantResult, cfg: dict[str, Any]) -> str:
+    """Infer the model vendor, falling back to the configured client family.
+
+    Clients and routers can serve several vendors. Unknown/private model IDs
+    still need an explicit family; this advisory signal cannot prove independence.
+    """
+    model = str(result.model or cfg.get("model") or "").lower()
+    publisher, separator, model_id = model.partition("/")
+    if separator and publisher in {"anthropic", "google", "openai"}:
+        return publisher
+    model_id = model_id if separator else model
+    if model_id.startswith("claude"):
+        return "anthropic"
+    if model_id.startswith("gemini"):
+        return "google"
+    if model_id.startswith(("gpt-", "o1", "o3", "o4")):
+        return "openai"
+    family = str(cfg.get("family") or _base_name(result.name)).lower()
+    return {
+        "gemini": "google", "antigravity": "google",
+        "claude": "anthropic", "codex": "openai",
+    }.get(family, family)
+
+
 def _index_by_base_name(
     results: list[ParticipantResult],
 ) -> dict[str, ParticipantResult]:
@@ -517,6 +543,7 @@ async def execute_council(
             "a council participant."
         )
     run_started_monotonic = time.monotonic()
+    citation_verifier = CitationVerifier(cwd)
     run_started_at = _utc_progress_timestamp()
     max_concurrency = int(config.get("defaults", {}).get("max_concurrency") or 4)
 
@@ -768,7 +795,7 @@ async def execute_council(
             tool_call_voting=tool_call_voting,
             quorum_tracker=_round_quorum_tracker(),
         )
-        verify_evidence_citations(run_results, cwd)
+        await run_blocking(verify_evidence_citations, run_results, cwd, verifier=citation_verifier)
     else:
         run_results = []
     # Merge pre-flight failures back in, preserving the original participant
@@ -996,6 +1023,7 @@ async def execute_council(
         )
     while (
         deliberate
+        and not deadline_reached()
         and max_rounds > round_number
         and has_disagreement(round_results)
         and not metadata.get("universal_abdication")
@@ -1079,7 +1107,7 @@ async def execute_council(
             tool_call_voting=tool_call_voting,
             quorum_tracker=_round_quorum_tracker(),
         )
-        verify_evidence_citations(next_results, cwd)
+        await run_blocking(verify_evidence_citations, next_results, cwd, verifier=citation_verifier)
         prior_round_results = list(round_results)
         round_number += 1
         round_results = [
@@ -1224,7 +1252,11 @@ async def execute_council(
                 for r in labeled
             }
         )
-        distinct = len(families)
+        vendors = {
+            _participant_vendor(r, participant_cfg.get(_base_name(r.name), {}) or {})
+            for r in labeled
+        }
+        distinct = len(vendors)
         # Only warn when there is actual labeled agreement whose vendor
         # diversity is in question. With zero labeled votes there is no
         # consensus to mistake for independent corroboration (the run is
@@ -1235,6 +1267,7 @@ async def execute_council(
                 "distinct_vendors": distinct,
                 "required": int(distinct_vendor_threshold),
                 "families": families,
+                "vendors": sorted(vendors),
                 "labeled_quorum": final_labeled,
             }
             emit(
@@ -1243,6 +1276,7 @@ async def execute_council(
                     "distinct_vendors": distinct,
                     "required": int(distinct_vendor_threshold),
                     "families": families,
+                    "vendors": sorted(vendors),
                     "round": metadata["rounds"],
                 }
             )
@@ -1283,9 +1317,10 @@ async def execute_council(
     # Exclude every failed result from the matrix input. In particular, a
     # pinned-model integrity failure retains captured output for audit, but
     # that text must never be attributed to the configured peer as a finding.
-    # Deliberation and synthesis already skip not-ok results; the matrix
-    # builder does not, hence the explicit filter here.
-    finding_matrix = build_matrix_from_results([r for r in final_results if r.ok])
+    # Deliberation, synthesis, and the matrix all skip not-ok results.
+    finding_matrix = await run_blocking(build_matrix_from_results,
+        [r for r in final_results if r.ok], verifier=citation_verifier
+    )
     if not finding_matrix.is_empty():
         metadata["finding_matrix"] = matrix_to_dict(finding_matrix)
 
@@ -1302,7 +1337,7 @@ async def execute_council(
     if missing_key_records:
         metadata["missing_key_peers"] = list(missing_key_records)
 
-    if synthesize_flag and should_synthesize(synthesize_flag, metadata):
+    if synthesize_flag and not deadline_reached() and should_synthesize(synthesize_flag, metadata):
         assert resolved_synthesizer is not None
         chair_name = resolved_synthesizer
         chair_preflight_error = preflight_failures.get(chair_name)
@@ -1391,6 +1426,13 @@ async def execute_council(
     if model_substituted_peers:
         metadata["model_substituted_peers"] = model_substituted_peers
 
+    if deadline_reached() or any(r.error == REQUEST_DEADLINE_ERROR for r in results):
+        metadata["request_deadline_reached"] = True
+        metadata["partial"] = True
+        metadata["deadline_stopped_peers"] = [r.name for r in results if r.error == REQUEST_DEADLINE_ERROR]
+        if deliberate:
+            metadata["deliberation_status"] = "request_deadline"
+        emit({"event": "request_deadline", "stopped_peers": metadata["deadline_stopped_peers"]})
     run_wall_elapsed = time.monotonic() - run_started_monotonic
     run_finished_at = _utc_progress_timestamp()
     participant_elapsed_aggregate = sum(

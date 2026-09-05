@@ -83,7 +83,7 @@ def test_model_substituted_kind_advertised_in_mcp_schema():
 def test_claude_fable_participant_shape():
     cf = DEFAULT_CONFIG["participants"]["claude_fable"]
     assert cf["family"] == "claude"
-    assert cf["model"] == "claude-fable-5"
+    assert cf["model"] == "claude-fable-5-1"
     # Observability + guard for the silent Fable→Opus refusal fallback.
     assert cf["usage_from_json"] is True
     assert cf["require_pinned_model"] is True
@@ -108,7 +108,7 @@ def test_build_cli_command_claude_fable_pins_model_no_fallback(tmp_path):
     cmd = _build_cli_command("claude_fable", cf, "p", tmp_path)
     # Model pinned.
     assert "--model" in cmd
-    assert cmd[cmd.index("--model") + 1] == "claude-fable-5"
+    assert cmd[cmd.index("--model") + 1] == "claude-fable-5-1"
     # Empty fallback_chain → NO `--fallback-model` (would be a silent swap path).
     assert "--fallback-model" not in cmd
     # usage_from_json → JSON output flag; read-only flag preserved.

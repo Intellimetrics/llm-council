@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from llm_council import __version__
+from llm_council.blocking import run_blocking
 from llm_council.config import (
     apply_tier_override,
     canonical_mode_name,
@@ -901,6 +902,9 @@ def _participant_verbose_notes(cfg: dict) -> list[str]:
         notes.append("usage_from_json=true (real token/cost telemetry)")
     if cfg.get("env_strict"):
         notes.append("env_strict=true (child env restricted to safe names)")
+    if cfg.get("type") == "cli" or "cache_response" in cfg:
+        enabled = bool(cfg.get("cache_response", cfg.get("type") != "cli"))
+        notes.append(f"cache_response={str(enabled).lower()}")
     if cfg.get("require_pinned_model"):
         notes.append("require_pinned_model=true (substituted answers dropped)")
     chain = cfg.get("fallback_chain")
@@ -2741,7 +2745,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
                     flush=True,
                 )
 
-        prompt = build_prompt(
+        prompt = await run_blocking(build_prompt,
             question,
             mode=mode,
             cwd=cwd,

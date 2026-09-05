@@ -253,6 +253,8 @@ def validate_config(config: dict[str, Any]) -> None:
         if not isinstance(participant, dict):
             raise ValueError(f"Participant '{name}' must be a mapping")
         ptype = participant.get("type")
+        if "cache_response" in participant and not isinstance(participant["cache_response"], bool):
+            raise ValueError(f"Participant '{name}' cache_response must be a boolean")
         if ptype not in PARTICIPANT_TYPES:
             raise ValueError(
                 f"Participant '{name}' has unsupported type '{ptype}'. "
@@ -861,6 +863,17 @@ def migrate_known_cli_defaults(config: dict[str, Any]) -> None:
     ):
         claude["args"] = list(DEFAULT_CONFIG["participants"]["claude"]["args"])
     codex = config.get("participants", {}).get("codex")
+    # Upgrade exact previously shipped chains, preserving customized chains
+    # and all explicit model pins (including API-key-only legacy models).
+    for family, peer, previous in (
+        ("claude", claude, ["claude-opus-4-6", "claude-sonnet-4-6"]),
+        ("codex", codex, ["gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"]),
+    ):
+        if (
+            isinstance(peer, dict) and peer.get("type") == "cli"
+            and peer.get("family") == family and peer.get("fallback_chain") == previous
+        ):
+            peer["fallback_chain"] = list(DEFAULT_CONFIG["participants"][family]["fallback_chain"])
     if isinstance(codex, dict) and (
         codex.get("type") == "cli"
         and codex.get("family") == "codex"

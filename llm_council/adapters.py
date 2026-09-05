@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
 import shlex
 import time
@@ -15,6 +16,9 @@ from urllib.parse import urlparse
 
 import httpx
 
+from llm_council.blocking import PEER_DEADLINE, deadline_reached, kill_process_group
+
+REQUEST_DEADLINE_ERROR = "Timeout: council request deadline reached; unfinished peer stopped"
 from llm_council.cache import (
     build_payload as cache_build_payload,
     cache_path as cache_path_for,
@@ -72,7 +76,7 @@ EMPTY_RETRY_FAILED_SUFFIX = (
 # from "flag only observed substitutions" to "require observed telemetry".
 # Otherwise a pre-change cache entry whose fallback ``model`` merely repeated
 # cfg.model could bypass the new fail-closed check.
-_MODEL_PIN_CACHE_CONTRACT_VERSION = 1
+_MODEL_PIN_CACHE_CONTRACT_VERSION = 2
 
 OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_HEADERS = {
@@ -575,6 +579,13 @@ def _cache_lookup(
     image_manifest: list[dict[str, Any]] | None = None,
 ) -> tuple[str | None, ParticipantResult | None]:
     if cache_ctx is None or cache_ctx.cache_disabled:
+        return None, None
+    # CLI peers can read files that are absent from the prompt, in every
+    # mode. Their result cannot safely be keyed on prompt/config alone.
+    # An explicit opt-in is reserved for custom CLIs restricted to stdin.
+    if cfg.get("cache_response") is False or (
+        cfg.get("type") == "cli" and not cfg.get("cache_response", False)
+    ):
         return None, None
     lookup_start = time.monotonic()
     cache_cfg = cfg
@@ -1215,7 +1226,8 @@ async def run_cli_participant(
 def _model_pin_satisfied(requested: str | None, served: str | None) -> bool:
     """True when the CLI-served model matches the pinned/requested model.
 
-    Lenient containment match so a dated or minor-version variant of the
+    Accept an exact model ID or its dated snapshot. A different minor
+    version is a different model, not a verified pin. A dated variant of the
     requested id (e.g. `claude-fable-5` vs `claude-fable-5-20260601`) still
     counts as satisfied, while a different model family (e.g. a Fable->Opus
     refusal fallback reporting `claude-opus-4-8`) does not. When either id is
@@ -1227,7 +1239,7 @@ def _model_pin_satisfied(requested: str | None, served: str | None) -> bool:
         return True
     r = requested.strip().lower()
     s = served.strip().lower()
-    return r in s or s in r
+    return r == s or bool(re.fullmatch(re.escape(r) + r"-\d{8}", s))
 
 
 async def _run_cli_once(
@@ -1278,6 +1290,7 @@ async def _run_cli_once(
     )
 
     proc: Any = None
+    communicate: asyncio.Task | None = None
     # stderr collected before a timeout kill — see `_cleanup_timed_out_process`.
     timed_out_stderr = b""
     try:
@@ -1288,6 +1301,7 @@ async def _run_cli_once(
             stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name == "posix",
         )
         if idle_timeout is not None:
             # Streaming read path (v0.12.0 opt-in): kill on N seconds of
@@ -1360,6 +1374,21 @@ async def _run_cli_once(
             if partial is not None:
                 timed_out_stderr = partial[1] or b""
             raise
+        finally:
+            # Also clean up on request cancellation, not only peer timeouts.
+            # Successful CLIs can leave background MCP/tool children behind.
+            cleanup = asyncio.create_task(_cleanup_timed_out_process(proc, communicate))
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                if not cleanup.cancelled():
+                    cleanup.exception()
+                raise
         elapsed = time.monotonic() - start
         out = stdout.decode(errors="replace").strip()
         err = stderr.decode(errors="replace").strip()
@@ -1896,6 +1925,10 @@ async def _cleanup_timed_out_process(
     *,
     terminate_grace_seconds: float = 2.0,
 ) -> tuple[bytes, bytes] | None:
+    # Only real subprocesses created above own a POSIX session. Test doubles
+    # and non-POSIX processes retain the terminate/kill fallback below.
+    if os.name == "posix" and isinstance(proc, asyncio.subprocess.Process):
+        kill_process_group(proc.pid)
     if proc.returncode is None:
         try:
             proc.terminate()
@@ -1916,9 +1949,14 @@ async def _cleanup_timed_out_process(
     # kill, the only record of what a timed-out CLI was doing. An idle-
     # deadline read raises its own TimeoutError here; that (like a pipe
     # error) just means no partial output is recoverable.
+    if communicate.cancelled():
+        return None
     try:
-        return await communicate
+        return await asyncio.wait_for(asyncio.shield(communicate), timeout=2.0)
     except (BrokenPipeError, ConnectionResetError, TimeoutError):
+        if not communicate.done():
+            communicate.cancel()
+            await asyncio.gather(communicate, return_exceptions=True)
         return None
 
 
@@ -2733,37 +2771,51 @@ async def run_participant(
     quorum_tracker: "QuorumTracker | None" = None,
 ) -> ParticipantResult:
     wall_start = time.monotonic()
-    ptype = cfg.get("type")
-    if ptype == "cli":
-        # CLI participants intentionally don't receive image_manifest at the
-        # adapter layer: they share the project filesystem with the host and
-        # open staged images themselves via the file paths listed in the
-        # ## Images prompt section. Adding `vision: true` to a CLI cfg
-        # therefore has no effect — the orchestrator's images_skipped check
-        # treats CLI as always image-aware (orchestrator.py).
-        result = await run_cli_participant(
-            name, cfg, prompt, cwd, cache_ctx=cache_ctx,
-            mode_multiplier=mode_multiplier, mode=mode,
-            quorum_tracker=quorum_tracker,
-        )
-    elif ptype in ("openrouter", "openai_compatible"):
-        result = await run_openai_compatible_participant(
-            name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx,
-            mode_multiplier=mode_multiplier, mode=mode,
-        )
-    elif ptype == "ollama":
-        result = await run_ollama_participant(
-            name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx,
-            mode_multiplier=mode_multiplier, mode=mode,
-        )
-    else:
+    deadline = PEER_DEADLINE.get()
+    limit = asyncio.timeout_at(deadline)
+    try:
+        async with limit:
+            if deadline_reached():
+                raise TimeoutError
+            ptype = cfg.get("type")
+            if ptype == "cli":
+                # CLI participants intentionally don't receive image_manifest at the
+                # adapter layer: they share the project filesystem with the host and
+                # open staged images themselves via the file paths listed in the
+                # ## Images prompt section. Adding `vision: true` to a CLI cfg
+                # therefore has no effect — the orchestrator's images_skipped check
+                # treats CLI as always image-aware (orchestrator.py).
+                result = await run_cli_participant(
+                    name, cfg, prompt, cwd, cache_ctx=cache_ctx,
+                    mode_multiplier=mode_multiplier, mode=mode,
+                    quorum_tracker=quorum_tracker,
+                )
+            elif ptype in ("openrouter", "openai_compatible"):
+                result = await run_openai_compatible_participant(
+                    name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx,
+                    mode_multiplier=mode_multiplier, mode=mode,
+                )
+            elif ptype == "ollama":
+                result = await run_ollama_participant(
+                    name, cfg, prompt, image_manifest=image_manifest, cache_ctx=cache_ctx,
+                    mode_multiplier=mode_multiplier, mode=mode,
+                )
+            else:
+                result = ParticipantResult(
+                    name=name,
+                    ok=False,
+                    output="",
+                    error=f"Unsupported participant type: {ptype}",
+                    elapsed_seconds=0,
+                    model=cfg.get("model"),
+                )
+    except TimeoutError:
+        if not limit.expired() and not deadline_reached():
+            raise
         result = ParticipantResult(
-            name=name,
-            ok=False,
-            output="",
-            error=f"Unsupported participant type: {ptype}",
-            elapsed_seconds=0,
-            model=cfg.get("model"),
+            name=name, ok=False, output="", error=REQUEST_DEADLINE_ERROR,
+            elapsed_seconds=time.monotonic() - wall_start,
+            model=cfg.get("model"), prompt_chars=len(prompt),
         )
     result = _with_envelope(
         result,

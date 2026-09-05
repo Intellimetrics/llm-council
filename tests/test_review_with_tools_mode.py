@@ -126,6 +126,13 @@ def test_directive_appended_for_codex_in_tools_mode():
     assert REVIEW_WITH_TOOLS_DIRECTIVE in result
 
 
+def test_directive_appended_for_antigravity_in_tools_mode():
+    from llm_council.context import ANTIGRAVITY_READ_TOOL_HINT
+    result = apply_per_peer_directives(_base_prompt(), mode="review-with-tools", family="antigravity")
+    assert REVIEW_WITH_TOOLS_DIRECTIVE in result
+    assert ANTIGRAVITY_READ_TOOL_HINT in result
+
+
 def test_directive_appended_for_gemini_in_tools_mode():
     base = _base_prompt()
     result = apply_per_peer_directives(base, mode="review-with-tools", family="gemini")

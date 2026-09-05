@@ -93,7 +93,7 @@ DEFAULT_CONFIG: dict = {
         # Entire MCP request wall-clock contract. Individual peer timeouts
         # remain independently configurable, but a stuck multi-round request
         # cannot outlive this top-level deadline unless the caller overrides it.
-        "mcp_request_timeout_seconds": 1200,
+        "mcp_request_timeout_seconds": 240,
         # Tier-2 secret scanner. "warn" (default) counts likely credentials
         # in the prompt body and emits a progress event but ships the prompt
         # UNCHANGED (no mitigation); "block" raises before any participant
@@ -193,9 +193,9 @@ DEFAULT_CONFIG: dict = {
             # Empty chain disables fallback. Chain[0] is a same-tier
             # one-version-back step (opus→opus); subsequent entries
             # progressively step down (opus→sonnet→haiku).
-            "fallback_chain": ["claude-opus-4-6", "claude-sonnet-4-6"],
+            "fallback_chain": ["claude-opus-5", "claude-sonnet-5"],
         },
-        # Claude Fable 5 as a read-only council peer. Fable runs its own
+        # Claude Fable 5.1 as a read-only council peer. Fable runs its own
         # safety classifiers on the INCOMING request (research-bio + most
         # cybersecurity content); on a false-positive refusal the Claude Code
         # surface transparently re-serves the request on Opus 4.8 — a SILENT
@@ -240,7 +240,7 @@ DEFAULT_CONFIG: dict = {
                 "--strict-mcp-config",
                 "--exclude-dynamic-system-prompt-sections",
             ],
-            "model": "claude-fable-5",
+            "model": "claude-fable-5-1",
             # Observability + guard for the silent Fable->Opus refusal fallback.
             "usage_from_json": True,
             "require_pinned_model": True,
@@ -293,13 +293,10 @@ DEFAULT_CONFIG: dict = {
             "max_prompt_chars": 120_000,
             "stdin_prompt": True,
             "env_passthrough": ["OPENAI_API_KEY"],
-            # Capability-graceful step-down: same-tier minor version back
-            # (gpt-5.4 from gpt-5.5), then codex-tuned variant (still
-            # capable for coding), then a small final fallback. Users on
-            # a different account tier should override in .llm-council.yaml;
-            # an unknown model id just makes that step fail and the walk
-            # continues (or the peer drops if chain is exhausted).
-            "fallback_chain": ["gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"],
+            # ChatGPT sign-in retired GPT-5.4 / mini on 2026-08-31.
+            # Terra preserves the general coding role; Luna is the smaller
+            # final fallback. Explicit model pins remain operator-owned.
+            "fallback_chain": ["gpt-5.6-terra", "gpt-5.6-luna"],
             # Reasoning effort pinned for the council turn via
             # `-c model_reasoning_effort=<value>` (injected by
             # `adapters._build_cli_command`). Codex otherwise inherits the
@@ -503,7 +500,7 @@ DEFAULT_CONFIG: dict = {
             "include_current": True,
             "description": "Native CLI participants reviewing the change.",
         },
-        # Consult Claude Fable 5 as a single read-only reviewer. `safe_context:
+        # Consult Claude Fable 5.1 as a single read-only reviewer. `safe_context:
         # true` injects the defensive-review framing (context.build_prompt) that
         # lowers Fable's false-positive safety-classifier refusals — the refusals
         # that otherwise trigger a silent fall-back to Opus. The `claude_fable`
@@ -518,7 +515,7 @@ DEFAULT_CONFIG: dict = {
             "safe_context": True,
             "timeout_multiplier": 1.5,
             "description": (
-                "Read-only second opinion from Claude Fable 5, with "
+                "Read-only second opinion from Claude Fable 5.1, with "
                 "defensive-review framing to reduce false-positive refusals. A "
                 "silent fall-back to Opus is detected and dropped, not recorded "
                 "as a Fable vote."

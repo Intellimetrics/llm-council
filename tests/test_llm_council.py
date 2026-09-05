@@ -3523,7 +3523,7 @@ def test_pinned_model_claude_cli_command_pins_model_via_flag():
     cfg = load_config(None)["participants"]["claude_fable"]
     cmd = _build_cli_command("claude_fable", cfg, "prompt", Path("/tmp"))
     assert "--model" in cmd
-    assert "claude-fable-5" in cmd
+    assert "claude-fable-5-1" in cmd
     assert cmd[0] == "claude"
 
 
@@ -4765,6 +4765,7 @@ def test_cache_hit_seconds_distinct_from_elapsed_seconds(tmp_path):
     name = "claude_test"
     cfg = {
         "type": "cli",
+        "cache_response": True,
         "command": "/bin/echo",
         "model": "test",
         "args": [],
@@ -5276,7 +5277,9 @@ def test_example_config_loads_exact_modes():
         "deepseek_v4_pro",
         "qwen_coder_plus",
     }
-    assert set(config["modes"]) == {"quick", "peer-only", "plan", "review"}
+    assert set(config["modes"]) == {
+        "quick", "peer-only", "plan", "review", "review-with-tools",
+    }
     # The example mirrors the local-CLI-only default rosters: hosted peers
     # are defined for opt-in but no example mode seats one.
     for mode_cfg in config["modes"].values():
@@ -9446,6 +9449,7 @@ def test_write_transcript_overflow_bullet_omitted_when_no_overflow(
 def _make_cli_cfg() -> dict:
     return {
         "type": "cli",
+        "cache_response": True,  # fixture is a pure echo with no filesystem tools
         "command": "echo",
         "args": ["RECOMMENDATION: yes - ok"],
         "stdin_prompt": False,

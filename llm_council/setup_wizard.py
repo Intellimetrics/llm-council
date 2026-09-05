@@ -49,6 +49,34 @@ _INSTRUCTION_BLOCK_NOTE = (
 )
 
 
+REVIEW_CONTEXT_GUIDANCE = """Review context and result handling:
+- Native CLI peers can read repository files beyond the attached diff. For a
+  code review, ask them to inspect affected callers, tests, and requirements
+  and cite source locations. Use `review-with-tools` when configured and the
+  user wants this verification; keep an explicitly requested mode.
+- Peers do not inherit this host's conversation, connected apps, or research
+  results. Put relevant requirements in the question and attach supporting
+  documents with `context_files`. Do not assume live web access. Hosted API
+  and Ollama peers receive supplied context without a filesystem tool loop.
+- For OKF caller/callee context, include a diff and set `okf_context: true`.
+  Mode settings are separate: `review-with-tools` does not inherit `review`'s
+  OKF setting. Check `metadata.okf_context` for attachment, staleness, and
+  included/matched concept counts. Missing prompt space can omit the excerpt.
+- Treat OKF edges as navigation hints. A verified source range establishes
+  that the location exists, not that a claim or call relationship is true.
+- Check `context_files_dropped`, failed peers, `degraded`, and
+  `metadata.partial` before describing review coverage. A partial result can
+  still have quorum; it is not a completed review by every participant.
+- MCP requests default to 240 seconds, including retries and finalization.
+  Increasing peer timeouts alone does not extend the request or host limit.
+  Preserve completed findings when a deadline stops other peers.
+- Use `continuation_id` for an explicit prior council run, not as a substitute
+  for supplying this host's missing context. When querying prior runs, inspect
+  `search_scope`; a limited search cannot rule out older relevant reviews.
+
+"""
+
+
 INSTRUCTION_TEXT = r"""# LLM Council
 
 This project has LLM Council installed. Use it as a read-only second-opinion
@@ -87,7 +115,7 @@ Routing rules:
 - Treat "with qwen" as including `qwen_coder_plus`.
 - Treat "with glm" as including `glm_5_1`.
 
-Reviewing UI, screenshots, or browser state:
+""" + REVIEW_CONTEXT_GUIDANCE + r"""Reviewing UI, screenshots, or browser state:
 - Council CLI participants share the project filesystem, so they can Read any
   file you stage. Inline screenshot bytes that live only in this agent's
   conversation context cannot be seen by council.
@@ -662,7 +690,8 @@ path for that.
 
 _HOST_SKILL_BODY = r"""When the user asks for a "council" review — natural triggers include
 "use council", "go to council", "ask council", "take this to council",
-or commands like /council, \council, /ask-council, \ask-council — call the
+"get a second opinion", or commands like /council, \council, /ask-council,
+\ask-council — call the
 `llm-council` MCP tool `council_run`.
 
 If the user wants to view or change configuration options (e.g. "open html automatically", "set defaults.auto_open_browser true"), or uses commands like /council config, \council config, /council-config, \council-config — call the `llm-council` MCP tool `council_config`.
@@ -671,6 +700,8 @@ If the user wants to view or change configuration options (e.g. "open html autom
 Routing rules:
 - Pass `current` as `{current}` so transcripts record which host will
   synthesize and act on the council output.
+- Pass `working_directory` as the absolute reviewed project path within the
+  MCP server's configured root.
 - Omit `mode` to use the configured project default. Use `consensus` when the
   user explicitly wants assigned-stance debate (for/against/neutral). Use
   `peer-only` when the user wants to exclude this host from the council. Use
@@ -685,7 +716,7 @@ Routing rules:
 - Treat "continue from <run_id>" as setting `continuation_id` to that
   prior run; the new transcript will record `parent_run_id`.
 
-Council output shape (when the host supports MCP outputSchema):
+""" + REVIEW_CONTEXT_GUIDANCE + r"""Council output shape (when the host supports MCP outputSchema):
 - `recommendation`: yes / no / tradeoff / leaning-yes / leaning-no /
   unknown — the unique leading final-round label; leaning-* when the top
   labels tie between a definite label and tradeoff with no opposing
@@ -695,7 +726,8 @@ Council output shape (when the host supports MCP outputSchema):
 - `transcript`: filesystem path to the markdown transcript
 
 Before acting on council feedback, summarize agreements, surface real
-disagreements, and ask the user before making large or risky edits.
+disagreements, and ask the user before making large or risky edits unless
+the user already authorized implementation.
 
 Council is read-only by default. Council participants must not edit
 files; this host agent remains responsible for deciding what to do next.

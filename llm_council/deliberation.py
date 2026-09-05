@@ -41,14 +41,6 @@ def deliberation_body_budget(
 MAX_DELIBERATION_PEER_EXCERPT_CHARS = 20_000
 
 
-def first_nonempty_line(text: str) -> str:
-    for line in text.splitlines():
-        cleaned = line.strip().strip(">*-_ ")
-        if cleaned:
-            return cleaned
-    return ""
-
-
 def model_comparison(results: list[ParticipantResult]) -> list[str]:
     from llm_council.adapters import is_timeout_error
 

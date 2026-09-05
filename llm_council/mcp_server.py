@@ -8,11 +8,14 @@ import base64
 import binascii
 import json
 import os
+import time
+import math
 import re
 from pathlib import Path
 from typing import Any
 
 from llm_council import __version__
+from llm_council.blocking import peer_deadline, run_blocking
 from llm_council.budget import (
     DEFAULT_MCP_MAX_PROMPT_CHARS,
     DEFAULT_IMAGE_MAX_BYTES,
@@ -166,7 +169,9 @@ def council_run_schema() -> dict[str, Any]:
                 "maximum": 7200,
                 "description": (
                     "Wall-clock deadline for the complete MCP council request. "
-                    "Defaults to defaults.mcp_request_timeout_seconds."
+                    "Defaults to 240s. Peer work stops early enough to return "
+                    "partial results and clean up before this deadline. Only "
+                    "increase it if the host tool-call timeout is also longer."
                 ),
             },
             "dry_run": {"type": "boolean", "default": False},
@@ -1156,31 +1161,35 @@ async def run_council(
         config = load_config(find_config(cwd, stop_at=_mcp_root()), search=False)
         configured_timeout = (
             config.get("defaults", {}).get("mcp_request_timeout_seconds")
-            or 1200
+            or 240
         )
         request_timeout = float(
-            arguments.get("request_timeout_seconds") or configured_timeout
+            arguments.get("request_timeout_seconds", configured_timeout)
         )
-        if request_timeout <= 0 or request_timeout > 7200:
+        if not math.isfinite(request_timeout) or request_timeout <= 0 or request_timeout > 7200:
             raise ValueError(
                 "request_timeout_seconds must be greater than 0 and no more "
                 "than 7200"
             )
         try:
-            async with asyncio.timeout(request_timeout):
-                return await _run_council_scoped(
-                    arguments,
-                    cwd=cwd,
-                    config=config,
-                    mcp_session=mcp_session,
-                    progress_token=progress_token,
-                )
+            # Leave time for process cleanup, verification, and transcripts
+            # after peer work stops. The default fits the host's 300s window.
+            deadline = time.monotonic() + request_timeout - min(10.0, request_timeout * .2)
+            with peer_deadline(deadline):
+                async with asyncio.timeout(request_timeout):
+                    return await _run_council_scoped(
+                        arguments,
+                        cwd=cwd,
+                        config=config,
+                        mcp_session=mcp_session,
+                        progress_token=progress_token,
+                    )
         except TimeoutError as exc:
             raise ValueError(
                 "CouncilRequestTimeout: the complete MCP council request "
-                f"exceeded {request_timeout:g}s. Raise "
-                "request_timeout_seconds/defaults.mcp_request_timeout_seconds, "
-                "choose fewer participants, or reduce rounds/context."
+                f"exceeded {request_timeout:g}s during preparation or finalization. "
+                "Reduce context or rounds. Only raise request_timeout_seconds "
+                "if the host's tool-call timeout is also longer."
             ) from exc
 
 
@@ -1342,7 +1351,7 @@ async def _run_council_scoped(
     okf_settings = resolve_okf_settings(config, mode, arguments.get("okf_context"))
     okf_events: list[dict[str, Any]] = []
     chunk_events: list[dict[str, Any]] = []
-    prompt = build_prompt(
+    prompt = await run_blocking(build_prompt,
         question,
         mode=mode,
         cwd=cwd,
@@ -1867,6 +1876,11 @@ async def _run_council_scoped(
         deliberated=bool(metadata.get("deliberated")),
         rounds=int(metadata.get("rounds") or 1),
     )
+    if metadata.get("partial"):
+        summary_markdown += (
+            "\n\n**Partial result:** the request deadline stopped remaining work. "
+            "Completed votes are preserved; unfinished peers do not vote."
+        )
     # Shared "pop key from metadata and lift its value to the top-level
     # payload" pattern. Returns the (possibly copied) metadata plus the
     # lifted value, preserving the historical `metadata.pop(key) or default`
@@ -2244,8 +2258,10 @@ def query_transcripts(arguments: dict[str, Any]) -> dict[str, Any]:
     top_k = 5 if top_k_raw is None else int(top_k_raw)
     if top_k < 1 or top_k > 50:
         raise ValueError("top_k must be between 1 and 50")
-    matches = search_similar(query_text, top_k=top_k, runs_dir=out_dir)
+    search_scope: dict[str, Any] = {}
+    matches = search_similar(query_text, top_k=top_k, runs_dir=out_dir, diagnostics=search_scope)
     return {
+        "search_scope": search_scope,
         "matches": [
             {
                 "run_id": match.run_id,
@@ -2486,7 +2502,7 @@ async def _serve() -> None:
             elif name == "council_estimate":
                 cwd = _resolve_working_directory(arguments)
                 with project_env_context(cwd, stop_at=_mcp_root()):
-                    result = estimate_run(arguments)
+                    result = await run_blocking(estimate_run, arguments)
             elif name == "council_list_modes":
                 cwd = _resolve_working_directory(arguments)
                 with project_env_context(cwd, stop_at=_mcp_root()):
@@ -2494,21 +2510,21 @@ async def _serve() -> None:
             elif name == "council_last_transcript":
                 cwd = _resolve_working_directory(arguments)
                 with project_env_context(cwd, stop_at=_mcp_root()):
-                    result = last_transcript(arguments)
+                    result = await run_blocking(last_transcript, arguments)
             elif name == "council_doctor":
                 cwd = _resolve_working_directory(arguments)
                 with project_env_context(cwd, stop_at=_mcp_root()):
-                    result = run_doctor(arguments)
+                    result = await run_blocking(run_doctor, arguments)
             elif name == "council_models":
-                result = list_models(arguments)
+                result = await run_blocking(list_models, arguments)
             elif name == "council_stats":
                 cwd = _resolve_working_directory(arguments)
                 with project_env_context(cwd, stop_at=_mcp_root()):
-                    result = run_stats(arguments)
+                    result = await run_blocking(run_stats, arguments)
             elif name == "council_query_transcripts":
                 cwd = _resolve_working_directory(arguments)
                 with project_env_context(cwd, stop_at=_mcp_root()):
-                    result = query_transcripts(arguments)
+                    result = await run_blocking(query_transcripts, arguments)
             elif name == "council_config":
                 cwd = _resolve_working_directory(arguments)
                 with project_env_context(cwd, stop_at=_mcp_root()):

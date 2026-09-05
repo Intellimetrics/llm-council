@@ -14,6 +14,7 @@ selects it for a council run.
 | Host | The primary developer agent that invokes the council and decides what to do with its advice. | Host | Current agent, orchestrator, reviewer |
 | Synthesis Chair | The optional participant that summarizes peer responses without replacing their votes. | Synthesis Chair | Judge, host, lead reviewer |
 | Transcript | The Markdown, JSON, or HTML record of one council run. | Transcript, HTML Transcript | Report, log, dashboard |
+| Partial Result | Completed findings preserved when the request deadline stops other peer work; quorum may still be met. | Partial result | Complete review, degraded as a synonym |
 
 Technical compatibility names such as the `current` input, `participants` API
 field, `other_cli_peers` strategy, and deprecated CLI aliases remain unchanged.

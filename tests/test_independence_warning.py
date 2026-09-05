@@ -32,7 +32,7 @@ def _result(name, *, label="yes"):
     )
 
 
-def _run(participant_cfg, config, *, participants=None):
+def _run(participant_cfg, config, *, participants=None, served_models=None):
     """Run a single-round ``execute_council`` over the given cfg/config.
 
     The fake ``run_participants`` returns one labeled vote per selected
@@ -43,7 +43,10 @@ def _run(participant_cfg, config, *, participants=None):
     names = participants or list(participant_cfg.keys())
 
     async def fake_run_participants(selected, *args, **kwargs):
-        return [_result(name) for name in selected]
+        results = [_result(name) for name in selected]
+        for result in results:
+            result.model = (served_models or {}).get(result.name)
+        return results
 
     async def fake_preflight(*args, **kwargs):
         return {}
@@ -119,6 +122,52 @@ def test_warning_absent_when_threshold_met():
     ]
     assert events == []
     assert metadata["degraded"] is False
+
+
+def test_google_clients_are_not_two_independent_vendors():
+    cfg = {
+        "gemini": {"type": "cli", "family": "gemini"},
+        "agy": {"type": "cli", "family": "antigravity"},
+    }
+    _, metadata = _run(cfg, {"defaults": {"min_distinct_vendors": 2}})
+    assert metadata["independence_warning"]["distinct_vendors"] == 1
+    assert metadata["degraded"] is False
+
+
+def test_antigravity_serving_claude_is_not_independent_of_claude_code():
+    cfg = {
+        "claude": {"type": "cli", "family": "claude"},
+        "agy": {"type": "cli", "family": "antigravity"},
+    }
+    _, metadata = _run(
+        cfg, {"defaults": {"min_distinct_vendors": 2}},
+        served_models={"claude": "claude-opus-5", "agy": "Claude Opus 4.6"},
+    )
+    assert metadata["independence_warning"]["vendors"] == ["anthropic"]
+
+
+def test_router_and_native_peer_serving_same_model_share_vendor():
+    cfg = {
+        "codex": {"type": "cli", "family": "codex"},
+        "router": {"type": "openrouter", "family": "openrouter"},
+    }
+    _, metadata = _run(
+        cfg, {"defaults": {"min_distinct_vendors": 2}},
+        served_models={"codex": "gpt-5.6-terra", "router": "openai/gpt-5.6-terra"},
+    )
+    assert metadata["independence_warning"]["vendors"] == ["openai"]
+
+
+def test_antigravity_and_gemini_serving_different_vendors_are_distinct():
+    cfg = {
+        "gemini": {"type": "cli", "family": "gemini"},
+        "agy": {"type": "cli", "family": "antigravity"},
+    }
+    _, metadata = _run(
+        cfg, {"defaults": {"min_distinct_vendors": 2}},
+        served_models={"gemini": "gemini-3.8-flash", "agy": "Claude Opus 4.6"},
+    )
+    assert "independence_warning" not in metadata
 
 
 def test_feature_off_when_threshold_unset():

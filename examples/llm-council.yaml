@@ -9,6 +9,7 @@ defaults:
   max_concurrency: 4
   transparent: false
   max_deliberation_rounds: 2
+  mcp_request_timeout_seconds: 240
 
 # Native CLI participants intentionally omit model by default so paid/max CLI
 # accounts can use their own current default model. Add model only when you want
@@ -48,6 +49,7 @@ participants:
     - --sandbox
     - read-only
     - --ephemeral
+    - --skip-git-repo-check
     - -c
     - mcp_servers={}
     - --cd
@@ -133,3 +135,13 @@ modes:
     strategy: other_cli_peers
     include_current: true
     description: Native CLI participants reviewing the change.
+    # Enable only when okf-rs is installed; inspect metadata.okf_context coverage.
+    # okf_context: true
+
+  review-with-tools:
+    strategy: other_cli_peers
+    include_current: true
+    experimental: true
+    description: Verify review claims using native read-only repository tools.
+    # Mode settings are separate; this does not inherit review's OKF toggle.
+    # okf_context: true

@@ -456,7 +456,9 @@ FINDINGS:
         _StubResult(name="claude:round2", output=text),
         _StubResult(name="codex:round2", output=text2),
     ]
-    matrix = build_matrix_from_results(results)
+    from llm_council.citations import CitationVerifier
+    (tmp_path / "auth.py").write_text("line\n" * 50)
+    matrix = build_matrix_from_results(results, verifier=CitationVerifier(tmp_path))
     assert len(matrix.clusters) == 1
     assert set(matrix.clusters[0].peers) == {"claude", "codex"}
 

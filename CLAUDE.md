@@ -1,6 +1,9 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides maintainer guidance for work in this repository. Read
+[AGENTS.md](AGENTS.md) for the shared workflow, council routing, context handling,
+and installation verification. Claude hosts pass `current: "claude"`.
+See [review context](docs/review-context.md) for the latest OKF dogfooding limits.
 
 ## Project
 
@@ -42,12 +45,13 @@ llm-council mcp-server
 llm-council stats
 ```
 
-CI (`.github/workflows/test.yml`) runs `pytest -q` on Python 3.11 and 3.12.
+CI (`.github/workflows/test.yml`) runs `pytest -q` on Linux with Python 3.11
+and 3.12 and Windows with Python 3.12.
 There is no separate lint/format step configured.
 
 ## Architecture
 
-The codebase is small and single-package (`llm_council/`). Two surfaces share
+The codebase is a single package (`llm_council/`). Two surfaces share
 the same core:
 
 1. `cli.py` (`main` -> `llm-council` script)
@@ -125,9 +129,9 @@ Key modules:
   fed back to peers in-round.
 - `query.py` (v0.9.0) — `SimilarMatch`, `search_similar()`. Jaccard
   token-overlap search over `.llm-council/runs/*.json` for prior
-  council questions. Reuses `convergence.tokenize`,
-  `deliberation.recommendation_label`, and
-  `stats.load_transcript_files`. Surface is MCP only
+  council questions. Reuses `convergence.tokenize` and the canonical final-round
+  verdict, with a bounded in-memory index of unchanged records. Coverage limits
+  are returned as `search_scope`; see `docs/request-limits.md`. Surface is MCP only
   (`council_query_transcripts`); no CLI subcommand. No new
   dependencies — sentence-transformers deferred until Jaccard proves
   insufficient.
@@ -205,7 +209,7 @@ Key modules:
   `CONTINUE_DEBATE:` lines alongside the `RECOMMENDATION:` label. Parsed by
   `adapters._extract_response_envelope`, stored on `ParticipantResult`, and
   emitted in transcripts / MCP `structured_results`. All fields are optional
-  in the current schema (v2). A peer that says `EFFORT: blocked` with no
+  in the current response contract (MCP schema v11). A peer that says `EFFORT: blocked` with no
   concrete entries in EITHER `BLOCKERS:` OR `ASSUMPTIONS:` is classified
   as abdication (`error_kind=abdicated`, `ok=False`, drops quorum) — no
   repair retry. Naming concrete missing artifacts in either list is
@@ -261,7 +265,8 @@ Key modules:
   rostered it; regression tests in `tests/test_deliberation_budget.py`).
 - **Mode-aware timeouts.** `defaults.py:DEFAULT_CONFIG["modes"]` may carry
   an optional `timeout_multiplier: float`. Resolution:
-  `effective = per_participant_timeout * mode_multiplier`. The
+  `effective = (per_participant_timeout + prompt_size_bonus) * mode_multiplier`,
+  still bounded by the MCP request deadline. See size scaling below. The
   per-participant `timeout` stays the source of truth for the base; the
   multiplier is layered on top so users who raised the base for a stubborn
   host CLI also benefit on consensus/deliberate runs. Defaults: consensus
@@ -269,12 +274,13 @@ Key modules:
   behavior). Helper: `adapters._resolve_effective_timeout`.
 - **Terse-retry on timeout.** When a peer times out
   (`is_timeout_error(error)`), the adapter performs one terse-retry with
-  `TERSE_RETRY_TIMEOUT_SECONDS` (60s, fixed) and `TERSE_RETRY_INSTRUCTION`
+  `_terse_retry_budget(original_timeout)` (30–120s) and `TERSE_RETRY_INSTRUCTION`
   appended to the prompt. Success sets `ok=True,
   recovered_after_timeout=True`. Failure falls through to normal timeout
   failure — no chained label-retry, no chained section-repair (three
   attempts past the cost ceiling). Mode-multiplier does NOT apply to the
-  retry. Disable per-participant with `terse_retry_on_timeout: false`.
+  retry. The request deadline bounds the entire retry pipeline. Disable
+  per-participant with `terse_retry_on_timeout: false`.
   **Quorum-aware skip (2026-08 field issue #1):** `run_participants`
   threads a per-round `adapters.QuorumTracker` (min-quorum derivation
   matches the post-run `degraded` computation); when a peer times out
@@ -552,7 +558,7 @@ Key modules:
   whole-`metadata` serialization, and rendered as a one-line ⚠️ note in
   the markdown transcript near the quorum/degraded summary.
 - **Fable peer: reduce false-positive refusals, detect the silent
-  Opus fallback (v0.16.0).** Claude Fable 5 runs request-side safety
+  Opus fallback (introduced in v0.16.0).** Historical Fable 5 dogfooding found request-side safety
   classifiers (research-bio + most cybersecurity content) that
   false-positive on benign security-adjacent review; on the Claude Code
   surface a refused request is silently re-served by Opus 4.8, and the
@@ -577,13 +583,13 @@ Key modules:
     refusal category — the structured format is all the council consumes).
     Factual context, **NOT** an instruction to bypass safety; harmless for
     non-Fable peers; absent unless a mode opts in.
-  - **Detect** — `claude_fable` pins `model: claude-fable-5` with
+  - **Detect** — `claude_fable` now pins `model: claude-fable-5-1` with
     `usage_from_json: true` (so `_parse_claude_usage_json` reports the model
     that ACTUALLY served the turn — selected as the `modelUsage` key with the
     most `outputTokens`, i.e. the answer's author, NOT the first key: a
     fallback turn can log both models and helper models can appear) and
-    `require_pinned_model: true`. When the served model fails the lenient
-    variant-tolerant `_model_pin_satisfied` check against the pinned id,
+    `require_pinned_model: true`. When the served model fails the exact-ID or
+    dated-snapshot `_model_pin_satisfied` check against the pinned id,
     `_run_cli_once` drops the peer (`ok=False`,
     `error_kind=model_substituted`, `ModelSubstituted:` prefix) so a
     substituted Opus answer never counts as a Fable vote; `result.model`
@@ -726,21 +732,27 @@ Key modules:
   `capture_output` is unbounded, and pipes held by surviving
   grandchildren can block past our own timeout). The generate timeout is
   clamped to `OKF_GENERATE_TIMEOUT_CEILING_SECONDS` (120s) regardless of
-  config because `build_prompt` runs on async call paths. `find_bundle`
-  refuses an `okf.toml` `output` that resolves outside cwd — the file
-  lives in the reviewed (possibly hostile) repo.
+  config. CLI/MCP async call paths use `blocking.run_blocking`; cancellation
+  signals the worker, kills/reaps the generator process group on POSIX, and
+  awaits temporary-directory cleanup. Project ContextVars propagate into the
+  worker. Bundle, index, and concept paths must stay inside their respective
+  project/bundle boundaries; concept traversal skips symlinks. File reads and
+  directory enumeration are bounded before allocation/sorting.
   Bundle acquisition is ephemeral-FIRST: the feature only runs when a
   diff exists, which means the working tree differs from HEAD for
   exactly the files under review, so a committed bundle is only a
-  fallback (marked `stale_attached` when its `source_revision` ≠ HEAD).
+  fallback (always marked `stale_attached`: even a revision equal to HEAD
+  cannot establish freshness for the working-tree changes under review).
   The excerpt renders into post-assembly prompt headroom only, so it can
   never trigger the overflow-chunking paths, and the machine interface
   is concept-file frontmatter (`resource: path#Lstart-Lend`,
   `relationships`) — okf-rs query subcommands have no JSON output. Line
   locators are kept verbatim (the format the 2026-08-31 A/B validated);
-  staleness is tolerated because `citations.py` verifies `[VERIFIED:...]`
-  tags against the working tree, so a stale locator degrades to an
-  unverified tag rather than silently wrong evidence. MCP surfacing is
+  citations are checked against working-tree line ranges. A stale locator can
+  still land on a valid range containing different code; verification proves
+  location existence, not freshness or claim truth. The host must inspect
+  source semantics. Current headroom is calculated before diff trimming, so
+  OKF can be omitted even when trimming later frees space. MCP surfacing is
   metadata-only (no top-level key, no schema bump). The opt-in canary
   `tests/test_live_okf_bundle.py` (`LLM_COUNCIL_LIVE_OKF_TEST=1`) guards
   the okf-rs frontmatter/read-only contract across upstream releases.
@@ -766,11 +778,11 @@ failure path; do not let strings drift.
 | `downstream_error`   | httpx / hosted-API failures other than timeouts (HTTPStatusError, ConnectError, RemoteProtocolError, ReadError, WriteError, ProxyError). httpx timeout class names are classified as `timeout` instead. |
 | `cli_nonzero_exit`   | CLI participant exited with a nonzero status and empty stderr. Prefix: `CliExitNonZero:` |
 | `preflight_failed`   | Local participant's `base_url` was unreachable at run start. Prefix: `PreflightFailed:` |
-| `abdicated`          | Peer emitted `RECOMMENDATION:` and `EFFORT: blocked` with no concrete missing artifact in EITHER `BLOCKERS:` or `ASSUMPTIONS:`. Terminal for the round — no repair retry, drops quorum so consensus doesn't form on a non-vote. The cache DOES persist the raw output; `_with_envelope` re-derives `ok=False` on every read so repeat runs still drop quorum without paying the peer again. Prefix: `AbdicatedResponse:` |
+| `abdicated`          | Peer emitted `RECOMMENDATION:` and `EFFORT: blocked` with no concrete missing artifact in EITHER `BLOCKERS:` or `ASSUMPTIONS:`. Terminal for the round — no repair retry, drops quorum so consensus doesn't form on a non-vote. When response caching is enabled (CLI peers default off), the cache persists the raw output; `_with_envelope` re-derives `ok=False` on every read so repeat runs still drop quorum without paying the peer again. Prefix: `AbdicatedResponse:` |
 | `incomplete_response` | Response had the `RECOMMENDATION:` label but missed one or more `(REQUIRED)` sections from the prompt after one repair-retry. Prefix: `IncompleteResponse:` |
 | `untagged_evidence`  | `defaults.strict_evidence: true` AND one or more EVIDENCE bullets lacked a `[PUBLISHED]/[OBSERVABLE]/[INFERRED]/[SPECULATIVE]` tag after one repair-retry. Prefix: `UntaggedEvidence:` |
 | `quota_exhausted`    | Peer hit a known quota / rate-limit signal (`RESOURCE_EXHAUSTED`, `quota_exceeded`, `Individual quota reached`, `rate_limit_exceeded`, `insufficient_quota`, `insufficient credits`, `usage limit`, `5-hour limit`, HTTP 429 with quota-adjacent text). Detected by `adapters.is_quota_exhausted_error` over the raw error string — no prefix synthesized. Surfaced top-level in transcripts and MCP `structured_results` as `quota_throttled_peers: [{peer, family, model, message}]`; orchestrator emits a `peer_quota_throttled` progress event per peer (deduped across rounds). A peer with a non-empty `cfg.fallback_chain` walks up to three next-in-chain models before landing in quorum. On success the peer recovers (`recovered_after_quota=True`, `model_fallback_used=<id>`, appears in `quota_recoveries` not `quota_throttled_peers`). On failure the peer drops with this error kind. Skipped for the Claude family because Claude's own `--fallback-model` CLI flag handles overload natively (auto-injected by `_build_cli_command` when chain non-empty). |
-| `model_substituted`  | A CLI peer with `require_pinned_model: true` was served by a model other than its pinned `model` — e.g. Claude Fable 5 refused and the Claude Code surface silently fell back to Opus 4.8. Prefix: `ModelSubstituted:`. Only observable when `usage_from_json: true` surfaces the served model id (the `modelUsage` key with the most `outputTokens` — the answer's author); the served model must fail the lenient variant-tolerant `adapters._model_pin_satisfied` check. Terminal for the peer (ok=False, drops quorum) so a substituted model's answer is never recorded as the requested model's vote; `result.model` still reports the REAL served model, and substituted outputs are excluded from the finding matrix. Detected live per round (round 1, round-2 deliberation) plus the synthesis-chair turn, and preserved through repair-retry merges (with combined original+retry output). Surfaced as `metadata['model_substituted_peers']: [{peer, requested, served_by, synthesis?}]` (omitted when empty), lifted top-level in the MCP `council_run` payload + schema, with a per-round `peer_model_substituted` progress event. Opt-in — a peer without `require_pinned_model` or without JSON usage never trips it. Known limit: attribution is by max cumulative `outputTokens`, so a mid-turn refusal fallback inside a long agentic turn can evade it. |
+| `model_substituted`  | A CLI peer with `require_pinned_model: true` was served by a model other than its pinned `model` — e.g. Claude Fable 5 refused and the Claude Code surface silently fell back to Opus 4.8. Prefix: `ModelSubstituted:`. Only observable when `usage_from_json: true` surfaces the served model id (the `modelUsage` key with the most `outputTokens` — the answer's author); the served model must fail the exact-ID-or-dated-snapshot `adapters._model_pin_satisfied` check. Terminal for the peer (ok=False, drops quorum) so a substituted model's answer is never recorded as the requested model's vote; `result.model` still reports the REAL served model, and substituted outputs are excluded from the finding matrix. Detected live per round (round 1, round-2 deliberation) plus the synthesis-chair turn, and preserved through repair-retry merges (with combined original+retry output). Surfaced as `metadata['model_substituted_peers']: [{peer, requested, served_by, synthesis?}]` (omitted when empty), lifted top-level in the MCP `council_run` payload + schema, with a per-round `peer_model_substituted` progress event. Opt-in — a peer without `require_pinned_model` or without JSON usage never trips it. Known limit: attribution is by max cumulative `outputTokens`, so a mid-turn refusal fallback inside a long agentic turn can evade it. |
 | `pinned_model_unverified` | A peer required pinned-model verification but the CLI output did not report a served model. Prefix: `PinnedModelUnverified:`. The answer is excluded from quorum rather than being attributed without evidence. |
 | `client_ineligible` | A native client is installed but durably ineligible for the configured account/tier — e.g. the retired standalone Gemini CLI's `IneligibleTierError` with `UNSUPPORTED_CLIENT` (Google ended individual-tier service 2026-06-18; the built-in `gemini` peer was removed in v0.20.0). Doctor's opt-in native probe surfaces the compatible fallback. |
 | `content_refused`    | A provider-side content/safety policy refused the turn — observed 2026-08 as codex exiting nonzero with OpenAI's "This content was flagged for possible cybersecurity risk … Trusted Access for Cyber" on attack-phrased security-review prompts ("find a bypass"); the same review phrased as verification passed. Pattern-detected over the error string (`adapters.CONTENT_REFUSAL_PATTERNS`, checked BEFORE the quota scan; also matches OpenAI `content_policy_violation` and Gemini `PROHIBITED_CONTENT` / `SAFETY`), no prefix synthesized — so hosted moderation errors classify too. Surfaced as `metadata.content_refused_peers: [{peer, family, model, message}]` (`message` = the matched refusal line, not codex's banner) + a `peer_content_refused` progress event, lifted top-level in the MCP payload (schema v11), and a ⚠️ transcript-header line. The fix is to REPHRASE, not to raise a limit. |
@@ -840,6 +852,14 @@ run is refused — set `defaults.max_continuation_depth: <N>` in
 
 ## Run-level budget caps
 
+MCP's default request deadline is 240 seconds. `blocking.peer_deadline` carries
+the earlier peer-work deadline through request ContextVars; `run_participant`
+enforces it around the entire retry pipeline. Deadline failures return through
+normal orchestration so completed votes and partial transcripts survive. Never
+launch further rounds after this deadline or turn request cancellation into a
+retry. Native subprocesses own POSIX process groups; cleanup must finish on
+success as well as cancellation/error. See `docs/request-limits.md`.
+
 `--max-cost-usd` and `--max-tokens` (CLI) / `max_cost_usd`,
 `max_tokens` (MCP `council_run`) gate the run on the **pre-flight
 estimate** before any subprocess or HTTP call is made. The estimate sums
@@ -862,10 +882,10 @@ family, origin are untouched). Built-in modes ship without
 `model_overrides` on purpose — do NOT add vendor-affinity defaults
 without real-world evidence of a per-mode affinity.
 
-**Per-CLI model identity is not observable.** Native CLI peers
+**Native text-mode model identity is unreported by default.** Native CLI peers
 (claude/codex/antigravity) ship `model: None` intentionally so each
-runs under the user's own account-default model. llm-council has no hook to
-read which concrete model the CLI actually executed, so `result.model` stays
+runs under the user's own account-default model. With default text output,
+llm-council cannot read which concrete model executed, so `result.model` stays
 `None` — the transcript renders `cli default (unreported)` and the JSON shows
 `null`. To get a RECORDED model id, pin `participants.<peer>.model` (or use
 `--tier` / `modes.<name>.model_overrides`): `_build_cli_command` then injects
@@ -874,7 +894,10 @@ REQUESTED id — never a server-side confirmation that the CLI honored it. The
 estimate row substitutes the load-bearing `CLI_DEFAULT_MODEL_LABEL`
 (`"cli default"`) sentinel for `model: None` peers; `cli.py:cmd_estimate`
 compares against that same constant to render the peer NAME in the table.
-Antigravity 1.0.x accepts `--model`, so a configured model is injected like
+Opt-in `usage_from_json` can report served models and usage when supported by
+the native CLI; pinned-model verification fails closed when identity is absent.
+See [native models](docs/native-models.md) for the dated defaults snapshot.
+Antigravity accepts `--model`, so a configured model is injected like
 other non-Codex CLIs. Use the exact `agy models` display name: an unrecognized
 value silently falls back to Antigravity's session default, so a requested id
 is not proof of the model that served the response.

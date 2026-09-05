@@ -23,6 +23,7 @@ from typing import Any
 import re
 
 from llm_council.citations import (
+    CitationVerifier,
     VerifiedRef,
     parse_verified_tag,
     strip_verified_tag,
@@ -490,17 +491,19 @@ def matrix_to_dict(matrix: FindingMatrix) -> dict[str, Any]:
 
 def build_matrix_from_results(
     results: list[Any],
+    *, verifier: CitationVerifier | None = None,
 ) -> FindingMatrix:
     """Build a FindingMatrix from final-round results.
 
-    Each result must expose ``name`` and ``output`` attributes. Findings
-    whose ``[VERIFIED:...]`` ref appears in the result's evidence-
-    verification-failures list are marked ``verified=False`` so they cannot
-    contribute to a consensus cluster.
+    A tag is not a receipt. Verify FINDINGS references directly, including
+    references never repeated in EVIDENCE. Without a verifier, only explicit
+    positive EVIDENCE receipts can contribute to consensus clusters.
     """
 
     by_peer: dict[str, list[Finding]] = {}
     for result in results:
+        if getattr(result, "ok", True) is False:
+            continue
         output = getattr(result, "output", None) or ""
         peer_name = getattr(result, "name", "?")
         # Strip any `:roundN` suffix so multi-round entries share a peer
@@ -517,12 +520,28 @@ def build_matrix_from_results(
         failed_keys = set()
         for entry in failures:
             failed_keys.add(str(entry).split(" ", 1)[0])
+        positive_refs = {
+            (e.get("path"), e.get("start_line"), e.get("end_line", e.get("start_line")))
+            for e in (getattr(result, "evidence", None) or [])
+            if isinstance(e, dict) and e.get("tag") == "verified" and e.get("verified") is True
+        }
         materialized: list[Finding] = []
         for f in findings:
             verified = f.verified
             if f.verified_ref is not None:
                 key = f"{f.verified_ref.path}:{f.verified_ref.start_line}-{f.verified_ref.end_line}"
-                verified = False if key in failed_keys else True
+                ref = f.verified_ref
+                verified = (
+                    verifier.verify(ref) if verifier is not None
+                    else (ref.path, ref.start_line, ref.end_line) in positive_refs
+                )
+                if key in failed_keys:
+                    verified = False
+                if not verified and key not in failed_keys:
+                    result.evidence_verification_failures = [
+                        *(getattr(result, "evidence_verification_failures", None) or []), key
+                    ]
+                    failed_keys.add(key)
             materialized.append(
                 Finding(
                     id=f.id,

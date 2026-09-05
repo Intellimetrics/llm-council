@@ -428,8 +428,8 @@ def test_participant_and_mode_verbose_notes():
     assert "env_strict=true" in joined
     assert "fallback_chain: a → b" in joined
     assert "require_recommendation=false" in joined
-    # Defaults produce no notes.
-    assert _participant_verbose_notes({"type": "cli"}) == []
+    # Make the filesystem-aware CLI cache policy discoverable.
+    assert _participant_verbose_notes({"type": "cli"}) == ["cache_response=false"]
 
     mode_notes = _mode_verbose_notes(
         {
